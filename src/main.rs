@@ -18,6 +18,7 @@ struct Args {
     zoom: u32,
     width: Option<u32>,
     win_px: u32,
+    style: String,
     braille: bool,
     mono: bool,
     classify: bool,
@@ -31,8 +32,8 @@ fn arg_err(msg: &str) -> ! { eprintln!("{msg}"); std::process::exit(2); }
 
 fn parse_args() -> Args {
     let mut a = Args { lat: None, lon: None, place: None, zoom: 14, width: None, win_px: 640,
-                       braille: false, mono: false, classify: false, interactive: false,
-                       threshold: 195, image: None, png: None };
+                       style: "osm".to_string(), braille: false, mono: false, classify: false,
+                       interactive: false, threshold: 195, image: None, png: None };
     let mut it = std::env::args().skip(1);
     macro_rules! val { ($k:expr) => { it.next().unwrap_or_else(|| arg_err(&format!("{} は値が必要です", $k))) } }
     macro_rules! num { ($k:expr) => {{ let v = val!($k); v.parse().unwrap_or_else(|_| arg_err(&format!("{} の値が不正: {}", $k, v))) }} }
@@ -44,6 +45,7 @@ fn parse_args() -> Args {
             "--zoom" => a.zoom = num!("--zoom"),
             "--width" => a.width = Some(num!("--width")),
             "--win" => a.win_px = num!("--win"),
+            "--style" => a.style = val!("--style"),
             "--braille" => a.braille = true,
             "--mono" => a.mono = true,
             "--classify" => a.classify = true,
@@ -51,13 +53,13 @@ fn parse_args() -> Args {
             "--threshold" => a.threshold = num!("--threshold"),
             "--image" => a.image = Some(val!("--image")),
             "--png" => a.png = Some(val!("--png")),
-            "-h" | "--help" => { eprintln!("usage: termmap (--place \"住所\" | --lat LAT --lon LON) [--zoom Z] [-i] [--braille] [--classify] [--mono] [--width N] [--png OUT] | --image PNG"); std::process::exit(0); }
+            "-h" | "--help" => { eprintln!("usage: termmap (--place \"住所\" | --lat LAT --lon LON) [--zoom Z] [--style osm|voyager|dark|light] [-i] [--braille] [--classify] [--mono] [--width N] [--png OUT] | --image PNG"); std::process::exit(0); }
             _ => arg_err(&format!("unknown arg: {k}")),
         }
     }
     if a.image.is_none() && a.zoom > 20 { arg_err("--zoom は 0..=20 で指定 (OSMタイル有効域)"); }
     if a.win_px == 0 || a.win_px > 2048 { arg_err("--win は 1..=2048 で指定"); }
-    if a.width == Some(0) { arg_err("--width は 1 以上で指定"); }
+    if let Some(w) = a.width { if w == 0 || w > 1024 { arg_err("--width は 1..=1024 で指定"); } }
     a
 }
 
@@ -106,8 +108,17 @@ fn geocode(place: &str) -> Result<(f64, f64), String> {
     Ok((lat, lon))
 }
 
-fn fetch_tile(z: u32, x: i64, y: i64) -> Result<RgbImage, String> {
-    let url = format!("https://tile.openstreetmap.org/{z}/{x}/{y}.png");
+// タイルスタイル → URL。voyager/dark/light は CartoDB の label-free 系(端末で見やすい)。
+fn tile_url(style: &str, z: u32, x: i64, y: i64) -> String {
+    match style {
+        "voyager" => format!("https://basemaps.cartocdn.com/rastertiles/voyager_nolabels/{z}/{x}/{y}.png"),
+        "dark"    => format!("https://basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}.png"),
+        "light"   => format!("https://basemaps.cartocdn.com/light_nolabels/{z}/{x}/{y}.png"),
+        _         => format!("https://tile.openstreetmap.org/{z}/{x}/{y}.png"),
+    }
+}
+fn fetch_tile(style: &str, z: u32, x: i64, y: i64) -> Result<RgbImage, String> {
+    let url = tile_url(style, z, x, y);
     let resp = ureq::get(&url)
         .set("User-Agent", "termmap/0.1 (personal experiment)")
         .call().map_err(|e| format!("fetch tile {z}/{x}/{y}: {e}"))?;
@@ -117,7 +128,7 @@ fn fetch_tile(z: u32, x: i64, y: i64) -> Result<RgbImage, String> {
 }
 
 // 中心(cx,cy グローバルpx)から win_w×win_h の矩形窓を組み立てる。タイルは cache 経由。
-fn build_window(cx: f64, cy: f64, z: u32, win_w: u32, win_h: u32, cache: &mut Cache) -> Result<RgbImage, String> {
+fn build_window(cx: f64, cy: f64, z: u32, win_w: u32, win_h: u32, style: &str, cache: &mut Cache) -> Result<RgbImage, String> {
     let left = cx - win_w as f64 / 2.0;
     let top = cy - win_h as f64 / 2.0;
     let tf = TILE as f64;
@@ -141,7 +152,7 @@ fn build_window(cx: f64, cy: f64, z: u32, win_w: u32, win_h: u32, cache: &mut Ca
     const CONCURRENCY: usize = 8;
     for chunk in missing.chunks(CONCURRENCY) {
         let got: Vec<((i64, i64), Result<RgbImage, String>)> = std::thread::scope(|s| {
-            let hs: Vec<_> = chunk.iter().map(|&(wx, ty)| s.spawn(move || ((wx, ty), fetch_tile(z, wx, ty)))).collect();
+            let hs: Vec<_> = chunk.iter().map(|&(wx, ty)| s.spawn(move || ((wx, ty), fetch_tile(style, z, wx, ty)))).collect();
             hs.into_iter().map(|h| h.join().unwrap()).collect()
         });
         for ((wx, ty), r) in got { cache.insert((z, wx, ty), r?); }
@@ -149,7 +160,8 @@ fn build_window(cx: f64, cy: f64, z: u32, win_w: u32, win_h: u32, cache: &mut Ca
 
     let cols = (tx_max - tx_min + 1) as u32;
     let rows = (ty_max - ty_min + 1) as u32;
-    let mut canvas = RgbImage::from_pixel(cols * TILE, rows * TILE, image::Rgb([221, 221, 221]));
+    let bg = if style == "dark" { image::Rgb([26, 26, 26]) } else { image::Rgb([221, 221, 221]) };
+    let mut canvas = RgbImage::from_pixel(cols * TILE, rows * TILE, bg);
     for ty in ty_min..=ty_max {
         if ty < 0 || ty >= max_t { continue; }
         for tx in tx_min..=tx_max {
@@ -161,8 +173,8 @@ fn build_window(cx: f64, cy: f64, z: u32, win_w: u32, win_h: u32, cache: &mut Ca
             }
         }
     }
-    let crop_x = (left - tx_min as f64 * tf).round().max(0.0) as u32;
-    let crop_y = (top - ty_min as f64 * tf).round().max(0.0) as u32;
+    let crop_x = (left - tx_min as f64 * tf).max(0.0) as u32;
+    let crop_y = (top - ty_min as f64 * tf).max(0.0) as u32;
     Ok(image::imageops::crop_imm(&canvas, crop_x, crop_y, win_w, win_h).to_image())
 }
 
@@ -201,7 +213,7 @@ fn recolor(img: &RgbImage) -> RgbImage {
 
 fn render_halfblock(img: &RgbImage) -> String {
     let (w, h) = img.dimensions();
-    let mut out = String::with_capacity((w * h) as usize * 20);
+    let mut out = String::with_capacity(w as usize * h as usize * 20);
     let mut y = 0;
     while y + 1 < h {
         for x in 0..w {
@@ -219,7 +231,7 @@ fn render_braille(img: &RgbImage, mono: bool, classify_on: bool, threshold: u8) 
     let (w, h) = img.dimensions();
     let (cols, rows) = (w / 2, h / 4);
     let th = threshold as f64;
-    let mut out = String::with_capacity((cols * rows) as usize * 6);
+    let mut out = String::with_capacity(cols as usize * rows as usize * 6);
     for cy in 0..rows {
         for cx in 0..cols {
             let mut bits: u8 = 0;
@@ -244,7 +256,9 @@ fn render_braille(img: &RgbImage, mono: bool, classify_on: bool, threshold: u8) 
                 let (r, g, b) = cat_color([Cat::Water, Cat::Park, Cat::RoadMajor, Cat::Rail, Cat::Building, Cat::Other][bi]);
                 out.push_str(&format!("\x1b[38;2;{r};{g};{b}m{ch}"));
             } else {
-                out.push_str(&format!("\x1b[38;2;{};{};{}m{ch}", sr / n, sg / n, sb / n));
+                // braille はインク=暗い画素の平均色になりがちで沈むので輝度を持ち上げる
+                let br = |s: u32| ((s as f64 / n as f64) * 1.6).min(255.0) as u8;
+                out.push_str(&format!("\x1b[38;2;{};{};{}m{ch}", br(sr), br(sg), br(sb)));
             }
         }
         if !mono { out.push_str("\x1b[0m"); }
@@ -260,54 +274,65 @@ fn render(img: &RgbImage, a: &Args) -> String {
 }
 
 // ---- 対話モード (crossterm) ----
+// 端末状態を RAII で復元する。パニック/早期return でも Drop で raw mode と代替スクリーンを必ず戻す。
+struct TermGuard;
+impl TermGuard {
+    fn enter() -> std::io::Result<Self> {
+        crossterm::terminal::enable_raw_mode()?;
+        crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen, crossterm::cursor::Hide)?;
+        Ok(Self)
+    }
+}
+impl Drop for TermGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Show, crossterm::terminal::LeaveAlternateScreen);
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
 fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Result<()> {
-    use crossterm::{terminal, event::{self, Event, KeyCode}, cursor, execute};
+    use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+    let _guard = TermGuard::enter()?; // Drop で必ず端末復元
     let mut cache: Cache = HashMap::new();
     let mut out = std::io::stdout();
-    terminal::enable_raw_mode()?;
-    execute!(out, terminal::EnterAlternateScreen, cursor::Hide)?;
-    let res = (|| -> std::io::Result<()> {
-        loop {
-            let (tc, tr) = terminal::size().unwrap_or((100, 40));
-            let cols = tc.max(10) as u32;
-            let map_rows = (tr.max(3) - 1) as u32;
-            let (ow, oh) = if a.braille { (cols * 2, map_rows * 4) } else { (cols, map_rows * 2) };
-            let body = match build_window(cx, cy, z, ow, oh, &mut cache) {
-                Ok(img) => render(&img, a),
-                Err(e) => format!("取得失敗: {e}\r\n"),
-            };
-            let (lat, lon) = pixel_to_deg(cx, cy, z);
-            let status = format!(" z{z}  {lat:.5},{lon:.5}   ←↑↓→=pan  +/-=zoom  q=quit ");
-            let status: String = status.chars().take(cols as usize).collect();
-            write!(out, "\x1b[H{body}\x1b[{tr};1H\x1b[7m{status}\x1b[0m")?;
-            out.flush()?;
-            match event::read()? {
-                Event::Key(k) => {
-                    let (dx, dy) = (ow as f64 / 3.0, oh as f64 / 3.0);
-                    match k.code {
-                        KeyCode::Left => cx -= dx,
-                        KeyCode::Right => cx += dx,
-                        KeyCode::Up => cy -= dy,
-                        KeyCode::Down => cy += dy,
-                        KeyCode::Char('+') | KeyCode::Char('=') => if z < 19 { z += 1; cx *= 2.0; cy *= 2.0; },
-                        KeyCode::Char('-') | KeyCode::Char('_') => if z > 2 { z -= 1; cx /= 2.0; cy /= 2.0; },
-                        KeyCode::Char('q') | KeyCode::Esc => break,
-                        _ => {}
-                    }
-                    // ピクセル範囲を [0, n) に収める(経度wrap相当)
-                    let n = (TILE as f64) * 2f64.powi(z as i32);
-                    if cx < 0.0 { cx += n; } else if cx >= n { cx -= n; }
-                    cy = cy.clamp(0.0, n - 1.0);
+    loop {
+        let (tc, tr) = crossterm::terminal::size().unwrap_or((100, 40));
+        let cols = tc.max(10) as u32;
+        let map_rows = (tr.max(3) - 1) as u32;
+        let (ow, oh) = if a.braille { (cols * 2, map_rows * 4) } else { (cols, map_rows * 2) };
+        let body = match build_window(cx, cy, z, ow, oh, &a.style, &mut cache) {
+            Ok(img) => render(&img, a),
+            Err(e) => format!("取得失敗: {e}\r\n"),
+        };
+        let (lat, lon) = pixel_to_deg(cx, cy, z);
+        let status = format!(" z{z}  {lat:.5},{lon:.5}   ←↑↓→=pan  Shift=大きく  +/-=zoom  q=quit ");
+        let status: String = status.chars().take(cols as usize).collect();
+        write!(out, "\x1b[H{body}\x1b[{tr};1H\x1b[7m{status}\x1b[0m")?;
+        out.flush()?;
+        match event::read()? {
+            Event::Key(k) => {
+                // 通常=細かく(window/12), Shift併用=大きく(window/3)
+                let frac = if k.modifiers.contains(KeyModifiers::SHIFT) { 3.0 } else { 12.0 };
+                let (dx, dy) = ((ow as f64 / frac).max(1.0), (oh as f64 / frac).max(1.0));
+                match k.code {
+                    KeyCode::Left => cx -= dx,
+                    KeyCode::Right => cx += dx,
+                    KeyCode::Up => cy -= dy,
+                    KeyCode::Down => cy += dy,
+                    KeyCode::Char('+') | KeyCode::Char('=') => if z < 19 { z += 1; cx *= 2.0; cy *= 2.0; },
+                    KeyCode::Char('-') | KeyCode::Char('_') => if z > 2 { z -= 1; cx /= 2.0; cy /= 2.0; },
+                    KeyCode::Char('q') | KeyCode::Esc => break,
+                    _ => {}
                 }
-                Event::Resize(..) => {}
-                _ => {}
+                let n = (TILE as f64) * 2f64.powi(z as i32);
+                if cx < 0.0 { cx += n; } else if cx >= n { cx -= n; }
+                cy = cy.clamp(0.0, n - 1.0);
             }
+            Event::Resize(..) => {}
+            _ => {}
         }
-        Ok(())
-    })();
-    execute!(out, cursor::Show, terminal::LeaveAlternateScreen)?;
-    terminal::disable_raw_mode()?;
-    res
+    }
+    Ok(())
 }
 
 fn oneshot(src: RgbImage, a: &Args) {
@@ -351,7 +376,7 @@ fn main() {
     }
 
     let mut cache: Cache = HashMap::new();
-    match build_window(cx, cy, a.zoom, a.win_px, a.win_px, &mut cache) {
+    match build_window(cx, cy, a.zoom, a.win_px, a.win_px, &a.style, &mut cache) {
         Ok(src) => oneshot(src, &a),
         Err(e) => { eprintln!("{e}"); std::process::exit(1); }
     }
