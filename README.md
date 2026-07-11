@@ -20,6 +20,7 @@ OSM ラスタタイルを端末に描画する mapscii 風レンダラ。
     --lat LAT       中心の緯度
     --lon LON       中心の経度
     --resume        前回終了時の位置/ズーム/styleを復元 (--last 同義)
+    --here          GPS/測位で現在地を中心にする (要 CoreLocationCLI + 位置情報許可)
     --zoom Z        ズーム 0..=20 (既定 14)
     -i, --interactive   対話モード (矢印=パン, +/-=ズーム, a=中心の住所, q=終了)
     --braille       点字ドットで描画
@@ -46,5 +47,6 @@ OSM ラスタタイルを端末に描画する mapscii 風レンダラ。
 ## notes
 
 - タイル: `tile.openstreetmap.org` (© OpenStreetMap contributors, ODbL)
-- ジオコーディング: Nominatim
+- ジオコーディング/逆ジオコーディング: Nominatim
+- --here は CoreLocationCLI (`brew install corelocationcli`) 経由。初回は位置情報の許可が必要
 - 描画は「ラスタ画像を端末文字に変換」。classify の地物判定はピクセル色からの推定。

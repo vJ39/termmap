@@ -25,6 +25,7 @@ struct Args {
     edge: bool,
     interactive: bool,
     resume: bool,
+    here: bool,
     threshold: Option<u8>,
     image: Option<String>,
     png: Option<String>,
@@ -35,7 +36,7 @@ fn arg_err(msg: &str) -> ! { eprintln!("{msg}"); std::process::exit(2); }
 fn parse_args() -> Args {
     let mut a = Args { lat: None, lon: None, place: None, zoom: 14, width: None, win_px: 640,
                        style: "osm".to_string(), braille: false, mono: false, classify: false,
-                       edge: false, interactive: false, resume: false, threshold: None, image: None, png: None };
+                       edge: false, interactive: false, resume: false, here: false, threshold: None, image: None, png: None };
     let mut it = std::env::args().skip(1);
     macro_rules! val { ($k:expr) => { it.next().unwrap_or_else(|| arg_err(&format!("{} は値が必要です", $k))) } }
     macro_rules! num { ($k:expr) => {{ let v = val!($k); v.parse().unwrap_or_else(|_| arg_err(&format!("{} の値が不正: {}", $k, v))) }} }
@@ -54,10 +55,11 @@ fn parse_args() -> Args {
             "--edge" => a.edge = true,
             "-i" | "--interactive" => a.interactive = true,
             "--resume" | "--last" => a.resume = true,
+            "--here" => a.here = true,
             "--threshold" => a.threshold = Some(num!("--threshold")),
             "--image" => a.image = Some(val!("--image")),
             "--png" => a.png = Some(val!("--png")),
-            "-h" | "--help" => { eprintln!("usage: termmap (--place \"住所\" | --lat LAT --lon LON | --resume) [--zoom Z] [--style osm|voyager|dark|light] [-i] [--braille] [--classify] [--edge] [--mono] [--width N] [--png OUT] | --image PNG"); std::process::exit(0); }
+            "-h" | "--help" => { eprintln!("usage: termmap (--place \"住所\" | --lat LAT --lon LON | --resume | --here) [--zoom Z] [--style osm|voyager|dark|light] [-i] [--braille] [--classify] [--edge] [--mono] [--width N] [--png OUT] | --image PNG"); std::process::exit(0); }
             _ => arg_err(&format!("unknown arg: {k}")),
         }
     }
@@ -120,6 +122,30 @@ fn reverse_geocode(lat: f64, lon: f64) -> Result<String, String> {
         .call().map_err(|e| format!("revgeo: {e}"))?
         .into_string().map_err(|e| e.to_string())?;
     json_first(&body, "\"display_name\":\"").ok_or_else(|| "住所が取得できません".to_string())
+}
+
+// GPS/測位で現在地を取得 (--here)。macOS CoreLocationCLI に委譲。
+// 要: brew install corelocationcli + System Settings > Privacy > Location Services で許可。
+fn gps_here() -> Result<(f64, f64), String> {
+    let bin = if std::path::Path::new("/opt/homebrew/bin/CoreLocationCLI").exists() {
+        "/opt/homebrew/bin/CoreLocationCLI"
+    } else { "CoreLocationCLI" };
+    let out = std::process::Command::new(bin)
+        .args(["--format", "%latitude %longitude"])
+        .output()
+        .map_err(|e| format!("CoreLocationCLI 実行失敗: {e}\n  brew install corelocationcli を入れてください"))?;
+    let s = String::from_utf8_lossy(&out.stdout);
+    let e = String::from_utf8_lossy(&out.stderr);
+    let line = s.trim();
+    let mut it = line.split_whitespace();
+    let lat = it.next().and_then(|v| v.parse::<f64>().ok());
+    let lon = it.next().and_then(|v| v.parse::<f64>().ok());
+    match (lat, lon) {
+        (Some(la), Some(lo)) => Ok((la, lo)),
+        _ => Err(format!(
+            "測位できません: {}{}\n  System Settings > Privacy & Security > Location Services で CoreLocationCLI を許可してください",
+            line, e.trim())),
+    }
 }
 
 // タイルスタイル → URL。voyager/dark/light は CartoDB の label-free 系(端末で見やすい)。
@@ -326,13 +352,15 @@ struct TermGuard;
 impl TermGuard {
     fn enter() -> std::io::Result<Self> {
         crossterm::terminal::enable_raw_mode()?;
-        crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen, crossterm::cursor::Hide)?;
+        crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen,
+            crossterm::cursor::Hide, crossterm::event::EnableBracketedPaste)?;
         Ok(Self)
     }
 }
 impl Drop for TermGuard {
     fn drop(&mut self) {
-        let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Show, crossterm::terminal::LeaveAlternateScreen);
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste,
+            crossterm::cursor::Show, crossterm::terminal::LeaveAlternateScreen);
         let _ = crossterm::terminal::disable_raw_mode();
     }
 }
@@ -343,6 +371,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
     let mut cache: Cache = HashMap::new();
     let mut out = std::io::stdout();
     let mut addr = String::new(); // 'a' で現在地の住所を取得(パン/ズームで無効化)
+    let mut search: Option<String> = None; // '/' で住所検索モード(Some=入力中バッファ)
     loop {
         let (tc, tr) = crossterm::terminal::size().unwrap_or((100, 40));
         let cols = tc.max(10) as u32;
@@ -353,15 +382,37 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
             Err(e) => format!("取得失敗: {e}\r\n"),
         };
         let (lat, lon) = pixel_to_deg(cx, cy, z);
-        let status = if addr.is_empty() {
-            format!(" z{z}  {lat:.5},{lon:.5}   ←↑↓→=pan Shift=大 +/-=zoom a=住所 q=quit ")
+        let status = if let Some(buf) = &search {
+            format!(" 検索: {buf}\u{2588}   Enter=移動  Esc=取消 ")
+        } else if addr.is_empty() {
+            format!(" z{z}  {lat:.5},{lon:.5}   ←↑↓→=pan Shift=大 +/-=zoom /=検索 a=住所 q=quit ")
         } else {
-            format!(" z{z}  {lat:.5},{lon:.5}  {addr}   (a=更新 q=quit) ")
+            format!(" z{z}  {lat:.5},{lon:.5}  {addr}   (/=検索 a=更新 q=quit) ")
         };
         let status: String = status.chars().take(cols as usize).collect();
         write!(out, "\x1b[H{body}\x1b[{tr};1H\x1b[7m{status}\x1b[0m")?;
         out.flush()?;
         match event::read()? {
+            // 住所検索モード中: 文字を編集し Enter でジオコーディング→移動
+            Event::Key(k) if search.is_some() => {
+                let buf = search.as_mut().unwrap();
+                match k.code {
+                    KeyCode::Enter => {
+                        let q = buf.trim().to_string();
+                        search = None;
+                        if !q.is_empty() {
+                            match geocode(&q) {
+                                Ok((la, lo)) => { let (nx, ny) = deg_to_pixel(la, lo, z); cx = nx; cy = ny; addr.clear(); }
+                                Err(e) => { addr = format!("({e})"); }
+                            }
+                        }
+                    }
+                    KeyCode::Esc => search = None,
+                    KeyCode::Backspace => { buf.pop(); }
+                    KeyCode::Char(c) => buf.push(c),
+                    _ => {}
+                }
+            }
             Event::Key(k) => {
                 // 通常=細かく(window/12), Shift併用=大きく(window/3)
                 let frac = if k.modifiers.contains(KeyModifiers::SHIFT) { 3.0 } else { 12.0 };
@@ -374,6 +425,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                     KeyCode::Char('+') | KeyCode::Char('=') => if z < 19 { z += 1; cx *= 2.0; cy *= 2.0; addr.clear(); },
                     KeyCode::Char('-') | KeyCode::Char('_') => if z > 2 { z -= 1; cx /= 2.0; cy /= 2.0; addr.clear(); },
                     KeyCode::Char('a') => { addr = reverse_geocode(lat, lon).unwrap_or_else(|e| format!("({e})")); }
+                    KeyCode::Char('/') => search = Some(String::new()),
                     KeyCode::Char('q') | KeyCode::Esc => break,
                     _ => {}
                 }
@@ -381,6 +433,8 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                 if cx < 0.0 { cx += n; } else if cx >= n { cx -= n; }
                 cy = cy.clamp(0.0, n - 1.0);
             }
+            // IMEコミット/ペーストの日本語を検索バッファへ
+            Event::Paste(s) if search.is_some() => { search.as_mut().unwrap().push_str(&s); }
             Event::Resize(..) => {}
             _ => {}
         }
@@ -417,8 +471,10 @@ fn main() {
         return;
     }
 
-    // 中心座標の決定 (--resume > --place > --lat/--lon)
-    let (lat, lon) = if a.resume && a.place.is_none() && a.lat.is_none() && a.lon.is_none() {
+    // 中心座標の決定 (--here > --resume > --place > --lat/--lon)
+    let (lat, lon) = if a.here {
+        match gps_here() { Ok(v) => v, Err(e) => { eprintln!("{e}"); std::process::exit(1); } }
+    } else if a.resume && a.place.is_none() && a.lat.is_none() && a.lon.is_none() {
         match load_state() {
             Some((la, lo, z, st)) => { a.zoom = z; a.style = st; (la, lo) }
             None => { eprintln!("保存された location がありません (--resume)"); std::process::exit(1); }
