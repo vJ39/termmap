@@ -16,11 +16,12 @@ mod streetview;
 mod elevation;
 mod gpslive;
 mod searchcache;
-// 以下は今後の機能用(道路トレース/おすすめ相談)。まだ未wireのため dead_code 許容。
+mod roadsearch;
+#[allow(dead_code)]
+mod roadtrace; // point_at/sample等は使用、cut_segment等は将来用
+// 以下は今後の機能用(おすすめ相談)。まだ未wireのため dead_code 許容。
 #[allow(dead_code)]
 mod config;
-#[allow(dead_code)]
-mod roadtrace;
 #[allow(dead_code)]
 mod recommend;
 
@@ -356,6 +357,7 @@ const HELP: &[&str] = &[
     "   x              選択点を削除     c  ルート全消去",
     "   m              モード切替  下道 → 高速 → 最短",
     "   n              代替ルート候補を巡回(BRouterの案 1〜4)",
+    "   r              道路名/refで現在view内の道路を経路化(例: 国道16号 / E20)",
     "   W              走りまくり: 峠/展望を巡る周回を自動生成(連打で別案)",
     "",
     " [目的地・お気に入り]",
@@ -412,7 +414,7 @@ impl Drop for TermGuard {
 fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Result<()> {
     use crossterm::event::{self, Event, KeyCode, KeyModifiers};
     enum Focus { Map, Search(String), SaveName(String), NearSearch(String), PoiMenu, PoiList, RouteList, WaypointList,
-                 NewCat(String), SpotName(String, String), SpotList, SpotCatList, SpotRename(String, usize), Settings }
+                 NewCat(String), SpotName(String, String), SpotList, SpotCatList, SpotRename(String, usize), Settings, RoadSearch(String) }
     let _guard = TermGuard::enter()?; // Drop で必ず端末復元
     let mut cache: Cache = HashMap::new();
     let mut out = std::io::stdout();
@@ -659,13 +661,14 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
             Focus::SpotList => format!(" [{cur_cat}] ↑↓選択 Enter=移動 n=新規(現在地) x=削除 Esc=戻る "),
             Focus::SpotCatList => " カテゴリ: ↑↓選択 Enter=中へ n新規 r改名 c色 x削除(空のみ) Esc=閉 ".to_string(),
             Focus::Settings => " 設定: ↑↓選択 Enter/Space=切替 s=保存 Esc=閉 ".to_string(),
+            Focus::RoadSearch(buf) => format!(" 道路名/ref: {buf}\u{2588}   Enter=view内をルート化 Esc=取消 "),
             Focus::SpotRename(buf, _) => format!(" カテゴリ改名: {buf}\u{2588}   Enter=確定 Esc=取消 "),
             Focus::PoiMenu => " 目的地: 1ガソスタ 2カフェ 3コンビニ 4道の駅 5展望 6公園 7峠道  / キーワード周辺検索  Esc=取消 ".to_string(),
             Focus::PoiList => format!(" [{}] ↑↓選択 Enter=移動 s始 e終 v経由 f再検索 Esc閉 ", poi_label),
             Focus::RouteList => " お気に入り: ↑↓選択 Enter=読込 Esc=閉 ".to_string(),
             Focus::WaypointList => " 並べ替え: ↑↓/Tab 選択  [ ]移動  x削除  +/-拡縮  Esc閉 ".to_string(),
             Focus::Map => {
-                let base = format!(" ?ヘルプ z{z} {lat:.4},{lon:.4} | s始 e終 v経由({}) m:{} n候補 W走 f目的地 P点 V表 i実写 E標高 A再生 G現在地 S保存 L呼出 gGPX o共有 ,設定 /検索 q",
+                let base = format!(" ?ヘルプ z{z} {lat:.4},{lon:.4} | s始 e終 v経由({}) m:{} n候補 r道路 W走 f目的地 P点 V表 i実写 E標高 A再生 G現在地 S保存 L呼出 gGPX o共有 ,設定 /検索 q",
                     wps.len(), mode_label(&mode));
                 match &route_note { Some(rn) => format!("{base} | {rn} "), None => base }
             }
@@ -791,6 +794,34 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                         }
                         KeyCode::Esc => {}
                         _ => focus = Focus::Settings,
+                    },
+                    Focus::RoadSearch(mut buf) => match k.code { // 道路名/ref で現在view内をルート化
+                        KeyCode::Enter => {
+                            let name = buf.trim().to_string();
+                            if !name.is_empty() {
+                                let (n_lat, w_lon) = pixel_to_deg(cx - ow as f64 / 2.0, cy - oh as f64 / 2.0, z);
+                                let (s_lat, e_lon) = pixel_to_deg(cx + ow as f64 / 2.0, cy + oh as f64 / 2.0, z);
+                                match roadsearch::fetch(&name, s_lat, w_lon, n_lat, e_lon) {
+                                    Ok(frags) if !frags.is_empty() => {
+                                        let rf: Vec<roadtrace::RoadFrag> = frags.into_iter().map(|(pts, oneway)| roadtrace::RoadFrag { pts, oneway }).collect();
+                                        let poly = roadtrace::assemble_polyline(&rf);
+                                        let samp = roadtrace::sample_every(&poly, cfg.sample_interval_m.max(100.0));
+                                        if samp.len() >= 2 {
+                                            wps = samp; wp_sel = 0;
+                                            let (nn, jj) = trigger_route(&mut spec, &wps, &pois, &mode, 0);
+                                            route_note = nn; route_job = jj;
+                                            addr = format!("道路: {name} ({}点で経路化)", wps.len());
+                                        } else { addr = "道路: 点が足りない(拡大/移動して再検索)".into(); }
+                                    }
+                                    Ok(_) => addr = format!("道路が見つからない: {name}(view内に無い)"),
+                                    Err(e) => addr = format!("道路: {e}"),
+                                }
+                            }
+                        }
+                        KeyCode::Esc => {}
+                        KeyCode::Backspace => { buf.pop(); focus = Focus::RoadSearch(buf); }
+                        KeyCode::Char(c) => { buf.push(c); focus = Focus::RoadSearch(buf); }
+                        _ => focus = Focus::RoadSearch(buf),
                     },
                     Focus::SpotList => match k.code { // cur_cat のスポット一覧
                         KeyCode::Up => { sp_sel = sp_sel.saturating_sub(1); focus = Focus::SpotList; }
@@ -1042,6 +1073,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                             KeyCode::Char('?') => help = true,
                             KeyCode::Char('P') => { cat_sel = 0; focus = Focus::SpotCatList; } // マイスポット(カテゴリ一覧)
                             KeyCode::Char(',') => { set_sel = 0; focus = Focus::Settings; } // 設定画面
+                            KeyCode::Char('r') => focus = Focus::RoadSearch(String::new()), // 道路名でルート(現在view内)
                             KeyCode::Char('V') => { show_spots = !show_spots; apply_spots(&mut spec, &spots, &spot_cats, show_spots); addr = if show_spots { "マイスポット表示".into() } else { "マイスポット非表示".into() }; }
                             KeyCode::Char('E') => { // 標高プロファイルの表示/非表示
                                 show_elev = !show_elev;
@@ -1113,7 +1145,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                 }
             }
             Some(Event::Paste(s)) => { match &mut focus {
-                Focus::Search(buf) | Focus::SaveName(buf) | Focus::NearSearch(buf) | Focus::NewCat(buf) => buf.push_str(&s),
+                Focus::Search(buf) | Focus::SaveName(buf) | Focus::NearSearch(buf) | Focus::NewCat(buf) | Focus::RoadSearch(buf) => buf.push_str(&s),
                 Focus::SpotName(buf, _) | Focus::SpotRename(buf, _) => buf.push_str(&s),
                 _ => {}
             } }
