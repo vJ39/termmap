@@ -524,7 +524,6 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                             KeyCode::Up => { let (a, b) = streetview::step(slat_c, slon_c, hd_c as f64, 20.0); (a, b, hd_c) }
                             _ => { let (a, b) = streetview::step(slat_c, slon_c, hd_c as f64 + 180.0, 20.0); (a, b, hd_c) }
                         };
-                        show_busy(&mut out, cols, tr, "実写取得中…");
                         if let Ok(im) = streetview::fetch(nlat, nlon, nhd, 640, 480, &cfg.streetview_api_key) {
                             street = Some((im, nhd, nlat, nlon)); // Err時は現状維持(行き止まり等)
                         }
