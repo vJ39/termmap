@@ -345,6 +345,7 @@ const HELP: &[&str] = &[
     "   + / -          ズーム",
     "   /              住所・地名で検索して移動",
     "   a              中心の住所を表示",
+    "   Enter          中心付近の最寄りお気に入りにスナップ＋名前表示",
     "",
     " [ルートを作る]  中心の十字(黄)が置く位置",
     "   s / e / v      中心を 始点 / 終点 / 経由点 にする",
@@ -951,6 +952,23 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                             KeyCode::Down => { cy += step; addr.clear(); }
                             KeyCode::Char('+') | KeyCode::Char('=') => if z < 19 { z += 1; cx *= 2.0; cy *= 2.0; addr.clear(); },
                             KeyCode::Char('-') | KeyCode::Char('_') => if z > 2 { z -= 1; cx /= 2.0; cy /= 2.0; addr.clear(); },
+                            KeyCode::Enter => { // 中心付近の最寄りお気に入りにスナップ＋名前表示
+                                let mut best: Option<(f64, usize)> = None;
+                                for (i, s) in spots.iter().enumerate() {
+                                    let (gx, gy) = deg_to_pixel(s.lat, s.lon, z);
+                                    let dpx = ((gx - cx).powi(2) + (gy - cy).powi(2)).sqrt();
+                                    if best.map_or(true, |(bd, _)| dpx < bd) { best = Some((dpx, i)); }
+                                }
+                                match best {
+                                    Some((dpx, i)) if dpx <= (ow.min(oh) as f64) * 0.25 => {
+                                        let s = &spots[i];
+                                        let (nx, ny) = deg_to_pixel(s.lat, s.lon, z); cx = nx; cy = ny;
+                                        addr = if s.name.is_empty() { "★(無名スポット)".into() } else { format!("★{}", s.name) };
+                                    }
+                                    Some(_) => addr = "近くにお気に入り無し".into(),
+                                    None => addr = "お気に入り未登録".into(),
+                                }
+                            }
                             KeyCode::Char('a') => addr = reverse_geocode(lat, lon).unwrap_or_else(|e| format!("({e})")),
                             KeyCode::Char('/') => focus = Focus::Search(String::new()),
                             KeyCode::Char('f') => focus = Focus::PoiMenu,
