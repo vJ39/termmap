@@ -780,25 +780,25 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                 let cur = std::mem::replace(&mut focus, Focus::Map);
                 match cur {
                     Focus::Search(mut buf) => match k.code {
-                        KeyCode::Enter => { // その場所へ中心を移動するだけ(追加しない)
+                        KeyCode::Enter => { // 候補を一覧表示(左袖)。Enterで移動/s e vで経路点
                             let q = buf.trim().to_string();
                             if !q.is_empty() {
                                 let ckey = searchcache::make_key(&q, lat, lon);
-                                let cached = scache.get(&ckey).and_then(|v| v.first().map(|(la, lo, _)| (*la, *lo)));
-                                let coord = match cached {
-                                    Some(c) => Some(c), // キャッシュヒット=API叩かない
-                                    None => match geocode(&q, Some((lat, lon)), &cfg.streetview_api_key) {
-                                        Ok((la, lo)) => {
-                                            scache.insert(ckey, vec![(la, lo, q.clone())]);
-                                            let _ = searchcache::save(&scache);
-                                            Some((la, lo))
-                                        }
-                                        Err(_) => None,
-                                    },
+                                let results: Vec<(f64, f64, String)> = match scache.get(&ckey) {
+                                    Some(v) => v.clone(), // キャッシュヒット=API叩かない
+                                    None => {
+                                        let r = geocode_list(&q, Some((lat, lon)), &cfg.streetview_api_key);
+                                        if !r.is_empty() { scache.insert(ckey, r.clone()); let _ = searchcache::save(&scache); }
+                                        r
+                                    }
                                 };
-                                match coord {
-                                    Some((la, lo)) => { let (nx, ny) = deg_to_pixel(la, lo, z); cx = nx; cy = ny; addr.clear(); }
-                                    None => addr = format!("見つからない: {q}"),
+                                if results.is_empty() { addr = format!("見つからない: {q}"); }
+                                else {
+                                    pois = results.into_iter().take(8).map(|(la, lo, nm)| (la, lo, nm, PoiCat::Waypoint)).collect();
+                                    poi_sel = 0;
+                                    poi_label = format!("検索:{q}");
+                                    set_markers(&mut spec, &wps, &pois);
+                                    focus = Focus::PoiList;
                                 }
                             }
                         }
