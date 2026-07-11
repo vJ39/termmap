@@ -613,7 +613,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                     format!("mono     {}", onoff(opts.mono)),
                     format!("style    {}", opts.style),
                     format!("既定mode {}", cfg.route_profile),
-                    format!("道路間隔 {}m", cfg.sample_interval_m as i64),
+                    format!("r道路点間隔 {}m", cfg.sample_interval_m as i64),
                     format!("spot既定 {}", onoff(cfg.show_spots)),
                     format!("おすすめ {}", onoff(cfg.llm_recommend_enabled)),
                     format!("LLM      {}", cfg.llm_model),
