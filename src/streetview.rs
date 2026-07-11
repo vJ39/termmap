@@ -42,6 +42,19 @@ fn status_of(compact: &str) -> String {
     "取得エラー".to_string()
 }
 
+/// (lat,lon) から heading 方向へ dist_m メートル進んだ地点を返す。
+/// Street View は隣接パノラマのグラフを持たないので、少し前進した点で再取得すると
+/// metadata が最寄りパノラマにスナップする＝実質「前へ進む」挙動になる。
+pub fn step(lat: f64, lon: f64, heading_deg: f64, dist_m: f64) -> (f64, f64) {
+    let r = 6_371_000.0_f64; // 地球半径(m)
+    let br = heading_deg.to_radians();
+    let dr = dist_m / r;
+    let (lat1, lon1) = (lat.to_radians(), lon.to_radians());
+    let lat2 = (lat1.sin() * dr.cos() + lat1.cos() * dr.sin() * br.cos()).asin();
+    let lon2 = lon1 + (br.sin() * dr.sin() * lat1.cos()).atan2(dr.cos() - lat1.sin() * lat2.sin());
+    (lat2.to_degrees(), lon2.to_degrees())
+}
+
 /// 実写画像を RgbImage(w x h、最大 640) で返す。被覆が無ければ Err("この地点に画像なし")。
 pub fn fetch(lat: f64, lon: f64, heading: i32, w: u32, h: u32, key: &str) -> Result<RgbImage, String> {
     if !available(key) {

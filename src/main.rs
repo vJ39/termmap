@@ -368,7 +368,7 @@ const HELP: &[&str] = &[
     "   o              スマホ共有(GoogleマップのQRをポップアップ表示)",
     "",
     " [実写]",
-    "   i              中心地点の実写(Street View)を全画面表示  ←→向き Esc/q戻る",
+    "   i              中心地点の実写(Street View)を全画面表示  ←→向き ↑↓前後移動 Esc/q戻る",
     "                   要 config.toml [streetview] api_key",
     "",
     " [起動オプション]  --range KM,.. 航続リング / --route / --load-route 名前",
@@ -463,18 +463,23 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                     let _ = write!(out, "\x1b[{};1H{}\x1b[K", i + 1, ln);
                 }
                 let hd = ((heading % 360) + 360) % 360;
-                let st = fit_cells(&format!(" 実写 heading {hd}°  ←→向き  Esc/q戻る  {slat:.4},{slon:.4} "), cols as usize);
+                let st = fit_cells(&format!(" 実写 h{hd}°  ←→向き ↑↓移動  Esc/q戻る  {slat:.4},{slon:.4} "), cols as usize);
                 let _ = write!(out, "\x1b[{};1H\x1b[7m{st}\x1b[0m\x1b[K", tr);
                 let _ = out.flush();
             }
             let (hd_c, slat_c, slon_c) = { let (_, h, la, lo) = street.as_ref().unwrap(); (*h, *la, *lo) };
             if let Event::Key(k) = event::read()? {
                 match k.code {
-                    KeyCode::Left | KeyCode::Right => {
-                        let hd2 = hd_c + if k.code == KeyCode::Left { -45 } else { 45 };
-                        match streetview::fetch(slat_c, slon_c, hd2, 640, 480, &cfg.streetview_api_key) {
-                            Ok(im) => street = Some((im, hd2, slat_c, slon_c)),
-                            Err(e) => { addr = format!("実写: {e}"); street = None; }
+                    KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down => {
+                        // ←→=向き回転 / ↑↓=向き方向に前後移動(隣パノラマへスナップ)
+                        let (nlat, nlon, nhd) = match k.code {
+                            KeyCode::Left => (slat_c, slon_c, hd_c - 45),
+                            KeyCode::Right => (slat_c, slon_c, hd_c + 45),
+                            KeyCode::Up => { let (a, b) = streetview::step(slat_c, slon_c, hd_c as f64, 20.0); (a, b, hd_c) }
+                            _ => { let (a, b) = streetview::step(slat_c, slon_c, hd_c as f64 + 180.0, 20.0); (a, b, hd_c) }
+                        };
+                        if let Ok(im) = streetview::fetch(nlat, nlon, nhd, 640, 480, &cfg.streetview_api_key) {
+                            street = Some((im, nhd, nlat, nlon)); // Err時は現状維持(行き止まり等)
                         }
                     }
                     KeyCode::Esc | KeyCode::Char('q') => street = None,
