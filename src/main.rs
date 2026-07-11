@@ -699,7 +699,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                         KeyCode::Enter => { // その場所へ中心を移動するだけ(追加しない)
                             let q = buf.trim().to_string();
                             if !q.is_empty() {
-                                match geocode(&q) {
+                                match geocode(&q, Some((lat, lon)), &cfg.streetview_api_key) {
                                     Ok((la, lo)) => { let (nx, ny) = deg_to_pixel(la, lo, z); cx = nx; cy = ny; addr.clear(); }
                                     Err(_) => addr = format!("見つからない: {q}"),
                                 }
@@ -1108,7 +1108,7 @@ fn main() {
             None => { eprintln!("保存された location がありません (--resume)"); std::process::exit(1); }
         }
     } else if let Some(p) = &a.place {
-        match geocode(p) { Ok(v) => v, Err(e) => { eprintln!("{e}"); std::process::exit(1); } }
+        match geocode(p, None, "") { Ok(v) => v, Err(e) => { eprintln!("{e}"); std::process::exit(1); } }
     } else if let Some(wps) = a.route.as_ref().filter(|w| !w.is_empty()) {
         wps[0] // --route のみ指定時は始点を中心にする
     } else {

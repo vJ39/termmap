@@ -17,17 +17,67 @@ pub fn json_first(body: &str, key: &str) -> Option<String> {
     let j = rest.find('"')?;
     Some(rest[..j].to_string())
 }
-pub fn geocode(place: &str) -> Result<(f64, f64), String> {
+// 地名/施設名を座標に。near があれば現在地周辺を優先し、他県へ飛ぶのを防ぐ。
+// 優先順: ① Google Geocoding(キーあり・現在地bounds) → ② Nominatim(near周辺viewbox) → ③ Nominatim(全国)
+pub fn geocode(place: &str, near: Option<(f64, f64)>, google_key: &str) -> Result<(f64, f64), String> {
+    if !google_key.trim().is_empty() {
+        if let Ok(v) = google_geocode(place, near, google_key) {
+            return Ok(v);
+        }
+    }
+    if let Some((lat, lon)) = near {
+        let d = 0.35; // ≈ ±35km
+        let vb = format!("{},{},{},{}", lon - d, lat - d, lon + d, lat + d);
+        let url = format!("https://nominatim.openstreetmap.org/search?format=json&limit=1&accept-language=ja&bounded=1&viewbox={}&q={}", vb, urlencode(place));
+        if let Ok(v) = nominatim_req(&url) {
+            return Ok(v);
+        }
+    }
     let url = format!("https://nominatim.openstreetmap.org/search?format=json&limit=1&accept-language=ja&q={}", urlencode(place));
-    let body = ureq::get(&url)
+    nominatim_req(&url).map_err(|_| format!("住所が見つかりません: {place}"))
+}
+
+fn nominatim_req(url: &str) -> Result<(f64, f64), String> {
+    let body = ureq::get(url)
         .set("User-Agent", "termmap/0.1 (personal experiment)")
         .timeout(std::time::Duration::from_secs(20)).call().map_err(|e| format!("geocode: {e}"))?
         .into_string().map_err(|e| e.to_string())?;
-    let lat = json_first(&body, "\"lat\":\"").ok_or_else(|| format!("住所が見つかりません: {place}"))?;
-    let lon = json_first(&body, "\"lon\":\"").ok_or_else(|| format!("住所が見つかりません: {place}"))?;
+    let lat = json_first(&body, "\"lat\":\"").ok_or("no result")?;
+    let lon = json_first(&body, "\"lon\":\"").ok_or("no result")?;
     let lat: f64 = lat.parse().map_err(|_| "lat parse失敗".to_string())?;
     let lon: f64 = lon.parse().map_err(|_| "lon parse失敗".to_string())?;
     Ok((lat, lon))
+}
+
+fn google_geocode(place: &str, near: Option<(f64, f64)>, key: &str) -> Result<(f64, f64), String> {
+    let mut url = format!("https://maps.googleapis.com/maps/api/geocode/json?language=ja&region=jp&address={}&key={}", urlencode(place), key);
+    if let Some((lat, lon)) = near {
+        let d = 0.3;
+        url.push_str(&format!("&bounds={},{}|{},{}", lat - d, lon - d, lat + d, lon + d)); // sw|ne
+    }
+    let body = ureq::get(&url)
+        .timeout(std::time::Duration::from_secs(20)).call().map_err(|e| format!("google geocode: {e}"))?
+        .into_string().map_err(|e| e.to_string())?;
+    parse_google_latlng(&body).ok_or_else(|| "google no result".to_string())
+}
+
+// Google Geocoding応答から最初の geometry.location の (lat,lng) を拾う。数値形式("lat" : 35.6)。
+fn parse_google_latlng(body: &str) -> Option<(f64, f64)> {
+    let loc = body.find("\"location\"")?;
+    let s = &body[loc..];
+    let lat = num_after_key(s, "\"lat\"")?;
+    let lng = num_after_key(s, "\"lng\"")?;
+    Some((lat, lng))
+}
+
+fn num_after_key(s: &str, key: &str) -> Option<f64> {
+    let i = s.find(key)?;
+    let b = s[i + key.len()..].as_bytes();
+    let mut a = 0;
+    while a < b.len() && !(b[a].is_ascii_digit() || b[a] == b'-' || b[a] == b'.') { a += 1; }
+    let mut e = a;
+    while e < b.len() && (b[e].is_ascii_digit() || b[e] == b'-' || b[e] == b'.') { e += 1; }
+    std::str::from_utf8(&b[a..e]).ok()?.parse().ok()
 }
 
 // 逆ジオコーディング (Nominatim reverse) → 住所文字列(display_name)
@@ -157,5 +207,14 @@ mod tests {
     fn json_helpers() {
         assert_eq!(json_str(r#"{"name": "王子駅"}"#, "name").as_deref(), Some("王子駅"));
         assert!((json_num(r#"{"lat": 35.7}"#, "\"lat\":").unwrap() - 35.7).abs() < 1e-9);
+    }
+
+    #[test]
+    fn google_latlng_from_geometry() {
+        let body = r#"{"results":[{"geometry":{"location":{"lat":35.6094,"lng":139.7402}}}],"status":"OK"}"#;
+        let (la, lo) = parse_google_latlng(body).unwrap();
+        assert!((la - 35.6094).abs() < 1e-6 && (lo - 139.7402).abs() < 1e-6);
+        // REQUEST_DENIED等 location無しは None
+        assert!(parse_google_latlng(r#"{"status":"REQUEST_DENIED"}"#).is_none());
     }
 }
