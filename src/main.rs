@@ -166,43 +166,29 @@ fn reverse_geocode(lat: f64, lon: f64) -> Result<String, String> {
     json_first(&body, "\"display_name\":\"").ok_or_else(|| "住所が取得できません".to_string())
 }
 
-// 現在表示範囲(bbox)でキーワード周辺検索(Nominatim viewbox+bounded)。(lat,lon,表示名)列。
+// キーワードを区切り(ハイフン/中黒/空白)を任意許容する Overpass 正規表現に。
+// 「セブンイレブン」で name=「セブン-イレブン」を拾えるようにする。
+fn overpass_name_pattern(q: &str) -> String {
+    let parts: Vec<String> = q.trim().chars().filter(|c| !c.is_whitespace() && *c != '　').map(|c| {
+        match c { '\\' | '"' | '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$' => format!("\\{c}"), _ => c.to_string() }
+    }).collect();
+    parts.join("[-ー・‐ 　]?")
+}
+// 現在表示範囲(bbox)でキーワード周辺検索。name/brand に q を含む地物を Overpass で(部分一致・区切り許容・大小無視)。
+// Nominatim(ジオコーダ)はチェーン店の近傍列挙に弱いので Overpass の name/brand 正規表現検索を使う。
 fn search_nearby(q: &str, s: f64, w: f64, n: f64, e: f64) -> Vec<(f64, f64, String)> {
-    let url = format!(
-        "https://nominatim.openstreetmap.org/search?format=json&limit=25&accept-language=ja&bounded=1&viewbox={},{},{},{}&q={}",
-        w, n, e, s, urlencode(q)
+    let pat = overpass_name_pattern(q);
+    let b = format!("{:.5},{:.5},{:.5},{:.5}", s, w, n, e);
+    let query = format!(
+        "[out:json][timeout:25];(nwr[\"name\"~\"{pat}\",i]({b});nwr[\"brand\"~\"{pat}\",i]({b}););out center;"
     );
-    let body = match ureq::get(&url).set("User-Agent", "termmap/0.1 (personal experiment)")
+    let url = format!("https://overpass-api.de/api/interpreter?data={}", urlencode(&query));
+    let body = match ureq::get(&url).set("User-Agent", "termmap/0.1 (personal experiment)").set("Accept", "application/json")
         .timeout(std::time::Duration::from_secs(20)).call() {
         Ok(r) => r.into_string().unwrap_or_default(),
         Err(_) => return Vec::new(),
     };
-    let mut out = Vec::new();
-    let bytes = body.as_bytes();
-    let mut i = match body.find('[') { Some(p) => p, None => return out };
-    let (mut depth, mut obj_start, mut in_obj, mut in_str, mut esc) = (0i32, 0usize, false, false, false);
-    while i < bytes.len() {
-        let b = bytes[i];
-        if in_str {
-            if esc { esc = false; } else if b == b'\\' { esc = true; } else if b == b'"' { in_str = false; }
-        } else {
-            match b {
-                b'"' => in_str = true,
-                b'{' => { if depth == 0 { obj_start = i; in_obj = true; } depth += 1; }
-                b'}' => { depth -= 1; if depth == 0 && in_obj {
-                    let obj = &body[obj_start..=i];
-                    let la = json_str(obj, "lat").and_then(|s| s.parse::<f64>().ok());
-                    let lo = json_str(obj, "lon").and_then(|s| s.parse::<f64>().ok());
-                    if let (Some(la), Some(lo)) = (la, lo) { out.push((la, lo, json_str(obj, "display_name").unwrap_or_default())); }
-                    in_obj = false;
-                }}
-                b']' => { if depth == 0 { break; } }
-                _ => {}
-            }
-        }
-        i += 1;
-    }
-    out
+    parse_overpass(&body)
 }
 
 // GPS/測位で現在地を取得 (--here)。macOS CoreLocationCLI に委譲。
