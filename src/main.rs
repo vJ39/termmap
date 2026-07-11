@@ -362,6 +362,7 @@ const HELP: &[&str] = &[
     "   S / L          ルートを お気に入り保存 / 呼び出し",
     "   g              ルートを GPX 保存 (termmap-route.gpx)",
     "   E              標高プロファイル 表示/非表示 (ルート確定後・下部に折れ線)",
+    "   A              ルート再生 開始/停止 (プレビュー走行・全体を約20秒で自動パン)",
     "   G              ライブ現在地 ON/OFF (CoreLocationCLIを5秒毎・自位置と軌跡を表示)",
     "",
     " [マイスポット] (ラーメン等をカテゴリ別に色分け保存)",
@@ -433,6 +434,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
     let mut gps_rx: Option<std::sync::mpsc::Receiver<(f64, f64)>> = None; // G ライブ現在地の受信
     let mut gps_pos: Option<(f64, f64)> = None; // 最新の自位置
     let mut gps_trail: Vec<(f64, f64)> = Vec::new(); // 通過ブレッドクラム
+    let mut play: Option<f64> = None; // A ルート再生(先頭からの距離m。Noneで停止)
     // ルート計算のバックグラウンド受信(マーカーは即時、ルート線は別スレッド)
     let (mut route_note, mut route_job) = {
         let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0);
@@ -516,6 +518,20 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                 if gps_trail.len() > 300 { gps_trail.remove(0); }
                 let (nx, ny) = deg_to_pixel(la, lo, z); cx = nx; cy = ny;
             }
+        }
+        if play.is_some() { // ルート再生: 位置を進めて自動パン(全体を約20秒で走破)
+            if let Some(rt) = spec.routes.last().map(|r| r.pts.clone()) {
+                if rt.len() >= 2 {
+                    let total = roadtrace::polyline_len(&rt);
+                    let d = play.unwrap() + (total / 250.0).max(1.0);
+                    if d >= total { play = None; addr = "再生: 終了".into(); }
+                    else {
+                        play = Some(d);
+                        let (pla, plo) = roadtrace::point_at(&rt, d);
+                        let (nx, ny) = deg_to_pixel(pla, plo, z); cx = nx; cy = ny;
+                    }
+                } else { play = None; }
+            } else { play = None; }
         }
         let (lat, lon) = pixel_to_deg(cx, cy, z);
 
@@ -621,7 +637,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
             Focus::RouteList => " お気に入り: ↑↓選択 Enter=読込 Esc=閉 ".to_string(),
             Focus::WaypointList => " 並べ替え: ↑↓/Tab 選択  [ ]移動  x削除  +/-拡縮  Esc閉 ".to_string(),
             Focus::Map => {
-                let base = format!(" ?ヘルプ z{z} {lat:.4},{lon:.4} | s始 e終 v経由({}) m:{} n候補 W走 f目的地 P点 V表 i実写 E標高 G現在地 S保存 L呼出 gGPX o共有 /検索 q",
+                let base = format!(" ?ヘルプ z{z} {lat:.4},{lon:.4} | s始 e終 v経由({}) m:{} n候補 W走 f目的地 P点 V表 i実写 E標高 A再生 G現在地 S保存 L呼出 gGPX o共有 /検索 q",
                     wps.len(), mode_label(&mode));
                 match &route_note { Some(rn) => format!("{base} | {rn} "), None => base }
             }
@@ -665,7 +681,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => { route_job = None; None }
             }
-        } else if gps_rx.is_some() {
+        } else if gps_rx.is_some() || play.is_some() {
             if event::poll(std::time::Duration::from_millis(80))? { Some(event::read()?) } else { None }
         } else {
             Some(event::read()?)
@@ -950,6 +966,12 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                             KeyCode::Char('E') => { // 標高プロファイルの表示/非表示
                                 show_elev = !show_elev;
                                 if show_elev && (spec.routes.is_empty() || !route_ele.iter().any(|&z| z != 0.0)) { addr = "標高: ルート確定後に表示".into(); }
+                            }
+                            KeyCode::Char('A') => { // ルート再生(プレビュー走行)の開始/停止
+                                if spec.routes.last().map_or(false, |r| r.pts.len() >= 2) {
+                                    if play.is_some() { play = None; addr = "再生: 停止".into(); }
+                                    else { play = Some(0.0); addr = "再生: 開始(Aで停止)".into(); }
+                                } else { addr = "再生: ルート未確定".into(); }
                             }
                             KeyCode::Char('G') => { // ライブ現在地(ブレッドクラム)の ON/OFF
                                 if gps_rx.is_some() { gps_rx = None; addr = "ライブ現在地: OFF".into(); }

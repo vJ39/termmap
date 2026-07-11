@@ -205,6 +205,31 @@ pub fn sample_every(poly: &[(f64, f64)], meters: f64) -> Vec<(f64, f64)> {
     result
 }
 
+/// ポリラインの総距離(メートル)。
+pub fn polyline_len(poly: &[(f64, f64)]) -> f64 {
+    poly.windows(2).map(|w| haversine_m(w[0], w[1])).sum()
+}
+
+/// ポリライン先頭から dist_m メートル進んだ地点を線形補間で返す。範囲外は端にクランプ。
+pub fn point_at(poly: &[(f64, f64)], dist_m: f64) -> (f64, f64) {
+    if poly.is_empty() {
+        return (0.0, 0.0);
+    }
+    if poly.len() == 1 || dist_m <= 0.0 {
+        return poly[0];
+    }
+    let mut acc = 0.0;
+    for w in poly.windows(2) {
+        let seg = haversine_m(w[0], w[1]);
+        if acc + seg >= dist_m {
+            let t = if seg > 0.0 { (dist_m - acc) / seg } else { 0.0 };
+            return (w[0].0 + (w[1].0 - w[0].0) * t, w[0].1 + (w[1].1 - w[0].1) * t);
+        }
+        acc += seg;
+    }
+    *poly.last().unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,5 +363,17 @@ mod tests {
         let result = sample_every(&poly, 0.0);
         assert_eq!(result.first(), Some(&poly[0]));
         assert_eq!(result.last(), Some(&poly[poly.len() - 1]));
+    }
+
+    #[test]
+    fn point_at_interpolates_and_clamps() {
+        // 経線上の約1.11km区間(0.01度)。中点付近を補間で拾えること。
+        let poly = vec![(35.0, 139.0), (35.01, 139.0)];
+        let total = polyline_len(&poly);
+        assert!(total > 1000.0 && total < 1200.0);
+        let mid = point_at(&poly, total / 2.0);
+        assert!((mid.0 - 35.005).abs() < 1e-4 && (mid.1 - 139.0).abs() < 1e-9);
+        assert_eq!(point_at(&poly, 0.0), poly[0]); // 先頭
+        assert_eq!(point_at(&poly, total * 2.0), poly[1]); // 範囲外→末尾
     }
 }
