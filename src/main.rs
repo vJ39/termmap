@@ -453,6 +453,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
     let mut gps_trail: Vec<(f64, f64)> = Vec::new(); // 通過ブレッドクラム
     let mut play: Option<f64> = None; // A ルート再生(先頭からの距離m。Noneで停止)
     let mut scache = searchcache::load(); // 検索結果キャッシュ(キーワード+位置→結果。API節約)
+    let mut popup: Option<String> = None; // 中央に出す一時ポップアップ(スポット名等・任意キーで閉じる)
     // ルート計算のバックグラウンド受信(マーカーは即時、ルート線は別スレッド)
     let (mut route_note, mut route_job) = {
         let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0);
@@ -675,13 +676,26 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
             Focus::RouteList => " お気に入り: ↑↓選択 Enter=読込 Esc=閉 ".to_string(),
             Focus::WaypointList => " 並べ替え: ↑↓/Tab 選択  [ ]移動  x削除  +/-拡縮  Esc閉 ".to_string(),
             Focus::Map => {
-                let base = format!(" ?ヘルプ z{z} {lat:.4},{lon:.4} | s始 e終 v経由({}) m:{} n候補 r道路 W走 f目的地 P点 V表 i実写 E標高 A再生 G現在地 S保存 L呼出 gGPX o共有 ,設定 /検索 q",
+                let live = if gps_rx.is_some() { "●LIVE(Gで解除) " } else { "" };
+                let playing = if play.is_some() { "▶再生中(Aで停止) " } else { "" };
+                let base = format!(" {live}{playing}?ヘルプ z{z} {lat:.4},{lon:.4} | s始 e終 v経由({}) m:{} n候補 r道路 W走 f目的地 P点 V表 i実写 E標高 A再生 G現在地 S保存 L呼出 gGPX o共有 ,設定 /検索 q",
                     wps.len(), mode_label(&mode));
                 match &route_note { Some(rn) => format!("{base} | {rn} "), None => base }
             }
         };
         let status = fit_cells(&status, cols as usize);
         write!(out, "\x1b[{};1H\x1b[7m{status}\x1b[0m", tr)?;
+
+        if let Some(msg) = &popup { // 中央に名前ポップアップ(任意キーで閉じる)
+            let text = format!("  {}  ", msg);
+            let w = text.chars().count();
+            let c0 = ((cols as usize).saturating_sub(w) / 2).max(1);
+            let r0 = (map_rows / 2).max(1);
+            let pad = " ".repeat(w);
+            let _ = write!(out, "\x1b[{};{}H\x1b[30;47m{}\x1b[0m", r0, c0, pad);
+            let _ = write!(out, "\x1b[{};{}H\x1b[30;47m{}\x1b[0m", r0 + 1, c0, text);
+            let _ = write!(out, "\x1b[{};{}H\x1b[30;47m{}\x1b[0m", r0 + 2, c0, pad);
+        }
 
         // QR共有ポップアップ(地図の上に白地で重ねる。白地×黒でどのテーマでもスキャン可)
         if let Some(q) = &qr_view {
@@ -730,6 +744,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                 if route_job.is_some() { route_job = None; route_note = Some("中断".to_string()); } // 計算中断(アプリは終了しない)
             }
             Some(Event::Key(_)) if qr_view.is_some() => qr_view = None, // ポップアップを閉じる
+            Some(Event::Key(_)) if popup.is_some() => popup = None, // 名前ポップアップを閉じる
             Some(Event::Key(k)) => {
                 let cur = std::mem::replace(&mut focus, Focus::Map);
                 match cur {
@@ -1067,7 +1082,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                                     Some((dpx, i)) if dpx <= (ow.min(oh) as f64) * 0.25 => {
                                         let s = &spots[i];
                                         let (nx, ny) = deg_to_pixel(s.lat, s.lon, z); cx = nx; cy = ny;
-                                        addr = if s.name.is_empty() { "★(無名スポット)".into() } else { format!("★{}", s.name) };
+                                        popup = Some(if s.name.is_empty() { "★ (無名スポット)".into() } else { format!("★ {} [{}]", s.name, s.cat) });
                                     }
                                     Some(_) => addr = "近くにお気に入り無し".into(),
                                     None => addr = "お気に入り未登録".into(),
