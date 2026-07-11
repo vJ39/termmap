@@ -137,6 +137,42 @@ fn urlencode(s: &str) -> String {
     }
     o
 }
+fn urldecode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) { out.push(b); i += 3; continue; }
+        }
+        if bytes[i] == b'+' { out.push(b' '); } else { out.push(bytes[i]); }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+fn num_after(url: &str, tag: &str) -> Option<f64> {
+    let i = url.find(tag)? + tag.len();
+    let rest = &url[i..];
+    let end = rest.find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-')).unwrap_or(rest.len());
+    rest[..end].parse().ok()
+}
+// GoogleマップのURLから (lat,lon,店名) を取り出す。地点ピン(!3d/!4d)を優先、無ければ表示中心(@lat,lon)。
+fn parse_gmaps_place(url: &str) -> Option<(f64, f64, String)> {
+    let (lat, lon) = match (num_after(url, "!3d"), num_after(url, "!4d")) {
+        (Some(a), Some(b)) => (a, b),
+        _ => {
+            let i = url.find('@')? + 1;
+            let mut it = url[i..].split(',');
+            (it.next()?.parse().ok()?, it.next()?.parse().ok()?)
+        }
+    };
+    let name = url.find("/place/").map(|i| {
+        let rest = &url[i + 7..];
+        let end = rest.find('/').unwrap_or(rest.len());
+        urldecode(&rest[..end])
+    }).unwrap_or_default();
+    Some((lat, lon, name))
+}
 fn json_first(body: &str, key: &str) -> Option<String> {
     let i = body.find(key)? + key.len();
     let rest = &body[i..];
@@ -1200,7 +1236,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
             Focus::SaveName(buf) => format!(" ルート名: {buf}\u{2588}   Enter=保存 Esc=取消 "),
             Focus::NearSearch(buf) => format!(" 周辺検索: {buf}\u{2588}   Enter=検索 Esc=取消 "),
             Focus::NewCat(buf) => format!(" 新規カテゴリ: {buf}\u{2588}   Enter=作成 Esc=取消 "),
-            Focus::SpotName(buf, cat) => format!(" [{cat}] スポット名: {buf}\u{2588}   Enter=保存 Esc=取消 "),
+            Focus::SpotName(buf, cat) => format!(" [{cat}] 名前 or GoogleマップURL: {buf}\u{2588}   Enter=保存 Esc=取消 "),
             Focus::SpotList => format!(" [{cur_cat}] ↑↓選択 Enter=移動 n=新規(現在地) x=削除 Esc=戻る "),
             Focus::SpotCatList => " カテゴリ: ↑↓選択 Enter=中へ n新規 r改名 c色 x削除(空のみ) Esc=閉 ".to_string(),
             Focus::SpotRename(buf, _) => format!(" カテゴリ改名: {buf}\u{2588}   Enter=確定 Esc=取消 "),
@@ -1348,13 +1384,26 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                     },
                     Focus::SpotName(mut buf, cat) => match k.code {
                         KeyCode::Enter => {
-                            let s = Spot { lat, lon, cat: cat.clone(), name: buf.trim().to_string() };
-                            let _ = ensure_spot_cat(&s.cat, &mut spot_cats);
-                            addr = match append_spot(&s) { Ok(_) => format!("スポット保存: {}", s.name), Err(e) => format!("({e})") };
-                            spots.push(s);
-                            show_spots = true;
-                            apply_spots(&mut spec, &spots, &spot_cats, show_spots);
-                            focus = Focus::SpotList; // カテゴリのスポット一覧へ戻る
+                            let t = buf.trim().to_string();
+                            // 決定: 保存(座標,名前) / エラー / 入力継続。空・不正URL・短縮URLを弾く
+                            enum Act { Save(f64, f64, String), Err(String), Cont }
+                            let act = if t.is_empty() { Act::Cont }
+                                else if t.starts_with("http") {
+                                    if t.contains("goo.gl") || t.contains("maps.app") { Act::Err("短縮URLは不可。Googleマップの通常URL(…/@…/!3d…!4d…)を貼って".into()) }
+                                    else if let Some((la, lo, nm)) = parse_gmaps_place(&t) { Act::Save(la, lo, if nm.trim().is_empty() { "(無名)".into() } else { nm }) }
+                                    else { Act::Err("URLから位置を取得できません(GoogleマップのURLか確認)".into()) }
+                                } else { Act::Save(lat, lon, t.clone()) };
+                            match act {
+                                Act::Save(la, lo, name) => {
+                                    let s = Spot { lat: la, lon: lo, cat: cat.clone(), name };
+                                    let _ = ensure_spot_cat(&s.cat, &mut spot_cats);
+                                    addr = match append_spot(&s) { Ok(_) => format!("スポット保存: {}", s.name), Err(e) => format!("({e})") };
+                                    spots.push(s); show_spots = true; apply_spots(&mut spec, &spots, &spot_cats, show_spots);
+                                    focus = Focus::SpotList;
+                                }
+                                Act::Err(msg) => { addr = msg; focus = Focus::SpotName(t, cat); }
+                                Act::Cont => focus = Focus::SpotName(String::new(), cat),
+                            }
                         }
                         KeyCode::Esc => focus = Focus::SpotList,
                         KeyCode::Backspace => { buf.pop(); focus = Focus::SpotName(buf, cat); }
@@ -1369,12 +1418,19 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                                 let (vb, vr) = pixel_to_deg(cx + ow as f64 * 1.25, cy + oh as f64 * 1.25, z);
                                 let rlat = 2.0 / 111.0;
                                 let rlon = 2.0 / (111.0 * lat.to_radians().cos().abs().max(0.1));
+                                // お気に入りスポット優先: 名前一致(大小無視)を★付きで先頭に(距離順)
+                                let ql = q.to_lowercase();
+                                let mut mine: Vec<(f64, f64, String, PoiCat)> = spots.iter()
+                                    .filter(|s| s.name.to_lowercase().contains(&ql))
+                                    .map(|s| (s.lat, s.lon, format!("★{}", s.name), PoiCat::Home)).collect();
+                                mine.sort_by(|p, r| haversine_km((lat, lon), (p.0, p.1)).partial_cmp(&haversine_km((lat, lon), (r.0, r.1))).unwrap_or(std::cmp::Ordering::Equal));
                                 let v = search_nearby(&q, vb.min(lat - rlat), vl.min(lon - rlon), vt.max(lat + rlat), vr.max(lon + rlon));
-                                if v.is_empty() { addr = format!("周辺に無し: {q}"); }
+                                let mut osm: Vec<(f64, f64, String, PoiCat)> = v.into_iter().map(|(a, b, nm)| (a, b, nm, PoiCat::Other)).collect();
+                                osm.sort_by(|p, r| haversine_km((lat, lon), (p.0, p.1)).partial_cmp(&haversine_km((lat, lon), (r.0, r.1))).unwrap_or(std::cmp::Ordering::Equal));
+                                mine.extend(osm);
+                                if mine.is_empty() { addr = format!("周辺に無し: {q}"); }
                                 else {
-                                    let mut items: Vec<(f64, f64, String, PoiCat)> = v.into_iter().map(|(a, b, nm)| (a, b, nm, PoiCat::Other)).collect();
-                                    items.sort_by(|p, r| haversine_km((lat, lon), (p.0, p.1)).partial_cmp(&haversine_km((lat, lon), (r.0, r.1))).unwrap_or(std::cmp::Ordering::Equal));
-                                    pois = items; poi_sel = 0; poi_label = format!("周辺:{q}");
+                                    pois = mine; poi_sel = 0; poi_label = format!("周辺:{q}");
                                     set_markers(&mut spec, &wps, &pois);
                                     focus = Focus::PoiList;
                                 }
@@ -1791,5 +1847,19 @@ mod tests {
         let a = meters_per_pixel(35.0, 12);
         let b = meters_per_pixel(35.0, 13);
         assert!((a / b - 2.0).abs() < 1e-6); // ズーム+1で半分
+    }
+
+    #[test]
+    fn gmaps_place_and_urldecode() {
+        let url = "https://www.google.co.jp/maps/place/%E6%BA%80%E5%B7%9E%E8%BB%92/@35.3835299,139.6160282,19.44z/data=!3m1!5s0x60184366ecf5c297!4m6!3m5!8m2!3d35.3836675!4d139.6162832!16s%2Fg%2F1tmkkyjd";
+        let (la, lo, name) = parse_gmaps_place(url).unwrap();
+        assert!((la - 35.3836675).abs() < 1e-6 && (lo - 139.6162832).abs() < 1e-6); // !3d/!4d を優先
+        assert_eq!(name, "満州軒");
+        // /place 無し・@座標のみ
+        let (la2, _, n2) = parse_gmaps_place("https://www.google.com/maps/@35.68,139.76,15z").unwrap();
+        assert!((la2 - 35.68).abs() < 1e-9 && n2.is_empty());
+        // 非URL/座標無しは None
+        assert!(parse_gmaps_place("ただの文字列").is_none());
+        assert_eq!(urldecode("%E7%8E%8B%E5%AD%90"), "王子");
     }
 }
