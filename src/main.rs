@@ -12,6 +12,13 @@ mod route;
 mod poi;
 mod spots;
 mod share;
+// 以下は今後の機能用(設定画面/道路トレース/おすすめ相談)。まだ未wireのため dead_code 許容。
+#[allow(dead_code)]
+mod config;
+#[allow(dead_code)]
+mod roadtrace;
+#[allow(dead_code)]
+mod recommend;
 
 use std::collections::HashMap;
 use std::io::Write;
