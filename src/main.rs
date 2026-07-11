@@ -841,6 +841,18 @@ fn apply_spots(spec: &mut OverlaySpec, spots: &[Spot], cats: &[(String, u8)], sh
     spec.spots.clear();
     if show { for s in spots { spec.spots.push((s.lat, s.lon, spot_color_of(&s.cat, cats))); } }
 }
+fn save_all_spots(spots: &[Spot]) -> Result<(), String> {
+    let p = spots_path().ok_or("HOME不明")?;
+    if let Some(d) = p.parent() { let _ = std::fs::create_dir_all(d); }
+    let s: String = spots.iter().map(|s| format!("{},{},{},{}\n", s.lat, s.lon, spot_clean(&s.cat), spot_clean(&s.name))).collect();
+    std::fs::write(p, s).map_err(|e| e.to_string())
+}
+fn save_all_cats(cats: &[(String, u8)]) -> Result<(), String> {
+    let p = spot_cats_path().ok_or("HOME不明")?;
+    if let Some(d) = p.parent() { let _ = std::fs::create_dir_all(d); }
+    let s: String = cats.iter().map(|(n, i)| format!("{n}\t{i}\n")).collect();
+    std::fs::write(p, s).map_err(|e| e.to_string())
+}
 
 // ---- 目的地検索 (Overpass) ----
 struct PoiKind { key: char, label: &'static str, filter: &'static str, cat: PoiCat }
@@ -1041,6 +1053,8 @@ const HELP: &[&str] = &[
     " [マイスポット] (ラーメン等をカテゴリ別に色分け保存)",
     "   P              現在地(中心)をスポット登録: カテゴリ → 名前",
     "   V              マイスポットの表示 / 非表示",
+    "   l              スポット一覧: ↑↓ / Enter移動 / x削除 / Esc閉",
+    "   k              カテゴリ管理: ↑↓ / r改名 / c色変更 / x削除(空のみ) / Esc閉",
     "   o              スマホ共有(GoogleマップのQRをポップアップ表示)",
     "",
     " [起動オプション]  --range KM,.. 航続リング / --route / --load-route 名前",
@@ -1071,7 +1085,8 @@ impl Drop for TermGuard {
 
 fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Result<()> {
     use crossterm::event::{self, Event, KeyCode, KeyModifiers};
-    enum Focus { Map, Search(String), SaveName(String), NearSearch(String), PoiMenu, PoiList, RouteList, WaypointList, SpotCat(String), SpotName(String, String) }
+    enum Focus { Map, Search(String), SaveName(String), NearSearch(String), PoiMenu, PoiList, RouteList, WaypointList,
+                 SpotCat(String), SpotName(String, String), SpotList, SpotCatList, SpotRename(String, usize) }
     let _guard = TermGuard::enter()?; // Drop で必ず端末復元
     let mut cache: Cache = HashMap::new();
     let mut out = std::io::stdout();
@@ -1100,6 +1115,8 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
     let mut spots = load_spots();          // マイスポット
     let mut spot_cats = load_spot_cats();
     let mut show_spots = true;
+    let mut sp_sel: usize = 0;
+    let mut cat_sel: usize = 0;
     apply_spots(&mut spec, &spots, &spot_cats, show_spots);
 
     let _ = write!(out, "\x1b[2J");
@@ -1119,7 +1136,9 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
         }
         let show_routes = matches!(focus, Focus::RouteList);
         let show_wps = matches!(focus, Focus::WaypointList);
-        let gut: u32 = if !pois.is_empty() || show_routes || show_wps { 26 } else { 0 };
+        let show_splist = matches!(focus, Focus::SpotList);
+        let show_catlist = matches!(focus, Focus::SpotCatList);
+        let gut: u32 = if !pois.is_empty() || show_routes || show_wps || show_splist || show_catlist { 26 } else { 0 };
         let map_cols = cols.saturating_sub(gut).max(10);
         let (ow, oh) = if a.braille || a.edge { (map_cols * 2, map_rows * 4) } else { (map_cols, map_rows * 2) };
         let (lat, lon) = pixel_to_deg(cx, cy, z);
@@ -1152,6 +1171,12 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                     format!("#{} {} {:.3},{:.3}", i + 1, role, la, lo)
                 }).collect();
                 ("並べ替え".to_string(), its, wp_sel)
+            } else if show_splist {
+                let its = spots.iter().map(|s| format!("{} [{}]", if s.name.is_empty() { "(無名)" } else { &s.name }, s.cat)).collect();
+                ("マイスポット".to_string(), its, sp_sel)
+            } else if show_catlist {
+                let its = spot_cats.iter().map(|(n, i)| format!("{} 色{}", n, i)).collect();
+                ("カテゴリ".to_string(), its, cat_sel)
             } else if show_routes {
                 ("お気に入り".to_string(), route_names.clone(), rn_sel)
             } else {
@@ -1189,6 +1214,9 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
             Focus::NearSearch(buf) => format!(" 周辺検索: {buf}\u{2588}   Enter=検索 Esc=取消 "),
             Focus::SpotCat(buf) => format!(" スポットのカテゴリ: {buf}\u{2588}   Enter=次へ Esc=取消 "),
             Focus::SpotName(buf, cat) => format!(" [{cat}] スポット名: {buf}\u{2588}   Enter=保存 Esc=取消 "),
+            Focus::SpotList => " マイスポット: ↑↓選択 Enter=移動 x=削除 Esc=閉 ".to_string(),
+            Focus::SpotCatList => " カテゴリ: ↑↓選択 r=改名 c=色変更 x=削除(空のみ) Esc=閉 ".to_string(),
+            Focus::SpotRename(buf, _) => format!(" カテゴリ改名: {buf}\u{2588}   Enter=確定 Esc=取消 "),
             Focus::PoiMenu => " 目的地: 1ガソスタ 2カフェ 3コンビニ 4道の駅 5展望 6公園 7峠道  / キーワード周辺検索  Esc=取消 ".to_string(),
             Focus::PoiList => format!(" [{}] ↑↓選択 Enter=移動 s始 e終 v経由 f再検索 Esc閉 ", poi_label),
             Focus::RouteList => " お気に入り: ↑↓選択 Enter=読込 Esc=閉 ".to_string(),
@@ -1262,6 +1290,65 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                         KeyCode::Backspace => { buf.pop(); focus = Focus::Search(buf); }
                         KeyCode::Char(c) => { buf.push(c); focus = Focus::Search(buf); }
                         _ => focus = Focus::Search(buf),
+                    },
+                    Focus::SpotList => match k.code {
+                        KeyCode::Up => { sp_sel = sp_sel.saturating_sub(1); focus = Focus::SpotList; }
+                        KeyCode::Down => { if sp_sel + 1 < spots.len() { sp_sel += 1; } focus = Focus::SpotList; }
+                        KeyCode::Enter => { if let Some(s) = spots.get(sp_sel) { let (nx, ny) = deg_to_pixel(s.lat, s.lon, z); cx = nx; cy = ny; } focus = Focus::SpotList; }
+                        KeyCode::Char('x') => {
+                            if sp_sel < spots.len() {
+                                spots.remove(sp_sel);
+                                if sp_sel >= spots.len() && sp_sel > 0 { sp_sel -= 1; }
+                                let _ = save_all_spots(&spots);
+                                apply_spots(&mut spec, &spots, &spot_cats, show_spots);
+                            }
+                            if !spots.is_empty() { focus = Focus::SpotList; }
+                        }
+                        KeyCode::Esc => {}
+                        _ => focus = Focus::SpotList,
+                    },
+                    Focus::SpotCatList => match k.code {
+                        KeyCode::Up => { cat_sel = cat_sel.saturating_sub(1); focus = Focus::SpotCatList; }
+                        KeyCode::Down => { if cat_sel + 1 < spot_cats.len() { cat_sel += 1; } focus = Focus::SpotCatList; }
+                        KeyCode::Char('r') => { if let Some((n, _)) = spot_cats.get(cat_sel) { focus = Focus::SpotRename(n.clone(), cat_sel); } }
+                        KeyCode::Char('c') => {
+                            if let Some(e) = spot_cats.get_mut(cat_sel) { e.1 = (e.1 + 1) % SPOT_PALETTE.len() as u8; }
+                            let _ = save_all_cats(&spot_cats);
+                            apply_spots(&mut spec, &spots, &spot_cats, show_spots);
+                            focus = Focus::SpotCatList;
+                        }
+                        KeyCode::Char('x') => {
+                            if let Some((name, _)) = spot_cats.get(cat_sel).cloned() {
+                                if spots.iter().any(|s| s.cat == name) { addr = format!("使用中: {name}(先に空に)"); focus = Focus::SpotCatList; }
+                                else {
+                                    spot_cats.remove(cat_sel);
+                                    if cat_sel >= spot_cats.len() && cat_sel > 0 { cat_sel -= 1; }
+                                    let _ = save_all_cats(&spot_cats);
+                                    if !spot_cats.is_empty() { focus = Focus::SpotCatList; }
+                                }
+                            }
+                        }
+                        KeyCode::Esc => {}
+                        _ => focus = Focus::SpotCatList,
+                    },
+                    Focus::SpotRename(mut buf, idx) => match k.code {
+                        KeyCode::Enter => {
+                            let new = spot_clean(buf.trim());
+                            if !new.is_empty() {
+                                if let Some(old) = spot_cats.get(idx).map(|(n, _)| n.clone()) {
+                                    for s in spots.iter_mut() { if s.cat == old { s.cat = new.clone(); } }
+                                    if let Some(e) = spot_cats.get_mut(idx) { e.0 = new; }
+                                    let _ = save_all_spots(&spots);
+                                    let _ = save_all_cats(&spot_cats);
+                                    apply_spots(&mut spec, &spots, &spot_cats, show_spots);
+                                }
+                            }
+                            focus = Focus::SpotCatList;
+                        }
+                        KeyCode::Esc => focus = Focus::SpotCatList,
+                        KeyCode::Backspace => { buf.pop(); focus = Focus::SpotRename(buf, idx); }
+                        KeyCode::Char(c) => { buf.push(c); focus = Focus::SpotRename(buf, idx); }
+                        _ => focus = Focus::SpotRename(buf, idx),
                     },
                     Focus::SpotCat(mut buf) => match k.code {
                         KeyCode::Enter => { let cat = buf.trim().to_string(); if !cat.is_empty() { focus = Focus::SpotName(String::new(), cat); } }
@@ -1434,6 +1521,8 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                             KeyCode::Char('?') => help = true,
                             KeyCode::Char('P') => focus = Focus::SpotCat(String::new()), // マイスポット追加(中心にドロップ)
                             KeyCode::Char('V') => { show_spots = !show_spots; apply_spots(&mut spec, &spots, &spot_cats, show_spots); addr = if show_spots { "マイスポット表示".into() } else { "マイスポット非表示".into() }; }
+                            KeyCode::Char('l') => { if spots.is_empty() { addr = "スポット無し".into(); } else { sp_sel = 0; focus = Focus::SpotList; } }
+                            KeyCode::Char('k') => { if spot_cats.is_empty() { addr = "カテゴリ無し".into(); } else { cat_sel = 0; focus = Focus::SpotCatList; } }
                             KeyCode::Char('n') => { // BRouter の代替ルート候補を巡回
                                 if wps.len() >= 2 {
                                     route_alt = (route_alt + 1) % 4;
@@ -1478,7 +1567,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
             }
             Some(Event::Paste(s)) => { match &mut focus {
                 Focus::Search(buf) | Focus::SaveName(buf) | Focus::NearSearch(buf) | Focus::SpotCat(buf) => buf.push_str(&s),
-                Focus::SpotName(buf, _) => buf.push_str(&s),
+                Focus::SpotName(buf, _) | Focus::SpotRename(buf, _) => buf.push_str(&s),
                 _ => {}
             } }
             _ => {}
