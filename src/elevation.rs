@@ -92,6 +92,18 @@ pub fn elevation_stats(ele: &[f64]) -> (f64, f64, f64) {
     (min, max, ascent)
 }
 
+/// n_points 個の経路点のうち index 番目が、幅 width のプロファイル上で占める列(0..width-1)。
+/// 標高帯に「現在地カーソル」を出すための位置変換(純粋・テスト対象)。
+pub fn profile_col(n_points: usize, index: usize, width: usize) -> usize {
+    if width == 0 {
+        return 0;
+    }
+    if n_points <= 1 {
+        return 0;
+    }
+    (index * (width - 1) / (n_points - 1)).min(width - 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,5 +197,15 @@ mod tests {
         for row in &rows {
             assert_eq!(row.chars().count(), 8);
         }
+    }
+
+    #[test]
+    fn profile_col_maps_endpoints_and_clamps() {
+        assert_eq!(profile_col(2, 0, 10), 0); // 始点=左端
+        assert_eq!(profile_col(2, 1, 10), 9); // 終点=右端
+        assert_eq!(profile_col(5, 2, 100), 49); // 中間(2/4*99=49.5→49、整数除算)
+        assert_eq!(profile_col(1, 0, 10), 0); // 点1つ
+        assert_eq!(profile_col(10, 5, 1), 0); // 幅1
+        assert_eq!(profile_col(10, 0, 0), 0); // 幅0安全
     }
 }

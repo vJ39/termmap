@@ -659,6 +659,20 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
             for (i, line) in chart.iter().enumerate() {
                 let _ = write!(out, "\x1b[{};1H{}\x1b[K", map_rows + 2 + i as u32, line);
             }
+            // 地図中心が経路上のどこかを示す縦カーソル(パン/再生で動く)
+            if let Some(rt) = spec.routes.last() {
+                if rt.pts.len() >= 2 {
+                    let (mut bi, mut bd) = (0usize, f64::MAX);
+                    for (i, p) in rt.pts.iter().enumerate() {
+                        let d = (p.0 - lat).powi(2) + (p.1 - lon).powi(2);
+                        if d < bd { bd = d; bi = i; }
+                    }
+                    let col = elevation::profile_col(rt.pts.len(), bi, cols as usize);
+                    for i in 0..elev_h as usize {
+                        let _ = write!(out, "\x1b[{};{}H\x1b[1;31m|\x1b[0m", map_rows + 2 + i as u32, col + 1);
+                    }
+                }
+            }
         }
         let status = match &focus {
             Focus::Search(buf) => format!(" 検索: {buf}\u{2588}   Enter=移動 Esc=取消 "),
