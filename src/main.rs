@@ -286,11 +286,12 @@ fn parse_geojson_line(body: &str) -> Option<Vec<(f64, f64)>> {
     if pts.is_empty() { None } else { Some(pts) }
 }
 // mode: "short"=最短(shortest) / それ以外=裏道(safety)。wps は (lat,lon) 列。
-fn fetch_route(wps: &[(f64, f64)], mode: &str) -> Result<RouteResult, String> {
+fn fetch_route(wps: &[(f64, f64)], mode: &str, alt: u32) -> Result<RouteResult, String> {
     if wps.len() < 2 { return Err("--route は始点と終点(2点以上)が必要".into()); }
     let profile = route_profile(mode);
+    let alt = alt.min(3); // BRouter の代替ルートは 0..=3
     let lonlats = wps.iter().map(|(la, lo)| format!("{lo},{la}")).collect::<Vec<_>>().join("|");
-    let url = format!("https://brouter.de/brouter?lonlats={lonlats}&profile={profile}&alternativeidx=0&format=geojson");
+    let url = format!("https://brouter.de/brouter?lonlats={lonlats}&profile={profile}&alternativeidx={alt}&format=geojson");
     let body = ureq::get(&url)
         .set("User-Agent", "termmap/0.1 (personal experiment)")
         .call().map_err(|e| format!("route: {e}"))?
@@ -306,8 +307,9 @@ fn fetch_route(wps: &[(f64, f64)], mode: &str) -> Result<RouteResult, String> {
 fn gmaps_url(wps: &[(f64, f64)]) -> (String, usize) {
     let o = wps[0];
     let d = wps[wps.len() - 1];
+    // QRを小さく保つため座標は5桁(約1m)に丸め、travelmodeは既定(driving)で省略
     let mut u = format!(
-        "https://www.google.com/maps/dir/?api=1&travelmode=driving&origin={},{}&destination={},{}",
+        "https://www.google.com/maps/dir/?api=1&origin={:.5},{:.5}&destination={:.5},{:.5}",
         o.0, o.1, d.0, d.1
     );
     let mids: Vec<(f64, f64)> = if wps.len() > 2 { wps[1..wps.len() - 1].to_vec() } else { Vec::new() };
@@ -315,7 +317,7 @@ fn gmaps_url(wps: &[(f64, f64)]) -> (String, usize) {
     let dropped = mids.len().saturating_sub(MAX_WP);
     let used = &mids[..mids.len().min(MAX_WP)];
     if !used.is_empty() {
-        let s = used.iter().map(|(la, lo)| format!("{la},{lo}")).collect::<Vec<_>>().join("%7C");
+        let s = used.iter().map(|(la, lo)| format!("{la:.5},{lo:.5}")).collect::<Vec<_>>().join("%7C");
         u.push_str(&format!("&waypoints={s}"));
     }
     (u, dropped)
@@ -626,7 +628,7 @@ fn build_spec(a: &Args, center_lat: f64, center_lon: f64) -> OverlaySpec {
 // --route があれば BRouter で取得して spec に追加し、要約(距離/時間)を返す。--gpx 指定時は書き出し。
 fn attach_route(spec: &mut OverlaySpec, a: &Args) -> Result<Option<String>, String> {
     let wps = match &a.route { Some(w) => w, None => return Ok(None) };
-    let r = fetch_route(wps, &a.route_mode)?;
+    let r = fetch_route(wps, &a.route_mode, 0)?;
     if let Some(g) = &a.gpx { write_gpx(g, &r.pts)?; }
     let summary = format!("ルート {} {}点", route_summary(&a.route_mode, &r), r.pts.len());
     spec.routes.push(Route { pts: r.pts, color: [0, 220, 255], thickness: 2 });
@@ -832,7 +834,7 @@ fn recompute(spec: &mut OverlaySpec, wps: &[(f64, f64)], pois: &[(f64, f64, Stri
     }
     spec.routes.clear();
     if n >= 2 {
-        match fetch_route(wps, mode) {
+        match fetch_route(wps, mode, 0) {
             Ok(r) => {
                 let note = route_summary(mode, &r);
                 spec.routes.push(Route { pts: r.pts, color: [0, 220, 255], thickness: 2 });
@@ -859,6 +861,7 @@ const HELP: &[&str] = &[
     "   [ / ]          選択点を 前 / 後ろ へ並べ替え",
     "   x              選択点を削除     c  ルート全消去",
     "   m              モード切替  下道 → 高速 → 最短",
+    "   n              代替ルート候補を巡回(BRouterの案 1〜4)",
     "",
     " [目的地・お気に入り]",
     "   f              カテゴリ検索 1ｶﾞｿ 2ｶﾌｪ 3ｺﾝﾋﾞﾆ 4道の駅 5展望 6公園 7峠道",
@@ -915,6 +918,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
     let mut rn_sel: usize = 0;
     let mut help = false; // ? でヘルプ表示
     let mut qr_view: Option<String> = None; // o でGoogleマップQRをポップアップ表示
+    let mut route_alt: u32 = 0; // n で BRouter の代替ルート(0..=3)を巡回
     let mut route_note = recompute(&mut spec, &wps, &pois, &mode);
 
     let _ = write!(out, "\x1b[2J");
@@ -1006,7 +1010,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
             Focus::RouteList => " お気に入り: ↑↓選択 Enter=読込 Esc=閉 ".to_string(),
             Focus::WaypointList => " 並べ替え: ↑↓/Tab 選択  [ ]移動  x削除  +/-拡縮  Esc閉 ".to_string(),
             Focus::Map => {
-                let base = format!(" ?ヘルプ z{z} {lat:.4},{lon:.4} | s始 e終 v経由({}) Tab並替 m:{} f目的地 S保存 L呼出 gGPX o共有 /検索 a住所 q",
+                let base = format!(" ?ヘルプ z{z} {lat:.4},{lon:.4} | s始 e終 v経由({}) Tab並替 m:{} n候補 f目的地 S保存 L呼出 gGPX o共有 /検索 a q",
                     wps.len(), mode_label(&mode));
                 match &route_note { Some(rn) => format!("{base} | {rn} "), None => base }
             }
@@ -1164,10 +1168,24 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                             KeyCode::Char('v') => { if wps.len() < 2 { wps.push((lat, lon)); } else { wps.insert(wps.len() - 1, (lat, lon)); } route_note = recompute(&mut spec, &wps, &pois, &mode); }
                             KeyCode::Tab | KeyCode::BackTab => { if !wps.is_empty() { focus = Focus::WaypointList; } } // 並べ替えパネル
                             KeyCode::Char('?') => help = true,
+                            KeyCode::Char('n') => { // BRouter の代替ルート候補を巡回
+                                if wps.len() >= 2 {
+                                    route_alt = (route_alt + 1) % 4;
+                                    match fetch_route(&wps, &mode, route_alt) {
+                                        Ok(r) => {
+                                            spec.routes.clear();
+                                            let note = format!("案{}/4 {}", route_alt + 1, route_summary(&mode, &r));
+                                            spec.routes.push(Route { pts: r.pts, color: [0, 220, 255], thickness: 2 });
+                                            route_note = Some(note);
+                                        }
+                                        Err(e) => route_note = Some(format!("({e})")),
+                                    }
+                                } else { addr = "ルート未確定".into(); }
+                            }
                             KeyCode::Char('o') => { // スマホ共有(GoogleマップQR)
                                 if wps.len() >= 2 {
                                     let (url, _) = gmaps_url(&wps);
-                                    match qrcode::QrCode::new(url.as_bytes()) {
+                                    match qrcode::QrCode::with_error_correction_level(url.as_bytes(), qrcode::EcLevel::L) {
                                         Ok(c) => qr_view = Some(c.render::<qrcode::render::unicode::Dense1x2>().quiet_zone(true).build()),
                                         Err(_) => addr = "QR生成失敗".into(),
                                     }
@@ -1290,7 +1308,7 @@ fn main() {
                 let (url, dropped) = gmaps_url(wps);
                 if dropped > 0 { eprintln!("経由点が多いため末尾寄り {dropped} 点を省略(GoogleマップURLの上限)"); }
                 println!("{url}");
-                match qrcode::QrCode::new(url.as_bytes()) {
+                match qrcode::QrCode::with_error_correction_level(url.as_bytes(), qrcode::EcLevel::L) {
                     Ok(code) => println!("{}", code.render::<qrcode::render::unicode::Dense1x2>().quiet_zone(true).build()),
                     Err(e) => eprintln!("QR生成失敗: {e}"),
                 }
