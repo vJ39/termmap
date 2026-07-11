@@ -358,6 +358,7 @@ const HELP: &[&str] = &[
     "   m              モード切替  下道 → 高速 → 最短",
     "   n              代替ルート候補を巡回(BRouterの案 1〜4)",
     "   r              道路名/refで現在view内の道路を経路に追加(例: 国道16号 / E20)。複数のrで道を連結",
+    "   @              おすすめ: 方向性を入力→AI(claude)が提案→実在確認して候補表示(設定でON要)",
     "   W              走りまくり: 峠/展望を巡る周回を自動生成(連打で別案)",
     "",
     " [目的地・お気に入り]",
@@ -414,7 +415,7 @@ impl Drop for TermGuard {
 fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Result<()> {
     use crossterm::event::{self, Event, KeyCode, KeyModifiers};
     enum Focus { Map, Search(String), SaveName(String), NearSearch(String), PoiMenu, PoiList, RouteList, WaypointList,
-                 NewCat(String), SpotName(String, String), SpotList, SpotCatList, SpotRename(String, usize), Settings, RoadSearch(String), SpotEditName(String, usize) }
+                 NewCat(String), SpotName(String, String), SpotList, SpotCatList, SpotRename(String, usize), Settings, RoadSearch(String), SpotEditName(String, usize), Recommend(String) }
     let _guard = TermGuard::enter()?; // Drop で必ず端末復元
     let mut cache: Cache = HashMap::new();
     let mut out = std::io::stdout();
@@ -702,6 +703,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                 format!(" ▶ {desc}   [↑↓選択 Enter切替 s保存 Esc閉]")
             }
             Focus::RoadSearch(buf) => format!(" 道路名/ref: {buf}\u{2588}   Enter=view内を経路に追加(複数連結可・cで全消去) Esc=取消 "),
+            Focus::Recommend(buf) => format!(" おすすめ方向性: {buf}\u{2588}   例:海沿い気持ちいい峠  Enter=提案(数秒) Esc=取消 "),
             Focus::SpotRename(buf, _) => format!(" カテゴリ改名: {buf}\u{2588}   Enter=確定 Esc=取消 "),
             Focus::PoiMenu => " 目的地: 1ガソスタ 2カフェ 3コンビニ 4道の駅 5展望 6公園 7峠道  / キーワード周辺検索  Esc=取消 ".to_string(),
             Focus::PoiList => format!(" [{}] ↑↓選択 Enter=移動 s始 e終 v経由 f再検索 Esc閉 ", poi_label),
@@ -710,7 +712,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
             Focus::Map => {
                 let live = if gps_rx.is_some() { "●LIVE(Gで解除) " } else { "" };
                 let playing = if play.is_some() { "▶再生中(Aで停止) " } else { "" };
-                let base = format!(" {live}{playing}?ヘルプ z{z} {lat:.4},{lon:.4} | s始 e終 v経由({}) m:{} n候補 r道路 W走 f目的地 P点 V表 i実写 E標高 A再生 G現在地 S保存 L呼出 gGPX o共有 ,設定 /検索 q",
+                let base = format!(" {live}{playing}?ヘルプ z{z} {lat:.4},{lon:.4} | s始 e終 v経由({}) m:{} n候補 r道路 @提案 W走 f目的地 P点 V表 i実写 E標高 A再生 G現在地 S保存 L呼出 gGPX o共有 ,設定 /検索 q",
                     wps.len(), mode_label(&mode));
                 match &route_note { Some(rn) => format!("{base} | {rn} "), None => base }
             }
@@ -883,6 +885,37 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                         KeyCode::Backspace => { buf.pop(); focus = Focus::RoadSearch(buf); }
                         KeyCode::Char(c) => { buf.push(c); focus = Focus::RoadSearch(buf); }
                         _ => focus = Focus::RoadSearch(buf),
+                    },
+                    Focus::Recommend(mut buf) => match k.code { // おすすめ: 方向性→claude -p→実在確認→候補一覧
+                        KeyCode::Enter => {
+                            let dir = buf.trim().to_string();
+                            if !dir.is_empty() {
+                                match recommend::recommend(&cfg.llm_command, &cfg.llm_model, &dir) {
+                                    Ok(recs) if !recs.is_empty() => {
+                                        let mut verified: Vec<(f64, f64, String)> = Vec::new();
+                                        for r in recs.iter().take(8) {
+                                            let q = if r.area.is_empty() { r.name.clone() } else { format!("{} {}", r.area, r.name) };
+                                            if let Ok((la, lo)) = geocode(&q, Some((lat, lon)), &cfg.streetview_api_key) {
+                                                verified.push((la, lo, r.name.clone()));
+                                            }
+                                        }
+                                        if verified.is_empty() { addr = "おすすめ: 実在確認できる地点なし".into(); }
+                                        else {
+                                            pois = verified.into_iter().map(|(la, lo, nm)| (la, lo, nm, PoiCat::Home)).collect();
+                                            poi_sel = 0; poi_label = "おすすめ".into();
+                                            set_markers(&mut spec, &wps, &pois);
+                                            focus = Focus::PoiList;
+                                        }
+                                    }
+                                    Ok(_) => addr = "おすすめ: 提案が空だった".into(),
+                                    Err(e) => addr = format!("おすすめ: {e}"),
+                                }
+                            }
+                        }
+                        KeyCode::Esc => {}
+                        KeyCode::Backspace => { buf.pop(); focus = Focus::Recommend(buf); }
+                        KeyCode::Char(c) => { buf.push(c); focus = Focus::Recommend(buf); }
+                        _ => focus = Focus::Recommend(buf),
                     },
                     Focus::SpotList => match k.code { // cur_cat のスポット一覧
                         KeyCode::Up => { sp_sel = sp_sel.saturating_sub(1); focus = Focus::SpotList; }
@@ -1157,6 +1190,11 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                             KeyCode::Char('P') => { cat_sel = 0; focus = Focus::SpotCatList; } // マイスポット(カテゴリ一覧)
                             KeyCode::Char(',') => { set_sel = 0; focus = Focus::Settings; } // 設定画面
                             KeyCode::Char('r') => focus = Focus::RoadSearch(String::new()), // 道路名でルート(現在view内)
+                            KeyCode::Char('@') => { // おすすめツーリングスポット提案(claude -p)
+                                if !cfg.llm_recommend_enabled { addr = "おすすめ: 設定でOFF(,でON)".into(); }
+                                else if !recommend::claude_available(&cfg.llm_command) { addr = "おすすめ: claudeが無い(設定のLLM/コマンド確認)".into(); }
+                                else { focus = Focus::Recommend(String::new()); }
+                            }
                             KeyCode::Char('V') => { show_spots = !show_spots; apply_spots(&mut spec, &spots, &spot_cats, show_spots); addr = if show_spots { "マイスポット表示".into() } else { "マイスポット非表示".into() }; }
                             KeyCode::Char('E') => { // 標高プロファイルの表示/非表示
                                 show_elev = !show_elev;
@@ -1228,7 +1266,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                 }
             }
             Some(Event::Paste(s)) => { match &mut focus {
-                Focus::Search(buf) | Focus::SaveName(buf) | Focus::NearSearch(buf) | Focus::NewCat(buf) | Focus::RoadSearch(buf) => buf.push_str(&s),
+                Focus::Search(buf) | Focus::SaveName(buf) | Focus::NearSearch(buf) | Focus::NewCat(buf) | Focus::RoadSearch(buf) | Focus::Recommend(buf) => buf.push_str(&s),
                 Focus::SpotName(buf, _) | Focus::SpotRename(buf, _) | Focus::SpotEditName(buf, _) => buf.push_str(&s),
                 Focus::Settings if set_sel == 10 => { cfg.streetview_api_key = s.trim().to_string(); addr = "APIkey設定(sで保存)".into(); }
                 _ => {}
