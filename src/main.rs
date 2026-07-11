@@ -357,7 +357,7 @@ const HELP: &[&str] = &[
     "   x              選択点を削除     c  ルート全消去",
     "   m              モード切替  下道 → 高速 → 最短",
     "   n              代替ルート候補を巡回(BRouterの案 1〜4)",
-    "   r              道路名/refで現在view内の道路を経路化(例: 国道16号 / E20)",
+    "   r              道路名/refで現在view内の道路を経路に追加(例: 国道16号 / E20)。複数のrで道を連結",
     "   W              走りまくり: 峠/展望を巡る周回を自動生成(連打で別案)",
     "",
     " [目的地・お気に入り]",
@@ -700,7 +700,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                 };
                 format!(" ▶ {desc}   [↑↓選択 Enter切替 s保存 Esc閉]")
             }
-            Focus::RoadSearch(buf) => format!(" 道路名/ref: {buf}\u{2588}   Enter=view内をルート化 Esc=取消 "),
+            Focus::RoadSearch(buf) => format!(" 道路名/ref: {buf}\u{2588}   Enter=view内を経路に追加(複数連結可・cで全消去) Esc=取消 "),
             Focus::SpotRename(buf, _) => format!(" カテゴリ改名: {buf}\u{2588}   Enter=確定 Esc=取消 "),
             Focus::PoiMenu => " 目的地: 1ガソスタ 2カフェ 3コンビニ 4道の駅 5展望 6公園 7峠道  / キーワード周辺検索  Esc=取消 ".to_string(),
             Focus::PoiList => format!(" [{}] ↑↓選択 Enter=移動 s始 e終 v経由 f再検索 Esc閉 ", poi_label),
@@ -865,10 +865,12 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                                         let poly = roadtrace::assemble_polyline(&rf);
                                         let samp = roadtrace::sample_every(&poly, cfg.sample_interval_m.max(100.0));
                                         if samp.len() >= 2 {
-                                            wps = samp; wp_sel = 0;
+                                            wps.extend(samp); // 複数の道路名を順に繋げる(cで全消去してから始めると綺麗)
+                                            if wps.len() > 150 { wps.truncate(150); } // BRouter過負荷防止の上限
+                                            wp_sel = 0;
                                             let (nn, jj) = trigger_route(&mut spec, &wps, &pois, &mode, 0);
                                             route_note = nn; route_job = jj;
-                                            addr = format!("道路: {name} ({}点で経路化)", wps.len());
+                                            addr = format!("道路: {name} 追加 (計{}点/連結は次のrで続けて指定)", wps.len());
                                         } else { addr = "道路: 点が足りない(拡大/移動して再検索)".into(); }
                                     }
                                     Ok(_) => addr = format!("道路が見つからない: {name}(view内に無い)"),
