@@ -373,7 +373,7 @@ const HELP: &[&str] = &[
     " [マイスポット] (ラーメン等をカテゴリ別に色分け保存)",
     "   P              カテゴリ一覧を開く",
     "                   カテゴリ: ↑↓ Enter=中へ n新規 r改名 c色 x削除(空のみ)",
-    "                   スポット: ↑↓ Enter=移動 n新規(現在地) x削除 Esc戻る",
+    "                   スポット: ↑↓ Enter=移動 n新規(現在地) r改名 m位置を中心へ移動 x削除 Esc戻る",
     "   V              マイスポットの表示 / 非表示",
     "   o              スマホ共有(GoogleマップのQRをポップアップ表示)",
     "",
@@ -414,7 +414,7 @@ impl Drop for TermGuard {
 fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Result<()> {
     use crossterm::event::{self, Event, KeyCode, KeyModifiers};
     enum Focus { Map, Search(String), SaveName(String), NearSearch(String), PoiMenu, PoiList, RouteList, WaypointList,
-                 NewCat(String), SpotName(String, String), SpotList, SpotCatList, SpotRename(String, usize), Settings, RoadSearch(String) }
+                 NewCat(String), SpotName(String, String), SpotList, SpotCatList, SpotRename(String, usize), Settings, RoadSearch(String), SpotEditName(String, usize) }
     let _guard = TermGuard::enter()?; // Drop で必ず端末復元
     let mut cache: Cache = HashMap::new();
     let mut out = std::io::stdout();
@@ -682,7 +682,8 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
             Focus::NearSearch(buf) => format!(" 周辺検索: {buf}\u{2588}   Enter=検索 Esc=取消 "),
             Focus::NewCat(buf) => format!(" 新規カテゴリ: {buf}\u{2588}   Enter=作成 Esc=取消 "),
             Focus::SpotName(buf, cat) => format!(" [{cat}] 名前 or GoogleマップURL: {buf}\u{2588}   Enter=保存 Esc=取消 "),
-            Focus::SpotList => format!(" [{cur_cat}] ↑↓選択 Enter=移動 n=新規(現在地) x=削除 Esc=戻る "),
+            Focus::SpotList => format!(" [{cur_cat}] ↑↓ Enter移動 n新規 r改名 m位置を中心へ x削除 Esc戻る "),
+            Focus::SpotEditName(buf, _) => format!(" スポット改名: {buf}\u{2588}   Enter=確定 Esc=取消 "),
             Focus::SpotCatList => " カテゴリ: ↑↓選択 Enter=中へ n新規 r改名 c色 x削除(空のみ) Esc=閉 ".to_string(),
             Focus::Settings => {
                 let desc = match set_sel {
@@ -887,6 +888,15 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                         KeyCode::Up => { sp_sel = sp_sel.saturating_sub(1); focus = Focus::SpotList; }
                         KeyCode::Down => { let n = spots.iter().filter(|s| s.cat == cur_cat).count(); if sp_sel + 1 < n { sp_sel += 1; } focus = Focus::SpotList; }
                         KeyCode::Char('n') => focus = Focus::SpotName(String::new(), cur_cat.clone()), // 現在地を新規スポット
+                        KeyCode::Char('r') => { // 選択スポットを改名
+                            let idxs: Vec<usize> = spots.iter().enumerate().filter(|(_, s)| s.cat == cur_cat).map(|(i, _)| i).collect();
+                            match idxs.get(sp_sel) { Some(&gi) => focus = Focus::SpotEditName(spots[gi].name.clone(), gi), None => focus = Focus::SpotList }
+                        }
+                        KeyCode::Char('m') => { // 選択スポットを現在の中心へ移動
+                            let idxs: Vec<usize> = spots.iter().enumerate().filter(|(_, s)| s.cat == cur_cat).map(|(i, _)| i).collect();
+                            if let Some(&gi) = idxs.get(sp_sel) { spots[gi].lat = lat; spots[gi].lon = lon; let _ = save_all_spots(&spots); apply_spots(&mut spec, &spots, &spot_cats, show_spots); addr = "スポット位置を中心へ移動".into(); }
+                            focus = Focus::SpotList;
+                        }
                         KeyCode::Enter => {
                             let idxs: Vec<usize> = spots.iter().enumerate().filter(|(_, s)| s.cat == cur_cat).map(|(i, _)| i).collect();
                             if let Some(&gi) = idxs.get(sp_sel) { let (nx, ny) = deg_to_pixel(spots[gi].lat, spots[gi].lon, z); cx = nx; cy = ny; }
@@ -904,6 +914,19 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                         }
                         KeyCode::Esc => focus = Focus::SpotCatList,
                         _ => focus = Focus::SpotList,
+                    },
+                    Focus::SpotEditName(mut buf, gi) => match k.code { // スポット改名
+                        KeyCode::Enter => {
+                            let new = spot_clean(buf.trim());
+                            if let Some(s) = spots.get_mut(gi) { s.name = new; }
+                            let _ = save_all_spots(&spots);
+                            apply_spots(&mut spec, &spots, &spot_cats, show_spots);
+                            focus = Focus::SpotList;
+                        }
+                        KeyCode::Esc => focus = Focus::SpotList,
+                        KeyCode::Backspace => { buf.pop(); focus = Focus::SpotEditName(buf, gi); }
+                        KeyCode::Char(c) => { buf.push(c); focus = Focus::SpotEditName(buf, gi); }
+                        _ => focus = Focus::SpotEditName(buf, gi),
                     },
                     Focus::NewCat(mut buf) => match k.code {
                         KeyCode::Enter => { let name = buf.trim().to_string(); if !name.is_empty() { let _ = ensure_spot_cat(&name, &mut spot_cats); } focus = Focus::SpotCatList; }
@@ -1206,7 +1229,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
             }
             Some(Event::Paste(s)) => { match &mut focus {
                 Focus::Search(buf) | Focus::SaveName(buf) | Focus::NearSearch(buf) | Focus::NewCat(buf) | Focus::RoadSearch(buf) => buf.push_str(&s),
-                Focus::SpotName(buf, _) | Focus::SpotRename(buf, _) => buf.push_str(&s),
+                Focus::SpotName(buf, _) | Focus::SpotRename(buf, _) | Focus::SpotEditName(buf, _) => buf.push_str(&s),
                 Focus::Settings if set_sel == 10 => { cfg.streetview_api_key = s.trim().to_string(); addr = "APIkey設定(sで保存)".into(); }
                 _ => {}
             } }
