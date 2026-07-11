@@ -20,45 +20,66 @@ pub fn json_first(body: &str, key: &str) -> Option<String> {
 // 地名/施設名を座標に。near があれば現在地周辺を優先し、他県へ飛ぶのを防ぐ。
 // 優先順: ① Google Geocoding(キーあり・現在地bounds) → ② Nominatim(near周辺viewbox) → ③ Nominatim(全国)
 pub fn geocode(place: &str, near: Option<(f64, f64)>, google_key: &str) -> Result<(f64, f64), String> {
+    geocode_list(place, near, google_key)
+        .into_iter().next().map(|(la, lo, _)| (la, lo))
+        .ok_or_else(|| format!("住所が見つかりません: {place}"))
+}
+
+// 候補を最大8件返す。①Google(現在地bounds) → ②Nominatim(near周辺viewbox) → ③Nominatim(全国)
+pub fn geocode_list(place: &str, near: Option<(f64, f64)>, google_key: &str) -> Vec<(f64, f64, String)> {
     if !google_key.trim().is_empty() {
-        if let Ok(v) = google_geocode(place, near, google_key) {
-            return Ok(v);
-        }
+        let g = google_geocode_list(place, near, google_key);
+        if !g.is_empty() { return g; }
     }
     if let Some((lat, lon)) = near {
         let d = 0.35; // ≈ ±35km
         let vb = format!("{},{},{},{}", lon - d, lat - d, lon + d, lat + d);
-        let url = format!("https://nominatim.openstreetmap.org/search?format=json&limit=1&accept-language=ja&bounded=1&viewbox={}&q={}", vb, urlencode(place));
-        if let Ok(v) = nominatim_req(&url) {
-            return Ok(v);
-        }
+        let url = format!("https://nominatim.openstreetmap.org/search?format=json&limit=8&accept-language=ja&bounded=1&viewbox={}&q={}", vb, urlencode(place));
+        let l = nominatim_list(&url);
+        if !l.is_empty() { return l; }
     }
-    let url = format!("https://nominatim.openstreetmap.org/search?format=json&limit=1&accept-language=ja&q={}", urlencode(place));
-    nominatim_req(&url).map_err(|_| format!("住所が見つかりません: {place}"))
+    let url = format!("https://nominatim.openstreetmap.org/search?format=json&limit=8&accept-language=ja&q={}", urlencode(place));
+    nominatim_list(&url)
 }
 
-fn nominatim_req(url: &str) -> Result<(f64, f64), String> {
-    let body = ureq::get(url)
+fn nominatim_list(url: &str) -> Vec<(f64, f64, String)> {
+    let body = match ureq::get(url)
         .set("User-Agent", "termmap/0.1 (personal experiment)")
-        .timeout(std::time::Duration::from_secs(20)).call().map_err(|e| format!("geocode: {e}"))?
-        .into_string().map_err(|e| e.to_string())?;
-    let lat = json_first(&body, "\"lat\":\"").ok_or("no result")?;
-    let lon = json_first(&body, "\"lon\":\"").ok_or("no result")?;
-    let lat: f64 = lat.parse().map_err(|_| "lat parse失敗".to_string())?;
-    let lon: f64 = lon.parse().map_err(|_| "lon parse失敗".to_string())?;
-    Ok((lat, lon))
+        .timeout(std::time::Duration::from_secs(20)).call() {
+        Ok(r) => r.into_string().unwrap_or_default(),
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for chunk in body.split("\"place_id\"").skip(1) {
+        let lat = json_first(chunk, "\"lat\":\"").and_then(|s| s.parse::<f64>().ok());
+        let lon = json_first(chunk, "\"lon\":\"").and_then(|s| s.parse::<f64>().ok());
+        if let (Some(la), Some(lo)) = (lat, lon) {
+            out.push((la, lo, json_str(chunk, "display_name").unwrap_or_default()));
+        }
+        if out.len() >= 8 { break; }
+    }
+    out
 }
 
-fn google_geocode(place: &str, near: Option<(f64, f64)>, key: &str) -> Result<(f64, f64), String> {
+fn google_geocode_list(place: &str, near: Option<(f64, f64)>, key: &str) -> Vec<(f64, f64, String)> {
     let mut url = format!("https://maps.googleapis.com/maps/api/geocode/json?language=ja&region=jp&address={}&key={}", urlencode(place), key);
     if let Some((lat, lon)) = near {
         let d = 0.3;
         url.push_str(&format!("&bounds={},{}|{},{}", lat - d, lon - d, lat + d, lon + d)); // sw|ne
     }
-    let body = ureq::get(&url)
-        .timeout(std::time::Duration::from_secs(20)).call().map_err(|e| format!("google geocode: {e}"))?
-        .into_string().map_err(|e| e.to_string())?;
-    parse_google_latlng(&body).ok_or_else(|| "google no result".to_string())
+    let body = match ureq::get(&url).timeout(std::time::Duration::from_secs(20)).call() {
+        Ok(r) => r.into_string().unwrap_or_default(),
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for chunk in body.split("\"formatted_address\"").skip(1) {
+        if let Some((la, lo)) = parse_google_latlng(chunk) {
+            let name = chunk.splitn(3, '"').nth(1).unwrap_or("").to_string();
+            out.push((la, lo, name));
+        }
+        if out.len() >= 8 { break; }
+    }
+    out
 }
 
 // Google Geocoding応答から最初の geometry.location の (lat,lng) を拾う。数値形式("lat" : 35.6)。

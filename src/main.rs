@@ -606,18 +606,20 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
             } else if show_settings {
                 let onoff = |b: bool| if b { "ON" } else { "OFF" };
                 let keyset = if cfg.streetview_api_key.trim().is_empty() { "未設定" } else { "設定済" };
+                let mode_ja = match cfg.route_profile.as_str() { "car-fast" => "高速", "moped" => "下道", "shortest" => "最短", o => o };
+                let model_ja = match cfg.llm_model.as_str() { "claude-sonnet-5" => "sonnet", "claude-haiku-4-5" => "haiku", "claude-opus-4-8" => "opus", o => o };
                 let its = vec![
-                    format!("braille  {}", onoff(opts.braille)),
-                    format!("classify {}", onoff(opts.classify)),
-                    format!("edge     {}", onoff(opts.edge)),
-                    format!("mono     {}", onoff(opts.mono)),
-                    format!("style    {}", opts.style),
-                    format!("既定mode {}", cfg.route_profile),
+                    format!("点字ドット {}", onoff(opts.braille)),
+                    format!("地物色分け {}", onoff(opts.classify)),
+                    format!("輪郭抽出 {}", onoff(opts.edge)),
+                    format!("単色 {}", onoff(opts.mono)),
+                    format!("地図種別 {}", opts.style),
+                    format!("既定ルート {}", mode_ja),
                     format!("道路の点間隔 {}m", cfg.sample_interval_m as i64),
-                    format!("spot既定 {}", onoff(cfg.show_spots)),
+                    format!("スポット既定表示 {}", onoff(cfg.show_spots)),
                     format!("おすすめ {}", onoff(cfg.llm_recommend_enabled)),
-                    format!("LLM      {}", cfg.llm_model),
-                    format!("APIkey   {}", keyset),
+                    format!("提案AIモデル {}", model_ja),
+                    format!("APIキー {}", keyset),
                 ];
                 ("設定".to_string(), its, set_sel)
             } else if show_routes {
