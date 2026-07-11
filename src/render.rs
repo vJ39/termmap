@@ -1,0 +1,221 @@
+// 端末描画 (halfblock/braille/edge/classify) と オーバーレイ(POI/経路/リング)の構築・合成
+use image::RgbImage;
+use crate::geo::{deg_to_pixel, meters_per_pixel};
+
+fn lum(p: &image::Rgb<u8>) -> f64 { 0.299 * p[0] as f64 + 0.587 * p[1] as f64 + 0.114 * p[2] as f64 }
+
+#[derive(Clone, Copy, PartialEq)]
+enum Cat { Water, Park, RoadMajor, Rail, Building, Other }
+fn classify(p: &image::Rgb<u8>) -> Option<Cat> {
+    let (r, g, b) = (p[0] as i32, p[1] as i32, p[2] as i32);
+    let sat = r.max(g).max(b) - r.min(g).min(b);
+    let l = lum(p);
+    if b - r > 12 && b + 6 > g && b > 150 { return Some(Cat::Water); }
+    if g - r > 8 && g - b > 6 { return Some(Cat::Park); }
+    if r > 205 && g > 150 && (r - b) > 45 { return Some(Cat::RoadMajor); }
+    if l < 115.0 && sat < 45 { return Some(Cat::Rail); }
+    if sat > 6 && sat < 42 && r >= g && g >= b && l > 170.0 && l < 226.0 { return Some(Cat::Building); }
+    if l > 233.0 { return None; }
+    if sat < 14 { return Some(Cat::Other); }
+    None
+}
+fn cat_color(c: Cat) -> (u8, u8, u8) {
+    match c {
+        Cat::Water => (86, 170, 222), Cat::Park => (110, 190, 110),
+        Cat::RoadMajor => (240, 200, 70), Cat::Rail => (180, 95, 200),
+        Cat::Building => (200, 172, 148), Cat::Other => (150, 150, 150),
+    }
+}
+pub fn recolor(img: &RgbImage) -> RgbImage {
+    let (w, h) = img.dimensions();
+    let mut out = RgbImage::from_pixel(w, h, image::Rgb([245, 245, 245]));
+    for (x, y, p) in img.enumerate_pixels() {
+        if let Some(c) = classify(p) { let (r, g, b) = cat_color(c); out.put_pixel(x, y, image::Rgb([r, g, b])); }
+    }
+    out
+}
+
+pub fn render_halfblock(img: &RgbImage) -> String {
+    let (w, h) = img.dimensions();
+    let mut out = String::with_capacity(w as usize * h as usize * 20);
+    let mut y = 0;
+    while y + 1 < h {
+        for x in 0..w {
+            let t = img.get_pixel(x, y);
+            let b = img.get_pixel(x, y + 1);
+            out.push_str(&format!("\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m\u{2580}", t[0], t[1], t[2], b[0], b[1], b[2]));
+        }
+        out.push_str("\x1b[0m\r\n");
+        y += 2;
+    }
+    out
+}
+pub fn render_braille(img: &RgbImage, mono: bool, classify_on: bool, threshold: u8, edge: bool, ov: Option<&OverlayLayer>) -> String {
+    const BITS: [[u8; 4]; 2] = [[0x01, 0x02, 0x04, 0x40], [0x08, 0x10, 0x20, 0x80]];
+    let (w, h) = img.dimensions();
+    let (cols, rows) = (w / 2, h / 4);
+    let th = threshold as f64;
+    // エッジ検出: 隣接画素の色差(RGB各chの絶対差の和)。明るさが近くても色が違う境界(水際/緑地/道路)を拾う。
+    let grad = |x: u32, y: u32| -> f64 {
+        if x == 0 || y == 0 || x + 1 >= w || y + 1 >= h { return 0.0; }
+        let d = |p: &image::Rgb<u8>, q: &image::Rgb<u8>| {
+            (p[0] as f64 - q[0] as f64).abs() + (p[1] as f64 - q[1] as f64).abs() + (p[2] as f64 - q[2] as f64).abs()
+        };
+        d(img.get_pixel(x + 1, y), img.get_pixel(x - 1, y)) + d(img.get_pixel(x, y + 1), img.get_pixel(x, y - 1))
+    };
+    let mut out = String::with_capacity(cols as usize * rows as usize * 6);
+    for cy in 0..rows {
+        for cx in 0..cols {
+            let mut bits: u8 = 0;
+            let (mut sr, mut sg, mut sb, mut n) = (0u32, 0u32, 0u32, 0u32);
+            let mut cc = [0u32; 6];
+            let (mut ovr, mut ovg, mut ovb, mut ovn) = (0u32, 0u32, 0u32, 0u32);
+            for dx in 0..2u32 {
+                for dy in 0..4u32 {
+                    let (gx, gy) = (cx * 2 + dx, cy * 4 + dy);
+                    let p = img.get_pixel(gx, gy);
+                    let ovpix = ov.and_then(|o| o.get(gx, gy));
+                    let on = ovpix.is_some()
+                             || if edge { grad(gx, gy) > th }
+                                else if classify_on { classify(p).is_some() }
+                                else { lum(p) < th };
+                    if on {
+                        bits |= BITS[dx as usize][dy as usize];
+                        if let Some(c) = ovpix { ovr += c[0] as u32; ovg += c[1] as u32; ovb += c[2] as u32; ovn += 1; }
+                        else {
+                            sr += p[0] as u32; sg += p[1] as u32; sb += p[2] as u32; n += 1;
+                            if classify_on { if let Some(c) = classify(p) { cc[c as usize] += 1; } }
+                        }
+                    }
+                }
+            }
+            let ch = char::from_u32(0x2800 + bits as u32).unwrap();
+            if bits == 0 { out.push(' '); }
+            else if mono { out.push(ch); }
+            else if ovn > 0 { out.push_str(&format!("\x1b[38;2;{};{};{}m{ch}", ovr / ovn, ovg / ovn, ovb / ovn)); }
+            else if classify_on {
+                let bi = (0..6).max_by_key(|&i| cc[i]).unwrap();
+                let (r, g, b) = cat_color([Cat::Water, Cat::Park, Cat::RoadMajor, Cat::Rail, Cat::Building, Cat::Other][bi]);
+                out.push_str(&format!("\x1b[38;2;{r};{g};{b}m{ch}"));
+            } else {
+                // braille はインク=暗い画素の平均色になりがちで沈むので輝度を持ち上げる
+                let br = |s: u32| ((s as f64 / n as f64) * 1.6).min(255.0) as u8;
+                out.push_str(&format!("\x1b[38;2;{};{};{}m{ch}", br(sr), br(sg), br(sb)));
+            }
+        }
+        if !mono { out.push_str("\x1b[0m"); }
+        out.push_str("\r\n");
+    }
+    out
+}
+
+// ---- オーバーレイ (POIマーカー / 経路 / 航続リング) ----
+#[derive(Clone, Copy)]
+#[allow(dead_code)] // POI 実装(次増分)で全variant使用
+pub enum PoiCat { Home, Food, Fuel, Shop, Danger, Waypoint, Other }
+fn poi_color(c: PoiCat) -> [u8; 3] {
+    match c {
+        PoiCat::Home => [255, 64, 64], PoiCat::Food => [255, 140, 0],
+        PoiCat::Fuel => [255, 215, 0], PoiCat::Shop => [80, 200, 255],
+        PoiCat::Danger => [255, 0, 200], PoiCat::Waypoint => [120, 255, 120],
+        PoiCat::Other => [255, 255, 255],
+    }
+}
+#[allow(dead_code)] // POI 実装(次増分)で使用
+pub struct Poi { pub lat: f64, pub lon: f64, pub cat: PoiCat }
+pub struct Route { pub pts: Vec<(f64, f64)>, pub color: [u8; 3], pub thickness: u32 }
+pub struct Ring { pub lat: f64, pub lon: f64, pub radii_km: Vec<f64>, pub color: [u8; 3], pub thickness: u32 }
+pub struct OverlaySpec { pub pois: Vec<Poi>, pub routes: Vec<Route>, pub rings: Vec<Ring>, pub spots: Vec<(f64, f64, [u8; 3])> }
+impl OverlaySpec {
+    pub fn is_empty(&self) -> bool { self.pois.is_empty() && self.routes.is_empty() && self.rings.is_empty() && self.spots.is_empty() }
+}
+
+// インクマスク層。描画は最終出力寸法(resize後)で構築する。
+pub struct OverlayLayer { w: u32, h: u32, ink: Vec<Option<[u8; 3]>> }
+impl OverlayLayer {
+    fn new(w: u32, h: u32) -> Self { Self { w, h, ink: vec![None; (w as usize) * (h as usize)] } }
+    fn put(&mut self, x: i32, y: i32, c: [u8; 3]) {
+        if x < 0 || y < 0 || x as u32 >= self.w || y as u32 >= self.h { return; }
+        self.ink[(y as usize) * (self.w as usize) + x as usize] = Some(c);
+    }
+    fn get(&self, x: u32, y: u32) -> Option<[u8; 3]> {
+        if x >= self.w || y >= self.h { return None; }
+        self.ink[(y as usize) * (self.w as usize) + x as usize]
+    }
+}
+fn draw_marker(ov: &mut OverlayLayer, ix: i32, iy: i32, color: [u8; 3], size: i32) {
+    let half = size / 2;
+    for dy in -half - 1..=half + 1 { for dx in -half - 1..=half + 1 {
+        if dx.abs() > half || dy.abs() > half { ov.put(ix + dx, iy + dy, [20, 20, 20]); } // ハロー
+    }}
+    for dy in -half..=half { for dx in -half..=half { ov.put(ix + dx, iy + dy, color); }}
+}
+pub fn draw_line(ov: &mut OverlayLayer, mut x0: i32, mut y0: i32, x1: i32, y1: i32, color: [u8; 3], thickness: u32) {
+    let dx = (x1 - x0).abs(); let sx = if x0 < x1 { 1 } else { -1 };
+    let dy = -(y1 - y0).abs(); let sy = if y0 < y1 { 1 } else { -1 };
+    let mut err = dx + dy;
+    let t = thickness.max(1) as i32 - 1;
+    loop {
+        for oy in 0..=t { for ox in 0..=t { ov.put(x0 + ox, y0 + oy, color); }}
+        if x0 == x1 && y0 == y1 { break; }
+        let e2 = 2 * err;
+        if e2 >= dy { err += dy; x0 += sx; }
+        if e2 <= dx { err += dx; y0 += sy; }
+    }
+}
+fn draw_polyline(ov: &mut OverlayLayer, pts: &[(i32, i32)], color: [u8; 3], thickness: u32) {
+    for w in pts.windows(2) { draw_line(ov, w[0].0, w[0].1, w[1].0, w[1].1, color, thickness); }
+}
+pub fn draw_ring(ov: &mut OverlayLayer, cx: i32, cy: i32, radius: i32, color: [u8; 3], thickness: u32) {
+    if radius <= 0 { return; }
+    for rr in radius..radius + thickness.max(1) as i32 {
+        let (mut x, mut y, mut err) = (rr, 0i32, 1 - rr);
+        while x >= y {
+            for (px, py) in [(x, y), (y, x), (-x, y), (-y, x), (x, -y), (y, -x), (-x, -y), (-y, -x)] {
+                ov.put(cx + px, cy + py, color);
+            }
+            y += 1;
+            if err < 0 { err += 2 * y + 1; } else { x -= 1; err += 2 * (y - x) + 1; }
+        }
+    }
+}
+// spec(緯度経度) を 表示画像座標へ射影して焼く。win_w/h=元画像寸法, scale=resize比, out_w/h=最終寸法。
+pub fn build_overlay(spec: &OverlaySpec, cx: f64, cy: f64, z: u32, win_w: u32, win_h: u32,
+                 scale_x: f64, scale_y: f64, out_w: u32, out_h: u32) -> OverlayLayer {
+    let mut ov = OverlayLayer::new(out_w, out_h);
+    let left = cx - win_w as f64 / 2.0;
+    let top = cy - win_h as f64 / 2.0;
+    let to_img = |lat: f64, lon: f64| -> (i32, i32) {
+        let (gx, gy) = deg_to_pixel(lat, lon, z);
+        (((gx - left) * scale_x).floor() as i32, ((gy - top) * scale_y).floor() as i32)
+    };
+    for r in &spec.rings { // リング(最背面)
+        let (rx, ry) = to_img(r.lat, r.lon);
+        let mpp = meters_per_pixel(r.lat, z);
+        for km in &r.radii_km {
+            let rpx = ((km * 1000.0 / mpp) * scale_x).round() as i32;
+            draw_ring(&mut ov, rx, ry, rpx, r.color, r.thickness);
+        }
+    }
+    for rt in &spec.routes { // 経路
+        let pts: Vec<(i32, i32)> = rt.pts.iter().map(|&(la, lo)| to_img(la, lo)).collect();
+        draw_polyline(&mut ov, &pts, rt.color, rt.thickness);
+    }
+    for p in &spec.pois { // マーカー(最前面)
+        let (ix, iy) = to_img(p.lat, p.lon);
+        if ix < -4 || iy < -4 || ix > out_w as i32 + 4 || iy > out_h as i32 + 4 { continue; }
+        draw_marker(&mut ov, ix, iy, poi_color(p.cat), 3);
+    }
+    for (la, lo, col) in &spec.spots { // マイスポット(カテゴリ色)
+        let (ix, iy) = to_img(*la, *lo);
+        if ix < -4 || iy < -4 || ix > out_w as i32 + 4 || iy > out_h as i32 + 4 { continue; }
+        draw_marker(&mut ov, ix, iy, *col, 3);
+    }
+    ov
+}
+pub fn composite(img: &mut RgbImage, ov: &OverlayLayer) {
+    let (w, h) = img.dimensions();
+    for y in 0..h.min(ov.h) { for x in 0..w.min(ov.w) {
+        if let Some(c) = ov.get(x, y) { img.put_pixel(x, y, image::Rgb(c)); }
+    }}
+}
