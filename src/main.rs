@@ -140,7 +140,7 @@ fn geocode(place: &str) -> Result<(f64, f64), String> {
     let url = format!("https://nominatim.openstreetmap.org/search?format=json&limit=1&accept-language=ja&q={}", urlencode(place));
     let body = ureq::get(&url)
         .set("User-Agent", "termmap/0.1 (personal experiment)")
-        .call().map_err(|e| format!("geocode: {e}"))?
+        .timeout(std::time::Duration::from_secs(20)).call().map_err(|e| format!("geocode: {e}"))?
         .into_string().map_err(|e| e.to_string())?;
     let lat = json_first(&body, "\"lat\":\"").ok_or_else(|| format!("住所が見つかりません: {place}"))?;
     let lon = json_first(&body, "\"lon\":\"").ok_or_else(|| format!("住所が見つかりません: {place}"))?;
@@ -154,7 +154,7 @@ fn reverse_geocode(lat: f64, lon: f64) -> Result<String, String> {
     let url = format!("https://nominatim.openstreetmap.org/reverse?format=json&accept-language=ja&zoom=18&lat={lat}&lon={lon}");
     let body = ureq::get(&url)
         .set("User-Agent", "termmap/0.1 (personal experiment)")
-        .call().map_err(|e| format!("revgeo: {e}"))?
+        .timeout(std::time::Duration::from_secs(20)).call().map_err(|e| format!("revgeo: {e}"))?
         .into_string().map_err(|e| e.to_string())?;
     json_first(&body, "\"display_name\":\"").ok_or_else(|| "住所が取得できません".to_string())
 }
@@ -294,7 +294,7 @@ fn fetch_route(wps: &[(f64, f64)], mode: &str, alt: u32) -> Result<RouteResult, 
     let url = format!("https://brouter.de/brouter?lonlats={lonlats}&profile={profile}&alternativeidx={alt}&format=geojson");
     let body = ureq::get(&url)
         .set("User-Agent", "termmap/0.1 (personal experiment)")
-        .call().map_err(|e| format!("route: {e}"))?
+        .timeout(std::time::Duration::from_secs(20)).call().map_err(|e| format!("route: {e}"))?
         .into_string().map_err(|e| e.to_string())?;
     let pts = parse_geojson_line(&body).ok_or("route: geometry parse失敗")?;
     let num = |k: &str| json_first(body.as_str(), k).and_then(|s| s.trim().parse::<f64>().ok());
@@ -305,22 +305,16 @@ fn fetch_route(wps: &[(f64, f64)], mode: &str, alt: u32) -> Result<RouteResult, 
 }
 // waypoints → Googleマップ経路URL(origin/destination/waypoints)。経由点はURL上限で切る。
 fn gmaps_url(wps: &[(f64, f64)]) -> (String, usize) {
-    let o = wps[0];
-    let d = wps[wps.len() - 1];
-    // QRを小さく保つため座標は5桁(約1m)に丸め、travelmodeは既定(driving)で省略
-    let mut u = format!(
-        "https://www.google.com/maps/dir/?api=1&origin={:.5},{:.5}&destination={:.5},{:.5}",
-        o.0, o.1, d.0, d.1
-    );
-    let mids: Vec<(f64, f64)> = if wps.len() > 2 { wps[1..wps.len() - 1].to_vec() } else { Vec::new() };
-    const MAX_WP: usize = 9; // GoogleマップURL APIの経由点上限
-    let dropped = mids.len().saturating_sub(MAX_WP);
-    let used = &mids[..mids.len().min(MAX_WP)];
-    if !used.is_empty() {
-        let s = used.iter().map(|(la, lo)| format!("{la:.5},{lo:.5}")).collect::<Vec<_>>().join("%7C");
-        u.push_str(&format!("&waypoints={s}"));
-    }
-    (u, dropped)
+    // QRを小さく保つためパス形式(/maps/dir/lat,lon/...)+座標4桁(約11m)。クエリより短い。
+    const MAX_PT: usize = 10;
+    let dropped = wps.len().saturating_sub(MAX_PT);
+    let used: Vec<(f64, f64)> = if wps.len() <= MAX_PT {
+        wps.to_vec()
+    } else {
+        wps.iter().take(MAX_PT - 1).chain(std::iter::once(&wps[wps.len() - 1])).copied().collect()
+    };
+    let path = used.iter().map(|(la, lo)| format!("{la:.4},{lo:.4}")).collect::<Vec<_>>().join("/");
+    (format!("https://www.google.com/maps/dir/{path}"), dropped)
 }
 fn write_gpx(path: &str, pts: &[(f64, f64)]) -> Result<(), String> {
     let mut s = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<gpx version=\"1.1\" creator=\"termmap\" xmlns=\"http://www.topografix.com/GPX/1/1\">\n<trk><name>termmap route</name><trkseg>\n");
@@ -342,7 +336,7 @@ fn fetch_tile(style: &str, z: u32, x: i64, y: i64) -> Result<RgbImage, String> {
     let url = tile_url(style, z, x, y);
     let resp = ureq::get(&url)
         .set("User-Agent", "termmap/0.1 (personal experiment)")
-        .call().map_err(|e| format!("fetch tile {z}/{x}/{y}: {e}"))?;
+        .timeout(std::time::Duration::from_secs(20)).call().map_err(|e| format!("fetch tile {z}/{x}/{y}: {e}"))?;
     let mut buf = Vec::new();
     resp.into_reader().read_to_end(&mut buf).map_err(|e| e.to_string())?;
     Ok(image::load_from_memory(&buf).map_err(|e| format!("decode tile {z}/{x}/{y}: {e}"))?.to_rgb8())
@@ -801,7 +795,7 @@ fn fetch_pois(kind: &PoiKind, s: f64, w: f64, n: f64, e: f64) -> Result<Vec<(f64
     let body = ureq::get(&url)
         .set("User-Agent", "termmap/0.1 (personal experiment)")
         .set("Accept", "application/json")
-        .call().map_err(|e| format!("overpass: {e}"))?
+        .timeout(std::time::Duration::from_secs(20)).call().map_err(|e| format!("overpass: {e}"))?
         .into_string().map_err(|e| e.to_string())?;
     Ok(parse_overpass(&body))
 }
@@ -824,7 +818,7 @@ fn fit_cells(s: &str, cells: usize) -> String {
     o
 }
 // waypoints/pois/mode から spec の pois/routes を作り直し、ルート要約を返す(rings は保持)。
-fn recompute(spec: &mut OverlaySpec, wps: &[(f64, f64)], pois: &[(f64, f64, String, PoiCat)], mode: &str) -> Option<String> {
+fn set_markers(spec: &mut OverlaySpec, wps: &[(f64, f64)], pois: &[(f64, f64, String, PoiCat)]) {
     spec.pois.clear();
     for (la, lo, _, cat) in pois { spec.pois.push(Poi { lat: *la, lon: *lo, cat: *cat }); }
     let n = wps.len();
@@ -832,17 +826,21 @@ fn recompute(spec: &mut OverlaySpec, wps: &[(f64, f64)], pois: &[(f64, f64, Stri
         let cat = if idx == 0 { PoiCat::Waypoint } else if idx == n - 1 { PoiCat::Home } else { PoiCat::Food };
         spec.pois.push(Poi { lat: *la, lon: *lo, cat });
     }
+}
+type RouteRx = std::sync::mpsc::Receiver<Result<RouteResult, String>>;
+// マーカーは即反映し、ルートはバックグラウンドスレッドで計算する(受信チャネルを返す)。
+// Ctrl+C で受信側を捨てれば計算を中断できる(スレッドはtimeoutまで走るが結果は無視)。
+fn trigger_route(spec: &mut OverlaySpec, wps: &[(f64, f64)], pois: &[(f64, f64, String, PoiCat)], mode: &str, alt: u32) -> (Option<String>, Option<RouteRx>) {
+    set_markers(spec, wps, pois);
     spec.routes.clear();
-    if n >= 2 {
-        match fetch_route(wps, mode, 0) {
-            Ok(r) => {
-                let note = route_summary(mode, &r);
-                spec.routes.push(Route { pts: r.pts, color: [0, 220, 255], thickness: 2 });
-                Some(note)
-            }
-            Err(e) => Some(format!("({e})")),
-        }
-    } else { None }
+    if wps.len() >= 2 {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (w, m) = (wps.to_vec(), mode.to_string());
+        std::thread::spawn(move || { let _ = tx.send(fetch_route(&w, &m, alt)); });
+        (Some("計算中… (Ctrl+Cで中断)".to_string()), Some(rx))
+    } else {
+        (None, None)
+    }
 }
 
 // 対話モードの操作マニュアル(? で表示)
@@ -872,7 +870,7 @@ const HELP: &[&str] = &[
     "",
     " [起動オプション]  --range KM,.. 航続リング / --route / --load-route 名前",
     "",
-    "   ?  このヘルプ      q  終了      Esc  サブモード取消",
+    "   ?  ヘルプ   q  終了   Esc  サブモード取消   Ctrl+C  計算の中断(終了はq)",
     "",
     "   (任意のキーで閉じる)",
 ];
@@ -919,7 +917,11 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
     let mut help = false; // ? でヘルプ表示
     let mut qr_view: Option<String> = None; // o でGoogleマップQRをポップアップ表示
     let mut route_alt: u32 = 0; // n で BRouter の代替ルート(0..=3)を巡回
-    let mut route_note = recompute(&mut spec, &wps, &pois, &mode);
+    // ルート計算のバックグラウンド受信(マーカーは即時、ルート線は別スレッド)
+    let (mut route_note, mut route_job) = {
+        let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0);
+        (n_, j_)
+    };
 
     let _ = write!(out, "\x1b[2J");
     loop {
@@ -1022,19 +1024,46 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
         if let Some(q) = &qr_view {
             let lines: Vec<&str> = q.lines().collect();
             let qw = lines.iter().map(|l| l.chars().count()).max().unwrap_or(21);
-            let c0 = (cols as usize).saturating_sub(qw) as u32 / 2 + 1;
-            let r0 = ((map_rows as usize).saturating_sub(lines.len() + 2) / 2).max(1) as u32;
-            let _ = write!(out, "\x1b[{r0};{c0}H\x1b[30;47m スマホでスキャン → Googleマップ \x1b[0m");
+            let bw = qw + 2; // 左右1マスの白余白(quiet zoneは切ってあるので自前で細枠)
+            let c0 = (cols as usize).saturating_sub(bw) as u32 / 2 + 1;
+            let r0 = ((map_rows as usize).saturating_sub(lines.len() + 3) / 2).max(1) as u32;
+            let blank = " ".repeat(bw);
+            let _ = write!(out, "\x1b[{r0};{c0}Hスマホでスキャン→Googleマップ");
+            let _ = write!(out, "\x1b[{};{c0}H\x1b[30;47m{blank}\x1b[0m", r0 + 1); // 上白余白
             for (i, l) in lines.iter().enumerate() {
-                let _ = write!(out, "\x1b[{};{c0}H\x1b[30;47m{}\x1b[0m", r0 + 1 + i as u32, l);
+                let _ = write!(out, "\x1b[{};{c0}H\x1b[30;47m {} \x1b[0m", r0 + 2 + i as u32, l);
             }
+            let _ = write!(out, "\x1b[{};{c0}H\x1b[30;47m{blank}\x1b[0m", r0 + 2 + lines.len() as u32); // 下白余白
             let _ = write!(out, "\x1b[{};1H\x1b[7m 任意のキーで閉じる \x1b[0m\x1b[K", tr);
         }
         out.flush()?;
 
-        match event::read()? {
-            Event::Key(_) if qr_view.is_some() => qr_view = None, // ポップアップを閉じる
-            Event::Key(k) => {
+        // 入力待ち。ルート計算中(route_job)はポーリングして結果を取り込む
+        let ev: Option<Event> = if route_job.is_some() {
+            match route_job.as_ref().unwrap().try_recv() {
+                Ok(Ok(r)) => {
+                    spec.routes.clear();
+                    route_note = Some(route_summary(&mode, &r));
+                    spec.routes.push(Route { pts: r.pts, color: [0, 220, 255], thickness: 2 });
+                    route_job = None;
+                    None
+                }
+                Ok(Err(e)) => { route_note = Some(format!("({e})")); route_job = None; None }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    if event::poll(std::time::Duration::from_millis(80))? { Some(event::read()?) } else { None }
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => { route_job = None; None }
+            }
+        } else {
+            Some(event::read()?)
+        };
+        match ev {
+            None => {} // 再描画のみ(計算待ち)
+            Some(Event::Key(k)) if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) => {
+                if route_job.is_some() { route_job = None; route_note = Some("中断".to_string()); } // 計算中断(アプリは終了しない)
+            }
+            Some(Event::Key(_)) if qr_view.is_some() => qr_view = None, // ポップアップを閉じる
+            Some(Event::Key(k)) => {
                 let cur = std::mem::replace(&mut focus, Focus::Map);
                 match cur {
                     Focus::Search(mut buf) => match k.code {
@@ -1066,7 +1095,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                                         items.dedup_by(|p, q| !p.2.is_empty() && p.2 == q.2);
                                         items.sort_by(|p, q| haversine_km((lat, lon), (p.0, p.1)).partial_cmp(&haversine_km((lat, lon), (q.0, q.1))).unwrap_or(std::cmp::Ordering::Equal));
                                         pois = items; poi_sel = 0; poi_label = kind.label.to_string();
-                                        route_note = recompute(&mut spec, &wps, &pois, &mode);
+                                        { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; }
                                         focus = Focus::PoiList;
                                     }
                                     Err(e) => addr = format!("({e})"),
@@ -1081,7 +1110,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                         KeyCode::Enter => {
                             if let Some(p) = pois.get(poi_sel) {
                                 if wps.len() < 2 { wps.push((p.0, p.1)); } else { wps.insert(wps.len() - 1, (p.0, p.1)); }
-                                route_note = recompute(&mut spec, &wps, &pois, &mode);
+                                { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; }
                             }
                             focus = Focus::PoiList;
                         }
@@ -1089,7 +1118,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                             if let Some(p) = pois.get(poi_sel) {
                                 let pt = (p.0, p.1);
                                 if wps.is_empty() { wps.push(pt); } else { wps[0] = pt; }
-                                route_note = recompute(&mut spec, &wps, &pois, &mode);
+                                { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; }
                             }
                             focus = Focus::PoiList;
                         }
@@ -1097,12 +1126,12 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                             if let Some(p) = pois.get(poi_sel) {
                                 let pt = (p.0, p.1);
                                 if wps.len() >= 2 { let l = wps.len() - 1; wps[l] = pt; } else { wps.push(pt); }
-                                route_note = recompute(&mut spec, &wps, &pois, &mode);
+                                { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; }
                             }
                             focus = Focus::PoiList;
                         }
                         KeyCode::Char('p') => focus = Focus::PoiMenu,
-                        KeyCode::Esc => { pois.clear(); route_note = recompute(&mut spec, &wps, &pois, &mode); }
+                        KeyCode::Esc => { pois.clear(); { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } }
                         _ => focus = Focus::PoiList,
                     },
                     Focus::SaveName(mut buf) => match k.code {
@@ -1125,7 +1154,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                                 if let Some((w, m)) = load_named_route(name) {
                                     let (nx, ny) = deg_to_pixel(w[0].0, w[0].1, z); cx = nx; cy = ny;
                                     wps = w; mode = m; wp_sel = 0;
-                                    route_note = recompute(&mut spec, &wps, &pois, &mode);
+                                    { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; }
                                 }
                             }
                         }
@@ -1138,10 +1167,10 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                         KeyCode::Down | KeyCode::Tab => { if !wps.is_empty() { wp_sel = (wp_sel + 1) % wps.len(); } focus = Focus::WaypointList; }
                         KeyCode::Char('+') | KeyCode::Char('=') => { if z < 19 { z += 1; cx *= 2.0; cy *= 2.0; } focus = Focus::WaypointList; }
                         KeyCode::Char('-') | KeyCode::Char('_') => { if z > 2 { z -= 1; cx /= 2.0; cy /= 2.0; } focus = Focus::WaypointList; }
-                        KeyCode::Char('[') => { if wp_sel > 0 && wp_sel < wps.len() { wps.swap(wp_sel, wp_sel - 1); wp_sel -= 1; route_note = recompute(&mut spec, &wps, &pois, &mode); } focus = Focus::WaypointList; }
-                        KeyCode::Char(']') => { if wp_sel + 1 < wps.len() { wps.swap(wp_sel, wp_sel + 1); wp_sel += 1; route_note = recompute(&mut spec, &wps, &pois, &mode); } focus = Focus::WaypointList; }
+                        KeyCode::Char('[') => { if wp_sel > 0 && wp_sel < wps.len() { wps.swap(wp_sel, wp_sel - 1); wp_sel -= 1; { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } } focus = Focus::WaypointList; }
+                        KeyCode::Char(']') => { if wp_sel + 1 < wps.len() { wps.swap(wp_sel, wp_sel + 1); wp_sel += 1; { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } } focus = Focus::WaypointList; }
                         KeyCode::Char('x') => {
-                            if !wps.is_empty() { let i = wp_sel.min(wps.len() - 1); wps.remove(i); if wp_sel >= wps.len() && wp_sel > 0 { wp_sel -= 1; } route_note = recompute(&mut spec, &wps, &pois, &mode); }
+                            if !wps.is_empty() { let i = wp_sel.min(wps.len() - 1); wps.remove(i); if wp_sel >= wps.len() && wp_sel > 0 { wp_sel -= 1; } { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } }
                             if !wps.is_empty() { focus = Focus::WaypointList; } // 空になったら閉じる
                         }
                         KeyCode::Esc | KeyCode::Enter => {} // 閉じる → Map
@@ -1163,39 +1192,32 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                             KeyCode::Char('f') | KeyCode::Char('p') => focus = Focus::PoiMenu,
                             KeyCode::Char('S') => focus = Focus::SaveName(String::new()),
                             KeyCode::Char('L') => { route_names = list_named_routes(); rn_sel = 0; if route_names.is_empty() { addr = "お気に入り無し".into(); } else { focus = Focus::RouteList; } }
-                            KeyCode::Char('s') => { if wps.is_empty() { wps.push((lat, lon)); } else { wps[0] = (lat, lon); } route_note = recompute(&mut spec, &wps, &pois, &mode); }
-                            KeyCode::Char('e') => { if wps.len() >= 2 { let l = wps.len() - 1; wps[l] = (lat, lon); } else { wps.push((lat, lon)); } route_note = recompute(&mut spec, &wps, &pois, &mode); }
-                            KeyCode::Char('v') => { if wps.len() < 2 { wps.push((lat, lon)); } else { wps.insert(wps.len() - 1, (lat, lon)); } route_note = recompute(&mut spec, &wps, &pois, &mode); }
+                            KeyCode::Char('s') => { if wps.is_empty() { wps.push((lat, lon)); } else { wps[0] = (lat, lon); } { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } }
+                            KeyCode::Char('e') => { if wps.len() >= 2 { let l = wps.len() - 1; wps[l] = (lat, lon); } else { wps.push((lat, lon)); } { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } }
+                            KeyCode::Char('v') => { if wps.len() < 2 { wps.push((lat, lon)); } else { wps.insert(wps.len() - 1, (lat, lon)); } { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } }
                             KeyCode::Tab | KeyCode::BackTab => { if !wps.is_empty() { focus = Focus::WaypointList; } } // 並べ替えパネル
                             KeyCode::Char('?') => help = true,
                             KeyCode::Char('n') => { // BRouter の代替ルート候補を巡回
                                 if wps.len() >= 2 {
                                     route_alt = (route_alt + 1) % 4;
-                                    match fetch_route(&wps, &mode, route_alt) {
-                                        Ok(r) => {
-                                            spec.routes.clear();
-                                            let note = format!("案{}/4 {}", route_alt + 1, route_summary(&mode, &r));
-                                            spec.routes.push(Route { pts: r.pts, color: [0, 220, 255], thickness: 2 });
-                                            route_note = Some(note);
-                                        }
-                                        Err(e) => route_note = Some(format!("({e})")),
-                                    }
+                                    let (nn, jj) = trigger_route(&mut spec, &wps, &pois, &mode, route_alt);
+                                    route_note = nn; route_job = jj;
                                 } else { addr = "ルート未確定".into(); }
                             }
                             KeyCode::Char('o') => { // スマホ共有(GoogleマップQR)
                                 if wps.len() >= 2 {
                                     let (url, _) = gmaps_url(&wps);
                                     match qrcode::QrCode::with_error_correction_level(url.as_bytes(), qrcode::EcLevel::L) {
-                                        Ok(c) => qr_view = Some(c.render::<qrcode::render::unicode::Dense1x2>().quiet_zone(true).build()),
+                                        Ok(c) => qr_view = Some(c.render::<qrcode::render::unicode::Dense1x2>().quiet_zone(false).build()),
                                         Err(_) => addr = "QR生成失敗".into(),
                                     }
                                 } else { addr = "ルート未確定".into(); }
                             }
-                            KeyCode::Char('x') => { if !wps.is_empty() { let i = wp_sel.min(wps.len() - 1); wps.remove(i); if wp_sel >= wps.len() && wp_sel > 0 { wp_sel -= 1; } route_note = recompute(&mut spec, &wps, &pois, &mode); } }
-                            KeyCode::Char('[') => { if wp_sel > 0 && wp_sel < wps.len() { wps.swap(wp_sel, wp_sel - 1); wp_sel -= 1; route_note = recompute(&mut spec, &wps, &pois, &mode); } }
-                            KeyCode::Char(']') => { if wp_sel + 1 < wps.len() { wps.swap(wp_sel, wp_sel + 1); wp_sel += 1; route_note = recompute(&mut spec, &wps, &pois, &mode); } }
-                            KeyCode::Char('m') => { mode = match mode_label(&mode) { "下道" => "highway", "高速" => "short", _ => "surface" }.to_string(); route_note = recompute(&mut spec, &wps, &pois, &mode); }
-                            KeyCode::Char('c') => { wps.clear(); wp_sel = 0; route_note = recompute(&mut spec, &wps, &pois, &mode); }
+                            KeyCode::Char('x') => { if !wps.is_empty() { let i = wp_sel.min(wps.len() - 1); wps.remove(i); if wp_sel >= wps.len() && wp_sel > 0 { wp_sel -= 1; } { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } } }
+                            KeyCode::Char('[') => { if wp_sel > 0 && wp_sel < wps.len() { wps.swap(wp_sel, wp_sel - 1); wp_sel -= 1; { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } } }
+                            KeyCode::Char(']') => { if wp_sel + 1 < wps.len() { wps.swap(wp_sel, wp_sel + 1); wp_sel += 1; { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } } }
+                            KeyCode::Char('m') => { mode = match mode_label(&mode) { "下道" => "highway", "高速" => "short", _ => "surface" }.to_string(); { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } }
+                            KeyCode::Char('c') => { wps.clear(); wp_sel = 0; { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } }
                             KeyCode::Char('g') => match spec.routes.last() {
                                 Some(rt) => addr = match write_gpx("termmap-route.gpx", &rt.pts) { Ok(_) => "GPX保存: termmap-route.gpx".into(), Err(e) => format!("({e})") },
                                 None => addr = "ルート未確定".into(),
@@ -1210,7 +1232,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                     }
                 }
             }
-            Event::Paste(s) => { match &mut focus { Focus::Search(buf) | Focus::SaveName(buf) => buf.push_str(&s), _ => {} } }
+            Some(Event::Paste(s)) => { match &mut focus { Focus::Search(buf) | Focus::SaveName(buf) => buf.push_str(&s), _ => {} } }
             _ => {}
         }
     }
