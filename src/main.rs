@@ -14,6 +14,7 @@ mod spots;
 mod share;
 mod streetview;
 mod elevation;
+mod gpslive;
 // 以下は今後の機能用(道路トレース/おすすめ相談)。まだ未wireのため dead_code 許容。
 #[allow(dead_code)]
 mod config;
@@ -361,6 +362,7 @@ const HELP: &[&str] = &[
     "   S / L          ルートを お気に入り保存 / 呼び出し",
     "   g              ルートを GPX 保存 (termmap-route.gpx)",
     "   E              標高プロファイル 表示/非表示 (ルート確定後・下部に折れ線)",
+    "   G              ライブ現在地 ON/OFF (CoreLocationCLIを5秒毎・自位置と軌跡を表示)",
     "",
     " [マイスポット] (ラーメン等をカテゴリ別に色分け保存)",
     "   P              カテゴリ一覧を開く",
@@ -428,6 +430,9 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
     let mut route_ele: Vec<f64> = Vec::new(); // 直近ルートの標高列(pts と同数)
     let mut route_ascend: f64 = 0.0;          // 直近ルートの累積登り(m)
     let mut show_elev = false;                // E で標高プロファイル表示
+    let mut gps_rx: Option<std::sync::mpsc::Receiver<(f64, f64)>> = None; // G ライブ現在地の受信
+    let mut gps_pos: Option<(f64, f64)> = None; // 最新の自位置
+    let mut gps_trail: Vec<(f64, f64)> = Vec::new(); // 通過ブレッドクラム
     // ルート計算のバックグラウンド受信(マーカーは即時、ルート線は別スレッド)
     let (mut route_note, mut route_job) = {
         let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0);
@@ -504,6 +509,14 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
         let gut: u32 = if !pois.is_empty() || show_routes || show_wps || show_splist || show_catlist { 26 } else { 0 };
         let map_cols = cols.saturating_sub(gut).max(10);
         let (ow, oh) = if a.braille || a.edge { (map_cols * 2, map_rows * 4) } else { (map_cols, map_rows * 2) };
+        if let Some(rx) = &gps_rx { // ライブ現在地を取り込み、自位置に追従
+            while let Ok((la, lo)) = rx.try_recv() {
+                gps_pos = Some((la, lo));
+                gps_trail.push((la, lo));
+                if gps_trail.len() > 300 { gps_trail.remove(0); }
+                let (nx, ny) = deg_to_pixel(la, lo, z); cx = nx; cy = ny;
+            }
+        }
         let (lat, lon) = pixel_to_deg(cx, cy, z);
 
         let body = match build_window(cx, cy, z, ow, oh, &a.style, &mut cache) {
@@ -512,6 +525,20 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                 let (mx, my) = (ow as i32 / 2, oh as i32 / 2); // 中心クロスヘア(黄)
                 draw_line(&mut ov, mx - 6, my, mx + 6, my, [255, 255, 0], 1);
                 draw_line(&mut ov, mx, my - 6, mx, my + 6, [255, 255, 0], 1);
+                if gps_pos.is_some() { // ライブ現在地: トレイル(薄青)+自位置(赤)
+                    for (tla, tlo) in &gps_trail {
+                        let (gx, gy) = deg_to_pixel(*tla, *tlo, z);
+                        let ix = (gx - (cx - ow as f64 / 2.0)).floor() as i32;
+                        let iy = (gy - (cy - oh as f64 / 2.0)).floor() as i32;
+                        draw_ring(&mut ov, ix, iy, 1, [80, 160, 255], 1);
+                    }
+                    if let Some((gla, glo)) = gps_pos {
+                        let (gx, gy) = deg_to_pixel(gla, glo, z);
+                        let ix = (gx - (cx - ow as f64 / 2.0)).floor() as i32;
+                        let iy = (gy - (cy - oh as f64 / 2.0)).floor() as i32;
+                        draw_ring(&mut ov, ix, iy, 4, [255, 60, 60], 2);
+                    }
+                }
                 if !wps.is_empty() { // 選択中(Tab)の waypoint を白丸で強調
                     let s = wp_sel.min(wps.len() - 1);
                     let (gx, gy) = deg_to_pixel(wps[s].0, wps[s].1, z);
@@ -594,7 +621,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
             Focus::RouteList => " お気に入り: ↑↓選択 Enter=読込 Esc=閉 ".to_string(),
             Focus::WaypointList => " 並べ替え: ↑↓/Tab 選択  [ ]移動  x削除  +/-拡縮  Esc閉 ".to_string(),
             Focus::Map => {
-                let base = format!(" ?ヘルプ z{z} {lat:.4},{lon:.4} | s始 e終 v経由({}) m:{} n候補 W走 f目的地 P点 V表 i実写 E標高 S保存 L呼出 gGPX o共有 /検索 q",
+                let base = format!(" ?ヘルプ z{z} {lat:.4},{lon:.4} | s始 e終 v経由({}) m:{} n候補 W走 f目的地 P点 V表 i実写 E標高 G現在地 S保存 L呼出 gGPX o共有 /検索 q",
                     wps.len(), mode_label(&mode));
                 match &route_note { Some(rn) => format!("{base} | {rn} "), None => base }
             }
@@ -638,6 +665,8 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => { route_job = None; None }
             }
+        } else if gps_rx.is_some() {
+            if event::poll(std::time::Duration::from_millis(80))? { Some(event::read()?) } else { None }
         } else {
             Some(event::read()?)
         };
@@ -921,6 +950,14 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                             KeyCode::Char('E') => { // 標高プロファイルの表示/非表示
                                 show_elev = !show_elev;
                                 if show_elev && (spec.routes.is_empty() || !route_ele.iter().any(|&z| z != 0.0)) { addr = "標高: ルート確定後に表示".into(); }
+                            }
+                            KeyCode::Char('G') => { // ライブ現在地(ブレッドクラム)の ON/OFF
+                                if gps_rx.is_some() { gps_rx = None; addr = "ライブ現在地: OFF".into(); }
+                                else {
+                                    let bin = if std::path::Path::new("/opt/homebrew/bin/CoreLocationCLI").exists() { "/opt/homebrew/bin/CoreLocationCLI" } else { "CoreLocationCLI" };
+                                    if gpslive::available(bin) { gps_rx = Some(gpslive::start_poller(bin.to_string(), 5)); gps_trail.clear(); gps_pos = None; addr = "ライブ現在地: ON(5秒ごと)".into(); }
+                                    else { addr = "ライブ: CoreLocationCLI無し(brew install corelocationcli)".into(); }
+                                }
                             }
                             KeyCode::Char('i') => { // 実写(Street View)を中心地点で開く
                                 if !streetview::available(&cfg.streetview_api_key) { addr = "実写: APIキー未設定(config.toml [streetview])".into(); }
