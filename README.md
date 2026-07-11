@@ -49,6 +49,7 @@ OSM ラスタタイルを端末に描画する mapscii 風レンダラ。POI/ル
     --save-route N  現在の --route を名前 N でお気に入り保存
     --load-route N  お気に入り N を読み込む(始点を中心に)
     --routes        お気に入り一覧を表示
+    --share         ルートをGoogleマップ経路URL+端末QRで出力(スマホで開く)
 
 ### 出力
     --png OUT       カテゴリ色の PNG を書き出して終了

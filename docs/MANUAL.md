@@ -84,6 +84,7 @@ termmap --place "東京駅" -i
 7. `m` で下道 / 高速を切り替える。
 8. `S` で名前を付けて保存する。
 9. 次回は `--load-route 名前` で呼び出す。
+10. スマホで走るときは `--load-route 名前 --share` で Googleマップ経路URL + QR を出し、スキャンしてマップアプリで開く(または `--gpx` で書き出して OsmAnd 等に読ませる)。
 
 ## 画面と使用例
 
@@ -121,6 +122,7 @@ f の目的地検索（ガソスタ）。左袖に中心からの距離順でリ
 - `--save-route N` 現在のルートを名前 N で保存
 - `--load-route N` お気に入り N を読み込む
 - `--routes` お気に入り一覧
+- `--share` ルートを Googleマップ経路URL + 端末QR で出力(スマホでスキャンして開く)
 - `--here` 現在地を中心にする
 - `--resume` 前回終了時の状態を復元
 - `--style osm|voyager|dark|light` タイル種別

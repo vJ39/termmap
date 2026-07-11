@@ -35,6 +35,7 @@ struct Args {
     load_route: Option<String>,
     save_route: Option<String>,
     list_routes: bool,
+    share: bool,
     image: Option<String>,
     png: Option<String>,
 }
@@ -46,7 +47,7 @@ fn parse_args() -> Args {
                        style: "osm".to_string(), braille: false, mono: false, classify: false,
                        edge: false, interactive: false, resume: false, here: false, threshold: None,
                        range: Vec::new(), home: None, route: None, route_mode: "surface".to_string(),
-                       gpx: None, load_route: None, save_route: None, list_routes: false, image: None, png: None };
+                       gpx: None, load_route: None, save_route: None, list_routes: false, share: false, image: None, png: None };
     let mut it = std::env::args().skip(1);
     macro_rules! val { ($k:expr) => { it.next().unwrap_or_else(|| arg_err(&format!("{} は値が必要です", $k))) } }
     macro_rules! num { ($k:expr) => {{ let v = val!($k); v.parse().unwrap_or_else(|_| arg_err(&format!("{} の値が不正: {}", $k, v))) }} }
@@ -90,10 +91,11 @@ fn parse_args() -> Args {
             "--load-route" => a.load_route = Some(val!("--load-route")),
             "--save-route" => a.save_route = Some(val!("--save-route")),
             "--routes" => a.list_routes = true,
+            "--share" => a.share = true,
             "--threshold" => a.threshold = Some(num!("--threshold")),
             "--image" => a.image = Some(val!("--image")),
             "--png" => a.png = Some(val!("--png")),
-            "-h" | "--help" => { eprintln!("usage: termmap (--place \"住所\" | --lat LAT --lon LON | --resume | --here) [--zoom Z] [--style osm|voyager|dark|light] [-i] [--braille] [--classify] [--edge] [--mono] [--range KM,..] [--home LAT,LON] [--route \"LAT,LON;LAT,LON\"] [--route-mode surface|highway|short] [--gpx OUT] [--width N] [--png OUT] | --image PNG"); std::process::exit(0); }
+            "-h" | "--help" => { eprintln!("usage: termmap (--place \"住所\" | --lat LAT --lon LON | --resume | --here) [--zoom Z] [--style osm|voyager|dark|light] [-i] [--braille] [--classify] [--edge] [--mono] [--range KM,..] [--home LAT,LON] [--route \"LAT,LON;LAT,LON\"] [--route-mode surface|highway|short] [--gpx OUT] [--load-route N] [--save-route N] [--routes] [--share] [--width N] [--png OUT] | --image PNG"); std::process::exit(0); }
             _ => arg_err(&format!("unknown arg: {k}")),
         }
     }
@@ -299,6 +301,24 @@ fn fetch_route(wps: &[(f64, f64)], mode: &str) -> Result<RouteResult, String> {
     let time_s = num("\"total-time\": \"").or_else(|| num("\"total-time\":\"")).unwrap_or(0.0);
     let hw_m = expressway_meters(&body);
     Ok(RouteResult { pts, dist_m, time_s, hw_m })
+}
+// waypoints → Googleマップ経路URL(origin/destination/waypoints)。経由点はURL上限で切る。
+fn gmaps_url(wps: &[(f64, f64)]) -> (String, usize) {
+    let o = wps[0];
+    let d = wps[wps.len() - 1];
+    let mut u = format!(
+        "https://www.google.com/maps/dir/?api=1&travelmode=driving&origin={},{}&destination={},{}",
+        o.0, o.1, d.0, d.1
+    );
+    let mids: Vec<(f64, f64)> = if wps.len() > 2 { wps[1..wps.len() - 1].to_vec() } else { Vec::new() };
+    const MAX_WP: usize = 9; // GoogleマップURL APIの経由点上限
+    let dropped = mids.len().saturating_sub(MAX_WP);
+    let used = &mids[..mids.len().min(MAX_WP)];
+    if !used.is_empty() {
+        let s = used.iter().map(|(la, lo)| format!("{la},{lo}")).collect::<Vec<_>>().join("%7C");
+        u.push_str(&format!("&waypoints={s}"));
+    }
+    (u, dropped)
 }
 fn write_gpx(path: &str, pts: &[(f64, f64)]) -> Result<(), String> {
     let mut s = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<gpx version=\"1.1\" creator=\"termmap\" xmlns=\"http://www.topografix.com/GPX/1/1\">\n<trk><name>termmap route</name><trkseg>\n");
@@ -1236,6 +1256,23 @@ fn main() {
             },
             None => eprintln!("--save-route には --route または --load-route が必要"),
         }
+    }
+
+    // スマホ共有: Googleマップ経路URL + 端末QR を出して終了
+    if a.share {
+        match &a.route {
+            Some(wps) if wps.len() >= 2 => {
+                let (url, dropped) = gmaps_url(wps);
+                if dropped > 0 { eprintln!("経由点が多いため末尾寄り {dropped} 点を省略(GoogleマップURLの上限)"); }
+                println!("{url}");
+                match qrcode::QrCode::new(url.as_bytes()) {
+                    Ok(code) => println!("{}", code.render::<qrcode::render::unicode::Dense1x2>().quiet_zone(true).build()),
+                    Err(e) => eprintln!("QR生成失敗: {e}"),
+                }
+            }
+            _ => { eprintln!("--share には --route または --load-route が必要"); std::process::exit(2); }
+        }
+        return;
     }
 
     if a.interactive {
