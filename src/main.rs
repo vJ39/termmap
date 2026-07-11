@@ -166,6 +166,45 @@ fn reverse_geocode(lat: f64, lon: f64) -> Result<String, String> {
     json_first(&body, "\"display_name\":\"").ok_or_else(|| "住所が取得できません".to_string())
 }
 
+// 現在表示範囲(bbox)でキーワード周辺検索(Nominatim viewbox+bounded)。(lat,lon,表示名)列。
+fn search_nearby(q: &str, s: f64, w: f64, n: f64, e: f64) -> Vec<(f64, f64, String)> {
+    let url = format!(
+        "https://nominatim.openstreetmap.org/search?format=json&limit=25&accept-language=ja&bounded=1&viewbox={},{},{},{}&q={}",
+        w, n, e, s, urlencode(q)
+    );
+    let body = match ureq::get(&url).set("User-Agent", "termmap/0.1 (personal experiment)")
+        .timeout(std::time::Duration::from_secs(20)).call() {
+        Ok(r) => r.into_string().unwrap_or_default(),
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    let bytes = body.as_bytes();
+    let mut i = match body.find('[') { Some(p) => p, None => return out };
+    let (mut depth, mut obj_start, mut in_obj, mut in_str, mut esc) = (0i32, 0usize, false, false, false);
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_str {
+            if esc { esc = false; } else if b == b'\\' { esc = true; } else if b == b'"' { in_str = false; }
+        } else {
+            match b {
+                b'"' => in_str = true,
+                b'{' => { if depth == 0 { obj_start = i; in_obj = true; } depth += 1; }
+                b'}' => { depth -= 1; if depth == 0 && in_obj {
+                    let obj = &body[obj_start..=i];
+                    let la = json_str(obj, "lat").and_then(|s| s.parse::<f64>().ok());
+                    let lo = json_str(obj, "lon").and_then(|s| s.parse::<f64>().ok());
+                    if let (Some(la), Some(lo)) = (la, lo) { out.push((la, lo, json_str(obj, "display_name").unwrap_or_default())); }
+                    in_obj = false;
+                }}
+                b']' => { if depth == 0 { break; } }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
 // GPS/測位で現在地を取得 (--here)。macOS CoreLocationCLI に委譲。
 // 要: brew install corelocationcli + System Settings > Privacy > Location Services で許可。
 fn gps_here() -> Result<(f64, f64), String> {
@@ -926,6 +965,7 @@ const HELP: &[&str] = &[
     "",
     " [目的地・お気に入り]",
     "   f              カテゴリ検索 1ｶﾞｿ 2ｶﾌｪ 3ｺﾝﾋﾞﾆ 4道の駅 5展望 6公園 7峠道",
+    "                   / でキーワード周辺検索(現在範囲) → リスト",
     "                   → リスト: ↑↓選択 / s始点 e終点 Enter経由 / Esc閉",
     "   S / L          ルートを お気に入り保存 / 呼び出し",
     "   g              ルートを GPX 保存 (termmap-route.gpx)",
@@ -959,7 +999,7 @@ impl Drop for TermGuard {
 
 fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Result<()> {
     use crossterm::event::{self, Event, KeyCode, KeyModifiers};
-    enum Focus { Map, Search(String), SaveName(String), PoiMenu, PoiList, RouteList, WaypointList }
+    enum Focus { Map, Search(String), SaveName(String), NearSearch(String), PoiMenu, PoiList, RouteList, WaypointList }
     let _guard = TermGuard::enter()?; // Drop で必ず端末復元
     let mut cache: Cache = HashMap::new();
     let mut out = std::io::stdout();
@@ -1070,7 +1110,8 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
         let status = match &focus {
             Focus::Search(buf) => format!(" 検索: {buf}\u{2588}   Enter=移動 Esc=取消 "),
             Focus::SaveName(buf) => format!(" ルート名: {buf}\u{2588}   Enter=保存 Esc=取消 "),
-            Focus::PoiMenu => " 目的地: 1ガソスタ 2カフェ 3コンビニ 4道の駅 5展望 6公園 7峠道   Esc=取消 ".to_string(),
+            Focus::NearSearch(buf) => format!(" 周辺検索: {buf}\u{2588}   Enter=検索 Esc=取消 "),
+            Focus::PoiMenu => " 目的地: 1ガソスタ 2カフェ 3コンビニ 4道の駅 5展望 6公園 7峠道  / キーワード周辺検索  Esc=取消 ".to_string(),
             Focus::PoiList => format!(" [{}] ↑↓選択 s=始点 Enter=経由 e=終点 f=再検索 Esc=閉 ", poi_label),
             Focus::RouteList => " お気に入り: ↑↓選択 Enter=読込 Esc=閉 ".to_string(),
             Focus::WaypointList => " 並べ替え: ↑↓/Tab 選択  [ ]移動  x削除  +/-拡縮  Esc閉 ".to_string(),
@@ -1144,8 +1185,31 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                         KeyCode::Char(c) => { buf.push(c); focus = Focus::Search(buf); }
                         _ => focus = Focus::Search(buf),
                     },
+                    Focus::NearSearch(mut buf) => match k.code {
+                        KeyCode::Enter => {
+                            let q = buf.trim().to_string();
+                            if !q.is_empty() {
+                                let (lat_top, lon_left) = pixel_to_deg(cx - ow as f64 / 2.0, cy - oh as f64 / 2.0, z);
+                                let (lat_bot, lon_right) = pixel_to_deg(cx + ow as f64 / 2.0, cy + oh as f64 / 2.0, z);
+                                let v = search_nearby(&q, lat_bot, lon_left, lat_top, lon_right);
+                                if v.is_empty() { addr = format!("周辺に無し: {q}"); }
+                                else {
+                                    let mut items: Vec<(f64, f64, String, PoiCat)> = v.into_iter().map(|(a, b, nm)| (a, b, nm, PoiCat::Other)).collect();
+                                    items.sort_by(|p, r| haversine_km((lat, lon), (p.0, p.1)).partial_cmp(&haversine_km((lat, lon), (r.0, r.1))).unwrap_or(std::cmp::Ordering::Equal));
+                                    pois = items; poi_sel = 0; poi_label = format!("周辺:{q}");
+                                    set_markers(&mut spec, &wps, &pois);
+                                    focus = Focus::PoiList;
+                                }
+                            }
+                        }
+                        KeyCode::Esc => {}
+                        KeyCode::Backspace => { buf.pop(); focus = Focus::NearSearch(buf); }
+                        KeyCode::Char(c) => { buf.push(c); focus = Focus::NearSearch(buf); }
+                        _ => focus = Focus::NearSearch(buf),
+                    },
                     Focus::PoiMenu => match k.code {
                         KeyCode::Esc => {}
+                        KeyCode::Char('/') => focus = Focus::NearSearch(String::new()),
                         KeyCode::Char(c) => {
                             if let Some(kind) = POI_KINDS.iter().find(|kk| kk.key == c) {
                                 let (hw, hh) = (ow as f64 * 1.25, oh as f64 * 1.25); // 表示範囲の2.5倍を検索
@@ -1302,7 +1366,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                     }
                 }
             }
-            Some(Event::Paste(s)) => { match &mut focus { Focus::Search(buf) | Focus::SaveName(buf) => buf.push_str(&s), _ => {} } }
+            Some(Event::Paste(s)) => { match &mut focus { Focus::Search(buf) | Focus::SaveName(buf) | Focus::NearSearch(buf) => buf.push_str(&s), _ => {} } }
             _ => {}
         }
     }
