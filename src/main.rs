@@ -1189,9 +1189,11 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                         KeyCode::Enter => {
                             let q = buf.trim().to_string();
                             if !q.is_empty() {
-                                let (lat_top, lon_left) = pixel_to_deg(cx - ow as f64 / 2.0, cy - oh as f64 / 2.0, z);
-                                let (lat_bot, lon_right) = pixel_to_deg(cx + ow as f64 / 2.0, cy + oh as f64 / 2.0, z);
-                                let v = search_nearby(&q, lat_bot, lon_left, lat_top, lon_right);
+                                let (vt, vl) = pixel_to_deg(cx - ow as f64 * 1.25, cy - oh as f64 * 1.25, z);
+                                let (vb, vr) = pixel_to_deg(cx + ow as f64 * 1.25, cy + oh as f64 * 1.25, z);
+                                let rlat = 2.0 / 111.0;
+                                let rlon = 2.0 / (111.0 * lat.to_radians().cos().abs().max(0.1));
+                                let v = search_nearby(&q, vb.min(lat - rlat), vl.min(lon - rlon), vt.max(lat + rlat), vr.max(lon + rlon));
                                 if v.is_empty() { addr = format!("周辺に無し: {q}"); }
                                 else {
                                     let mut items: Vec<(f64, f64, String, PoiCat)> = v.into_iter().map(|(a, b, nm)| (a, b, nm, PoiCat::Other)).collect();
@@ -1212,18 +1214,20 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                         KeyCode::Char('/') => focus = Focus::NearSearch(String::new()),
                         KeyCode::Char(c) => {
                             if let Some(kind) = POI_KINDS.iter().find(|kk| kk.key == c) {
-                                let (hw, hh) = (ow as f64 * 1.25, oh as f64 * 1.25); // 表示範囲の2.5倍を検索
-                                let (lat_top, lon_left) = pixel_to_deg(cx - hw, cy - hh, z);
-                                let (lat_bot, lon_right) = pixel_to_deg(cx + hw, cy + hh, z);
-                                match fetch_pois(kind, lat_bot, lon_left, lat_top, lon_right) {
+                                // 表示範囲(2.5倍)と 半径2kmの箱 の広い方で検索(高ズームでも駅前を拾えるように)
+                                let (vt, vl) = pixel_to_deg(cx - ow as f64 * 1.25, cy - oh as f64 * 1.25, z);
+                                let (vb, vr) = pixel_to_deg(cx + ow as f64 * 1.25, cy + oh as f64 * 1.25, z);
+                                let rlat = 2.0 / 111.0;
+                                let rlon = 2.0 / (111.0 * lat.to_radians().cos().abs().max(0.1));
+                                match fetch_pois(kind, vb.min(lat - rlat), vl.min(lon - rlon), vt.max(lat + rlat), vr.max(lon + rlon)) {
                                     Ok(v) => {
                                         let mut items: Vec<(f64, f64, String, PoiCat)> = v.into_iter().map(|(la, lo, nm)| (la, lo, nm, kind.cat)).collect();
                                         items.sort_by(|p, q| p.2.cmp(&q.2));
                                         items.dedup_by(|p, q| !p.2.is_empty() && p.2 == q.2);
                                         items.sort_by(|p, q| haversine_km((lat, lon), (p.0, p.1)).partial_cmp(&haversine_km((lat, lon), (q.0, q.1))).unwrap_or(std::cmp::Ordering::Equal));
-                                        pois = items; poi_sel = 0; poi_label = kind.label.to_string();
-                                        { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; }
-                                        focus = Focus::PoiList;
+                                        items.truncate(50);
+                                        if items.is_empty() { addr = format!("周辺2kmに{}無し", kind.label); }
+                                        else { pois = items; poi_sel = 0; poi_label = kind.label.to_string(); set_markers(&mut spec, &wps, &pois); focus = Focus::PoiList; }
                                     }
                                     Err(e) => addr = format!("({e})"),
                                 }
@@ -1503,5 +1507,102 @@ fn main() {
             if let Some(g) = &a.gpx { if route_note.is_some() { eprintln!("GPX: {g}"); } }
         }
         Err(e) => { eprintln!("{e}"); std::process::exit(1); }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pixel_deg_roundtrip() {
+        for &(lat, lon, z) in &[(35.68, 139.76, 14u32), (0.0, 0.0, 5), (35.99, 139.08, 11)] {
+            let (px, py) = deg_to_pixel(lat, lon, z);
+            let (la, lo) = pixel_to_deg(px, py, z);
+            assert!((la - lat).abs() < 1e-6 && (lo - lon).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn haversine_known() {
+        let d = haversine_km((35.0, 139.0), (36.0, 139.0)); // 緯度1度 ≈ 111km
+        assert!((d - 111.2).abs() < 1.0, "{d}");
+    }
+
+    #[test]
+    fn bearing_cardinal() {
+        assert!(angdiff(bearing((35.0, 139.0), (36.0, 139.0)), 0.0) < 1.0);  // 北
+        assert!(angdiff(bearing((35.0, 139.0), (35.0, 140.0)), 90.0) < 1.0); // 東
+        assert!((angdiff(350.0, 10.0) - 20.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn profiles_and_labels() {
+        assert_eq!(route_profile("short"), "shortest");
+        assert_eq!(route_profile("highway"), "car-fast");
+        assert_eq!(route_profile("surface"), "moped");
+        assert_eq!(mode_label("highway"), "高速");
+        assert_eq!(mode_label("short"), "最短");
+        assert_eq!(mode_label("surface"), "下道");
+    }
+
+    #[test]
+    fn gmaps_url_pathform() {
+        let (u, dropped) = gmaps_url(&[(35.6812, 139.7671), (35.7141, 139.7774), (35.6595, 139.7967)]);
+        assert!(u.starts_with("https://www.google.com/maps/dir/35.6812,139.7671/"));
+        assert!(u.contains("/35.7141,139.7774/") && u.ends_with("/35.6595,139.7967"));
+        assert_eq!(dropped, 0);
+        let many: Vec<(f64, f64)> = (0..11).map(|i| (35.0 + i as f64 * 0.01, 139.0)).collect();
+        assert_eq!(gmaps_url(&many).1, 1); // 11点→上限10で1点省略
+    }
+
+    #[test]
+    fn parse_route_geometry() {
+        let body = r#"{"features":[{"geometry":{"coordinates":[[139.7,35.7,9.0],[139.71,35.71,10.0]]}}]}"#;
+        let pts = parse_geojson_line(body).unwrap();
+        assert_eq!(pts.len(), 2);
+        assert!((pts[0].0 - 35.7).abs() < 1e-9 && (pts[0].1 - 139.7).abs() < 1e-9); // (lat,lon)順
+    }
+
+    #[test]
+    fn parse_overpass_node_and_way() {
+        let body = r#"{"elements":[
+          {"type":"node","lat":35.75,"lon":139.73,"tags":{"name":"あ店","amenity":"fuel"}},
+          {"type":"way","center":{"lat":35.76,"lon":139.74},"tags":{"name":"い店"}}
+        ]}"#;
+        let v = parse_overpass(body);
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].2, "あ店"); // 空白後コロンでも名前を取れる
+        assert!((v[1].0 - 35.76).abs() < 1e-9); // wayはcenter
+    }
+
+    #[test]
+    fn json_helpers() {
+        assert_eq!(json_str(r#"{"name": "王子駅"}"#, "name").as_deref(), Some("王子駅"));
+        assert!((json_num(r#"{"lat": 35.7}"#, "\"lat\":").unwrap() - 35.7).abs() < 1e-9);
+    }
+
+    #[test]
+    fn expressway_meters_sums_motorway() {
+        let body = r#"{"features":[{"properties":{"messages":[
+          ["Longitude","Latitude","Elevation","Distance","CostPerKm","ElevCost","TurnCost","NodeCost","InitialCost","WayTags","NodeTags","Time","Energy"],
+          ["1","2","3","100","0","0","0","0","0","highway=motorway maxspeed=80","","0","0"],
+          ["1","2","3","50","0","0","0","0","0","highway=residential","","0","0"]
+        ]}}]}"#;
+        assert!((expressway_meters(body) - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn sanitize_and_fit() {
+        assert_eq!(sanitize_name("a/b:c"), "a_b_c");
+        assert_eq!(fit_cells("ab", 5), "ab   ");
+        assert!(fit_cells("あ", 4).starts_with("あ"));
+    }
+
+    #[test]
+    fn meters_per_pixel_halves_per_zoom() {
+        let a = meters_per_pixel(35.0, 12);
+        let b = meters_per_pixel(35.0, 13);
+        assert!((a / b - 2.0).abs() < 1e-6); // ズーム+1で半分
     }
 }
