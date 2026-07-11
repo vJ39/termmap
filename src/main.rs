@@ -865,6 +865,7 @@ const HELP: &[&str] = &[
     "                   → リスト: ↑↓選択 / s始点 e終点 Enter経由 / Esc閉",
     "   S / L          ルートを お気に入り保存 / 呼び出し",
     "   g              ルートを GPX 保存 (termmap-route.gpx)",
+    "   o              スマホ共有(GoogleマップのQRをポップアップ表示)",
     "",
     " [起動オプション]  --range KM,.. 航続リング / --route / --load-route 名前",
     "",
@@ -913,6 +914,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
     let mut route_names: Vec<String> = Vec::new(); // お気に入り一覧(L)
     let mut rn_sel: usize = 0;
     let mut help = false; // ? でヘルプ表示
+    let mut qr_view: Option<String> = None; // o でGoogleマップQRをポップアップ表示
     let mut route_note = recompute(&mut spec, &wps, &pois, &mode);
 
     let _ = write!(out, "\x1b[2J");
@@ -1004,16 +1006,30 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
             Focus::RouteList => " お気に入り: ↑↓選択 Enter=読込 Esc=閉 ".to_string(),
             Focus::WaypointList => " 並べ替え: ↑↓/Tab 選択  [ ]移動  x削除  +/-拡縮  Esc閉 ".to_string(),
             Focus::Map => {
-                let base = format!(" ?ヘルプ z{z} {lat:.4},{lon:.4} | s始 e終 v経由({}) Tab並替 m:{} f目的地 S保存 L呼出 gGPX /検索 a住所 q",
+                let base = format!(" ?ヘルプ z{z} {lat:.4},{lon:.4} | s始 e終 v経由({}) Tab並替 m:{} f目的地 S保存 L呼出 gGPX o共有 /検索 a住所 q",
                     wps.len(), mode_label(&mode));
                 match &route_note { Some(rn) => format!("{base} | {rn} "), None => base }
             }
         };
         let status = fit_cells(&status, cols as usize);
         write!(out, "\x1b[{};1H\x1b[7m{status}\x1b[0m", tr)?;
+
+        // QR共有ポップアップ(地図の上に白地で重ねる。白地×黒でどのテーマでもスキャン可)
+        if let Some(q) = &qr_view {
+            let lines: Vec<&str> = q.lines().collect();
+            let qw = lines.iter().map(|l| l.chars().count()).max().unwrap_or(21);
+            let c0 = (cols as usize).saturating_sub(qw) as u32 / 2 + 1;
+            let r0 = ((map_rows as usize).saturating_sub(lines.len() + 2) / 2).max(1) as u32;
+            let _ = write!(out, "\x1b[{r0};{c0}H\x1b[30;47m スマホでスキャン → Googleマップ \x1b[0m");
+            for (i, l) in lines.iter().enumerate() {
+                let _ = write!(out, "\x1b[{};{c0}H\x1b[30;47m{}\x1b[0m", r0 + 1 + i as u32, l);
+            }
+            let _ = write!(out, "\x1b[{};1H\x1b[7m 任意のキーで閉じる \x1b[0m\x1b[K", tr);
+        }
         out.flush()?;
 
         match event::read()? {
+            Event::Key(_) if qr_view.is_some() => qr_view = None, // ポップアップを閉じる
             Event::Key(k) => {
                 let cur = std::mem::replace(&mut focus, Focus::Map);
                 match cur {
@@ -1148,6 +1164,15 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                             KeyCode::Char('v') => { if wps.len() < 2 { wps.push((lat, lon)); } else { wps.insert(wps.len() - 1, (lat, lon)); } route_note = recompute(&mut spec, &wps, &pois, &mode); }
                             KeyCode::Tab | KeyCode::BackTab => { if !wps.is_empty() { focus = Focus::WaypointList; } } // 並べ替えパネル
                             KeyCode::Char('?') => help = true,
+                            KeyCode::Char('o') => { // スマホ共有(GoogleマップQR)
+                                if wps.len() >= 2 {
+                                    let (url, _) = gmaps_url(&wps);
+                                    match qrcode::QrCode::new(url.as_bytes()) {
+                                        Ok(c) => qr_view = Some(c.render::<qrcode::render::unicode::Dense1x2>().quiet_zone(true).build()),
+                                        Err(_) => addr = "QR生成失敗".into(),
+                                    }
+                                } else { addr = "ルート未確定".into(); }
+                            }
                             KeyCode::Char('x') => { if !wps.is_empty() { let i = wp_sel.min(wps.len() - 1); wps.remove(i); if wp_sel >= wps.len() && wp_sel > 0 { wp_sel -= 1; } route_note = recompute(&mut spec, &wps, &pois, &mode); } }
                             KeyCode::Char('[') => { if wp_sel > 0 && wp_sel < wps.len() { wps.swap(wp_sel, wp_sel - 1); wp_sel -= 1; route_note = recompute(&mut spec, &wps, &pois, &mode); } }
                             KeyCode::Char(']') => { if wp_sel + 1 < wps.len() { wps.swap(wp_sel, wp_sel + 1); wp_sel += 1; route_note = recompute(&mut spec, &wps, &pois, &mode); } }
