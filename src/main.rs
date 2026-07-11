@@ -22,8 +22,10 @@ struct Args {
     braille: bool,
     mono: bool,
     classify: bool,
+    edge: bool,
     interactive: bool,
-    threshold: u8,
+    resume: bool,
+    threshold: Option<u8>,
     image: Option<String>,
     png: Option<String>,
 }
@@ -33,7 +35,7 @@ fn arg_err(msg: &str) -> ! { eprintln!("{msg}"); std::process::exit(2); }
 fn parse_args() -> Args {
     let mut a = Args { lat: None, lon: None, place: None, zoom: 14, width: None, win_px: 640,
                        style: "osm".to_string(), braille: false, mono: false, classify: false,
-                       interactive: false, threshold: 195, image: None, png: None };
+                       edge: false, interactive: false, resume: false, threshold: None, image: None, png: None };
     let mut it = std::env::args().skip(1);
     macro_rules! val { ($k:expr) => { it.next().unwrap_or_else(|| arg_err(&format!("{} は値が必要です", $k))) } }
     macro_rules! num { ($k:expr) => {{ let v = val!($k); v.parse().unwrap_or_else(|_| arg_err(&format!("{} の値が不正: {}", $k, v))) }} }
@@ -49,11 +51,13 @@ fn parse_args() -> Args {
             "--braille" => a.braille = true,
             "--mono" => a.mono = true,
             "--classify" => a.classify = true,
+            "--edge" => a.edge = true,
             "-i" | "--interactive" => a.interactive = true,
-            "--threshold" => a.threshold = num!("--threshold"),
+            "--resume" | "--last" => a.resume = true,
+            "--threshold" => a.threshold = Some(num!("--threshold")),
             "--image" => a.image = Some(val!("--image")),
             "--png" => a.png = Some(val!("--png")),
-            "-h" | "--help" => { eprintln!("usage: termmap (--place \"住所\" | --lat LAT --lon LON) [--zoom Z] [--style osm|voyager|dark|light] [-i] [--braille] [--classify] [--mono] [--width N] [--png OUT] | --image PNG"); std::process::exit(0); }
+            "-h" | "--help" => { eprintln!("usage: termmap (--place \"住所\" | --lat LAT --lon LON | --resume) [--zoom Z] [--style osm|voyager|dark|light] [-i] [--braille] [--classify] [--edge] [--mono] [--width N] [--png OUT] | --image PNG"); std::process::exit(0); }
             _ => arg_err(&format!("unknown arg: {k}")),
         }
     }
@@ -226,11 +230,19 @@ fn render_halfblock(img: &RgbImage) -> String {
     }
     out
 }
-fn render_braille(img: &RgbImage, mono: bool, classify_on: bool, threshold: u8) -> String {
+fn render_braille(img: &RgbImage, mono: bool, classify_on: bool, threshold: u8, edge: bool) -> String {
     const BITS: [[u8; 4]; 2] = [[0x01, 0x02, 0x04, 0x40], [0x08, 0x10, 0x20, 0x80]];
     let (w, h) = img.dimensions();
     let (cols, rows) = (w / 2, h / 4);
     let th = threshold as f64;
+    // エッジ検出: 隣接画素の色差(RGB各chの絶対差の和)。明るさが近くても色が違う境界(水際/緑地/道路)を拾う。
+    let grad = |x: u32, y: u32| -> f64 {
+        if x == 0 || y == 0 || x + 1 >= w || y + 1 >= h { return 0.0; }
+        let d = |p: &image::Rgb<u8>, q: &image::Rgb<u8>| {
+            (p[0] as f64 - q[0] as f64).abs() + (p[1] as f64 - q[1] as f64).abs() + (p[2] as f64 - q[2] as f64).abs()
+        };
+        d(img.get_pixel(x + 1, y), img.get_pixel(x - 1, y)) + d(img.get_pixel(x, y + 1), img.get_pixel(x, y - 1))
+    };
     let mut out = String::with_capacity(cols as usize * rows as usize * 6);
     for cy in 0..rows {
         for cx in 0..cols {
@@ -240,7 +252,9 @@ fn render_braille(img: &RgbImage, mono: bool, classify_on: bool, threshold: u8) 
             for dx in 0..2u32 {
                 for dy in 0..4u32 {
                     let p = img.get_pixel(cx * 2 + dx, cy * 4 + dy);
-                    let on = if classify_on { classify(p).is_some() } else { lum(p) < th };
+                    let on = if edge { grad(cx * 2 + dx, cy * 4 + dy) > th }
+                             else if classify_on { classify(p).is_some() }
+                             else { lum(p) < th };
                     if on {
                         bits |= BITS[dx as usize][dy as usize];
                         sr += p[0] as u32; sg += p[1] as u32; sb += p[2] as u32; n += 1;
@@ -268,9 +282,32 @@ fn render_braille(img: &RgbImage, mono: bool, classify_on: bool, threshold: u8) 
 }
 
 fn render(img: &RgbImage, a: &Args) -> String {
-    if a.braille { render_braille(img, a.mono, a.classify, a.threshold) }
+    let th = a.threshold.unwrap_or(if a.edge { 45 } else { 195 });
+    if a.edge { render_braille(img, a.mono, false, th, true) }
+    else if a.braille { render_braille(img, a.mono, a.classify, th, false) }
     else if a.classify { render_halfblock(&recolor(img)) }
     else { render_halfblock(img) }
+}
+
+// ---- 直近 location の保存/復元 (--resume) ----
+fn state_file() -> Option<std::path::PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(std::path::PathBuf::from(home).join(".config/termmap/last.txt"))
+}
+fn save_state(lat: f64, lon: f64, z: u32, style: &str) {
+    if let Some(p) = state_file() {
+        if let Some(dir) = p.parent() { let _ = std::fs::create_dir_all(dir); }
+        let _ = std::fs::write(&p, format!("{lat} {lon} {z} {style}\n"));
+    }
+}
+fn load_state() -> Option<(f64, f64, u32, String)> {
+    let s = std::fs::read_to_string(state_file()?).ok()?;
+    let mut it = s.split_whitespace();
+    let lat = it.next()?.parse().ok()?;
+    let lon = it.next()?.parse().ok()?;
+    let z = it.next()?.parse().ok()?;
+    let style = it.next().unwrap_or("osm").to_string();
+    Some((lat, lon, z, style))
 }
 
 // ---- 対話モード (crossterm) ----
@@ -299,7 +336,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
         let (tc, tr) = crossterm::terminal::size().unwrap_or((100, 40));
         let cols = tc.max(10) as u32;
         let map_rows = (tr.max(3) - 1) as u32;
-        let (ow, oh) = if a.braille { (cols * 2, map_rows * 4) } else { (cols, map_rows * 2) };
+        let (ow, oh) = if a.braille || a.edge { (cols * 2, map_rows * 4) } else { (cols, map_rows * 2) };
         let body = match build_window(cx, cy, z, ow, oh, &a.style, &mut cache) {
             Ok(img) => render(&img, a),
             Err(e) => format!("取得失敗: {e}\r\n"),
@@ -332,6 +369,8 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
             _ => {}
         }
     }
+    let (lat, lon) = pixel_to_deg(cx, cy, z);
+    save_state(lat, lon, z, &a.style); // 終了時の位置を --resume 用に保存
     Ok(())
 }
 
@@ -345,13 +384,13 @@ fn oneshot(src: RgbImage, a: &Args) {
     let (sw, sh) = src.dimensions();
     let aspect = sh as f64 / sw as f64;
     let rows = ((cols as f64) * aspect / 2.0).round().max(1.0) as u32;
-    let (out_w, out_h) = if a.braille { (cols * 2, rows * 4) } else { (cols, rows * 2) };
+    let (out_w, out_h) = if a.braille || a.edge { (cols * 2, rows * 4) } else { (cols, rows * 2) };
     let resized = image::imageops::resize(&src, out_w, out_h, FilterType::Triangle);
     print!("{}", render(&resized, a).replace("\r\n", "\n"));
 }
 
 fn main() {
-    let a = parse_args();
+    let mut a = parse_args();
 
     // 画像モード
     if let Some(path) = &a.image {
@@ -362,11 +401,16 @@ fn main() {
         return;
     }
 
-    // 中心座標の決定 (--place 優先)
-    let (lat, lon) = if let Some(p) = &a.place {
+    // 中心座標の決定 (--resume > --place > --lat/--lon)
+    let (lat, lon) = if a.resume && a.place.is_none() && a.lat.is_none() && a.lon.is_none() {
+        match load_state() {
+            Some((la, lo, z, st)) => { a.zoom = z; a.style = st; (la, lo) }
+            None => { eprintln!("保存された location がありません (--resume)"); std::process::exit(1); }
+        }
+    } else if let Some(p) = &a.place {
         match geocode(p) { Ok(v) => v, Err(e) => { eprintln!("{e}"); std::process::exit(1); } }
     } else {
-        match (a.lat, a.lon) { (Some(la), Some(lo)) => (la, lo), _ => { eprintln!("need --place \"住所\" or --lat/--lon or --image"); std::process::exit(2); } }
+        match (a.lat, a.lon) { (Some(la), Some(lo)) => (la, lo), _ => { eprintln!("need --place \"住所\" or --lat/--lon or --image (or --resume)"); std::process::exit(2); } }
     };
     let (cx, cy) = deg_to_pixel(lat, lon, a.zoom);
 
@@ -377,7 +421,7 @@ fn main() {
 
     let mut cache: Cache = HashMap::new();
     match build_window(cx, cy, a.zoom, a.win_px, a.win_px, &a.style, &mut cache) {
-        Ok(src) => oneshot(src, &a),
+        Ok(src) => { save_state(lat, lon, a.zoom, &a.style); oneshot(src, &a); }
         Err(e) => { eprintln!("{e}"); std::process::exit(1); }
     }
 }
