@@ -712,7 +712,8 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
             Focus::Map => {
                 let live = if gps_rx.is_some() { "●LIVE(Gで解除) " } else { "" };
                 let playing = if play.is_some() { "▶再生中(Aで停止) " } else { "" };
-                let base = format!(" {live}{playing}?ヘルプ z{z} {lat:.4},{lon:.4} | s始 e終 v経由({}) m:{} n候補 r道路 @提案 W走 f目的地 P点 V表 i実写 E標高 A再生 G現在地 S保存 L呼出 gGPX o共有 ,設定 /検索 q",
+                let msg = if addr.is_empty() { String::new() } else { format!("» {addr} « ") }; // 一時メッセージを先頭に(切れない)
+                let base = format!(" {msg}{live}{playing}?ヘルプ z{z} {lat:.4},{lon:.4} | s始 e終 v経由({}) m:{} n候補 r道路 @提案 W走 f目的地 P点 V表 i実写 E標高 A再生 G現在地 S保存 L呼出 gGPX o共有 ,設定 /検索 q",
                     wps.len(), mode_label(&mode));
                 match &route_note { Some(rn) => format!("{base} | {rn} "), None => base }
             }
@@ -1182,9 +1183,9 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                             KeyCode::Char('f') => focus = Focus::PoiMenu,
                             KeyCode::Char('S') => focus = Focus::SaveName(String::new()),
                             KeyCode::Char('L') => { route_names = list_named_routes(); rn_sel = 0; if route_names.is_empty() { addr = "お気に入り無し".into(); } else { focus = Focus::RouteList; } }
-                            KeyCode::Char('s') => { if wps.is_empty() { wps.push((lat, lon)); } else { wps[0] = (lat, lon); } { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } }
-                            KeyCode::Char('e') => { if wps.len() >= 2 { let l = wps.len() - 1; wps[l] = (lat, lon); } else { wps.push((lat, lon)); } { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } }
-                            KeyCode::Char('v') => { if wps.len() < 2 { wps.push((lat, lon)); } else { wps.insert(wps.len() - 1, (lat, lon)); } { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } }
+                            KeyCode::Char('s') => { wp_set_start(&mut wps, (lat, lon)); { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } }
+                            KeyCode::Char('e') => { wp_set_end(&mut wps, (lat, lon)); { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } }
+                            KeyCode::Char('v') => { wp_add_via(&mut wps, (lat, lon)); { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } }
                             KeyCode::Tab | KeyCode::BackTab => { if !wps.is_empty() { focus = Focus::WaypointList; } } // 並べ替えパネル
                             KeyCode::Char('?') => help = true,
                             KeyCode::Char('P') => { cat_sel = 0; focus = Focus::SpotCatList; } // マイスポット(カテゴリ一覧)
@@ -1246,9 +1247,9 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                                     }
                                 } else { addr = "ルート未確定".into(); }
                             }
-                            KeyCode::Char('x') => { if !wps.is_empty() { let i = wp_sel.min(wps.len() - 1); wps.remove(i); if wp_sel >= wps.len() && wp_sel > 0 { wp_sel -= 1; } { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } } }
-                            KeyCode::Char('[') => { if wp_sel > 0 && wp_sel < wps.len() { wps.swap(wp_sel, wp_sel - 1); wp_sel -= 1; { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } } }
-                            KeyCode::Char(']') => { if wp_sel + 1 < wps.len() { wps.swap(wp_sel, wp_sel + 1); wp_sel += 1; { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } } }
+                            KeyCode::Char('x') => { wp_remove(&mut wps, &mut wp_sel); { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } }
+                            KeyCode::Char('[') => { wp_swap(&mut wps, &mut wp_sel, true); { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } }
+                            KeyCode::Char(']') => { wp_swap(&mut wps, &mut wp_sel, false); { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } }
                             KeyCode::Char('m') => { mode = match mode_label(&mode) { "下道" => "highway", "高速" => "short", _ => "surface" }.to_string(); { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } }
                             KeyCode::Char('c') => { wps.clear(); wp_sel = 0; { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } }
                             KeyCode::Char('g') => match spec.routes.last() {

@@ -187,9 +187,57 @@ pub fn trigger_route(spec: &mut OverlaySpec, wps: &[(f64, f64)], pois: &[(f64, f
     }
 }
 
+// ---- waypoint 操作(純粋・テスト対象。route再計算は呼び出し側) ----
+pub fn wp_set_start(wps: &mut Vec<(f64, f64)>, p: (f64, f64)) {
+    if wps.is_empty() { wps.push(p); } else { wps[0] = p; }
+}
+pub fn wp_set_end(wps: &mut Vec<(f64, f64)>, p: (f64, f64)) {
+    if wps.len() >= 2 { let l = wps.len() - 1; wps[l] = p; } else { wps.push(p); }
+}
+pub fn wp_add_via(wps: &mut Vec<(f64, f64)>, p: (f64, f64)) {
+    if wps.len() < 2 { wps.push(p); } else { let i = wps.len() - 1; wps.insert(i, p); }
+}
+pub fn wp_remove(wps: &mut Vec<(f64, f64)>, sel: &mut usize) {
+    if !wps.is_empty() {
+        let i = (*sel).min(wps.len() - 1);
+        wps.remove(i);
+        if *sel >= wps.len() && *sel > 0 { *sel -= 1; }
+    }
+}
+pub fn wp_swap(wps: &mut [(f64, f64)], sel: &mut usize, back: bool) {
+    if back {
+        if *sel > 0 && *sel < wps.len() { wps.swap(*sel, *sel - 1); *sel -= 1; }
+    } else if *sel + 1 < wps.len() {
+        wps.swap(*sel, *sel + 1);
+        *sel += 1;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn waypoint_ops() {
+        let mut w: Vec<(f64, f64)> = Vec::new();
+        wp_set_start(&mut w, (1.0, 1.0)); // 空→push
+        assert_eq!(w, vec![(1.0, 1.0)]);
+        wp_set_end(&mut w, (2.0, 2.0)); // len<2→push
+        assert_eq!(w, vec![(1.0, 1.0), (2.0, 2.0)]);
+        wp_add_via(&mut w, (1.5, 1.5)); // 終点手前へ
+        assert_eq!(w, vec![(1.0, 1.0), (1.5, 1.5), (2.0, 2.0)]);
+        wp_set_start(&mut w, (0.0, 0.0)); // 先頭置換
+        assert_eq!(w[0], (0.0, 0.0));
+        wp_set_end(&mut w, (9.0, 9.0)); // 末尾置換
+        assert_eq!(*w.last().unwrap(), (9.0, 9.0));
+        let mut sel = 1usize;
+        wp_swap(&mut w, &mut sel, false); // 後ろへ
+        assert_eq!(sel, 2);
+        wp_swap(&mut w, &mut sel, true); // 前へ
+        assert_eq!(sel, 1);
+        wp_remove(&mut w, &mut sel); // 中央削除
+        assert_eq!(w.len(), 2);
+    }
 
     #[test]
     fn profiles_and_labels() {
