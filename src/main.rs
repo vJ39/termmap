@@ -15,6 +15,7 @@ mod share;
 mod streetview;
 mod elevation;
 mod gpslive;
+mod searchcache;
 // 以下は今後の機能用(道路トレース/おすすめ相談)。まだ未wireのため dead_code 許容。
 #[allow(dead_code)]
 mod config;
@@ -449,6 +450,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
     let mut gps_pos: Option<(f64, f64)> = None; // 最新の自位置
     let mut gps_trail: Vec<(f64, f64)> = Vec::new(); // 通過ブレッドクラム
     let mut play: Option<f64> = None; // A ルート再生(先頭からの距離m。Noneで停止)
+    let mut scache = searchcache::load(); // 検索結果キャッシュ(キーワード+位置→結果。API節約)
     // ルート計算のバックグラウンド受信(マーカーは即時、ルート線は別スレッド)
     let (mut route_note, mut route_job) = {
         let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0);
@@ -725,9 +727,22 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                         KeyCode::Enter => { // その場所へ中心を移動するだけ(追加しない)
                             let q = buf.trim().to_string();
                             if !q.is_empty() {
-                                match geocode(&q, Some((lat, lon)), &cfg.streetview_api_key) {
-                                    Ok((la, lo)) => { let (nx, ny) = deg_to_pixel(la, lo, z); cx = nx; cy = ny; addr.clear(); }
-                                    Err(_) => addr = format!("見つからない: {q}"),
+                                let ckey = searchcache::make_key(&q, lat, lon);
+                                let cached = scache.get(&ckey).and_then(|v| v.first().map(|(la, lo, _)| (*la, *lo)));
+                                let coord = match cached {
+                                    Some(c) => Some(c), // キャッシュヒット=API叩かない
+                                    None => match geocode(&q, Some((lat, lon)), &cfg.streetview_api_key) {
+                                        Ok((la, lo)) => {
+                                            scache.insert(ckey, vec![(la, lo, q.clone())]);
+                                            let _ = searchcache::save(&scache);
+                                            Some((la, lo))
+                                        }
+                                        Err(_) => None,
+                                    },
+                                };
+                                match coord {
+                                    Some((la, lo)) => { let (nx, ny) = deg_to_pixel(la, lo, z); cx = nx; cy = ny; addr.clear(); }
+                                    None => addr = format!("見つからない: {q}"),
                                 }
                             }
                         }
