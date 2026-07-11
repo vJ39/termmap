@@ -420,7 +420,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
     let mut out = std::io::stdout();
     let mut addr = String::new();          // 'a' 住所 / 一時メッセージ
     let mut focus = Focus::Map;
-    let cfg = config::load_config();       // 設定(streetview key / 描画既定 等)
+    let mut cfg = config::load_config();   // 設定(streetview key / 描画既定 等・設定画面で書き換え)
     let mut opts = a.clone();              // 実行中に変えられる描画設定(Argsのコピー)
     // config を既定として適用(CLIフラグは ON 方向で優先。style は CLI が既定osmなら config 採用)
     opts.braille = opts.braille || cfg.braille;
@@ -604,12 +604,19 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                 ("カテゴリ".to_string(), its, cat_sel)
             } else if show_settings {
                 let onoff = |b: bool| if b { "ON" } else { "OFF" };
+                let keyset = if cfg.streetview_api_key.trim().is_empty() { "未設定" } else { "設定済" };
                 let its = vec![
                     format!("braille  {}", onoff(opts.braille)),
                     format!("classify {}", onoff(opts.classify)),
                     format!("edge     {}", onoff(opts.edge)),
                     format!("mono     {}", onoff(opts.mono)),
                     format!("style    {}", opts.style),
+                    format!("既定mode {}", cfg.route_profile),
+                    format!("道路間隔 {}m", cfg.sample_interval_m as i64),
+                    format!("spot既定 {}", onoff(cfg.show_spots)),
+                    format!("おすすめ {}", onoff(cfg.llm_recommend_enabled)),
+                    format!("LLM      {}", cfg.llm_model),
+                    format!("APIkey   {}", keyset),
                 ];
                 ("設定".to_string(), its, set_sel)
             } else if show_routes {
@@ -660,7 +667,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
             Focus::SpotName(buf, cat) => format!(" [{cat}] 名前 or GoogleマップURL: {buf}\u{2588}   Enter=保存 Esc=取消 "),
             Focus::SpotList => format!(" [{cur_cat}] ↑↓選択 Enter=移動 n=新規(現在地) x=削除 Esc=戻る "),
             Focus::SpotCatList => " カテゴリ: ↑↓選択 Enter=中へ n新規 r改名 c色 x削除(空のみ) Esc=閉 ".to_string(),
-            Focus::Settings => " 設定: ↑↓選択 Enter/Space=切替 s=保存 Esc=閉 ".to_string(),
+            Focus::Settings => " 設定: ↑↓選択 Enter切替 ←→数値 貼付=APIkey s保存 Esc閉 ".to_string(),
             Focus::RoadSearch(buf) => format!(" 道路名/ref: {buf}\u{2588}   Enter=view内をルート化 Esc=取消 "),
             Focus::SpotRename(buf, _) => format!(" カテゴリ改名: {buf}\u{2588}   Enter=確定 Esc=取消 "),
             Focus::PoiMenu => " 目的地: 1ガソスタ 2カフェ 3コンビニ 4道の駅 5展望 6公園 7峠道  / キーワード周辺検索  Esc=取消 ".to_string(),
@@ -774,27 +781,32 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                         KeyCode::Esc => {}
                         _ => focus = Focus::SpotCatList,
                     },
-                    Focus::Settings => match k.code { // 設定画面(描画モード/style)
-                        KeyCode::Up => { set_sel = set_sel.saturating_sub(1); focus = Focus::Settings; }
-                        KeyCode::Down => { if set_sel + 1 < 5 { set_sel += 1; } focus = Focus::Settings; }
-                        KeyCode::Enter | KeyCode::Char(' ') => {
-                            match set_sel {
-                                0 => opts.braille = !opts.braille,
-                                1 => opts.classify = !opts.classify,
-                                2 => opts.edge = !opts.edge,
-                                3 => opts.mono = !opts.mono,
-                                _ => { opts.style = match opts.style.as_str() { "osm" => "voyager", "voyager" => "dark", "dark" => "light", _ => "osm" }.to_string(); cache.clear(); }
-                            }
-                            focus = Focus::Settings;
+                    Focus::Settings => { let mut stay = true; match k.code { // 設定画面
+                        KeyCode::Up => { set_sel = set_sel.saturating_sub(1); }
+                        KeyCode::Down => { if set_sel + 1 < 11 { set_sel += 1; } }
+                        KeyCode::Left | KeyCode::Right => {
+                            if set_sel == 6 { let d = if k.code == KeyCode::Left { -100.0 } else { 100.0 }; cfg.sample_interval_m = (cfg.sample_interval_m + d).clamp(100.0, 5000.0); }
                         }
+                        KeyCode::Enter | KeyCode::Char(' ') => match set_sel {
+                            0 => opts.braille = !opts.braille,
+                            1 => opts.classify = !opts.classify,
+                            2 => opts.edge = !opts.edge,
+                            3 => opts.mono = !opts.mono,
+                            4 => { opts.style = match opts.style.as_str() { "osm" => "voyager", "voyager" => "dark", "dark" => "light", _ => "osm" }.to_string(); cache.clear(); }
+                            5 => cfg.route_profile = match cfg.route_profile.as_str() { "car-fast" => "moped", "moped" => "shortest", _ => "car-fast" }.to_string(),
+                            6 => {} // ←→で調整
+                            7 => { cfg.show_spots = !cfg.show_spots; show_spots = cfg.show_spots; apply_spots(&mut spec, &spots, &spot_cats, show_spots); }
+                            8 => cfg.llm_recommend_enabled = !cfg.llm_recommend_enabled,
+                            9 => cfg.llm_model = match cfg.llm_model.as_str() { "claude-sonnet-5" => "claude-haiku-4-5", "claude-haiku-4-5" => "claude-opus-4-8", _ => "claude-sonnet-5" }.to_string(),
+                            _ => addr = "APIkey: この行で貼り付け(Cmd+V)して設定".into(),
+                        },
                         KeyCode::Char('s') => {
-                            let mut c = config::load_config();
-                            c.braille = opts.braille; c.classify = opts.classify; c.edge = opts.edge; c.mono = opts.mono; c.style = opts.style.clone();
-                            addr = match config::save_config(&c) { Ok(_) => "設定を保存(config.toml)".into(), Err(e) => format!("保存失敗: {e}") };
+                            cfg.braille = opts.braille; cfg.classify = opts.classify; cfg.edge = opts.edge; cfg.mono = opts.mono; cfg.style = opts.style.clone();
+                            addr = match config::save_config(&cfg) { Ok(_) => "設定を保存(config.toml)".into(), Err(e) => format!("保存失敗: {e}") };
                         }
-                        KeyCode::Esc => {}
-                        _ => focus = Focus::Settings,
-                    },
+                        KeyCode::Esc => { stay = false; }
+                        _ => {}
+                    } if stay { focus = Focus::Settings; } },
                     Focus::RoadSearch(mut buf) => match k.code { // 道路名/ref で現在view内をルート化
                         KeyCode::Enter => {
                             let name = buf.trim().to_string();
@@ -1147,6 +1159,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
             Some(Event::Paste(s)) => { match &mut focus {
                 Focus::Search(buf) | Focus::SaveName(buf) | Focus::NearSearch(buf) | Focus::NewCat(buf) | Focus::RoadSearch(buf) => buf.push_str(&s),
                 Focus::SpotName(buf, _) | Focus::SpotRename(buf, _) => buf.push_str(&s),
+                Focus::Settings if set_sel == 10 => { cfg.streetview_api_key = s.trim().to_string(); addr = "APIkey設定(sで保存)".into(); }
                 _ => {}
             } }
             _ => {}
