@@ -37,6 +37,10 @@ pub struct Config {
     pub sample_interval_m: f64,
     pub style: String,
     pub show_spots: bool,
+    pub braille: bool,
+    pub classify: bool,
+    pub edge: bool,
+    pub mono: bool,
     pub streetview_api_key: String,
 }
 
@@ -50,6 +54,10 @@ impl Default for Config {
             sample_interval_m: 800.0,
             style: "osm".to_string(),
             show_spots: true,
+            braille: false,
+            classify: false,
+            edge: false,
+            mono: false,
             streetview_api_key: String::new(),
         }
     }
@@ -140,6 +148,10 @@ pub fn load_config_from(path: &Path) -> Config {
                     cfg.show_spots = b;
                 }
             }
+            ("display", "braille") => { if let Some(b) = parse_bool(value) { cfg.braille = b; } }
+            ("display", "classify") => { if let Some(b) = parse_bool(value) { cfg.classify = b; } }
+            ("display", "edge") => { if let Some(b) = parse_bool(value) { cfg.edge = b; } }
+            ("display", "mono") => { if let Some(b) = parse_bool(value) { cfg.mono = b; } }
             ("streetview", "api_key") => {
                 if let Some(s) = parse_string(value) {
                     cfg.streetview_api_key = s;
@@ -175,6 +187,10 @@ pub fn save_config_to(path: &Path, c: &Config) -> Result<(), String> {
          [display]\n\
          style = \"{}\"\n\
          show_spots = {}\n\
+         braille = {}\n\
+         classify = {}\n\
+         edge = {}\n\
+         mono = {}\n\
          \n\
          [streetview]\n\
          api_key = \"{}\"\n",
@@ -185,6 +201,10 @@ pub fn save_config_to(path: &Path, c: &Config) -> Result<(), String> {
         c.sample_interval_m,
         c.style,
         c.show_spots,
+        c.braille,
+        c.classify,
+        c.edge,
+        c.mono,
         c.streetview_api_key,
     );
 
@@ -309,6 +329,10 @@ mod tests {
             sample_interval_m: 12.5,
             style: "satellite".to_string(),
             show_spots: false,
+            braille: true,
+            classify: false,
+            edge: true,
+            mono: false,
             streetview_api_key: "AIzaTESTKEY_example_123".to_string(),
         };
         save_config_to(&path, &original).expect("save should succeed");
@@ -495,6 +519,10 @@ profile = "custom-profile"
             sample_interval_m: 1.0,
             style: "s".to_string(),
             show_spots: false,
+            braille: false,
+            classify: true,
+            edge: false,
+            mono: true,
             streetview_api_key: "k".to_string(),
         };
         save_config_to(&path, &cfg).unwrap();

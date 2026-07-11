@@ -35,6 +35,7 @@ use poi::*;
 use spots::*;
 use share::*;
 
+#[derive(Clone)]
 struct Args {
     lat: Option<f64>,
     lon: Option<f64>,
@@ -379,6 +380,10 @@ const HELP: &[&str] = &[
     "",
     " [起動オプション]  --range KM,.. 航続リング / --route / --load-route 名前",
     "",
+    "",
+    " [設定]  , で設定画面 (braille/classify/edge/mono/style を実行中に切替・sで保存)",
+    "         config.toml で既定を指定可 ([display]/[streetview])",
+    "",
     "   ?  ヘルプ   q  終了   Esc  サブモード取消   Ctrl+C  計算の中断(終了はq)",
     "",
     "   (任意のキーで閉じる)",
@@ -406,13 +411,21 @@ impl Drop for TermGuard {
 fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Result<()> {
     use crossterm::event::{self, Event, KeyCode, KeyModifiers};
     enum Focus { Map, Search(String), SaveName(String), NearSearch(String), PoiMenu, PoiList, RouteList, WaypointList,
-                 NewCat(String), SpotName(String, String), SpotList, SpotCatList, SpotRename(String, usize) }
+                 NewCat(String), SpotName(String, String), SpotList, SpotCatList, SpotRename(String, usize), Settings }
     let _guard = TermGuard::enter()?; // Drop で必ず端末復元
     let mut cache: Cache = HashMap::new();
     let mut out = std::io::stdout();
     let mut addr = String::new();          // 'a' 住所 / 一時メッセージ
     let mut focus = Focus::Map;
-    let cfg = config::load_config();       // 設定(いまは streetview api_key のみ使用)
+    let cfg = config::load_config();       // 設定(streetview key / 描画既定 等)
+    let mut opts = a.clone();              // 実行中に変えられる描画設定(Argsのコピー)
+    // config を既定として適用(CLIフラグは ON 方向で優先。style は CLI が既定osmなら config 採用)
+    opts.braille = opts.braille || cfg.braille;
+    opts.classify = opts.classify || cfg.classify;
+    opts.edge = opts.edge || cfg.edge;
+    opts.mono = opts.mono || cfg.mono;
+    if opts.style == "osm" { opts.style = cfg.style.clone(); }
+    let mut set_sel: usize = 0;            // 設定画面の選択行
     let mut street: Option<(RgbImage, i32, f64, f64)> = None; // 実写(画像, heading, lat, lon)
 
     let (home_lat, home_lon) = pixel_to_deg(cx, cy, z);
@@ -509,9 +522,10 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
         let show_wps = matches!(focus, Focus::WaypointList);
         let show_splist = matches!(focus, Focus::SpotList);
         let show_catlist = matches!(focus, Focus::SpotCatList);
-        let gut: u32 = if !pois.is_empty() || show_routes || show_wps || show_splist || show_catlist { 26 } else { 0 };
+        let show_settings = matches!(focus, Focus::Settings);
+        let gut: u32 = if !pois.is_empty() || show_routes || show_wps || show_splist || show_catlist || show_settings { 26 } else { 0 };
         let map_cols = cols.saturating_sub(gut).max(10);
-        let (ow, oh) = if a.braille || a.edge { (map_cols * 2, map_rows * 4) } else { (map_cols, map_rows * 2) };
+        let (ow, oh) = if opts.braille || opts.edge { (map_cols * 2, map_rows * 4) } else { (map_cols, map_rows * 2) };
         if let Some(rx) = &gps_rx { // ライブ現在地を取り込み、自位置に追従
             while let Ok((la, lo)) = rx.try_recv() {
                 gps_pos = Some((la, lo));
@@ -536,7 +550,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
         }
         let (lat, lon) = pixel_to_deg(cx, cy, z);
 
-        let body = match build_window(cx, cy, z, ow, oh, &a.style, &mut cache) {
+        let body = match build_window(cx, cy, z, ow, oh, &opts.style, &mut cache) {
             Ok(img) => {
                 let mut ov = build_overlay(&spec, cx, cy, z, ow, oh, 1.0, 1.0, ow, oh);
                 let (mx, my) = (ow as i32 / 2, oh as i32 / 2); // 中心クロスヘア(黄)
@@ -563,7 +577,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                     let iy = (gy - (cy - oh as f64 / 2.0)).floor() as i32;
                     draw_ring(&mut ov, ix, iy, 3, [255, 255, 255], 1);
                 }
-                render(&img, a, Some(&ov))
+                render(&img, &opts, Some(&ov))
             }
             Err(e) => format!("取得失敗: {e}\r\n"),
         };
@@ -584,6 +598,16 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
             } else if show_catlist {
                 let its = spot_cats.iter().map(|(n, i)| format!("{} 色{}", n, i)).collect();
                 ("カテゴリ".to_string(), its, cat_sel)
+            } else if show_settings {
+                let onoff = |b: bool| if b { "ON" } else { "OFF" };
+                let its = vec![
+                    format!("braille  {}", onoff(opts.braille)),
+                    format!("classify {}", onoff(opts.classify)),
+                    format!("edge     {}", onoff(opts.edge)),
+                    format!("mono     {}", onoff(opts.mono)),
+                    format!("style    {}", opts.style),
+                ];
+                ("設定".to_string(), its, set_sel)
             } else if show_routes {
                 ("お気に入り".to_string(), route_names.clone(), rn_sel)
             } else {
@@ -632,13 +656,14 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
             Focus::SpotName(buf, cat) => format!(" [{cat}] 名前 or GoogleマップURL: {buf}\u{2588}   Enter=保存 Esc=取消 "),
             Focus::SpotList => format!(" [{cur_cat}] ↑↓選択 Enter=移動 n=新規(現在地) x=削除 Esc=戻る "),
             Focus::SpotCatList => " カテゴリ: ↑↓選択 Enter=中へ n新規 r改名 c色 x削除(空のみ) Esc=閉 ".to_string(),
+            Focus::Settings => " 設定: ↑↓選択 Enter/Space=切替 s=保存 Esc=閉 ".to_string(),
             Focus::SpotRename(buf, _) => format!(" カテゴリ改名: {buf}\u{2588}   Enter=確定 Esc=取消 "),
             Focus::PoiMenu => " 目的地: 1ガソスタ 2カフェ 3コンビニ 4道の駅 5展望 6公園 7峠道  / キーワード周辺検索  Esc=取消 ".to_string(),
             Focus::PoiList => format!(" [{}] ↑↓選択 Enter=移動 s始 e終 v経由 f再検索 Esc閉 ", poi_label),
             Focus::RouteList => " お気に入り: ↑↓選択 Enter=読込 Esc=閉 ".to_string(),
             Focus::WaypointList => " 並べ替え: ↑↓/Tab 選択  [ ]移動  x削除  +/-拡縮  Esc閉 ".to_string(),
             Focus::Map => {
-                let base = format!(" ?ヘルプ z{z} {lat:.4},{lon:.4} | s始 e終 v経由({}) m:{} n候補 W走 f目的地 P点 V表 i実写 E標高 A再生 G現在地 S保存 L呼出 gGPX o共有 /検索 q",
+                let base = format!(" ?ヘルプ z{z} {lat:.4},{lon:.4} | s始 e終 v経由({}) m:{} n候補 W走 f目的地 P点 V表 i実写 E標高 A再生 G現在地 S保存 L呼出 gGPX o共有 ,設定 /検索 q",
                     wps.len(), mode_label(&mode));
                 match &route_note { Some(rn) => format!("{base} | {rn} "), None => base }
             }
@@ -730,6 +755,27 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                         KeyCode::Enter => { if let Some((name, _)) = spot_cats.get(cat_sel) { cur_cat = name.clone(); sp_sel = 0; focus = Focus::SpotList; } else { focus = Focus::SpotCatList; } }
                         KeyCode::Esc => {}
                         _ => focus = Focus::SpotCatList,
+                    },
+                    Focus::Settings => match k.code { // 設定画面(描画モード/style)
+                        KeyCode::Up => { set_sel = set_sel.saturating_sub(1); focus = Focus::Settings; }
+                        KeyCode::Down => { if set_sel + 1 < 5 { set_sel += 1; } focus = Focus::Settings; }
+                        KeyCode::Enter | KeyCode::Char(' ') => {
+                            match set_sel {
+                                0 => opts.braille = !opts.braille,
+                                1 => opts.classify = !opts.classify,
+                                2 => opts.edge = !opts.edge,
+                                3 => opts.mono = !opts.mono,
+                                _ => { opts.style = match opts.style.as_str() { "osm" => "voyager", "voyager" => "dark", "dark" => "light", _ => "osm" }.to_string(); cache.clear(); }
+                            }
+                            focus = Focus::Settings;
+                        }
+                        KeyCode::Char('s') => {
+                            let mut c = config::load_config();
+                            c.braille = opts.braille; c.classify = opts.classify; c.edge = opts.edge; c.mono = opts.mono; c.style = opts.style.clone();
+                            addr = match config::save_config(&c) { Ok(_) => "設定を保存(config.toml)".into(), Err(e) => format!("保存失敗: {e}") };
+                        }
+                        KeyCode::Esc => {}
+                        _ => focus = Focus::Settings,
                     },
                     Focus::SpotList => match k.code { // cur_cat のスポット一覧
                         KeyCode::Up => { sp_sel = sp_sel.saturating_sub(1); focus = Focus::SpotList; }
@@ -980,6 +1026,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                             KeyCode::Tab | KeyCode::BackTab => { if !wps.is_empty() { focus = Focus::WaypointList; } } // 並べ替えパネル
                             KeyCode::Char('?') => help = true,
                             KeyCode::Char('P') => { cat_sel = 0; focus = Focus::SpotCatList; } // マイスポット(カテゴリ一覧)
+                            KeyCode::Char(',') => { set_sel = 0; focus = Focus::Settings; } // 設定画面
                             KeyCode::Char('V') => { show_spots = !show_spots; apply_spots(&mut spec, &spots, &spot_cats, show_spots); addr = if show_spots { "マイスポット表示".into() } else { "マイスポット非表示".into() }; }
                             KeyCode::Char('E') => { // 標高プロファイルの表示/非表示
                                 show_elev = !show_elev;
@@ -1059,7 +1106,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
         }
     }
     let (lat, lon) = pixel_to_deg(cx, cy, z);
-    save_state(lat, lon, z, &a.style, &wps, &mode); // 終了時の位置とルートを --resume 用に保存
+    save_state(lat, lon, z, &opts.style, &wps, &mode); // 終了時の位置とルートを --resume 用に保存
     Ok(())
 }
 
