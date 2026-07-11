@@ -112,6 +112,16 @@ fn geocode(place: &str) -> Result<(f64, f64), String> {
     Ok((lat, lon))
 }
 
+// 逆ジオコーディング (Nominatim reverse) → 住所文字列(display_name)
+fn reverse_geocode(lat: f64, lon: f64) -> Result<String, String> {
+    let url = format!("https://nominatim.openstreetmap.org/reverse?format=json&accept-language=ja&zoom=18&lat={lat}&lon={lon}");
+    let body = ureq::get(&url)
+        .set("User-Agent", "termmap/0.1 (personal experiment)")
+        .call().map_err(|e| format!("revgeo: {e}"))?
+        .into_string().map_err(|e| e.to_string())?;
+    json_first(&body, "\"display_name\":\"").ok_or_else(|| "住所が取得できません".to_string())
+}
+
 // タイルスタイル → URL。voyager/dark/light は CartoDB の label-free 系(端末で見やすい)。
 fn tile_url(style: &str, z: u32, x: i64, y: i64) -> String {
     match style {
@@ -332,6 +342,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
     let _guard = TermGuard::enter()?; // Drop で必ず端末復元
     let mut cache: Cache = HashMap::new();
     let mut out = std::io::stdout();
+    let mut addr = String::new(); // 'a' で現在地の住所を取得(パン/ズームで無効化)
     loop {
         let (tc, tr) = crossterm::terminal::size().unwrap_or((100, 40));
         let cols = tc.max(10) as u32;
@@ -342,7 +353,11 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
             Err(e) => format!("取得失敗: {e}\r\n"),
         };
         let (lat, lon) = pixel_to_deg(cx, cy, z);
-        let status = format!(" z{z}  {lat:.5},{lon:.5}   ←↑↓→=pan  Shift=大きく  +/-=zoom  q=quit ");
+        let status = if addr.is_empty() {
+            format!(" z{z}  {lat:.5},{lon:.5}   ←↑↓→=pan Shift=大 +/-=zoom a=住所 q=quit ")
+        } else {
+            format!(" z{z}  {lat:.5},{lon:.5}  {addr}   (a=更新 q=quit) ")
+        };
         let status: String = status.chars().take(cols as usize).collect();
         write!(out, "\x1b[H{body}\x1b[{tr};1H\x1b[7m{status}\x1b[0m")?;
         out.flush()?;
@@ -352,12 +367,13 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                 let frac = if k.modifiers.contains(KeyModifiers::SHIFT) { 3.0 } else { 12.0 };
                 let (dx, dy) = ((ow as f64 / frac).max(1.0), (oh as f64 / frac).max(1.0));
                 match k.code {
-                    KeyCode::Left => cx -= dx,
-                    KeyCode::Right => cx += dx,
-                    KeyCode::Up => cy -= dy,
-                    KeyCode::Down => cy += dy,
-                    KeyCode::Char('+') | KeyCode::Char('=') => if z < 19 { z += 1; cx *= 2.0; cy *= 2.0; },
-                    KeyCode::Char('-') | KeyCode::Char('_') => if z > 2 { z -= 1; cx /= 2.0; cy /= 2.0; },
+                    KeyCode::Left => { cx -= dx; addr.clear(); }
+                    KeyCode::Right => { cx += dx; addr.clear(); }
+                    KeyCode::Up => { cy -= dy; addr.clear(); }
+                    KeyCode::Down => { cy += dy; addr.clear(); }
+                    KeyCode::Char('+') | KeyCode::Char('=') => if z < 19 { z += 1; cx *= 2.0; cy *= 2.0; addr.clear(); },
+                    KeyCode::Char('-') | KeyCode::Char('_') => if z > 2 { z -= 1; cx /= 2.0; cy /= 2.0; addr.clear(); },
+                    KeyCode::Char('a') => { addr = reverse_geocode(lat, lon).unwrap_or_else(|e| format!("({e})")); }
                     KeyCode::Char('q') | KeyCode::Esc => break,
                     _ => {}
                 }
@@ -421,7 +437,14 @@ fn main() {
 
     let mut cache: Cache = HashMap::new();
     match build_window(cx, cy, a.zoom, a.win_px, a.win_px, &a.style, &mut cache) {
-        Ok(src) => { save_state(lat, lon, a.zoom, &a.style); oneshot(src, &a); }
+        Ok(src) => {
+            save_state(lat, lon, a.zoom, &a.style);
+            oneshot(src, &a);
+            if a.png.is_none() { // 地図描画時のみ 中心座標+住所 をフッタ表示(stderr)
+                let addr = reverse_geocode(lat, lon).unwrap_or_default();
+                eprintln!("中心 {lat:.5},{lon:.5}  z{}  {}", a.zoom, addr);
+            }
+        }
         Err(e) => { eprintln!("{e}"); std::process::exit(1); }
     }
 }

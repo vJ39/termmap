@@ -21,7 +21,7 @@ OSM ラスタタイルを端末に描画する mapscii 風レンダラ。
     --lon LON       中心の経度
     --resume        前回終了時の位置/ズーム/styleを復元 (--last 同義)
     --zoom Z        ズーム 0..=20 (既定 14)
-    -i, --interactive   対話モード (矢印=パン, +/-=ズーム, q=終了)
+    -i, --interactive   対話モード (矢印=パン, +/-=ズーム, a=中心の住所, q=終了)
     --braille       点字ドットで描画
     --mono          色なし (braille をプレーンテキスト化)
     --classify      地物カテゴリ色分け (水域/緑地/幹線道路/線路/建物)
