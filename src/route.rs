@@ -2,7 +2,7 @@
 use crate::render::{OverlaySpec, Poi, PoiCat};
 use crate::poi::json_first;
 
-pub struct RouteResult { pub pts: Vec<(f64, f64)>, pub dist_m: f64, pub time_s: f64, pub hw_m: f64 }
+pub struct RouteResult { pub pts: Vec<(f64, f64)>, pub ele: Vec<f64>, pub dist_m: f64, pub time_s: f64, pub hw_m: f64, pub ascend_m: f64 }
 // short=最短 / highway=高速OK(car-fast) / それ以外=下道(高速回避, moped). 既知名は透過。
 fn route_profile(mode: &str) -> &str {
     match mode {
@@ -103,6 +103,37 @@ fn parse_geojson_line(body: &str) -> Option<Vec<(f64, f64)>> {
     }
     if pts.is_empty() { None } else { Some(pts) }
 }
+// geojson の各点 [lon,lat,elev] の3つ目(標高m)を pts と並行に収集する。
+// 欠損点は 0.0 を入れて pts と件数を一致させる。pts parse とは独立(既存の parse は変えない)。
+fn parse_geojson_ele(body: &str) -> Vec<f64> {
+    let mut ele = Vec::new();
+    let ci = match body.find("\"coordinates\"") { Some(i) => i, None => return ele };
+    let after = &body[ci..];
+    let open = match after.find('[') { Some(i) => i, None => return ele };
+    let mut depth = 0i32;
+    let mut close = None;
+    for (i, &b) in after.as_bytes().iter().enumerate().skip(open) {
+        match b {
+            b'[' => depth += 1,
+            b']' => { depth -= 1; if depth == 0 { close = Some(i); break; } }
+            _ => {}
+        }
+    }
+    let close = match close { Some(c) => c, None => return ele };
+    let inner = &after[open + 1..close];
+    let mut rest = inner;
+    while let Some(o) = rest.find('[') {
+        let c = match rest[o..].find(']') { Some(c) => c + o, None => break };
+        let mut it = rest[o + 1..c].split(',');
+        // 1つ目=lon, 2つ目=lat を読み飛ばし、3つ目=標高
+        let _ = it.next();
+        let _ = it.next();
+        let z = it.next().and_then(|s| s.trim().parse::<f64>().ok()).unwrap_or(0.0);
+        ele.push(z);
+        rest = &rest[c + 1..];
+    }
+    ele
+}
 // mode: "short"=最短(shortest) / それ以外=裏道(safety)。wps は (lat,lon) 列。
 pub fn fetch_route(wps: &[(f64, f64)], mode: &str, alt: u32) -> Result<RouteResult, String> {
     if wps.len() < 2 { return Err("--route は始点と終点(2点以上)が必要".into()); }
@@ -115,11 +146,13 @@ pub fn fetch_route(wps: &[(f64, f64)], mode: &str, alt: u32) -> Result<RouteResu
         .timeout(std::time::Duration::from_secs(20)).call().map_err(|e| format!("route: {e}"))?
         .into_string().map_err(|e| e.to_string())?;
     let pts = parse_geojson_line(&body).ok_or("route: geometry parse失敗")?;
+    let ele = parse_geojson_ele(&body);
     let num = |k: &str| json_first(body.as_str(), k).and_then(|s| s.trim().parse::<f64>().ok());
     let dist_m = num("\"track-length\": \"").or_else(|| num("\"track-length\":\"")).unwrap_or(0.0);
     let time_s = num("\"total-time\": \"").or_else(|| num("\"total-time\":\"")).unwrap_or(0.0);
+    let ascend_m = num("\"filtered ascend\": \"").or_else(|| num("\"filtered ascend\":\"")).unwrap_or(0.0);
     let hw_m = expressway_meters(&body);
-    Ok(RouteResult { pts, dist_m, time_s, hw_m })
+    Ok(RouteResult { pts, ele, dist_m, time_s, hw_m, ascend_m })
 }
 pub fn write_gpx(path: &str, pts: &[(f64, f64)]) -> Result<(), String> {
     let mut s = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<gpx version=\"1.1\" creator=\"termmap\" xmlns=\"http://www.topografix.com/GPX/1/1\">\n<trk><name>termmap route</name><trkseg>\n");
@@ -174,6 +207,21 @@ mod tests {
         let pts = parse_geojson_line(body).unwrap();
         assert_eq!(pts.len(), 2);
         assert!((pts[0].0 - 35.7).abs() < 1e-9 && (pts[0].1 - 139.7).abs() < 1e-9); // (lat,lon)順
+        // 標高(3つ目)も pts と並行に拾えていること
+        let ele = parse_geojson_ele(body);
+        assert_eq!(ele.len(), pts.len());
+        assert!((ele[0] - 9.0).abs() < 1e-9 && (ele[1] - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fetch_route_parses_ele_and_ascend() {
+        // filtered ascend が properties から拾えること(単体パーサの整合確認)
+        let body = r#"{"features":[{"properties":{"filtered ascend": "123"}}]}"#;
+        let asc = json_first(body, "\"filtered ascend\": \"")
+            .or_else(|| json_first(body, "\"filtered ascend\":\""))
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .unwrap_or(0.0);
+        assert!((asc - 123.0).abs() < 1e-9);
     }
 
     #[test]

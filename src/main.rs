@@ -13,6 +13,7 @@ mod poi;
 mod spots;
 mod share;
 mod streetview;
+mod elevation;
 // 以下は今後の機能用(道路トレース/おすすめ相談)。まだ未wireのため dead_code 許容。
 #[allow(dead_code)]
 mod config;
@@ -359,6 +360,7 @@ const HELP: &[&str] = &[
     "                   → リスト: ↑↓選択 Enter移動 / s始点 e終点 v経由 / f再検索 Esc閉",
     "   S / L          ルートを お気に入り保存 / 呼び出し",
     "   g              ルートを GPX 保存 (termmap-route.gpx)",
+    "   E              標高プロファイル 表示/非表示 (ルート確定後・下部に折れ線)",
     "",
     " [マイスポット] (ラーメン等をカテゴリ別に色分け保存)",
     "   P              カテゴリ一覧を開く",
@@ -423,6 +425,9 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
     let mut help = false; // ? でヘルプ表示
     let mut qr_view: Option<String> = None; // o でGoogleマップQRをポップアップ表示
     let mut route_alt: u32 = 0; // n で BRouter の代替ルート(0..=3)を巡回
+    let mut route_ele: Vec<f64> = Vec::new(); // 直近ルートの標高列(pts と同数)
+    let mut route_ascend: f64 = 0.0;          // 直近ルートの累積登り(m)
+    let mut show_elev = false;                // E で標高プロファイル表示
     // ルート計算のバックグラウンド受信(マーカーは即時、ルート線は別スレッド)
     let (mut route_note, mut route_job) = {
         let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0);
@@ -488,6 +493,10 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
             }
             continue;
         }
+        // 標高プロファイル帯を出すぶん地図の行数を減らす(E)
+        let elev_on = show_elev && !spec.routes.is_empty() && route_ele.len() >= 2 && route_ele.iter().any(|&z| z != 0.0);
+        let elev_h: u32 = if elev_on { (map_rows / 3).clamp(4, 12) } else { 0 };
+        let map_rows = if elev_h > 0 { map_rows.saturating_sub(elev_h + 1).max(3) } else { map_rows };
         let show_routes = matches!(focus, Focus::RouteList);
         let show_wps = matches!(focus, Focus::WaypointList);
         let show_splist = matches!(focus, Focus::SpotList);
@@ -562,6 +571,15 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                 write!(out, "\x1b[{};1H{}", i + 1, ln)?;
             }
         }
+        if elev_h > 0 { // 標高プロファイル帯(地図の下・ステータスの上)
+            let (mn, mx, _asc) = elevation::elevation_stats(&route_ele);
+            let label = fit_cells(&format!(" 標高 ↑{route_ascend:.0}m  最高{mx:.0}m 最低{mn:.0}m  (Eで消す) "), cols as usize);
+            let _ = write!(out, "\x1b[{};1H\x1b[7m{label}\x1b[0m\x1b[K", map_rows + 1);
+            let chart = elevation::elevation_chart(&route_ele, cols as usize, elev_h as usize);
+            for (i, line) in chart.iter().enumerate() {
+                let _ = write!(out, "\x1b[{};1H{}\x1b[K", map_rows + 2 + i as u32, line);
+            }
+        }
         let status = match &focus {
             Focus::Search(buf) => format!(" 検索: {buf}\u{2588}   Enter=移動 Esc=取消 "),
             Focus::SaveName(buf) => format!(" ルート名: {buf}\u{2588}   Enter=保存 Esc=取消 "),
@@ -576,7 +594,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
             Focus::RouteList => " お気に入り: ↑↓選択 Enter=読込 Esc=閉 ".to_string(),
             Focus::WaypointList => " 並べ替え: ↑↓/Tab 選択  [ ]移動  x削除  +/-拡縮  Esc閉 ".to_string(),
             Focus::Map => {
-                let base = format!(" ?ヘルプ z{z} {lat:.4},{lon:.4} | s始 e終 v経由({}) m:{} n候補 W走 f目的地 P点 V表 i実写 S保存 L呼出 gGPX o共有 /検索 q",
+                let base = format!(" ?ヘルプ z{z} {lat:.4},{lon:.4} | s始 e終 v経由({}) m:{} n候補 W走 f目的地 P点 V表 i実写 E標高 S保存 L呼出 gGPX o共有 /検索 q",
                     wps.len(), mode_label(&mode));
                 match &route_note { Some(rn) => format!("{base} | {rn} "), None => base }
             }
@@ -608,6 +626,8 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                 Ok(Ok(r)) => {
                     spec.routes.clear();
                     route_note = Some(route_summary(&mode, &r));
+                    route_ele = r.ele;
+                    route_ascend = r.ascend_m;
                     spec.routes.push(Route { pts: r.pts, color: [0, 220, 255], thickness: 2 });
                     route_job = None;
                     None
@@ -898,6 +918,10 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                             KeyCode::Char('?') => help = true,
                             KeyCode::Char('P') => { cat_sel = 0; focus = Focus::SpotCatList; } // マイスポット(カテゴリ一覧)
                             KeyCode::Char('V') => { show_spots = !show_spots; apply_spots(&mut spec, &spots, &spot_cats, show_spots); addr = if show_spots { "マイスポット表示".into() } else { "マイスポット非表示".into() }; }
+                            KeyCode::Char('E') => { // 標高プロファイルの表示/非表示
+                                show_elev = !show_elev;
+                                if show_elev && (spec.routes.is_empty() || !route_ele.iter().any(|&z| z != 0.0)) { addr = "標高: ルート確定後に表示".into(); }
+                            }
                             KeyCode::Char('i') => { // 実写(Street View)を中心地点で開く
                                 if !streetview::available(&cfg.streetview_api_key) { addr = "実写: APIキー未設定(config.toml [streetview])".into(); }
                                 else { addr = "実写取得中…".into();
