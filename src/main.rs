@@ -613,7 +613,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                     format!("mono     {}", onoff(opts.mono)),
                     format!("style    {}", opts.style),
                     format!("既定mode {}", cfg.route_profile),
-                    format!("道路化の点間隔 {}m", cfg.sample_interval_m as i64),
+                    format!("道路の点間隔 {}m", cfg.sample_interval_m as i64),
                     format!("spot既定 {}", onoff(cfg.show_spots)),
                     format!("おすすめ {}", onoff(cfg.llm_recommend_enabled)),
                     format!("LLM      {}", cfg.llm_model),
@@ -682,7 +682,22 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
             Focus::SpotName(buf, cat) => format!(" [{cat}] 名前 or GoogleマップURL: {buf}\u{2588}   Enter=保存 Esc=取消 "),
             Focus::SpotList => format!(" [{cur_cat}] ↑↓選択 Enter=移動 n=新規(現在地) x=削除 Esc=戻る "),
             Focus::SpotCatList => " カテゴリ: ↑↓選択 Enter=中へ n新規 r改名 c色 x削除(空のみ) Esc=閉 ".to_string(),
-            Focus::Settings => " 設定: ↑↓選択 Enter切替 ←→数値 貼付=APIkey s保存 Esc閉 ".to_string(),
+            Focus::Settings => {
+                let desc = match set_sel {
+                    0 => "braille: 点字ドットで高精細描画(色は淡め)。OFFはハーフブロック",
+                    1 => "classify: 地物を色分け(水域/緑地/道路/建物)。地形が見やすい",
+                    2 => "edge: 輪郭抽出表示(線画風)",
+                    3 => "mono: 単色描画(色を使わない)",
+                    4 => "style: タイル種別を循環(osm=標準/voyager/dark=暗/light=淡)",
+                    5 => "既定mode: 起動時のルート種別。car-fast=高速優先 / moped=下道(高速回避) / shortest=最短距離",
+                    6 => "道路の点間隔: rの道路名ルートで、その道を何mおきの点でなぞるか(小=忠実で点多/大=粗い)。←→で調整",
+                    7 => "spot既定: 起動時にお気に入りスポットを表示するか",
+                    8 => "おすすめ: claude -p でツーリングスポットを提案する機能のON/OFF(未実装)",
+                    9 => "LLM: おすすめに使うモデルを循環(claude-sonnet-5/haiku/opus)",
+                    _ => "APIkey: Google(Street View/検索)のキー。この行でCmd+V貼付→設定、sで保存",
+                };
+                format!(" ▶ {desc}   [↑↓選択 Enter切替 s保存 Esc閉]")
+            }
             Focus::RoadSearch(buf) => format!(" 道路名/ref: {buf}\u{2588}   Enter=view内をルート化 Esc=取消 "),
             Focus::SpotRename(buf, _) => format!(" カテゴリ改名: {buf}\u{2588}   Enter=確定 Esc=取消 "),
             Focus::PoiMenu => " 目的地: 1ガソスタ 2カフェ 3コンビニ 4道の駅 5展望 6公園 7峠道  / キーワード周辺検索  Esc=取消 ".to_string(),
