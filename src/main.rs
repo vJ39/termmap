@@ -36,6 +36,9 @@ struct Args {
     save_route: Option<String>,
     list_routes: bool,
     share: bool,
+    wander: bool,
+    dist: Option<f64>,
+    shape: String,
     image: Option<String>,
     png: Option<String>,
 }
@@ -47,7 +50,8 @@ fn parse_args() -> Args {
                        style: "osm".to_string(), braille: false, mono: false, classify: false,
                        edge: false, interactive: false, resume: false, here: false, threshold: None,
                        range: Vec::new(), home: None, route: None, route_mode: "surface".to_string(),
-                       gpx: None, load_route: None, save_route: None, list_routes: false, share: false, image: None, png: None };
+                       gpx: None, load_route: None, save_route: None, list_routes: false, share: false,
+                       wander: false, dist: None, shape: "loop".to_string(), image: None, png: None };
     let mut it = std::env::args().skip(1);
     macro_rules! val { ($k:expr) => { it.next().unwrap_or_else(|| arg_err(&format!("{} は値が必要です", $k))) } }
     macro_rules! num { ($k:expr) => {{ let v = val!($k); v.parse().unwrap_or_else(|_| arg_err(&format!("{} の値が不正: {}", $k, v))) }} }
@@ -92,6 +96,9 @@ fn parse_args() -> Args {
             "--save-route" => a.save_route = Some(val!("--save-route")),
             "--routes" => a.list_routes = true,
             "--share" => a.share = true,
+            "--wander" => a.wander = true,
+            "--dist" => a.dist = Some(num!("--dist")),
+            "--shape" => a.shape = val!("--shape"),
             "--threshold" => a.threshold = Some(num!("--threshold")),
             "--image" => a.image = Some(val!("--image")),
             "--png" => a.png = Some(val!("--png")),
@@ -806,6 +813,61 @@ fn haversine_km(a: (f64, f64), b: (f64, f64)) -> f64 {
     let h = (dlat / 2.0).sin().powi(2) + la1.cos() * la2.cos() * (dlon / 2.0).sin().powi(2);
     2.0 * r * h.sqrt().asin()
 }
+fn bearing(from: (f64, f64), to: (f64, f64)) -> f64 {
+    let (la1, la2) = (from.0.to_radians(), to.0.to_radians());
+    let dlon = (to.1 - from.1).to_radians();
+    let y = dlon.sin() * la2.cos();
+    let x = la1.cos() * la2.sin() - la1.sin() * la2.cos() * dlon.cos();
+    y.atan2(x).to_degrees().rem_euclid(360.0)
+}
+fn angdiff(a: f64, b: f64) -> f64 { let d = (a - b).abs() % 360.0; d.min(360.0 - d) }
+fn rng_seed() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1) | 1
+}
+fn lcg(s: &mut u64) -> u64 { *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); *s >> 16 }
+
+// 走りまくりモード: 峠/展望を経由する周回(or片道)の waypoint 列を生成。
+fn wander_route(origin: (f64, f64), dist_km: f64, shape: &str) -> Result<Vec<(f64, f64)>, String> {
+    let r_km = if shape == "oneway" { (dist_km / 2.5).max(1.0) } else { (dist_km / 7.0).max(1.0) };
+    let dlat = r_km / 111.0;
+    let dlon = r_km / (111.0 * origin.0.to_radians().cos().abs().max(0.1));
+    let (s, w, n, e) = (origin.0 - dlat, origin.1 - dlon, origin.0 + dlat, origin.1 + dlon);
+    let mut cands: Vec<(f64, f64, f64, f64)> = Vec::new(); // lat,lon,距離km,方位角
+    for kind in POI_KINDS.iter().filter(|k| k.label == "峠道" || k.label == "展望") {
+        if let Ok(v) = fetch_pois(kind, s, w, n, e) {
+            for (la, lo, _) in v { cands.push((la, lo, haversine_km(origin, (la, lo)), bearing(origin, (la, lo)))); }
+        }
+    }
+    if cands.is_empty() { return Err("スポット(峠/展望)が見つからない。距離を上げるか山方面で試して".into()); }
+    let band: Vec<(f64, f64, f64, f64)> = cands.iter().cloned().filter(|t| t.2 >= r_km * 0.4 && t.2 <= r_km * 1.3).collect();
+    let pool = if band.len() >= 2 { band } else { cands };
+    let mut rng = rng_seed();
+    let k = ((dist_km / 20.0).round() as usize).clamp(2, 6);
+    let mut wps = vec![origin];
+    if shape == "oneway" {
+        let dir = (lcg(&mut rng) % 360) as f64;
+        let mut sel: Vec<(f64, f64, f64, f64)> = pool.iter().cloned().filter(|t| angdiff(t.3, dir) < 60.0).collect();
+        sel.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+        for t in sel.into_iter().take(k) { wps.push((t.0, t.1)); }
+        if wps.len() < 2 { return Err("その方角にスポットが無い".into()); }
+    } else {
+        let offset = (lcg(&mut rng) % 360) as f64;
+        let mut picked: Vec<(f64, f64, f64)> = Vec::new();
+        for i in 0..k {
+            let center = (offset + 360.0 * i as f64 / k as f64) % 360.0;
+            if let Some(t) = pool.iter().min_by(|a, b| angdiff(a.3, center).partial_cmp(&angdiff(b.3, center)).unwrap_or(std::cmp::Ordering::Equal)) {
+                if angdiff(t.3, center) < 360.0 / k as f64 && !picked.iter().any(|p| (p.0 - t.0).abs() < 1e-6 && (p.1 - t.1).abs() < 1e-6) {
+                    picked.push((t.0, t.1, t.3));
+                }
+            }
+        }
+        if picked.is_empty() { return Err("スポットが足りない".into()); }
+        picked.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+        for (la, lo, _) in picked { wps.push((la, lo)); }
+        wps.push(origin); // 周回で戻る
+    }
+    Ok(wps)
+}
 // 文字列を cells 幅に収める(非ASCII=2セル概算)。不足は空白パディング。
 fn fit_cells(s: &str, cells: usize) -> String {
     let (mut w, mut o) = (0usize, String::new());
@@ -860,6 +922,7 @@ const HELP: &[&str] = &[
     "   x              選択点を削除     c  ルート全消去",
     "   m              モード切替  下道 → 高速 → 最短",
     "   n              代替ルート候補を巡回(BRouterの案 1〜4)",
+    "   W              走りまくり: 峠/展望を巡る周回を自動生成(連打で別案)",
     "",
     " [目的地・お気に入り]",
     "   f              カテゴリ検索 1ｶﾞｿ 2ｶﾌｪ 3ｺﾝﾋﾞﾆ 4道の駅 5展望 6公園 7峠道",
@@ -1012,7 +1075,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
             Focus::RouteList => " お気に入り: ↑↓選択 Enter=読込 Esc=閉 ".to_string(),
             Focus::WaypointList => " 並べ替え: ↑↓/Tab 選択  [ ]移動  x削除  +/-拡縮  Esc閉 ".to_string(),
             Focus::Map => {
-                let base = format!(" ?ヘルプ z{z} {lat:.4},{lon:.4} | s始 e終 v経由({}) Tab並替 m:{} n候補 f目的地 S保存 L呼出 gGPX o共有 /検索 a q",
+                let base = format!(" ?ヘルプ z{z} {lat:.4},{lon:.4} | s始 e終 v経由({}) Tab並替 m:{} n候補 W走 f目的地 S保存 L呼出 gGPX o共有 /検索 q",
                     wps.len(), mode_label(&mode));
                 match &route_note { Some(rn) => format!("{base} | {rn} "), None => base }
             }
@@ -1204,6 +1267,13 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                                     route_note = nn; route_job = jj;
                                 } else { addr = "ルート未確定".into(); }
                             }
+                            KeyCode::Char('W') => { // 走りまくり(峠/展望の周回)を生成。連打で別案
+                                let dist = a.dist.unwrap_or(40.0);
+                                match wander_route((lat, lon), dist, &a.shape) {
+                                    Ok(w) => { wps = w; wp_sel = 0; let (nn, jj) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = nn; route_job = jj; }
+                                    Err(e) => addr = format!("({e})"),
+                                }
+                            }
                             KeyCode::Char('o') => { // スマホ共有(GoogleマップQR)
                                 if wps.len() >= 2 {
                                     let (url, _) = gmaps_url(&wps);
@@ -1310,6 +1380,15 @@ fn main() {
     } else {
         match (a.lat, a.lon) { (Some(la), Some(lo)) => (la, lo), _ => { eprintln!("need --place \"住所\" or --lat/--lon or --image (or --resume)"); std::process::exit(2); } }
     };
+    // 走りまくりモード: 峠/展望を経由する周回(or片道)を生成して a.route に載せる
+    if a.wander {
+        let origin = a.home.unwrap_or((lat, lon));
+        let dist = a.dist.unwrap_or(40.0);
+        match wander_route(origin, dist, &a.shape) {
+            Ok(w) => a.route = Some(w),
+            Err(e) => { eprintln!("wander: {e}"); std::process::exit(1); }
+        }
+    }
     let (cx, cy) = deg_to_pixel(lat, lon, a.zoom);
 
     // お気に入りルート保存(--save-route。--route か --load-route が前提)
