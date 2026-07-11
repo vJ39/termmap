@@ -562,9 +562,9 @@ fn poi_color(c: PoiCat) -> [u8; 3] {
 struct Poi { lat: f64, lon: f64, cat: PoiCat }
 struct Route { pts: Vec<(f64, f64)>, color: [u8; 3], thickness: u32 }
 struct Ring { lat: f64, lon: f64, radii_km: Vec<f64>, color: [u8; 3], thickness: u32 }
-struct OverlaySpec { pois: Vec<Poi>, routes: Vec<Route>, rings: Vec<Ring> }
+struct OverlaySpec { pois: Vec<Poi>, routes: Vec<Route>, rings: Vec<Ring>, spots: Vec<(f64, f64, [u8; 3])> }
 impl OverlaySpec {
-    fn is_empty(&self) -> bool { self.pois.is_empty() && self.routes.is_empty() && self.rings.is_empty() }
+    fn is_empty(&self) -> bool { self.pois.is_empty() && self.routes.is_empty() && self.rings.is_empty() && self.spots.is_empty() }
 }
 
 // 緯度latズームzでの m/px (Web Mercator)
@@ -648,6 +648,11 @@ fn build_overlay(spec: &OverlaySpec, cx: f64, cy: f64, z: u32, win_w: u32, win_h
         if ix < -4 || iy < -4 || ix > out_w as i32 + 4 || iy > out_h as i32 + 4 { continue; }
         draw_marker(&mut ov, ix, iy, poi_color(p.cat), 3);
     }
+    for (la, lo, col) in &spec.spots { // マイスポット(カテゴリ色)
+        let (ix, iy) = to_img(*la, *lo);
+        if ix < -4 || iy < -4 || ix > out_w as i32 + 4 || iy > out_h as i32 + 4 { continue; }
+        draw_marker(&mut ov, ix, iy, *col, 3);
+    }
     ov
 }
 fn composite(img: &mut RgbImage, ov: &OverlayLayer) {
@@ -663,7 +668,7 @@ fn build_spec(a: &Args, center_lat: f64, center_lon: f64) -> OverlaySpec {
         let (rl, ro) = a.home.unwrap_or((center_lat, center_lon));
         rings.push(Ring { lat: rl, lon: ro, radii_km: a.range.clone(), color: [255, 90, 90], thickness: 2 });
     }
-    OverlaySpec { pois: Vec::new(), routes: Vec::new(), rings }
+    OverlaySpec { pois: Vec::new(), routes: Vec::new(), rings, spots: Vec::new() }
 }
 // --route があれば BRouter で取得して spec に追加し、要約(距離/時間)を返す。--gpx 指定時は書き出し。
 fn attach_route(spec: &mut OverlaySpec, a: &Args) -> Result<Option<String>, String> {
@@ -772,6 +777,69 @@ fn list_named_routes() -> Vec<String> {
     }
     v.sort();
     v
+}
+
+// ---- マイスポット (カテゴリ別に色分けして保存・重畳) ----
+const SPOT_PALETTE: [[u8; 3]; 10] = [
+    [255, 64, 64], [255, 140, 0], [255, 215, 0], [120, 255, 120], [80, 200, 255],
+    [180, 120, 255], [255, 80, 200], [0, 220, 180], [200, 160, 90], [180, 180, 180],
+];
+struct Spot { lat: f64, lon: f64, cat: String, name: String }
+fn spots_path() -> Option<std::path::PathBuf> { Some(std::path::PathBuf::from(std::env::var("HOME").ok()?).join(".config/termmap/spots.txt")) }
+fn spot_cats_path() -> Option<std::path::PathBuf> { Some(std::path::PathBuf::from(std::env::var("HOME").ok()?).join(".config/termmap/spot-categories.txt")) }
+fn spot_clean(s: &str) -> String { s.trim().replace(['\n', ','], " ") } // カテゴリ/名前にカンマ・改行を入れない
+fn load_spots() -> Vec<Spot> {
+    let mut v = Vec::new();
+    if let Some(s) = spots_path().and_then(|p| std::fs::read_to_string(p).ok()) {
+        for l in s.lines() {
+            let mut it = l.splitn(4, ',');
+            if let (Some(la), Some(lo), Some(cat), Some(name)) = (it.next(), it.next(), it.next(), it.next()) {
+                if let (Ok(la), Ok(lo)) = (la.trim().parse(), lo.trim().parse()) {
+                    v.push(Spot { lat: la, lon: lo, cat: cat.trim().to_string(), name: name.trim().to_string() });
+                }
+            }
+        }
+    }
+    v
+}
+fn append_spot(s: &Spot) -> Result<(), String> {
+    use std::io::Write;
+    let p = spots_path().ok_or("HOME不明")?;
+    if let Some(d) = p.parent() { let _ = std::fs::create_dir_all(d); }
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&p).map_err(|e| e.to_string())?;
+    writeln!(f, "{},{},{},{}", s.lat, s.lon, spot_clean(&s.cat), spot_clean(&s.name)).map_err(|e| e.to_string())
+}
+fn load_spot_cats() -> Vec<(String, u8)> {
+    let mut v = Vec::new();
+    if let Some(s) = spot_cats_path().and_then(|p| std::fs::read_to_string(p).ok()) {
+        for l in s.lines() {
+            let mut it = l.splitn(2, '\t');
+            if let (Some(n), Some(i)) = (it.next(), it.next()) {
+                if let Ok(idx) = i.trim().parse::<u8>() { v.push((n.to_string(), idx)); }
+            }
+        }
+    }
+    v
+}
+fn ensure_spot_cat(name: &str, cats: &mut Vec<(String, u8)>) -> u8 {
+    use std::io::Write;
+    let name = spot_clean(name);
+    if let Some((_, c)) = cats.iter().find(|(n, _)| *n == name) { return *c; }
+    let idx = (cats.len() % SPOT_PALETTE.len()) as u8;
+    cats.push((name.clone(), idx));
+    if let Some(p) = spot_cats_path() {
+        if let Some(d) = p.parent() { let _ = std::fs::create_dir_all(d); }
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) { let _ = writeln!(f, "{name}\t{idx}"); }
+    }
+    idx
+}
+fn spot_color_of(cat: &str, cats: &[(String, u8)]) -> [u8; 3] {
+    let idx = cats.iter().find(|(n, _)| n == cat).map(|(_, c)| *c).unwrap_or(9);
+    SPOT_PALETTE[(idx as usize) % SPOT_PALETTE.len()]
+}
+fn apply_spots(spec: &mut OverlaySpec, spots: &[Spot], cats: &[(String, u8)], show: bool) {
+    spec.spots.clear();
+    if show { for s in spots { spec.spots.push((s.lat, s.lon, spot_color_of(&s.cat, cats))); } }
 }
 
 // ---- 目的地検索 (Overpass) ----
@@ -966,9 +1034,13 @@ const HELP: &[&str] = &[
     " [目的地・お気に入り]",
     "   f              カテゴリ検索 1ｶﾞｿ 2ｶﾌｪ 3ｺﾝﾋﾞﾆ 4道の駅 5展望 6公園 7峠道",
     "                   / でキーワード周辺検索(現在範囲) → リスト",
-    "                   → リスト: ↑↓選択 / s始点 e終点 Enter経由 / Esc閉",
+    "                   → リスト: ↑↓選択 Enter移動 / s始点 e終点 v経由 / f再検索 Esc閉",
     "   S / L          ルートを お気に入り保存 / 呼び出し",
     "   g              ルートを GPX 保存 (termmap-route.gpx)",
+    "",
+    " [マイスポット] (ラーメン等をカテゴリ別に色分け保存)",
+    "   P              現在地(中心)をスポット登録: カテゴリ → 名前",
+    "   V              マイスポットの表示 / 非表示",
     "   o              スマホ共有(GoogleマップのQRをポップアップ表示)",
     "",
     " [起動オプション]  --range KM,.. 航続リング / --route / --load-route 名前",
@@ -999,7 +1071,7 @@ impl Drop for TermGuard {
 
 fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Result<()> {
     use crossterm::event::{self, Event, KeyCode, KeyModifiers};
-    enum Focus { Map, Search(String), SaveName(String), NearSearch(String), PoiMenu, PoiList, RouteList, WaypointList }
+    enum Focus { Map, Search(String), SaveName(String), NearSearch(String), PoiMenu, PoiList, RouteList, WaypointList, SpotCat(String), SpotName(String, String) }
     let _guard = TermGuard::enter()?; // Drop で必ず端末復元
     let mut cache: Cache = HashMap::new();
     let mut out = std::io::stdout();
@@ -1025,6 +1097,10 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
         let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0);
         (n_, j_)
     };
+    let mut spots = load_spots();          // マイスポット
+    let mut spot_cats = load_spot_cats();
+    let mut show_spots = true;
+    apply_spots(&mut spec, &spots, &spot_cats, show_spots);
 
     let _ = write!(out, "\x1b[2J");
     loop {
@@ -1111,12 +1187,14 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
             Focus::Search(buf) => format!(" 検索: {buf}\u{2588}   Enter=移動 Esc=取消 "),
             Focus::SaveName(buf) => format!(" ルート名: {buf}\u{2588}   Enter=保存 Esc=取消 "),
             Focus::NearSearch(buf) => format!(" 周辺検索: {buf}\u{2588}   Enter=検索 Esc=取消 "),
+            Focus::SpotCat(buf) => format!(" スポットのカテゴリ: {buf}\u{2588}   Enter=次へ Esc=取消 "),
+            Focus::SpotName(buf, cat) => format!(" [{cat}] スポット名: {buf}\u{2588}   Enter=保存 Esc=取消 "),
             Focus::PoiMenu => " 目的地: 1ガソスタ 2カフェ 3コンビニ 4道の駅 5展望 6公園 7峠道  / キーワード周辺検索  Esc=取消 ".to_string(),
-            Focus::PoiList => format!(" [{}] ↑↓選択 s=始点 Enter=経由 e=終点 f=再検索 Esc=閉 ", poi_label),
+            Focus::PoiList => format!(" [{}] ↑↓選択 Enter=移動 s始 e終 v経由 f再検索 Esc閉 ", poi_label),
             Focus::RouteList => " お気に入り: ↑↓選択 Enter=読込 Esc=閉 ".to_string(),
             Focus::WaypointList => " 並べ替え: ↑↓/Tab 選択  [ ]移動  x削除  +/-拡縮  Esc閉 ".to_string(),
             Focus::Map => {
-                let base = format!(" ?ヘルプ z{z} {lat:.4},{lon:.4} | s始 e終 v経由({}) Tab並替 m:{} n候補 W走 f目的地 S保存 L呼出 gGPX o共有 /検索 q",
+                let base = format!(" ?ヘルプ z{z} {lat:.4},{lon:.4} | s始 e終 v経由({}) m:{} n候補 W走 f目的地 P点 V表 S保存 L呼出 gGPX o共有 /検索 q",
                     wps.len(), mode_label(&mode));
                 match &route_note { Some(rn) => format!("{base} | {rn} "), None => base }
             }
@@ -1185,6 +1263,27 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                         KeyCode::Char(c) => { buf.push(c); focus = Focus::Search(buf); }
                         _ => focus = Focus::Search(buf),
                     },
+                    Focus::SpotCat(mut buf) => match k.code {
+                        KeyCode::Enter => { let cat = buf.trim().to_string(); if !cat.is_empty() { focus = Focus::SpotName(String::new(), cat); } }
+                        KeyCode::Esc => {}
+                        KeyCode::Backspace => { buf.pop(); focus = Focus::SpotCat(buf); }
+                        KeyCode::Char(c) => { buf.push(c); focus = Focus::SpotCat(buf); }
+                        _ => focus = Focus::SpotCat(buf),
+                    },
+                    Focus::SpotName(mut buf, cat) => match k.code {
+                        KeyCode::Enter => {
+                            let s = Spot { lat, lon, cat: cat.clone(), name: buf.trim().to_string() };
+                            let _ = ensure_spot_cat(&s.cat, &mut spot_cats);
+                            addr = match append_spot(&s) { Ok(_) => format!("スポット保存: {}/{}", s.cat, s.name), Err(e) => format!("({e})") };
+                            spots.push(s);
+                            show_spots = true;
+                            apply_spots(&mut spec, &spots, &spot_cats, show_spots);
+                        }
+                        KeyCode::Esc => {}
+                        KeyCode::Backspace => { buf.pop(); focus = Focus::SpotName(buf, cat); }
+                        KeyCode::Char(c) => { buf.push(c); focus = Focus::SpotName(buf, cat); }
+                        _ => focus = Focus::SpotName(buf, cat),
+                    },
                     Focus::NearSearch(mut buf) => match k.code {
                         KeyCode::Enter => {
                             let q = buf.trim().to_string();
@@ -1238,11 +1337,8 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                     Focus::PoiList => match k.code {
                         KeyCode::Up => { poi_sel = poi_sel.saturating_sub(1); focus = Focus::PoiList; }
                         KeyCode::Down => { if poi_sel + 1 < pois.len() { poi_sel += 1; } focus = Focus::PoiList; }
-                        KeyCode::Enter => {
-                            if let Some(p) = pois.get(poi_sel) {
-                                if wps.len() < 2 { wps.push((p.0, p.1)); } else { wps.insert(wps.len() - 1, (p.0, p.1)); }
-                                { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; }
-                            }
+                        KeyCode::Enter => { // 選択地点へ移動するだけ(ルートには足さない)
+                            if let Some(p) = pois.get(poi_sel) { let (nx, ny) = deg_to_pixel(p.0, p.1, z); cx = nx; cy = ny; }
                             focus = Focus::PoiList;
                         }
                         KeyCode::Char('s') => {
@@ -1261,8 +1357,16 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                             }
                             focus = Focus::PoiList;
                         }
-                        KeyCode::Char('p') => focus = Focus::PoiMenu,
-                        KeyCode::Esc => { pois.clear(); { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } }
+                        KeyCode::Char('v') => {
+                            if let Some(p) = pois.get(poi_sel) {
+                                let pt = (p.0, p.1);
+                                if wps.len() < 2 { wps.push(pt); } else { wps.insert(wps.len() - 1, pt); }
+                                { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; }
+                            }
+                            focus = Focus::PoiList;
+                        }
+                        KeyCode::Char('f') | KeyCode::Char('p') => focus = Focus::PoiMenu,
+                        KeyCode::Esc => { pois.clear(); set_markers(&mut spec, &wps, &pois); }
                         _ => focus = Focus::PoiList,
                     },
                     Focus::SaveName(mut buf) => match k.code {
@@ -1328,6 +1432,8 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                             KeyCode::Char('v') => { if wps.len() < 2 { wps.push((lat, lon)); } else { wps.insert(wps.len() - 1, (lat, lon)); } { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } }
                             KeyCode::Tab | KeyCode::BackTab => { if !wps.is_empty() { focus = Focus::WaypointList; } } // 並べ替えパネル
                             KeyCode::Char('?') => help = true,
+                            KeyCode::Char('P') => focus = Focus::SpotCat(String::new()), // マイスポット追加(中心にドロップ)
+                            KeyCode::Char('V') => { show_spots = !show_spots; apply_spots(&mut spec, &spots, &spot_cats, show_spots); addr = if show_spots { "マイスポット表示".into() } else { "マイスポット非表示".into() }; }
                             KeyCode::Char('n') => { // BRouter の代替ルート候補を巡回
                                 if wps.len() >= 2 {
                                     route_alt = (route_alt + 1) % 4;
@@ -1370,7 +1476,11 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                     }
                 }
             }
-            Some(Event::Paste(s)) => { match &mut focus { Focus::Search(buf) | Focus::SaveName(buf) | Focus::NearSearch(buf) => buf.push_str(&s), _ => {} } }
+            Some(Event::Paste(s)) => { match &mut focus {
+                Focus::Search(buf) | Focus::SaveName(buf) | Focus::NearSearch(buf) | Focus::SpotCat(buf) => buf.push_str(&s),
+                Focus::SpotName(buf, _) => buf.push_str(&s),
+                _ => {}
+            } }
             _ => {}
         }
     }
