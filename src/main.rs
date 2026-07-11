@@ -1365,7 +1365,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                             }
                             focus = Focus::PoiList;
                         }
-                        KeyCode::Char('f') | KeyCode::Char('p') => focus = Focus::PoiMenu,
+                        KeyCode::Char('f') => focus = Focus::PoiMenu,
                         KeyCode::Esc => { pois.clear(); set_markers(&mut spec, &wps, &pois); }
                         _ => focus = Focus::PoiList,
                     },
@@ -1424,7 +1424,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                             KeyCode::Char('-') | KeyCode::Char('_') => if z > 2 { z -= 1; cx /= 2.0; cy /= 2.0; addr.clear(); },
                             KeyCode::Char('a') => addr = reverse_geocode(lat, lon).unwrap_or_else(|e| format!("({e})")),
                             KeyCode::Char('/') => focus = Focus::Search(String::new()),
-                            KeyCode::Char('f') | KeyCode::Char('p') => focus = Focus::PoiMenu,
+                            KeyCode::Char('f') => focus = Focus::PoiMenu,
                             KeyCode::Char('S') => focus = Focus::SaveName(String::new()),
                             KeyCode::Char('L') => { route_names = list_named_routes(); rn_sel = 0; if route_names.is_empty() { addr = "お気に入り無し".into(); } else { focus = Focus::RouteList; } }
                             KeyCode::Char('s') => { if wps.is_empty() { wps.push((lat, lon)); } else { wps[0] = (lat, lon); } { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } }
