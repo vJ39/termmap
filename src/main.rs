@@ -982,7 +982,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
             Focus::PoiMenu => " 目的地: 1ガソスタ 2カフェ 3コンビニ 4道の駅 5展望 6公園 7峠道   Esc=取消 ".to_string(),
             Focus::PoiList => format!(" [{}] ↑↓選択 s=始点 Enter=経由 e=終点 f=再検索 Esc=閉 ", poi_label),
             Focus::RouteList => " お気に入り: ↑↓選択 Enter=読込 Esc=閉 ".to_string(),
-            Focus::WaypointList => " 並べ替え: ↑↓/Tab 選択  [ ]移動  x削除  Esc閉 ".to_string(),
+            Focus::WaypointList => " 並べ替え: ↑↓/Tab 選択  [ ]移動  x削除  +/-拡縮  Esc閉 ".to_string(),
             Focus::Map => {
                 let base = format!(" ?ヘルプ z{z} {lat:.4},{lon:.4} | s始 e終 v経由({}) Tab並替 m:{} f目的地 S保存 L呼出 gGPX /検索 a住所 q",
                     wps.len(), mode_label(&mode));
@@ -1096,6 +1096,8 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                     Focus::WaypointList => match k.code {
                         KeyCode::Up | KeyCode::BackTab => { if !wps.is_empty() { wp_sel = (wp_sel + wps.len() - 1) % wps.len(); } focus = Focus::WaypointList; }
                         KeyCode::Down | KeyCode::Tab => { if !wps.is_empty() { wp_sel = (wp_sel + 1) % wps.len(); } focus = Focus::WaypointList; }
+                        KeyCode::Char('+') | KeyCode::Char('=') => { if z < 19 { z += 1; cx *= 2.0; cy *= 2.0; } focus = Focus::WaypointList; }
+                        KeyCode::Char('-') | KeyCode::Char('_') => { if z > 2 { z -= 1; cx /= 2.0; cy /= 2.0; } focus = Focus::WaypointList; }
                         KeyCode::Char('[') => { if wp_sel > 0 && wp_sel < wps.len() { wps.swap(wp_sel, wp_sel - 1); wp_sel -= 1; route_note = recompute(&mut spec, &wps, &pois, &mode); } focus = Focus::WaypointList; }
                         KeyCode::Char(']') => { if wp_sel + 1 < wps.len() { wps.swap(wp_sel, wp_sel + 1); wp_sel += 1; route_note = recompute(&mut spec, &wps, &pois, &mode); } focus = Focus::WaypointList; }
                         KeyCode::Char('x') => {
