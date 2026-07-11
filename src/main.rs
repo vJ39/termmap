@@ -823,6 +823,36 @@ fn recompute(spec: &mut OverlaySpec, wps: &[(f64, f64)], pois: &[(f64, f64, Stri
     } else { None }
 }
 
+// 対話モードの操作マニュアル(? で表示)
+const HELP: &[&str] = &[
+    " termmap 対話モード ─ 操作マニュアル",
+    "",
+    " [移動]",
+    "   ←↑↓→        パン (Shift+矢印で大きく)",
+    "   + / -          ズーム",
+    "   /              住所・地名で検索して移動",
+    "   a              中心の住所を表示",
+    "",
+    " [ルートを作る]  中心の十字(黄)が置く位置",
+    "   s / e / v      中心を 始点 / 終点 / 経由点 にする",
+    "   Tab / S-Tab    点を選択 (白丸で強調)",
+    "   [ / ]          選択点を 前 / 後ろ へ並べ替え",
+    "   x              選択点を削除     c  ルート全消去",
+    "   m              モード切替  下道 → 高速 → 最短",
+    "",
+    " [目的地・お気に入り]",
+    "   f              カテゴリ検索 1ｶﾞｿ 2ｶﾌｪ 3ｺﾝﾋﾞﾆ 4道の駅 5展望 6公園 7峠道",
+    "                   → リスト: ↑↓選択 / s始点 e終点 Enter経由 / Esc閉",
+    "   S / L          ルートを お気に入り保存 / 呼び出し",
+    "   g              ルートを GPX 保存 (termmap-route.gpx)",
+    "",
+    " [起動オプション]  --range KM,.. 航続リング / --route / --load-route 名前",
+    "",
+    "   ?  このヘルプ      q  終了      Esc  サブモード取消",
+    "",
+    "   (任意のキーで閉じる)",
+];
+
 // ---- 対話モード (crossterm) ----
 // 端末状態を RAII で復元する。パニック/早期return でも Drop で raw mode と代替スクリーンを必ず戻す。
 struct TermGuard;
@@ -844,7 +874,7 @@ impl Drop for TermGuard {
 
 fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Result<()> {
     use crossterm::event::{self, Event, KeyCode, KeyModifiers};
-    enum Focus { Map, Search(String), SaveName(String), PoiMenu, PoiList, RouteList }
+    enum Focus { Map, Search(String), SaveName(String), PoiMenu, PoiList, RouteList, WaypointList }
     let _guard = TermGuard::enter()?; // Drop で必ず端末復元
     let mut cache: Cache = HashMap::new();
     let mut out = std::io::stdout();
@@ -862,6 +892,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
     let mut poi_label = String::new();
     let mut route_names: Vec<String> = Vec::new(); // お気に入り一覧(L)
     let mut rn_sel: usize = 0;
+    let mut help = false; // ? でヘルプ表示
     let mut route_note = recompute(&mut spec, &wps, &pois, &mode);
 
     let _ = write!(out, "\x1b[2J");
@@ -869,8 +900,19 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
         let (tc, tr) = crossterm::terminal::size().unwrap_or((100, 40));
         let cols = tc.max(20) as u32;
         let map_rows = (tr.max(3) - 1) as u32;
+        if help { // ヘルプ全画面。任意キーで閉じる
+            let _ = write!(out, "\x1b[2J\x1b[H");
+            for (i, l) in HELP.iter().enumerate().take(map_rows as usize) {
+                let _ = write!(out, "\x1b[{};1H{}\x1b[K", i + 1, l);
+            }
+            let _ = write!(out, "\x1b[{};1H\x1b[7m 任意のキーで閉じる \x1b[0m\x1b[K", tr);
+            let _ = out.flush();
+            if let Event::Key(_) = event::read()? { help = false; }
+            continue;
+        }
         let show_routes = matches!(focus, Focus::RouteList);
-        let gut: u32 = if !pois.is_empty() || show_routes { 26 } else { 0 };
+        let show_wps = matches!(focus, Focus::WaypointList);
+        let gut: u32 = if !pois.is_empty() || show_routes || show_wps { 26 } else { 0 };
         let map_cols = cols.saturating_sub(gut).max(10);
         let (ow, oh) = if a.braille || a.edge { (map_cols * 2, map_rows * 4) } else { (map_cols, map_rows * 2) };
         let (lat, lon) = pixel_to_deg(cx, cy, z);
@@ -886,7 +928,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                     let (gx, gy) = deg_to_pixel(wps[s].0, wps[s].1, z);
                     let ix = (gx - (cx - ow as f64 / 2.0)).floor() as i32;
                     let iy = (gy - (cy - oh as f64 / 2.0)).floor() as i32;
-                    draw_ring(&mut ov, ix, iy, 5, [255, 255, 255], 2);
+                    draw_ring(&mut ov, ix, iy, 3, [255, 255, 255], 1);
                 }
                 render(&img, a, Some(&ov))
             }
@@ -896,7 +938,14 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
         // 左袖リスト(POI か お気に入り)の各行を組む
         let glines: Vec<String> = if gut > 0 {
             let gw = gut as usize;
-            let (header, items, sel): (String, Vec<String>, usize) = if show_routes {
+            let (header, items, sel): (String, Vec<String>, usize) = if show_wps {
+                let n = wps.len();
+                let its = wps.iter().enumerate().map(|(i, (la, lo))| {
+                    let role = if i == 0 { "始点" } else if i + 1 == n { "終点" } else { "経由" };
+                    format!("#{} {} {:.3},{:.3}", i + 1, role, la, lo)
+                }).collect();
+                ("並べ替え".to_string(), its, wp_sel)
+            } else if show_routes {
                 ("お気に入り".to_string(), route_names.clone(), rn_sel)
             } else {
                 let its = pois.iter().map(|(la, lo, nm, _)| {
@@ -933,9 +982,10 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
             Focus::PoiMenu => " 目的地: 1ガソスタ 2カフェ 3コンビニ 4道の駅 5展望 6公園 7峠道   Esc=取消 ".to_string(),
             Focus::PoiList => format!(" [{}] ↑↓選択 s=始点 Enter=経由 e=終点 f=再検索 Esc=閉 ", poi_label),
             Focus::RouteList => " お気に入り: ↑↓選択 Enter=読込 Esc=閉 ".to_string(),
+            Focus::WaypointList => " 並べ替え: ↑↓/Tab 選択  [ ]移動  x削除  Esc閉 ".to_string(),
             Focus::Map => {
-                let base = format!(" z{z} {lat:.4},{lon:.4} | s始 e終 v経由({}) Tab#{} []並替 x消 m:{} f目的地 S保存 L呼出 gGPX /検索 a住所 q",
-                    wps.len(), if wps.is_empty() { 0 } else { wp_sel + 1 }, mode_label(&mode));
+                let base = format!(" ?ヘルプ z{z} {lat:.4},{lon:.4} | s始 e終 v経由({}) Tab並替 m:{} f目的地 S保存 L呼出 gGPX /検索 a住所 q",
+                    wps.len(), mode_label(&mode));
                 match &route_note { Some(rn) => format!("{base} | {rn} "), None => base }
             }
         };
@@ -1042,6 +1092,19 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                         KeyCode::Esc => {}
                         _ => focus = Focus::RouteList,
                     },
+                    // 並べ替えパネル: 順序を見ながら選択/移動/削除
+                    Focus::WaypointList => match k.code {
+                        KeyCode::Up | KeyCode::BackTab => { if !wps.is_empty() { wp_sel = (wp_sel + wps.len() - 1) % wps.len(); } focus = Focus::WaypointList; }
+                        KeyCode::Down | KeyCode::Tab => { if !wps.is_empty() { wp_sel = (wp_sel + 1) % wps.len(); } focus = Focus::WaypointList; }
+                        KeyCode::Char('[') => { if wp_sel > 0 && wp_sel < wps.len() { wps.swap(wp_sel, wp_sel - 1); wp_sel -= 1; route_note = recompute(&mut spec, &wps, &pois, &mode); } focus = Focus::WaypointList; }
+                        KeyCode::Char(']') => { if wp_sel + 1 < wps.len() { wps.swap(wp_sel, wp_sel + 1); wp_sel += 1; route_note = recompute(&mut spec, &wps, &pois, &mode); } focus = Focus::WaypointList; }
+                        KeyCode::Char('x') => {
+                            if !wps.is_empty() { let i = wp_sel.min(wps.len() - 1); wps.remove(i); if wp_sel >= wps.len() && wp_sel > 0 { wp_sel -= 1; } route_note = recompute(&mut spec, &wps, &pois, &mode); }
+                            if !wps.is_empty() { focus = Focus::WaypointList; } // 空になったら閉じる
+                        }
+                        KeyCode::Esc | KeyCode::Enter => {} // 閉じる → Map
+                        _ => focus = Focus::WaypointList,
+                    },
                     Focus::Map => {
                         let frac = if k.modifiers.contains(KeyModifiers::SHIFT) { 4.0 } else { 16.0 };
                         let step = (oh as f64 / frac).max(1.0);
@@ -1061,8 +1124,8 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                             KeyCode::Char('s') => { if wps.is_empty() { wps.push((lat, lon)); } else { wps[0] = (lat, lon); } route_note = recompute(&mut spec, &wps, &pois, &mode); }
                             KeyCode::Char('e') => { if wps.len() >= 2 { let l = wps.len() - 1; wps[l] = (lat, lon); } else { wps.push((lat, lon)); } route_note = recompute(&mut spec, &wps, &pois, &mode); }
                             KeyCode::Char('v') => { if wps.len() < 2 { wps.push((lat, lon)); } else { wps.insert(wps.len() - 1, (lat, lon)); } route_note = recompute(&mut spec, &wps, &pois, &mode); }
-                            KeyCode::Tab => { if !wps.is_empty() { wp_sel = (wp_sel + 1) % wps.len(); } }
-                            KeyCode::BackTab => { if !wps.is_empty() { wp_sel = (wp_sel + wps.len() - 1) % wps.len(); } }
+                            KeyCode::Tab | KeyCode::BackTab => { if !wps.is_empty() { focus = Focus::WaypointList; } } // 並べ替えパネル
+                            KeyCode::Char('?') => help = true,
                             KeyCode::Char('x') => { if !wps.is_empty() { let i = wp_sel.min(wps.len() - 1); wps.remove(i); if wp_sel >= wps.len() && wp_sel > 0 { wp_sel -= 1; } route_note = recompute(&mut spec, &wps, &pois, &mode); } }
                             KeyCode::Char('[') => { if wp_sel > 0 && wp_sel < wps.len() { wps.swap(wp_sel, wp_sel - 1); wp_sel -= 1; route_note = recompute(&mut spec, &wps, &pois, &mode); } }
                             KeyCode::Char(']') => { if wp_sel + 1 < wps.len() { wps.swap(wp_sel, wp_sel + 1); wp_sel += 1; route_note = recompute(&mut spec, &wps, &pois, &mode); } }
