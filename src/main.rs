@@ -157,43 +157,6 @@ fn reverse_geocode(lat: f64, lon: f64) -> Result<String, String> {
     json_first(&body, "\"display_name\":\"").ok_or_else(|| "住所が取得できません".to_string())
 }
 
-// 語で広域検索(Nominatim, 複数ヒット)。(lat,lon,表示名) の列を返す。
-fn geocode_list(q: &str, limit: u32) -> Vec<(f64, f64, String)> {
-    let url = format!("https://nominatim.openstreetmap.org/search?format=json&limit={limit}&accept-language=ja&q={}", urlencode(q));
-    let body = match ureq::get(&url).set("User-Agent", "termmap/0.1 (personal experiment)").call() {
-        Ok(r) => r.into_string().unwrap_or_default(),
-        Err(_) => return Vec::new(),
-    };
-    let mut out = Vec::new();
-    let bytes = body.as_bytes();
-    let mut i = match body.find('[') { Some(p) => p, None => return out };
-    let (mut depth, mut obj_start, mut in_obj, mut in_str, mut esc) = (0i32, 0usize, false, false, false);
-    while i < bytes.len() {
-        let b = bytes[i];
-        if in_str {
-            if esc { esc = false; } else if b == b'\\' { esc = true; } else if b == b'"' { in_str = false; }
-        } else {
-            match b {
-                b'"' => in_str = true,
-                b'{' => { if depth == 0 { obj_start = i; in_obj = true; } depth += 1; }
-                b'}' => { depth -= 1; if depth == 0 && in_obj {
-                    let obj = &body[obj_start..=i];
-                    let la = json_str(obj, "lat").and_then(|s| s.parse::<f64>().ok());
-                    let lo = json_str(obj, "lon").and_then(|s| s.parse::<f64>().ok());
-                    if let (Some(la), Some(lo)) = (la, lo) {
-                        out.push((la, lo, json_str(obj, "display_name").unwrap_or_default()));
-                    }
-                    in_obj = false;
-                }}
-                b']' => { if depth == 0 { break; } }
-                _ => {}
-            }
-        }
-        i += 1;
-    }
-    out
-}
-
 // GPS/測位で現在地を取得 (--here)。macOS CoreLocationCLI に委譲。
 // 要: brew install corelocationcli + System Settings > Privacy > Location Services で許可。
 fn gps_here() -> Result<(f64, f64), String> {
@@ -918,6 +881,13 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                 let (mx, my) = (ow as i32 / 2, oh as i32 / 2); // 中心クロスヘア(黄)
                 draw_line(&mut ov, mx - 6, my, mx + 6, my, [255, 255, 0], 1);
                 draw_line(&mut ov, mx, my - 6, mx, my + 6, [255, 255, 0], 1);
+                if !wps.is_empty() { // 選択中(Tab)の waypoint を白丸で強調
+                    let s = wp_sel.min(wps.len() - 1);
+                    let (gx, gy) = deg_to_pixel(wps[s].0, wps[s].1, z);
+                    let ix = (gx - (cx - ow as f64 / 2.0)).floor() as i32;
+                    let iy = (gy - (cy - oh as f64 / 2.0)).floor() as i32;
+                    draw_ring(&mut ov, ix, iy, 5, [255, 255, 255], 2);
+                }
                 render(&img, a, Some(&ov))
             }
             Err(e) => format!("取得失敗: {e}\r\n"),
@@ -958,10 +928,10 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
             }
         }
         let status = match &focus {
-            Focus::Search(buf) => format!(" 検索(語): {buf}\u{2588}   Enter=検索 Esc=取消 "),
+            Focus::Search(buf) => format!(" 検索: {buf}\u{2588}   Enter=移動 Esc=取消 "),
             Focus::SaveName(buf) => format!(" ルート名: {buf}\u{2588}   Enter=保存 Esc=取消 "),
             Focus::PoiMenu => " 目的地: 1ガソスタ 2カフェ 3コンビニ 4道の駅 5展望 6公園 7峠道   Esc=取消 ".to_string(),
-            Focus::PoiList => format!(" [{}] ↑↓選択 Enter=経由に追加 e=終点 f=再検索 Esc=閉 ", poi_label),
+            Focus::PoiList => format!(" [{}] ↑↓選択 s=始点 Enter=経由 e=終点 f=再検索 Esc=閉 ", poi_label),
             Focus::RouteList => " お気に入り: ↑↓選択 Enter=読込 Esc=閉 ".to_string(),
             Focus::Map => {
                 let base = format!(" z{z} {lat:.4},{lon:.4} | s始 e終 v経由({}) Tab#{} []並替 x消 m:{} f目的地 S保存 L呼出 gGPX /検索 a住所 q",
@@ -978,18 +948,12 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                 let cur = std::mem::replace(&mut focus, Focus::Map);
                 match cur {
                     Focus::Search(mut buf) => match k.code {
-                        KeyCode::Enter => {
+                        KeyCode::Enter => { // その場所へ中心を移動するだけ(追加しない)
                             let q = buf.trim().to_string();
                             if !q.is_empty() {
-                                let results = geocode_list(&q, 20);
-                                if results.is_empty() { addr = format!("見つからない: {q}"); }
-                                else {
-                                    let (la, lo) = (results[0].0, results[0].1);
-                                    let (nx, ny) = deg_to_pixel(la, lo, z); cx = nx; cy = ny; addr.clear();
-                                    pois = results.into_iter().map(|(a, b, nm)| (a, b, nm, PoiCat::Other)).collect();
-                                    poi_sel = 0; poi_label = format!("検索:{q}");
-                                    route_note = recompute(&mut spec, &wps, &pois, &mode);
-                                    focus = Focus::PoiList; // 候補一覧から経由/終点に追加できる
+                                match geocode(&q) {
+                                    Ok((la, lo)) => { let (nx, ny) = deg_to_pixel(la, lo, z); cx = nx; cy = ny; addr.clear(); }
+                                    Err(_) => addr = format!("見つからない: {q}"),
                                 }
                             }
                         }
@@ -1027,6 +991,14 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                         KeyCode::Enter => {
                             if let Some(p) = pois.get(poi_sel) {
                                 if wps.len() < 2 { wps.push((p.0, p.1)); } else { wps.insert(wps.len() - 1, (p.0, p.1)); }
+                                route_note = recompute(&mut spec, &wps, &pois, &mode);
+                            }
+                            focus = Focus::PoiList;
+                        }
+                        KeyCode::Char('s') => {
+                            if let Some(p) = pois.get(poi_sel) {
+                                let pt = (p.0, p.1);
+                                if wps.is_empty() { wps.push(pt); } else { wps[0] = pt; }
                                 route_note = recompute(&mut spec, &wps, &pois, &mode);
                             }
                             focus = Focus::PoiList;
@@ -1090,6 +1062,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                             KeyCode::Char('e') => { if wps.len() >= 2 { let l = wps.len() - 1; wps[l] = (lat, lon); } else { wps.push((lat, lon)); } route_note = recompute(&mut spec, &wps, &pois, &mode); }
                             KeyCode::Char('v') => { if wps.len() < 2 { wps.push((lat, lon)); } else { wps.insert(wps.len() - 1, (lat, lon)); } route_note = recompute(&mut spec, &wps, &pois, &mode); }
                             KeyCode::Tab => { if !wps.is_empty() { wp_sel = (wp_sel + 1) % wps.len(); } }
+                            KeyCode::BackTab => { if !wps.is_empty() { wp_sel = (wp_sel + wps.len() - 1) % wps.len(); } }
                             KeyCode::Char('x') => { if !wps.is_empty() { let i = wp_sel.min(wps.len() - 1); wps.remove(i); if wp_sel >= wps.len() && wp_sel > 0 { wp_sel -= 1; } route_note = recompute(&mut spec, &wps, &pois, &mode); } }
                             KeyCode::Char('[') => { if wp_sel > 0 && wp_sel < wps.len() { wps.swap(wp_sel, wp_sel - 1); wp_sel -= 1; route_note = recompute(&mut spec, &wps, &pois, &mode); } }
                             KeyCode::Char(']') => { if wp_sel + 1 < wps.len() { wps.swap(wp_sel, wp_sel + 1); wp_sel += 1; route_note = recompute(&mut spec, &wps, &pois, &mode); } }
