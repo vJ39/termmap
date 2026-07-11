@@ -339,6 +339,20 @@ fn fit_cells(s: &str, cells: usize) -> String {
     o
 }
 
+// 同期API待ちの間、中央に「通信中…」を出す(呼び出し直前にflushして表示)。
+// 同期処理なのでアニメーションはしないが、待ちが起きていることを示す。
+fn show_busy<W: std::io::Write>(out: &mut W, cols: u32, rows: u16, msg: &str) {
+    let text = format!("  ⏳ {}  ", msg);
+    let w = text.chars().count();
+    let c0 = ((cols as usize).saturating_sub(w) / 2).max(1);
+    let r0 = (rows / 2).max(1);
+    let pad = " ".repeat(w);
+    let _ = write!(out, "\x1b[{};{}H\x1b[7m{}\x1b[0m", r0, c0, pad);
+    let _ = write!(out, "\x1b[{};{}H\x1b[7m{}\x1b[0m", r0 + 1, c0, text);
+    let _ = write!(out, "\x1b[{};{}H\x1b[7m{}\x1b[0m", r0 + 2, c0, pad);
+    let _ = out.flush();
+}
+
 // 対話モードの操作マニュアル(? で表示)
 const HELP: &[&str] = &[
     " termmap 対話モード ─ 操作マニュアル",
@@ -510,6 +524,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                             KeyCode::Up => { let (a, b) = streetview::step(slat_c, slon_c, hd_c as f64, 20.0); (a, b, hd_c) }
                             _ => { let (a, b) = streetview::step(slat_c, slon_c, hd_c as f64 + 180.0, 20.0); (a, b, hd_c) }
                         };
+                        show_busy(&mut out, cols, tr, "実写取得中…");
                         if let Ok(im) = streetview::fetch(nlat, nlon, nhd, 640, 480, &cfg.streetview_api_key) {
                             street = Some((im, nhd, nlat, nlon)); // Err時は現状維持(行き止まり等)
                         }
@@ -791,6 +806,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                                 let results: Vec<(f64, f64, String)> = match scache.get(&ckey) {
                                     Some(v) => v.clone(), // キャッシュヒット=API叩かない
                                     None => {
+                                        show_busy(&mut out, cols, tr, "検索中…");
                                         let r = geocode_list(&q, Some((lat, lon)), &cfg.streetview_api_key);
                                         if !r.is_empty() { scache.insert(ckey, r.clone()); let _ = searchcache::save(&scache); }
                                         r
@@ -863,6 +879,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                             if !name.is_empty() {
                                 let (n_lat, w_lon) = pixel_to_deg(cx - ow as f64 / 2.0, cy - oh as f64 / 2.0, z);
                                 let (s_lat, e_lon) = pixel_to_deg(cx + ow as f64 / 2.0, cy + oh as f64 / 2.0, z);
+                                show_busy(&mut out, cols, tr, "道路検索中…");
                                 match roadsearch::fetch(&name, s_lat, w_lon, n_lat, e_lon) {
                                     Ok(frags) if !frags.is_empty() => {
                                         let rf: Vec<roadtrace::RoadFrag> = frags.into_iter().map(|(pts, oneway)| roadtrace::RoadFrag { pts, oneway }).collect();
@@ -891,6 +908,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                         KeyCode::Enter => {
                             let dir = buf.trim().to_string();
                             if !dir.is_empty() {
+                                show_busy(&mut out, cols, tr, "AI提案中…(数秒)");
                                 match recommend::recommend(&cfg.llm_command, &cfg.llm_model, &dir) {
                                     Ok(recs) if !recs.is_empty() => {
                                         let mut verified: Vec<(f64, f64, String)> = Vec::new();
@@ -1217,7 +1235,8 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                             }
                             KeyCode::Char('i') => { // 実写(Street View)を中心地点で開く
                                 if !streetview::available(&cfg.streetview_api_key) { addr = "実写: APIキー未設定(config.toml [streetview])".into(); }
-                                else { addr = "実写取得中…".into();
+                                else {
+                                    show_busy(&mut out, cols, tr, "実写取得中…");
                                     match streetview::fetch(lat, lon, 0, 640, 480, &cfg.streetview_api_key) {
                                         Ok(img) => { street = Some((img, 0, lat, lon)); addr.clear(); }
                                         Err(e) => addr = format!("実写: {e}"),
