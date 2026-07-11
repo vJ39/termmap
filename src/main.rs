@@ -12,7 +12,8 @@ mod route;
 mod poi;
 mod spots;
 mod share;
-// 以下は今後の機能用(設定画面/道路トレース/おすすめ相談)。まだ未wireのため dead_code 許容。
+mod streetview;
+// 以下は今後の機能用(道路トレース/おすすめ相談)。まだ未wireのため dead_code 許容。
 #[allow(dead_code)]
 mod config;
 #[allow(dead_code)]
@@ -366,6 +367,10 @@ const HELP: &[&str] = &[
     "   V              マイスポットの表示 / 非表示",
     "   o              スマホ共有(GoogleマップのQRをポップアップ表示)",
     "",
+    " [実写]",
+    "   i              中心地点の実写(Street View)を全画面表示  ←→向き Esc/q戻る",
+    "                   要 config.toml [streetview] api_key",
+    "",
     " [起動オプション]  --range KM,.. 航続リング / --route / --load-route 名前",
     "",
     "   ?  ヘルプ   q  終了   Esc  サブモード取消   Ctrl+C  計算の中断(終了はq)",
@@ -401,6 +406,8 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
     let mut out = std::io::stdout();
     let mut addr = String::new();          // 'a' 住所 / 一時メッセージ
     let mut focus = Focus::Map;
+    let cfg = config::load_config();       // 設定(いまは streetview api_key のみ使用)
+    let mut street: Option<(RgbImage, i32, f64, f64)> = None; // 実写(画像, heading, lat, lon)
 
     let (home_lat, home_lon) = pixel_to_deg(cx, cy, z);
     let mut spec = build_spec(a, home_lat, home_lon); // --range のリングは保持
@@ -442,6 +449,38 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
             let _ = write!(out, "\x1b[{};1H\x1b[7m 任意のキーで閉じる \x1b[0m\x1b[K", tr);
             let _ = out.flush();
             if let Event::Key(_) = event::read()? { help = false; }
+            continue;
+        }
+        if street.is_some() { // 実写(Street View)全画面。←→で向き、Esc/qで戻る
+            { // 描画(不変借用のスコープ)
+                let (img, heading, slat, slon) = street.as_ref().unwrap();
+                let rs = image::imageops::resize(img, cols.max(10), map_rows * 2, FilterType::Triangle);
+                let art = render_halfblock(&rs);
+                let sv_lines: Vec<&str> = art.split("\r\n").collect();
+                let _ = write!(out, "\x1b[H");
+                for i in 0..map_rows as usize {
+                    let ln = sv_lines.get(i).copied().unwrap_or("");
+                    let _ = write!(out, "\x1b[{};1H{}\x1b[K", i + 1, ln);
+                }
+                let hd = ((heading % 360) + 360) % 360;
+                let st = fit_cells(&format!(" 実写 heading {hd}°  ←→向き  Esc/q戻る  {slat:.4},{slon:.4} "), cols as usize);
+                let _ = write!(out, "\x1b[{};1H\x1b[7m{st}\x1b[0m\x1b[K", tr);
+                let _ = out.flush();
+            }
+            let (hd_c, slat_c, slon_c) = { let (_, h, la, lo) = street.as_ref().unwrap(); (*h, *la, *lo) };
+            if let Event::Key(k) = event::read()? {
+                match k.code {
+                    KeyCode::Left | KeyCode::Right => {
+                        let hd2 = hd_c + if k.code == KeyCode::Left { -45 } else { 45 };
+                        match streetview::fetch(slat_c, slon_c, hd2, 640, 480, &cfg.streetview_api_key) {
+                            Ok(im) => street = Some((im, hd2, slat_c, slon_c)),
+                            Err(e) => { addr = format!("実写: {e}"); street = None; }
+                        }
+                    }
+                    KeyCode::Esc | KeyCode::Char('q') => street = None,
+                    _ => {}
+                }
+            }
             continue;
         }
         let show_routes = matches!(focus, Focus::RouteList);
@@ -532,7 +571,7 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
             Focus::RouteList => " お気に入り: ↑↓選択 Enter=読込 Esc=閉 ".to_string(),
             Focus::WaypointList => " 並べ替え: ↑↓/Tab 選択  [ ]移動  x削除  +/-拡縮  Esc閉 ".to_string(),
             Focus::Map => {
-                let base = format!(" ?ヘルプ z{z} {lat:.4},{lon:.4} | s始 e終 v経由({}) m:{} n候補 W走 f目的地 P点 V表 S保存 L呼出 gGPX o共有 /検索 q",
+                let base = format!(" ?ヘルプ z{z} {lat:.4},{lon:.4} | s始 e終 v経由({}) m:{} n候補 W走 f目的地 P点 V表 i実写 S保存 L呼出 gGPX o共有 /検索 q",
                     wps.len(), mode_label(&mode));
                 match &route_note { Some(rn) => format!("{base} | {rn} "), None => base }
             }
@@ -854,6 +893,15 @@ fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Resul
                             KeyCode::Char('?') => help = true,
                             KeyCode::Char('P') => { cat_sel = 0; focus = Focus::SpotCatList; } // マイスポット(カテゴリ一覧)
                             KeyCode::Char('V') => { show_spots = !show_spots; apply_spots(&mut spec, &spots, &spot_cats, show_spots); addr = if show_spots { "マイスポット表示".into() } else { "マイスポット非表示".into() }; }
+                            KeyCode::Char('i') => { // 実写(Street View)を中心地点で開く
+                                if !streetview::available(&cfg.streetview_api_key) { addr = "実写: APIキー未設定(config.toml [streetview])".into(); }
+                                else { addr = "実写取得中…".into();
+                                    match streetview::fetch(lat, lon, 0, 640, 480, &cfg.streetview_api_key) {
+                                        Ok(img) => { street = Some((img, 0, lat, lon)); addr.clear(); }
+                                        Err(e) => addr = format!("実写: {e}"),
+                                    }
+                                }
+                            }
                             KeyCode::Char('n') => { // BRouter の代替ルート候補を巡回
                                 if wps.len() >= 2 {
                                     route_alt = (route_alt + 1) % 4;

@@ -37,6 +37,7 @@ pub struct Config {
     pub sample_interval_m: f64,
     pub style: String,
     pub show_spots: bool,
+    pub streetview_api_key: String,
 }
 
 impl Default for Config {
@@ -49,6 +50,7 @@ impl Default for Config {
             sample_interval_m: 800.0,
             style: "osm".to_string(),
             show_spots: true,
+            streetview_api_key: String::new(),
         }
     }
 }
@@ -138,6 +140,11 @@ pub fn load_config_from(path: &Path) -> Config {
                     cfg.show_spots = b;
                 }
             }
+            ("streetview", "api_key") => {
+                if let Some(s) = parse_string(value) {
+                    cfg.streetview_api_key = s;
+                }
+            }
             _ => {}
         }
     }
@@ -167,7 +174,10 @@ pub fn save_config_to(path: &Path, c: &Config) -> Result<(), String> {
          \n\
          [display]\n\
          style = \"{}\"\n\
-         show_spots = {}\n",
+         show_spots = {}\n\
+         \n\
+         [streetview]\n\
+         api_key = \"{}\"\n",
         c.llm_recommend_enabled,
         c.llm_model,
         c.llm_command,
@@ -175,6 +185,7 @@ pub fn save_config_to(path: &Path, c: &Config) -> Result<(), String> {
         c.sample_interval_m,
         c.style,
         c.show_spots,
+        c.streetview_api_key,
     );
 
     std::fs::write(path, contents).map_err(|e| format!("failed to write {}: {}", path.display(), e))
@@ -298,6 +309,7 @@ mod tests {
             sample_interval_m: 12.5,
             style: "satellite".to_string(),
             show_spots: false,
+            streetview_api_key: "AIzaTESTKEY_example_123".to_string(),
         };
         save_config_to(&path, &original).expect("save should succeed");
         let loaded = load_config_from(&path);
@@ -483,6 +495,7 @@ profile = "custom-profile"
             sample_interval_m: 1.0,
             style: "s".to_string(),
             show_spots: false,
+            streetview_api_key: "k".to_string(),
         };
         save_config_to(&path, &cfg).unwrap();
         let loaded = load_config_from(&path);
