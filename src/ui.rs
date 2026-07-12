@@ -317,7 +317,7 @@ impl Drop for TermGuard {
 pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Result<()> {
     use crossterm::event::{self, Event, KeyCode, KeyModifiers};
     enum Focus { Map, Menu(MenuLevel), Search(String), SaveName(String), NearSearch(String), PoiMenu, PoiList, RouteList, WaypointList,
-                 NewCat(String), SpotForm { name: String, url: String, field: usize }, SpotList, SpotCatList, SpotRename(String, usize), Settings, RoadSearch(String), SpotEditName(String, usize), Recommend(String), RouteForm { sel: usize } }
+                 NewCat(String), SpotForm { name: String, url: String, field: usize }, SpotList, SpotCatList, SpotRename(String, usize), Settings, RoadSearch(String), SpotEditName(String, usize), Recommend(String), RouteForm { sel: usize }, ColorPick { cat: usize } }
     let _guard = TermGuard::enter()?; // Drop で必ず端末復元
     let mut cache: Cache = Cache::new();
     let mut out = std::io::stdout();
@@ -374,6 +374,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     let mut cur_cat = String::new(); // スポット一覧で表示中のカテゴリ
     let mut pending_spot: Option<(f64, f64, String)> = None; // 検索結果からお気に入り登録する際の保留(座標+名前)。カテゴリ選択待ち
     let mut list_offset: usize = 0; // 左袖リストのスクロール開始位置(表示中の1リストで共有・ensure_visibleで追従)
+    let mut color_sel: u8 = 0; // 色ピッカーで選択中のパレットindex
     apply_spots(&mut spec, &spots, &spot_cats, show_spots);
 
     // メニュー項目/直接キー どちらからでも同じ処理を走らせる。
@@ -619,7 +620,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 }).collect();
                 (format!("{cur_cat}"), its, sp_sel)
             } else if show_catlist {
-                let its = spot_cats.iter().map(|(n, i)| format!("{} 色{}", n, i)).collect();
+                let its = spot_cats.iter().map(|(n, _)| n.clone()).collect(); // 色は c で実色スウォッチから選ぶ(番号表示はやめた)
                 ("カテゴリ".to_string(), its, cat_sel)
             } else if show_settings {
                 let onoff = |b: bool| if b { "ON" } else { "OFF" };
@@ -744,6 +745,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             Focus::RouteList => " お気に入り: ↑↓選択 Enter=読込 Esc=閉 ".to_string(),
             Focus::WaypointList => " 並べ替え: ↑↓/Tab 選択  [ ]移動  x削除  +/-拡縮  Esc閉 ".to_string(),
             Focus::RouteForm { .. } => " ルート作成: ↑↓選択 Enter=実行 x削除(経由) [ ]並替 Esc戻る ".to_string(),
+            Focus::ColorPick { .. } => " 色を選択: ←→ Enter=決定 Esc=取消 ".to_string(),
             Focus::Menu(MenuLevel::Categories) => " ↑↓カテゴリ Enter展開 / 文字キーで直接実行 Esc閉 ".to_string(),
             Focus::Menu(MenuLevel::Items(_)) => " ↑↓選択 Enter実行 / 右端キーでも実行 Esc戻る ".to_string(),
             Focus::Map => {
@@ -848,6 +850,34 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             Focus::SpotEditName(b, _) => draw_input_panel(&mut out, cols, map_rows, "スポット名を変更", "Enter=確定  Esc=取消", b, input_cur),
             _ => {}
         }
+        // 色ピッカー(中央パネル・実色スウォッチ)。選択中は [ ] で囲む
+        if let Focus::ColorPick { .. } = &focus {
+            const BG: &str = "\x1b[30;47m";
+            const RST: &str = "\x1b[0m";
+            let iw = SPOT_PALETTE.len() * 4 + 2; // 各色4セル(枠含む)+左余白2
+            let blank = " ".repeat(iw);
+            let mut sw = String::from(BG);
+            sw.push_str("  ");
+            for (i, c) in SPOT_PALETTE.iter().enumerate() {
+                let s = i as u8 == color_sel;
+                sw.push_str(BG);
+                sw.push(if s { '[' } else { ' ' });
+                sw.push_str(&format!("\x1b[48;2;{};{};{}m  ", c[0], c[1], c[2]));
+                sw.push_str(BG);
+                sw.push(if s { ']' } else { ' ' });
+            }
+            sw.push_str(RST);
+            let title = fit_cells("  色を選択", iw);
+            let hint = fit_cells("  ←→ 選択   Enter 決定   Esc 取消", iw);
+            let r0 = ((map_rows as usize).saturating_sub(6) / 2).max(1) as u32;
+            let c0 = ((cols as usize).saturating_sub(iw) / 2).max(1) as u32;
+            let _ = write!(out, "\x1b[{};{}H{}{}{}", r0, c0, BG, blank, RST);
+            let _ = write!(out, "\x1b[{};{}H{}{}{}", r0 + 1, c0, BG, title, RST);
+            let _ = write!(out, "\x1b[{};{}H{}", r0 + 2, c0, sw);
+            let _ = write!(out, "\x1b[{};{}H{}{}{}", r0 + 3, c0, BG, blank, RST);
+            let _ = write!(out, "\x1b[{};{}H{}{}{}", r0 + 4, c0, BG, hint, RST);
+            let _ = write!(out, "\x1b[{};{}H{}{}{}", r0 + 5, c0, BG, blank, RST);
+        }
         out.flush()?;
 
         // 入力待ち。ルート計算中(route_job)はポーリングして結果を取り込む
@@ -929,8 +959,10 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                         }
                         KeyCode::Char('r') => { if let Some((n, _)) = spot_cats.get(cat_sel) { input_cur = n.chars().count(); focus = Focus::SpotRename(n.clone(), cat_sel); } else { focus = Focus::SpotCatList; } }
                         KeyCode::Char('c') => {
-                            if let Some(e) = spot_cats.get_mut(cat_sel) { e.1 = (e.1 + 1) % SPOT_PALETTE.len() as u8; let _ = save_all_cats(&spot_cats); apply_spots(&mut spec, &spots, &spot_cats, show_spots); }
-                            focus = Focus::SpotCatList;
+                            match spot_cats.get(cat_sel) {
+                                Some((_, ci)) => { color_sel = *ci; focus = Focus::ColorPick { cat: cat_sel }; }
+                                None => focus = Focus::SpotCatList,
+                            }
                         }
                         KeyCode::Char('x') => {
                             if let Some((name, _)) = spot_cats.get(cat_sel).cloned() {
@@ -1356,6 +1388,20 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                 focus = Focus::RouteForm { sel: s };
                             }
                             _ => focus = Focus::RouteForm { sel: s },
+                        }
+                    }
+                    // 色ピッカー: ←→でパレット選択、Enterで確定
+                    Focus::ColorPick { cat } => {
+                        let n = SPOT_PALETTE.len() as u8;
+                        match k.code {
+                            KeyCode::Left => { color_sel = (color_sel + n - 1) % n; focus = Focus::ColorPick { cat }; }
+                            KeyCode::Right => { color_sel = (color_sel + 1) % n; focus = Focus::ColorPick { cat }; }
+                            KeyCode::Enter => {
+                                if let Some(e) = spot_cats.get_mut(cat) { e.1 = color_sel; let _ = save_all_cats(&spot_cats); apply_spots(&mut spec, &spots, &spot_cats, show_spots); }
+                                focus = Focus::SpotCatList;
+                            }
+                            KeyCode::Esc => { focus = Focus::SpotCatList; }
+                            _ => focus = Focus::ColorPick { cat },
                         }
                     }
                     Focus::Map => {
