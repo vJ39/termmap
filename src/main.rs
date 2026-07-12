@@ -18,6 +18,7 @@ mod elevation;
 mod gpslive;
 mod searchcache;
 mod roadsearch;
+mod sound;
 mod ui;
 #[allow(dead_code)]
 mod roadtrace; // point_at/sample等は使用、cut_segment等は将来用

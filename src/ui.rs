@@ -393,6 +393,8 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     let mut onboard = onboarded_marker().map_or(false, |p| !p.exists()); // 初回起動なら操作案内を出す
     let mut spot_move_confirm: Option<usize> = None; // m(中心へ移動)の確認待ち。上書きは破壊的なのでy/nを挟む
     apply_spots(&mut spec, &spots, &spot_cats, show_spots);
+    // 操作UI効果音(macOS afplay)。設定OFF/非macOS/afplay不在なら no-op。設定トグルで作り直す。
+    let mut snd = sound::Sound::new(cfg.sound_enabled);
 
     // メニュー項目/直接キー どちらからでも同じ処理を走らせる。
     // lat/lon/cols/tr は各ループで再計算されるフレーム値。マクロ衛生性のため引数で受け取る。
@@ -402,14 +404,14 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             MenuAction::SearchPoi => { focus = Focus::PoiMenu; }
             MenuAction::ShowAddress => { addr = reverse_geocode($lat, $lon).unwrap_or_else(|e| format!("({e})")); }
             MenuAction::Recommend => {
-                if !cfg.llm_recommend_enabled { addr = "おすすめ: 設定でOFF(,でON)".into(); }
-                else if !recommend::claude_available(&cfg.llm_command) { addr = "おすすめ: claudeが無い(設定のLLM/コマンド確認)".into(); }
+                if !cfg.llm_recommend_enabled { snd.play("error"); addr = "おすすめ: 設定でOFF(,でON)".into(); }
+                else if !recommend::claude_available(&cfg.llm_command) { snd.play("error"); addr = "おすすめ: claudeが無い(設定のLLM/コマンド確認)".into(); }
                 else { input_cur = 0; focus = Focus::Recommend(String::new()); }
             }
             MenuAction::RouteForm => { focus = Focus::RouteForm { sel: 0 }; }
-            MenuAction::SetStart => { wp_set_start(&mut wps, ($lat, $lon)); let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; }
-            MenuAction::SetEnd => { wp_set_end(&mut wps, ($lat, $lon)); let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; }
-            MenuAction::AddVia => { wp_add_via(&mut wps, ($lat, $lon)); let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; }
+            MenuAction::SetStart => { snd.play("pop"); wp_set_start(&mut wps, ($lat, $lon)); let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; }
+            MenuAction::SetEnd => { snd.play("pop"); wp_set_end(&mut wps, ($lat, $lon)); let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; }
+            MenuAction::AddVia => { snd.play("pop"); wp_add_via(&mut wps, ($lat, $lon)); let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; }
             MenuAction::RoadRoute => { input_cur = 0; focus = Focus::RoadSearch(String::new()); }
             MenuAction::Wander => {
                 let dist = a.dist.unwrap_or(40.0);
@@ -424,7 +426,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     route_alt = (route_alt + 1) % 4;
                     let (nn, jj) = trigger_route(&mut spec, &wps, &pois, &mode, route_alt);
                     route_note = nn; route_job = jj;
-                } else { addr = "ルート未確定".into(); }
+                } else { snd.play("error"); addr = "ルート未確定".into(); }
             }
             MenuAction::ClearRoute => { wps.clear(); wp_sel = 0; let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; }
             MenuAction::ManageSpots => { cat_sel = 0; focus = Focus::SpotCatList; }
@@ -434,7 +436,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 if show_elev && (spec.routes.is_empty() || !route_ele.iter().any(|&z| z != 0.0)) { addr = "標高: ルート確定後に表示".into(); }
             }
             MenuAction::StreetView => {
-                if !streetview::available(&cfg.google_maps_api_key) { addr = "実写: APIキー未設定(config.toml [streetview])".into(); }
+                if !streetview::available(&cfg.google_maps_api_key) { snd.play("error"); addr = "実写: APIキー未設定(config.toml [streetview])".into(); }
                 else {
                     // 実写取得を別スレッドへ。focus は Map のまま(メニューは既に閉じている)でスピナーが回る。
                     let (la, lo) = ($lat, $lon);
@@ -451,7 +453,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 if spec.routes.last().map_or(false, |r| r.pts.len() >= 2) {
                     if play.is_some() { play = None; addr = "再生: 停止".into(); }
                     else { play = Some(0.0); addr = "再生: 開始(Aで停止)".into(); }
-                } else { addr = "再生: ルート未確定".into(); }
+                } else { snd.play("error"); addr = "再生: ルート未確定".into(); }
             }
             MenuAction::ToggleGps => {
                 if gps_rx.is_some() { gps_rx = None; addr = "ライブ現在地: OFF".into(); }
@@ -465,7 +467,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             MenuAction::LoadRoute => { route_names = list_named_routes(); rn_sel = 0; if route_names.is_empty() { addr = "お気に入り無し".into(); } else { focus = Focus::RouteList; } }
             MenuAction::SaveGpx => match spec.routes.last() {
                 Some(rt) => addr = match write_gpx("termmap-route.gpx", &rt.pts) { Ok(_) => "GPX保存: termmap-route.gpx".into(), Err(e) => format!("({e})") },
-                None => addr = "ルート未確定".into(),
+                None => { snd.play("error"); addr = "ルート未確定".into(); }
             },
             MenuAction::ShareQr => {
                 if wps.len() >= 2 {
@@ -474,7 +476,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                         Ok(c) => qr_view = Some(c.render::<qrcode::render::unicode::Dense1x2>().quiet_zone(false).build()),
                         Err(_) => addr = "QR生成失敗".into(),
                     }
-                } else { addr = "ルート未確定".into(); }
+                } else { snd.play("error"); addr = "ルート未確定".into(); }
             }
             MenuAction::Settings => { set_sel = 0; focus = Focus::Settings; }
             MenuAction::Help => { help = true; }
@@ -678,6 +680,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     format!("提案AIモデル {}", model_ja),
                     format!("実写(StreetView) {}", onoff(cfg.streetview_enabled)),
                     format!("画像表示(iTerm2) {}", onoff(cfg.image_mode)),
+                    format!("サウンド {}", onoff(cfg.sound_enabled)),
                     format!("Google APIキー {}", keyset),
                 ];
                 ("設定".to_string(), its, set_sel)
@@ -783,6 +786,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     9 => "LLM: おすすめに使うモデルを循環(claude-sonnet-5/haiku/opus)",
                     10 => "実写: iで中心地点のStreet Viewを開く機能のON/OFF(要Google APIキー)",
                     11 => if image_capable() { "画像表示: 地図と実写をiTerm2インライン画像で実画像表示(AAでなく実画像)。Iキーでも切替" } else { "画像表示: この端末は画像非対応(iTerm2/WezTermで有効)" },
+                    12 => "サウンド: 操作音のON/OFF(macOSのafplayで再生)。切替は次回起動から確実に反映",
                     _ => "Google APIキー: 検索(Geocoding)とStreet View共通。この行でCmd+V貼付→設定、sで保存。環境変数TERMMAP_GOOGLE_API_KEYでも可",
                 };
                 format!(" ▶ {desc}   [↑↓選択 Enter切替 s保存 Esc閉]")
@@ -979,8 +983,8 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             match search_job.as_ref().unwrap().try_recv() {
                 Ok((ckey, q, res)) => {
                     match res {
-                        Err(e) => addr = format!("検索できません（{e}）"),
-                        Ok(v) if v.is_empty() => addr = format!("見つからない: {q}"),
+                        Err(e) => { snd.play("error"); addr = format!("検索できません（{e}）"); }
+                        Ok(v) if v.is_empty() => { snd.play("error"); addr = format!("見つからない: {q}"); }
                         Ok(v) => {
                             scache.insert(ckey, v.clone()); let _ = searchcache::save(&scache);
                             pois = v.into_iter().take(8).map(|(la, lo, nm)| (la, lo, nm, PoiCat::Waypoint)).collect();
@@ -1008,7 +1012,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     let mut got: Vec<(f64, f64, String, PoiCat)> = osm.into_iter().map(|(a, b, nm)| (a, b, nm, PoiCat::Other)).collect();
                     got.sort_by(|p, r| haversine_km((lat, lon), (p.0, p.1)).partial_cmp(&haversine_km((lat, lon), (r.0, r.1))).unwrap_or(std::cmp::Ordering::Equal));
                     mine.extend(got);
-                    if mine.is_empty() { addr = format!("周辺に無し: {q}"); }
+                    if mine.is_empty() { snd.play("error"); addr = format!("周辺に無し: {q}"); }
                     else {
                         pois = mine; poi_sel = 0; poi_label = format!("周辺:{q}");
                         set_markers(&mut spec, &wps, &pois);
@@ -1082,6 +1086,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             Some(Event::Key(k)) if spot_move_confirm.is_some() => { // 「中心へ移動」の確認(y=実行/他=取消)
                 let gi = spot_move_confirm.take().unwrap();
                 if let KeyCode::Char('y') = k.code {
+                    snd.play("confirm");
                     if let Some(s) = spots.get_mut(gi) { s.lat = lat; s.lon = lon; }
                     let _ = save_all_spots(&spots); apply_spots(&mut spec, &spots, &spot_cats, show_spots);
                     addr = "スポット位置を中心へ移動".into();
@@ -1104,7 +1109,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                 let ckey = searchcache::make_key(&q, lat, lon);
                                 // キャッシュヒットは即適用(同期)。ミス時のみ別スレッドで検索(通信/サーバ障害は0件と区別)。
                                 if let Some(v) = scache.get(&ckey).cloned() {
-                                    if v.is_empty() { addr = format!("見つからない: {q}"); }
+                                    if v.is_empty() { snd.play("error"); addr = format!("見つからない: {q}"); }
                                     else {
                                         pois = v.into_iter().take(8).map(|(la, lo, nm)| (la, lo, nm, PoiCat::Waypoint)).collect();
                                         poi_sel = 0;
@@ -1125,7 +1130,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                 }
                             }
                         }
-                        KeyCode::Esc => {}
+                        KeyCode::Esc => { snd.play("back"); }
                         other => { edit_line(&mut buf, &mut input_cur, other); focus = Focus::Search(buf); } // ←→/文字/BS/Del/Home/End
                     },
                     Focus::SpotCatList => match k.code { // カテゴリ一覧(P)
@@ -1159,6 +1164,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             if let Some((la, lo, nm)) = pending_spot.take() {
                                 // 検索結果からの登録: 選択カテゴリに新規スポットとして保存
                                 if let Some(cat) = cat {
+                                    snd.play("pop");
                                     let s = Spot { lat: la, lon: lo, cat: cat.clone(), name: spot_clean(&nm) };
                                     let _ = append_spot(&s);
                                     spots.push(s);
@@ -1171,12 +1177,12 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                 cur_cat = cat; sp_sel = 0; focus = Focus::SpotList;
                             } else { focus = Focus::SpotCatList; }
                         }
-                        KeyCode::Esc => { pending_spot = None; } // 登録キャンセル時も保留を消す→Mapへ
+                        KeyCode::Esc => { snd.play("back"); pending_spot = None; } // 登録キャンセル時も保留を消す→Mapへ
                         _ => focus = Focus::SpotCatList,
                     },
                     Focus::Settings => { let mut stay = true; match k.code { // 設定画面
                         KeyCode::Up => { set_sel = set_sel.saturating_sub(1); }
-                        KeyCode::Down => { if set_sel + 1 < 13 { set_sel += 1; } }
+                        KeyCode::Down => { if set_sel + 1 < 14 { set_sel += 1; } }
                         KeyCode::Left | KeyCode::Right => {
                             if set_sel == 6 { let d = if k.code == KeyCode::Left { -100.0 } else { 100.0 }; cfg.sample_interval_m = (cfg.sample_interval_m + d).clamp(100.0, 5000.0); }
                         }
@@ -1193,13 +1199,14 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             9 => cfg.llm_model = match cfg.llm_model.as_str() { "claude-sonnet-5" => "claude-haiku-4-5", "claude-haiku-4-5" => "claude-opus-4-8", _ => "claude-sonnet-5" }.to_string(),
                             10 => cfg.streetview_enabled = !cfg.streetview_enabled,
                             11 => cfg.image_mode = !cfg.image_mode,
+                            12 => { cfg.sound_enabled = !cfg.sound_enabled; snd = sound::Sound::new(cfg.sound_enabled); snd.play("confirm"); }
                             _ => addr = "APIキー: この行で貼り付け(Cmd+V)して設定".into(),
                         },
                         KeyCode::Char('s') => {
                             cfg.braille = opts.braille; cfg.classify = opts.classify; cfg.edge = opts.edge; cfg.mono = opts.mono; cfg.style = opts.style.clone();
                             addr = match config::save_config(&cfg) { Ok(_) => "設定を保存(config.toml)".into(), Err(e) => format!("保存失敗: {e}") };
                         }
-                        KeyCode::Esc => { stay = false; }
+                        KeyCode::Esc => { snd.play("back"); stay = false; }
                         _ => {}
                     } if stay { focus = Focus::Settings; } },
                     Focus::RoadSearch(mut buf) => match k.code { // 道路名/ref で現在view内をルート化
@@ -1228,7 +1235,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                 }
                             }
                         }
-                        KeyCode::Esc => {}
+                        KeyCode::Esc => { snd.play("back"); }
                         other => { edit_line(&mut buf, &mut input_cur, other); focus = Focus::RoadSearch(buf); }
                     },
                     Focus::Recommend(mut buf) => match k.code { // おすすめ: 方向性→claude -p→実在確認→候補一覧
@@ -1260,7 +1267,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                 focus = Focus::Map; // UIは生きたまま(スピナー表示・Escで中断)
                             }
                         }
-                        KeyCode::Esc => {}
+                        KeyCode::Esc => { snd.play("back"); }
                         other => { edit_line(&mut buf, &mut input_cur, other); focus = Focus::Recommend(buf); }
                     },
                     Focus::SpotList => match k.code { // cur_cat のスポット一覧
@@ -1301,11 +1308,12 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             }
                             focus = Focus::SpotList;
                         }
-                        KeyCode::Esc => focus = Focus::SpotCatList,
+                        KeyCode::Esc => { snd.play("back"); focus = Focus::SpotCatList; }
                         _ => focus = Focus::SpotList,
                     },
                     Focus::SpotEditName(mut buf, gi) => match k.code { // スポット改名
                         KeyCode::Enter => {
+                            snd.play("confirm");
                             let new = spot_clean(buf.trim());
                             if let Some(s) = spots.get_mut(gi) { s.name = new; }
                             let _ = save_all_spots(&spots);
@@ -1316,8 +1324,8 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                         other => { edit_line(&mut buf, &mut input_cur, other); focus = Focus::SpotEditName(buf, gi); }
                     },
                     Focus::NewCat(mut buf) => match k.code {
-                        KeyCode::Enter => { let name = buf.trim().to_string(); if !name.is_empty() { let _ = ensure_spot_cat(&name, &mut spot_cats); } focus = Focus::SpotCatList; }
-                        KeyCode::Esc => focus = Focus::SpotCatList,
+                        KeyCode::Enter => { let name = buf.trim().to_string(); if !name.is_empty() { snd.play("confirm"); let _ = ensure_spot_cat(&name, &mut spot_cats); } focus = Focus::SpotCatList; }
+                        KeyCode::Esc => { snd.play("back"); focus = Focus::SpotCatList; }
                         other => { edit_line(&mut buf, &mut input_cur, other); focus = Focus::NewCat(buf); }
                     },
                     Focus::SpotRename(mut buf, idx) => match k.code {
@@ -1340,7 +1348,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     Focus::SpotForm { mut name, mut url, mut field } => match k.code { // 新規スポット登録フォーム
                         KeyCode::Up | KeyCode::BackTab => { field = (field + 3) % 4; input_cur = form_cur(&name, &url, field); focus = Focus::SpotForm { name, url, field }; }
                         KeyCode::Down | KeyCode::Tab => { field = (field + 1) % 4; input_cur = form_cur(&name, &url, field); focus = Focus::SpotForm { name, url, field }; }
-                        KeyCode::Esc => focus = Focus::SpotList, // 取消
+                        KeyCode::Esc => { snd.play("back"); focus = Focus::SpotList; } // 取消
                         KeyCode::Enter => match field {
                             0 => { field = 1; input_cur = url.chars().count(); focus = Focus::SpotForm { name, url, field }; } // 次のフィールドへ
                             1 => { field = 2; input_cur = 0; focus = Focus::SpotForm { name, url, field }; }
@@ -1361,6 +1369,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                     } else { Act::Err("URLから位置を取得できません(GoogleマップのURLか確認)".into()) };
                                 match act {
                                     Act::Save(la, lo, nm) => {
+                                        snd.play("confirm");
                                         let s = Spot { lat: la, lon: lo, cat: cur_cat.clone(), name: nm };
                                         let _ = ensure_spot_cat(&s.cat, &mut spot_cats);
                                         addr = match append_spot(&s) { Ok(_) => format!("スポット保存: {}", s.name), Err(e) => format!("({e})") };
@@ -1399,7 +1408,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                 focus = Focus::Map; // UIは生きたまま(スピナー表示・Escで中断)
                             }
                         }
-                        KeyCode::Esc => {}
+                        KeyCode::Esc => { snd.play("back"); }
                         other => { edit_line(&mut buf, &mut input_cur, other); focus = Focus::NearSearch(buf); }
                     },
                     Focus::PoiMenu => match k.code {
@@ -1416,7 +1425,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                     show_busy(&mut out, cols, tr, "検索中…");
                                     match poi_search(&POI_KINDS[i], cx, cy, z, ow, oh, lat, lon) {
                                         Ok(items) if !items.is_empty() => { pois = items; poi_sel = 0; poi_label = POI_KINDS[i].label.to_string(); set_markers(&mut spec, &wps, &pois); focus = Focus::PoiList; }
-                                        Ok(_) => { addr = format!("周辺2kmに{}無し", POI_KINDS[i].label); focus = Focus::PoiMenu; }
+                                        Ok(_) => { snd.play("error"); addr = format!("周辺2kmに{}無し", POI_KINDS[i].label); focus = Focus::PoiMenu; }
                                         Err(e) => { addr = format!("({e})"); focus = Focus::PoiMenu; }
                                     }
                                 }
@@ -1434,6 +1443,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                         }
                         KeyCode::Char('s') => {
                             if let Some(p) = pois.get(poi_sel) {
+                                snd.play("pop");
                                 let pt = (p.0, p.1);
                                 if wps.is_empty() { wps.push(pt); } else { wps[0] = pt; }
                                 { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; }
@@ -1442,6 +1452,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                         }
                         KeyCode::Char('e') => {
                             if let Some(p) = pois.get(poi_sel) {
+                                snd.play("pop");
                                 let pt = (p.0, p.1);
                                 if wps.len() >= 2 { let l = wps.len() - 1; wps[l] = pt; } else { wps.push(pt); }
                                 { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; }
@@ -1450,6 +1461,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                         }
                         KeyCode::Char('v') => {
                             if let Some(p) = pois.get(poi_sel) {
+                                snd.play("pop");
                                 let pt = (p.0, p.1);
                                 if wps.len() < 2 { wps.push(pt); } else { wps.insert(wps.len() - 1, pt); }
                                 { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; }
@@ -1472,10 +1484,10 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                         KeyCode::Enter => {
                             let name = buf.trim().to_string();
                             if !name.is_empty() {
-                                addr = match save_named_route(&name, &mode, &wps) { Ok(_) => format!("保存: {name}"), Err(e) => format!("({e})") };
+                                addr = match save_named_route(&name, &mode, &wps) { Ok(_) => { snd.play("confirm"); format!("保存: {name}") }, Err(e) => format!("({e})") };
                             }
                         }
-                        KeyCode::Esc => {}
+                        KeyCode::Esc => { snd.play("back"); }
                         other => { edit_line(&mut buf, &mut input_cur, other); focus = Focus::SaveName(buf); }
                     },
                     Focus::RouteList => match k.code {
@@ -1513,7 +1525,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                         KeyCode::Up => { menu_cat_sel = menu_cat_sel.saturating_sub(1); focus = Focus::Menu(MenuLevel::Categories); }
                         KeyCode::Down => { if menu_cat_sel + 1 < MENU_CATEGORIES.len() { menu_cat_sel += 1; } focus = Focus::Menu(MenuLevel::Categories); }
                         KeyCode::Enter => { menu_item_sel = 0; focus = Focus::Menu(MenuLevel::Items(menu_cat_sel)); }
-                        KeyCode::Esc => {} // 閉じる → Map
+                        KeyCode::Esc => { snd.play("back"); } // 閉じる → Map
                         KeyCode::Char(c) => match menu_action_for_key(c) {
                             Some(act) => run_action!(act, lat, lon, cols, tr),
                             None => focus = Focus::Menu(MenuLevel::Categories),
@@ -1527,7 +1539,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             KeyCode::Up => { menu_item_sel = menu_item_sel.saturating_sub(1); focus = Focus::Menu(MenuLevel::Items(ci)); }
                             KeyCode::Down => { if menu_item_sel + 1 < items.len() { menu_item_sel += 1; } focus = Focus::Menu(MenuLevel::Items(ci)); }
                             KeyCode::Enter => run_action!(items[menu_item_sel].action, lat, lon, cols, tr),
-                            KeyCode::Esc => { focus = Focus::Menu(MenuLevel::Categories); } // 上位カテゴリへ戻る
+                            KeyCode::Esc => { snd.play("back"); focus = Focus::Menu(MenuLevel::Categories); } // 上位カテゴリへ戻る
                             KeyCode::Char(c) => match items.iter().find(|it| it.key == c) {
                                 Some(it) => run_action!(it.action, lat, lon, cols, tr),
                                 None => focus = Focus::Menu(MenuLevel::Items(ci)),
@@ -1543,7 +1555,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                         match k.code {
                             KeyCode::Up => { s = s.saturating_sub(1); focus = Focus::RouteForm { sel: s }; }
                             KeyCode::Down => { if s + 1 < rows.len() { s += 1; } focus = Focus::RouteForm { sel: s }; }
-                            KeyCode::Esc => {} // 閉じる → Map
+                            KeyCode::Esc => { snd.play("back"); } // 閉じる → Map
                             KeyCode::Enter => match row {
                                 RfRow::Start => { wp_set_start(&mut wps, (lat, lon)); let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; focus = Focus::RouteForm { sel: s }; }
                                 RfRow::End => { wp_set_end(&mut wps, (lat, lon)); let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; focus = Focus::RouteForm { sel: s }; }
@@ -1581,7 +1593,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                 if let Some(e) = spot_cats.get_mut(cat) { e.1 = color_sel; let _ = save_all_cats(&spot_cats); apply_spots(&mut spec, &spots, &spot_cats, show_spots); }
                                 focus = Focus::SpotCatList;
                             }
-                            KeyCode::Esc => { focus = Focus::SpotCatList; }
+                            KeyCode::Esc => { snd.play("back"); focus = Focus::SpotCatList; }
                             _ => focus = Focus::ColorPick { cat },
                         }
                     }
@@ -1618,18 +1630,18 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             KeyCode::Char('f') => focus = Focus::PoiMenu,
                             KeyCode::Char('S') => { input_cur = 0; focus = Focus::SaveName(String::new()); }
                             KeyCode::Char('L') => { route_names = list_named_routes(); rn_sel = 0; if route_names.is_empty() { addr = "お気に入り無し".into(); } else { focus = Focus::RouteList; } }
-                            KeyCode::Char('s') => { wp_set_start(&mut wps, (lat, lon)); { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } }
-                            KeyCode::Char('e') => { wp_set_end(&mut wps, (lat, lon)); { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } }
-                            KeyCode::Char('v') => { wp_add_via(&mut wps, (lat, lon)); { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } }
+                            KeyCode::Char('s') => { snd.play("pop"); wp_set_start(&mut wps, (lat, lon)); { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } }
+                            KeyCode::Char('e') => { snd.play("pop"); wp_set_end(&mut wps, (lat, lon)); { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } }
+                            KeyCode::Char('v') => { snd.play("pop"); wp_add_via(&mut wps, (lat, lon)); { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } }
                             KeyCode::Tab | KeyCode::BackTab => { if !wps.is_empty() { focus = Focus::WaypointList; } } // 並べ替えパネル
-                            KeyCode::Char(' ') => { menu_cat_sel = 0; focus = Focus::Menu(MenuLevel::Categories); } // Space=メニュー(カテゴリ→展開の2階層)
+                            KeyCode::Char(' ') => { snd.play("blip"); menu_cat_sel = 0; focus = Focus::Menu(MenuLevel::Categories); } // Space=メニュー(カテゴリ→展開の2階層)
                             KeyCode::Char('?') => help = true,
                             KeyCode::Char('P') => { cat_sel = 0; focus = Focus::SpotCatList; } // マイスポット(カテゴリ一覧)
                             KeyCode::Char(',') => { set_sel = 0; focus = Focus::Settings; } // 設定画面
                             KeyCode::Char('r') => { input_cur = 0; focus = Focus::RoadSearch(String::new()); } // 道路名でルート(現在view内)
                             KeyCode::Char('@') => { // おすすめツーリングスポット提案(claude -p)
-                                if !cfg.llm_recommend_enabled { addr = "おすすめ: 設定でOFF(,でON)".into(); }
-                                else if !recommend::claude_available(&cfg.llm_command) { addr = "おすすめ: claudeが無い(設定のLLM/コマンド確認)".into(); }
+                                if !cfg.llm_recommend_enabled { snd.play("error"); addr = "おすすめ: 設定でOFF(,でON)".into(); }
+                                else if !recommend::claude_available(&cfg.llm_command) { snd.play("error"); addr = "おすすめ: claudeが無い(設定のLLM/コマンド確認)".into(); }
                                 else { input_cur = 0; focus = Focus::Recommend(String::new()); }
                             }
                             KeyCode::Char('V') => { show_spots = !show_spots; apply_spots(&mut spec, &spots, &spot_cats, show_spots); addr = if show_spots { "マイスポット表示".into() } else { "マイスポット非表示".into() }; }
@@ -1641,7 +1653,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                 if spec.routes.last().map_or(false, |r| r.pts.len() >= 2) {
                                     if play.is_some() { play = None; addr = "再生: 停止".into(); }
                                     else { play = Some(0.0); addr = "再生: 開始(Aで停止)".into(); }
-                                } else { addr = "再生: ルート未確定".into(); }
+                                } else { snd.play("error"); addr = "再生: ルート未確定".into(); }
                             }
                             KeyCode::Char('G') => { // ライブ現在地(ブレッドクラム)の ON/OFF
                                 if gps_rx.is_some() { gps_rx = None; addr = "ライブ現在地: OFF".into(); }
@@ -1652,8 +1664,8 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                 }
                             }
                             KeyCode::Char('i') => { // 実写(Street View)を中心地点で開く
-                                if !cfg.streetview_enabled { addr = "実写: OFF(設定で有効化)".into(); }
-                                else if !streetview::available(&cfg.google_maps_api_key) { addr = "実写: Google APIキー未設定([google] maps_api_key)".into(); }
+                                if !cfg.streetview_enabled { snd.play("error"); addr = "実写: OFF(設定で有効化)".into(); }
+                                else if !streetview::available(&cfg.google_maps_api_key) { snd.play("error"); addr = "実写: Google APIキー未設定([google] maps_api_key)".into(); }
                                 else {
                                     // 実写取得を別スレッドへ(focusはMapのまま=スピナーが回る)
                                     let (la, lo) = (lat, lon);
@@ -1677,7 +1689,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                     route_alt = (route_alt + 1) % 4;
                                     let (nn, jj) = trigger_route(&mut spec, &wps, &pois, &mode, route_alt);
                                     route_note = nn; route_job = jj;
-                                } else { addr = "ルート未確定".into(); }
+                                } else { snd.play("error"); addr = "ルート未確定".into(); }
                             }
                             KeyCode::Char('W') => { // 走りまくり(峠/展望の周回)を生成。連打で別案
                                 let dist = a.dist.unwrap_or(40.0);
@@ -1693,7 +1705,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                         Ok(c) => qr_view = Some(c.render::<qrcode::render::unicode::Dense1x2>().quiet_zone(false).build()),
                                         Err(_) => addr = "QR生成失敗".into(),
                                     }
-                                } else { addr = "ルート未確定".into(); }
+                                } else { snd.play("error"); addr = "ルート未確定".into(); }
                             }
                             KeyCode::Char('x') => { wp_remove(&mut wps, &mut wp_sel); { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } }
                             KeyCode::Char('[') => { wp_swap(&mut wps, &mut wp_sel, true); { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } }
@@ -1702,7 +1714,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             KeyCode::Char('c') => { wps.clear(); wp_sel = 0; { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } }
                             KeyCode::Char('g') => match spec.routes.last() {
                                 Some(rt) => addr = match write_gpx("termmap-route.gpx", &rt.pts) { Ok(_) => "GPX保存: termmap-route.gpx".into(), Err(e) => format!("({e})") },
-                                None => addr = "ルート未確定".into(),
+                                None => { snd.play("error"); addr = "ルート未確定".into(); }
                             },
                             KeyCode::Char('q') => quit = true, // Esc はサブモードの取消専用(Mapでは終了しない)
                             _ => {}
@@ -1718,7 +1730,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 Focus::Search(buf) | Focus::SaveName(buf) | Focus::NearSearch(buf) | Focus::NewCat(buf) | Focus::RoadSearch(buf) | Focus::Recommend(buf) => insert_str_at(buf, &mut input_cur, &s),
                 Focus::SpotForm { name, url, field } => { if *field == 0 { insert_str_at(name, &mut input_cur, &s); } else if *field == 1 { insert_str_at(url, &mut input_cur, &s); } }
                 Focus::SpotRename(buf, _) | Focus::SpotEditName(buf, _) => insert_str_at(buf, &mut input_cur, &s),
-                Focus::Settings if set_sel == 12 => { cfg.google_maps_api_key = s.trim().to_string(); addr = "APIキー設定(sで保存)".into(); }
+                Focus::Settings if set_sel == 13 => { cfg.google_maps_api_key = s.trim().to_string(); addr = "APIキー設定(sで保存)".into(); }
                 _ => {}
             } }
             _ => {}

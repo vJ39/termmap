@@ -44,6 +44,7 @@ pub struct Config {
     pub image_mode: bool,            // インライン画像(iTerm2 OSC1337)で実画像を描画。既定OFF(AA描画)
     pub google_maps_api_key: String, // Google Maps系(Geocoding検索/Street View)共通キー。旧streetview_api_keyから改名
     pub streetview_enabled: bool,     // 実写(i)を使うか
+    pub sound_enabled: bool,          // 操作UI効果音(macOS afplay)を鳴らすか
 }
 
 impl Default for Config {
@@ -63,6 +64,7 @@ impl Default for Config {
             image_mode: false,
             google_maps_api_key: String::new(),
             streetview_enabled: true,
+            sound_enabled: true,
         }
     }
 }
@@ -167,6 +169,11 @@ pub fn load_config_from(path: &Path) -> Config {
                     cfg.streetview_enabled = b;
                 }
             }
+            ("sound", "enabled") => {
+                if let Some(b) = parse_bool(value) {
+                    cfg.sound_enabled = b;
+                }
+            }
             // 旧スキーマ後方互換: [streetview] api_key を google_maps_api_key に取り込む(未設定時のみ)
             ("streetview", "api_key") => {
                 if cfg.google_maps_api_key.is_empty() {
@@ -215,6 +222,9 @@ pub fn save_config_to(path: &Path, c: &Config) -> Result<(), String> {
          maps_api_key = \"{}\"\n\
          \n\
          [streetview]\n\
+         enabled = {}\n\
+         \n\
+         [sound]\n\
          enabled = {}\n",
         c.llm_recommend_enabled,
         c.llm_model,
@@ -230,6 +240,7 @@ pub fn save_config_to(path: &Path, c: &Config) -> Result<(), String> {
         c.image_mode,
         c.google_maps_api_key,
         c.streetview_enabled,
+        c.sound_enabled,
     );
 
     // APIキーを含むので unix では 0600。書込中クラッシュで壊さないよう atomic。
@@ -369,6 +380,7 @@ mod tests {
             mono: false,
             image_mode: true,
             google_maps_api_key: "AIzaTESTKEY_example_123".to_string(), streetview_enabled: true,
+            sound_enabled: false,
         };
         save_config_to(&path, &original).expect("save should succeed");
         let loaded = load_config_from(&path);
@@ -581,6 +593,7 @@ profile = "custom-profile"
             mono: true,
             image_mode: false,
             google_maps_api_key: "k".to_string(), streetview_enabled: true,
+            sound_enabled: true,
         };
         save_config_to(&path, &cfg).unwrap();
         let loaded = load_config_from(&path);
