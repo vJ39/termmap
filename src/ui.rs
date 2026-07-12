@@ -424,16 +424,25 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         if let Some(q) = &qr_view {
             let lines: Vec<&str> = q.lines().collect();
             let qw = lines.iter().map(|l| l.chars().count()).max().unwrap_or(21);
-            let bw = qw + 2; // 左右1マスの白余白(quiet zoneは切ってあるので自前で細枠)
-            let c0 = (cols as usize).saturating_sub(bw) as u32 / 2 + 1;
-            let r0 = ((map_rows as usize).saturating_sub(lines.len() + 3) / 2).max(1) as u32;
-            let blank = " ".repeat(bw);
-            let _ = write!(out, "\x1b[{r0};{c0}Hスマホでスキャン→Googleマップ");
-            let _ = write!(out, "\x1b[{};{c0}H\x1b[30;47m{blank}\x1b[0m", r0 + 1); // 上白余白
+            let padx = 2usize; // 左右の白余白(quiet zone)
+            let bw = qw + padx * 2;
+            let c0 = ((cols as usize).saturating_sub(bw) / 2).max(1) as u32;
+            // 行構成: ラベル / 上白余白×2 / QR / 下白余白×2
+            let total = lines.len() + 5;
+            let r0 = ((map_rows as usize).saturating_sub(total) / 2).max(1) as u32;
+            let hpad = " ".repeat(bw);
+            let side = " ".repeat(padx);
+            // ラベルを箱幅で中央寄せ
+            let label = "スマホでスキャン → Googleマップ";
+            let lw: usize = label.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum();
+            let lc = c0 + (bw.saturating_sub(lw) / 2) as u32;
+            let _ = write!(out, "\x1b[{r0};{lc}H\x1b[1m{label}\x1b[0m");
+            // 純白の箱(bright white 107 + black 30)。上下2行の白余白でquiet zone確保
+            for k in 0..2 { let _ = write!(out, "\x1b[{};{c0}H\x1b[30;107m{hpad}\x1b[0m", r0 + 1 + k); }
             for (i, l) in lines.iter().enumerate() {
-                let _ = write!(out, "\x1b[{};{c0}H\x1b[30;47m {} \x1b[0m", r0 + 2 + i as u32, l);
+                let _ = write!(out, "\x1b[{};{c0}H\x1b[30;107m{side}{l:<qw$}{side}\x1b[0m", r0 + 3 + i as u32, qw = qw);
             }
-            let _ = write!(out, "\x1b[{};{c0}H\x1b[30;47m{blank}\x1b[0m", r0 + 2 + lines.len() as u32); // 下白余白
+            for k in 0..2 { let _ = write!(out, "\x1b[{};{c0}H\x1b[30;107m{hpad}\x1b[0m", r0 + 3 + lines.len() as u32 + k); }
             let _ = write!(out, "\x1b[{};1H\x1b[7m 任意のキーで閉じる \x1b[0m\x1b[K", tr);
         }
         out.flush()?;
