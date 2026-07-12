@@ -89,6 +89,30 @@ fn show_busy<W: std::io::Write>(out: &mut W, cols: u32, rows: u16, msg: &str) {
     let _ = out.flush();
 }
 
+// 単一テキスト欄の中央入力パネル(底面バーでなく地図中央に重畳。SpotFormと同じ手法)。
+// title=見出し / hint=下部の操作説明 / buf=入力中の文字列 / cur=カーソル文字位置。
+fn draw_input_panel<W: std::io::Write>(out: &mut W, cols: u32, map_rows: u32, title: &str, hint: &str, buf: &str, cur: usize) {
+    const BG: &str = "\x1b[30;47m";  // 黒字・白地
+    const RST: &str = "\x1b[0m";
+    let iw = (cols as usize).saturating_sub(6).clamp(24, 64); // ボックス内容幅
+    let input_line = format!("  ▸ {}", render_with_cursor(buf, cur));
+    let blank = " ".repeat(iw);
+    let rows: [String; 6] = [
+        blank.clone(),
+        fit_cells(&format!("  {title}"), iw),
+        blank.clone(),
+        fit_cells(&input_line, iw),
+        blank.clone(),
+        fit_cells(&format!("  {hint}"), iw),
+    ];
+    let r0 = ((map_rows as usize).saturating_sub(rows.len() + 1) / 2).max(1) as u32;
+    let c0 = ((cols as usize).saturating_sub(iw) / 2).max(1) as u32;
+    for (i, line) in rows.iter().enumerate() {
+        let _ = write!(out, "\x1b[{};{}H{}{}{}", r0 + i as u32, c0, BG, line, RST);
+    }
+    let _ = write!(out, "\x1b[{};{}H{}{}{}", r0 + rows.len() as u32, c0, BG, blank, RST);
+}
+
 // 対話モードの操作マニュアル(? で表示)
 const HELP: &[&str] = &[
     " termmap 対話モード ─ 操作マニュアル",
@@ -613,13 +637,13 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             }
         }
         let status = match &focus {
-            Focus::Search(buf) => format!(" 検索: {}   Enter=移動 Esc=取消 ", render_with_cursor(buf, input_cur)),
-            Focus::SaveName(buf) => format!(" ルート名: {}   Enter=保存 Esc=取消 ", render_with_cursor(buf, input_cur)),
-            Focus::NearSearch(buf) => format!(" 周辺検索: {}   Enter=検索 Esc=取消 ", render_with_cursor(buf, input_cur)),
-            Focus::NewCat(buf) => format!(" 新規カテゴリ: {}   Enter=作成 Esc=取消 ", render_with_cursor(buf, input_cur)),
+            Focus::Search(_) => " 中央フォームに入力中 ".to_string(),
+            Focus::SaveName(_) => " 中央フォームに入力中 ".to_string(),
+            Focus::NearSearch(_) => " 中央フォームに入力中 ".to_string(),
+            Focus::NewCat(_) => " 中央フォームに入力中 ".to_string(),
             Focus::SpotForm { .. } => " 新規スポット: ↑↓/Tab移動 入力/貼付 Enter=次/送信 Esc=取消 ".to_string(),
             Focus::SpotList => format!(" [{cur_cat}] ↑↓ Enter移動 [ ]並替 n新規 r改名 m中心へ x削除 Esc戻る "),
-            Focus::SpotEditName(buf, _) => format!(" スポット改名: {}   Enter=確定 Esc=取消 ", render_with_cursor(buf, input_cur)),
+            Focus::SpotEditName(_, _) => " 中央フォームに入力中 ".to_string(),
             Focus::SpotCatList => " カテゴリ: ↑↓選択 [ ]並替 Enter=中へ n新規 r改名 c色 x削除(空のみ) Esc=閉 ".to_string(),
             Focus::Settings => {
                 let desc = match set_sel {
@@ -637,9 +661,9 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 };
                 format!(" ▶ {desc}   [↑↓選択 Enter切替 s保存 Esc閉]")
             }
-            Focus::RoadSearch(buf) => format!(" 道路名/ref: {}   Enter=view内を経路に追加(複数連結可・cで全消去) Esc=取消 ", render_with_cursor(buf, input_cur)),
-            Focus::Recommend(buf) => format!(" おすすめ方向性: {}   例:海沿い気持ちいい峠  Enter=提案(数秒) Esc=取消 ", render_with_cursor(buf, input_cur)),
-            Focus::SpotRename(buf, _) => format!(" カテゴリ改名: {}   Enter=確定 Esc=取消 ", render_with_cursor(buf, input_cur)),
+            Focus::RoadSearch(_) => " 中央フォームに入力中 ".to_string(),
+            Focus::Recommend(_) => " 中央フォームに入力中 ".to_string(),
+            Focus::SpotRename(_, _) => " 中央フォームに入力中 ".to_string(),
             Focus::PoiMenu => " 目的地カテゴリ: ↑↓選択 Enter=検索 (数字1-7も可 / キーワードは最終行かEnter) Esc=取消 ".to_string(),
             Focus::PoiList => format!(" [{}] ↑↓選択 Enter=移動 s始 e終 v経由 f再検索 Esc閉 ", poi_label),
             Focus::RouteList => " お気に入り: ↑↓選択 Enter=読込 Esc=閉 ".to_string(),
@@ -735,6 +759,18 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             }
             let _ = write!(out, "\x1b[{};{}H{}", r0 + rows.len() as u32, c0, btn);
             let _ = write!(out, "\x1b[{};{}H{}{}{}", r0 + rows.len() as u32 + 1, c0, BG, blank, RST);
+        }
+        // 単一テキスト入力は地図中央のフォームで受ける(底面バーで完結させない)
+        match &focus {
+            Focus::Search(b) => draw_input_panel(&mut out, cols, map_rows, "地名・住所で検索", "Enter=検索  Esc=取消  (住所も入力OK)", b, input_cur),
+            Focus::SaveName(b) => draw_input_panel(&mut out, cols, map_rows, "ルートに名前を付けて保存", "Enter=保存  Esc=取消", b, input_cur),
+            Focus::NearSearch(b) => draw_input_panel(&mut out, cols, map_rows, "このあたりでキーワード検索", "Enter=検索  Esc=取消", b, input_cur),
+            Focus::NewCat(b) => draw_input_panel(&mut out, cols, map_rows, "新しいカテゴリ名", "Enter=作成  Esc=取消", b, input_cur),
+            Focus::RoadSearch(b) => draw_input_panel(&mut out, cols, map_rows, "道路名・国道番号でルートに追加", "Enter=view内を追加(複数可)  Esc=取消", b, input_cur),
+            Focus::Recommend(b) => draw_input_panel(&mut out, cols, map_rows, "おすすめの方向性 (例: 海沿い / 峠)", "Enter=提案(数秒)  Esc=取消", b, input_cur),
+            Focus::SpotRename(b, _) => draw_input_panel(&mut out, cols, map_rows, "カテゴリ名を変更", "Enter=確定  Esc=取消", b, input_cur),
+            Focus::SpotEditName(b, _) => draw_input_panel(&mut out, cols, map_rows, "スポット名を変更", "Enter=確定  Esc=取消", b, input_cur),
+            _ => {}
         }
         out.flush()?;
 
