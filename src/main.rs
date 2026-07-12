@@ -71,6 +71,20 @@ struct Args {
 
 fn arg_err(msg: &str) -> ! { eprintln!("{msg}"); std::process::exit(2); }
 
+// Web Mercator の緯度有効域(±)。これを超えると deg_to_pixel の tan/ln が非有限化する。
+const WM_LAT: f64 = 85.051_128_78;
+
+// "lat,lon" を厳密にパースする。要素の過不足・範囲外はエラーにする(filter_map で黙って捨てない)。
+fn parse_point(raw: &str) -> Result<(f64, f64), String> {
+    let mut it = raw.split(',');
+    let lat: f64 = it.next().ok_or("緯度がありません")?.trim().parse().map_err(|_| format!("緯度が不正: {raw}"))?;
+    let lon: f64 = it.next().ok_or("経度がありません")?.trim().parse().map_err(|_| format!("経度が不正: {raw}"))?;
+    if it.next().is_some() { return Err(format!("座標の要素が多すぎます: {raw}")); }
+    if !(-WM_LAT..=WM_LAT).contains(&lat) { return Err(format!("緯度がWeb Mercator範囲外(±85.05): {lat}")); }
+    if !(-180.0..=180.0).contains(&lon) { return Err(format!("経度が範囲外(±180): {lon}")); }
+    Ok((lat, lon))
+}
+
 fn parse_args() -> Args {
     let mut a = Args { lat: None, lon: None, place: None, zoom: 14, width: None, win_px: 640,
                        style: "osm".to_string(), braille: false, mono: false, classify: false,
@@ -98,21 +112,26 @@ fn parse_args() -> Args {
             "--here" => a.here = true,
             "--range" => {
                 let v = val!("--range");
-                a.range = v.split(',').filter_map(|s| s.trim().parse::<f64>().ok()).filter(|&k| k > 0.0).collect();
-                if a.range.is_empty() { arg_err("--range は正の数値CSV (例 10,20,30)"); }
+                let mut rs = Vec::new();
+                for s in v.split(',') {
+                    let s = s.trim();
+                    if s.is_empty() { continue; }
+                    let km: f64 = s.parse().unwrap_or_else(|_| arg_err(&format!("--range の値が不正: {s}")));
+                    if km <= 0.0 { arg_err("--range は正の数値CSV (例 10,20,30)"); }
+                    rs.push(km);
+                }
+                if rs.is_empty() { arg_err("--range は正の数値CSV (例 10,20,30)"); }
+                a.range = rs;
             }
             "--home" => {
                 let v = val!("--home");
-                let p: Vec<f64> = v.split(',').filter_map(|s| s.trim().parse().ok()).collect();
-                if p.len() != 2 { arg_err("--home は lat,lon 形式"); }
-                a.home = Some((p[0], p[1]));
+                a.home = Some(parse_point(&v).unwrap_or_else(|e| arg_err(&e)));
             }
             "--route" => {
                 let v = val!("--route");
-                let wps: Vec<(f64, f64)> = v.split(';').filter_map(|p| {
-                    let mut it = p.split(',');
-                    Some((it.next()?.trim().parse().ok()?, it.next()?.trim().parse().ok()?))
-                }).collect();
+                let wps: Vec<(f64, f64)> = v.split(';')
+                    .map(|p| parse_point(p).unwrap_or_else(|e| arg_err(&e)))
+                    .collect();
                 if wps.len() < 2 { arg_err("--route は lat,lon;lat,lon 形式(2点以上)"); }
                 a.route = Some(wps);
             }
@@ -134,6 +153,8 @@ fn parse_args() -> Args {
     }
     if a.image.is_none() && a.zoom > 20 { arg_err("--zoom は 0..=20 で指定 (OSMタイル有効域)"); }
     if let Some(w) = a.width { if w == 0 || w > 1024 { arg_err("--width は 1..=1024 で指定"); } }
+    if let Some(la) = a.lat { if !(-WM_LAT..=WM_LAT).contains(&la) { arg_err("--lat は -85.05..=85.05 (Web Mercator有効域)"); } }
+    if let Some(lo) = a.lon { if !(-180.0..=180.0).contains(&lo) { arg_err("--lon は -180..=180"); } }
     a
 }
 
@@ -478,5 +499,16 @@ mod tests {
         assert_eq!(sanitize_name("a/b:c"), "a_b_c");
         assert_eq!(fit_cells("ab", 5), "ab   ");
         assert!(fit_cells("あ", 4).starts_with("あ"));
+    }
+
+    #[test]
+    fn parse_point_strict() {
+        assert_eq!(parse_point("35.68,139.76").unwrap(), (35.68, 139.76));
+        assert_eq!(parse_point(" 35.0 , 139.0 ").unwrap(), (35.0, 139.0)); // 空白は許容
+        assert!(parse_point("35.0,invalid").is_err());   // 経度不正
+        assert!(parse_point("壊れた値").is_err());        // 経度欠落
+        assert!(parse_point("35,139,extra").is_err());   // 要素過多
+        assert!(parse_point("88.0,139.0").is_err());      // 緯度がWeb Mercator範囲外
+        assert!(parse_point("35.0,200.0").is_err());      // 経度範囲外
     }
 }
