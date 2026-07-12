@@ -5,6 +5,7 @@
 //   --interactive(-i): カーソルキーでパン、+/- でズーム、q で終了
 //   --png PATH : カテゴリ色PNGを書き出す(確認用)  --image PNG : 既存画像を描画
 
+mod fsutil;
 mod geo;
 mod tiles;
 mod render;
@@ -210,7 +211,7 @@ fn save_state(lat: f64, lon: f64, z: u32, style: &str, wps: &[(f64, f64)], mode:
             let j = wps.iter().map(|(la, lo)| format!("{la},{lo}")).collect::<Vec<_>>().join(";");
             s.push_str(&format!("route {mode} {j}\n"));
         }
-        let _ = std::fs::write(&p, s);
+        let _ = fsutil::write_atomic(&p, s.as_bytes(), None);
     }
 }
 fn load_state() -> Option<(f64, f64, u32, String)> {
@@ -250,7 +251,7 @@ fn save_named_route(name: &str, mode: &str, wps: &[(f64, f64)]) -> Result<(), St
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let mut s = format!("{mode}\n");
     for (la, lo) in wps { s.push_str(&format!("{la},{lo}\n")); }
-    std::fs::write(dir.join(format!("{}.txt", sanitize_name(name))), s).map_err(|e| e.to_string())
+    fsutil::write_atomic(&dir.join(format!("{}.txt", sanitize_name(name))), s.as_bytes(), None).map_err(|e| e.to_string())
 }
 fn load_named_route(name: &str) -> Option<(Vec<(f64, f64)>, String)> {
     let dir = routes_dir()?;

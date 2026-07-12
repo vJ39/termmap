@@ -208,7 +208,9 @@ pub fn save_config_to(path: &Path, c: &Config) -> Result<(), String> {
         c.streetview_api_key,
     );
 
-    std::fs::write(path, contents).map_err(|e| format!("failed to write {}: {}", path.display(), e))
+    // APIキーを含むので unix では 0600。書込中クラッシュで壊さないよう atomic。
+    crate::fsutil::write_atomic(path, contents.as_bytes(), Some(0o600))
+        .map_err(|e| format!("failed to write {}: {}", path.display(), e))
 }
 
 /// Loads the config from the standard location (`config_path()`), or

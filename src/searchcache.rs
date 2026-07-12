@@ -21,7 +21,34 @@
 //! being written, since each cache entry must stay on a single line.
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+
+/// キャッシュに書く最大エントリ数(ファイル肥大防止)。座標は経年で陳腐化しないので TTL は設けない。
+const MAX_CACHE_ENTRIES: usize = 3000;
+
+/// tmp へ書いてから rename する原子的保存(このファイルは crate:: 非依存で単体テスト可能に保つため自前)。
+fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
+    if let Some(d) = dir {
+        std::fs::create_dir_all(d)?;
+    }
+    let dir = dir.unwrap_or_else(|| Path::new("."));
+    let fname = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "cache".into());
+    let tmp = dir.join(format!(".{fname}.{}.tmp", std::process::id()));
+    let res = (|| {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.flush()?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path)
+    })();
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
+}
 
 /// Returns `$HOME/.config/termmap/search-cache.tsv`, or `None` if `HOME`
 /// is unset/empty.
@@ -127,9 +154,15 @@ pub fn save_to(
         }
     }
 
+    // ファイル肥大防止の件数上限。座標は経年で陳腐化しないため per-entry TTL は設けず、
+    // 総エントリ数だけ MAX_CACHE_ENTRIES で頭打ちにする(超過分は書かない)。
     let mut out = String::new();
-    for (key, entries) in map {
+    let mut written = 0usize;
+    'outer: for (key, entries) in map {
         for (lat, lon, name) in entries {
+            if written >= MAX_CACHE_ENTRIES {
+                break 'outer;
+            }
             out.push_str(key);
             out.push('\t');
             out.push_str(&lat.to_string());
@@ -138,10 +171,12 @@ pub fn save_to(
             out.push('\t');
             out.push_str(&sanitize_name(name));
             out.push('\n');
+            written += 1;
         }
     }
 
-    std::fs::write(path, out).map_err(|e| format!("failed to write cache {}: {}", path.display(), e))
+    atomic_write(path, out.as_bytes())
+        .map_err(|e| format!("failed to write cache {}: {}", path.display(), e))
 }
 
 /// Loads the cache from the default location ([`cache_path`]). Returns

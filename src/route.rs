@@ -158,7 +158,7 @@ pub fn write_gpx(path: &str, pts: &[(f64, f64)]) -> Result<(), String> {
     let mut s = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<gpx version=\"1.1\" creator=\"termmap\" xmlns=\"http://www.topografix.com/GPX/1/1\">\n<trk><name>termmap route</name><trkseg>\n");
     for (la, lo) in pts { s.push_str(&format!("<trkpt lat=\"{la}\" lon=\"{lo}\"></trkpt>\n")); }
     s.push_str("</trkseg></trk>\n</gpx>\n");
-    std::fs::write(path, s).map_err(|e| format!("gpx write {path}: {e}"))
+    crate::fsutil::write_atomic(std::path::Path::new(path), s.as_bytes(), None).map_err(|e| format!("gpx write {path}: {e}"))
 }
 
 // waypoints/pois/mode から spec の pois/routes を作り直し、ルート要約を返す(rings は保持)。
