@@ -172,7 +172,7 @@ const HELP: &[&str] = &[
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MenuAction {
     SearchPlace, SearchPoi, ShowAddress, Recommend,                        // 検索・移動
-    SetStart, SetEnd, AddVia, RoadRoute, Wander, CycleMode, AltRoute, ClearRoute, // ルート作成
+    RouteForm, SetStart, SetEnd, AddVia, RoadRoute, Wander, CycleMode, AltRoute, ClearRoute, // ルート作成
     ManageSpots, ToggleSpots,                                              // スポット
     ToggleElevation, StreetView, PlayRoute, ToggleGps,                     // ナビ・表示
     SaveRoute, LoadRoute, SaveGpx, ShareQr,                                // 保存・共有
@@ -189,6 +189,7 @@ const MENU_CATEGORIES: &[MenuCategory] = &[
         MenuItem { label: "おすすめを出す",    key: '@', action: MenuAction::Recommend },
     ]},
     MenuCategory { label: "ルート作成", items: &[
+        MenuItem { label: "ルートを組み立てる",  key: 'R', action: MenuAction::RouteForm },
         MenuItem { label: "始点を設定",        key: 's', action: MenuAction::SetStart },
         MenuItem { label: "終点を設定",        key: 'e', action: MenuAction::SetEnd },
         MenuItem { label: "経由地を追加",      key: 'v', action: MenuAction::AddVia },
@@ -240,6 +241,45 @@ fn menu_row(label: &str, key: char, w: usize) -> String {
     format!("  {label}{}{key_s}", " ".repeat(pad))
 }
 
+// ルート作成フォーム(左袖パネル)の行。地図は見えたまま＝中心基準の設定が効く。
+#[derive(Clone, Copy)]
+enum RfRow { Start, End, Via(usize), AddVia, AddRoad, Mode, Draw, Clear, Back }
+
+// wps から表示行を組む。始点→経由(複数)→終点→操作。sel はこの Vec の index。
+fn routeform_rows(wps: &[(f64, f64)]) -> Vec<RfRow> {
+    let mut r = vec![RfRow::Start];
+    if wps.len() > 2 {
+        for i in 1..wps.len() - 1 { r.push(RfRow::Via(i)); }
+    }
+    r.push(RfRow::End);
+    r.push(RfRow::AddVia);
+    r.push(RfRow::AddRoad);
+    r.push(RfRow::Mode);
+    r.push(RfRow::Draw);
+    r.push(RfRow::Clear);
+    r.push(RfRow::Back);
+    r
+}
+
+// 各行の表示ラベル。座標は3桁。始点/終点は未設定なら「(未設定)」。
+fn rf_label(row: RfRow, wps: &[(f64, f64)], mode_lbl: &str) -> String {
+    let co = |p: (f64, f64)| format!("{:.3},{:.3}", p.0, p.1);
+    match row {
+        RfRow::Start => format!("始点  {}", wps.first().map(|&p| co(p)).unwrap_or_else(|| "(未設定)".into())),
+        RfRow::End => {
+            let e = if wps.len() >= 2 { wps.last().copied() } else { None };
+            format!("終点  {}", e.map(co).unwrap_or_else(|| "(未設定)".into()))
+        }
+        RfRow::Via(i) => format!("  経由 {}", wps.get(i).map(|&p| co(p)).unwrap_or_default()),
+        RfRow::AddVia => "＋ 経由地を追加(地図中心)".into(),
+        RfRow::AddRoad => "＋ 道路名で追加".into(),
+        RfRow::Mode => format!("移動モード: {mode_lbl}"),
+        RfRow::Draw => "▶ ルートを引く".into(),
+        RfRow::Clear => "✕ ルートを消去".into(),
+        RfRow::Back => "← 戻る".into(),
+    }
+}
+
 // ---- 対話モード (crossterm) ----
 // 端末状態を RAII で復元する。パニック/早期return でも Drop で raw mode と代替スクリーンを必ず戻す。
 struct TermGuard;
@@ -262,7 +302,7 @@ impl Drop for TermGuard {
 pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Result<()> {
     use crossterm::event::{self, Event, KeyCode, KeyModifiers};
     enum Focus { Map, Menu(MenuLevel), Search(String), SaveName(String), NearSearch(String), PoiMenu, PoiList, RouteList, WaypointList,
-                 NewCat(String), SpotForm { name: String, url: String, field: usize }, SpotList, SpotCatList, SpotRename(String, usize), Settings, RoadSearch(String), SpotEditName(String, usize), Recommend(String) }
+                 NewCat(String), SpotForm { name: String, url: String, field: usize }, SpotList, SpotCatList, SpotRename(String, usize), Settings, RoadSearch(String), SpotEditName(String, usize), Recommend(String), RouteForm { sel: usize } }
     let _guard = TermGuard::enter()?; // Drop で必ず端末復元
     let mut cache: Cache = Cache::new();
     let mut out = std::io::stdout();
@@ -332,6 +372,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 else if !recommend::claude_available(&cfg.llm_command) { addr = "おすすめ: claudeが無い(設定のLLM/コマンド確認)".into(); }
                 else { input_cur = 0; focus = Focus::Recommend(String::new()); }
             }
+            MenuAction::RouteForm => { focus = Focus::RouteForm { sel: 0 }; }
             MenuAction::SetStart => { wp_set_start(&mut wps, ($lat, $lon)); let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; }
             MenuAction::SetEnd => { wp_set_end(&mut wps, ($lat, $lon)); let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; }
             MenuAction::AddVia => { wp_add_via(&mut wps, ($lat, $lon)); let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; }
@@ -465,7 +506,8 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         let show_settings = matches!(focus, Focus::Settings);
         let show_menu = matches!(focus, Focus::Menu(_));
         let show_poimenu = matches!(focus, Focus::PoiMenu);
-        let gut: u32 = if !pois.is_empty() || show_routes || show_wps || show_splist || show_catlist || show_settings || show_menu || show_poimenu { 26 } else { 0 };
+        let show_routeform = matches!(focus, Focus::RouteForm { .. });
+        let gut: u32 = if !pois.is_empty() || show_routes || show_wps || show_splist || show_catlist || show_settings || show_menu || show_poimenu || show_routeform { 28 } else { 0 };
         let map_cols = cols.saturating_sub(gut).max(10);
         let (ow, oh) = if opts.braille || opts.edge { (map_cols * 2, map_rows * 4) } else { (map_cols, map_rows * 2) };
         if let Some(p) = &gps_rx { // ライブ現在地を取り込み、自位置に追従
@@ -542,6 +584,10 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     }
                     _ => ("メニュー".to_string(), Vec::new(), 0),
                 }
+            } else if show_routeform {
+                let sel = if let Focus::RouteForm { sel } = &focus { *sel } else { 0 };
+                let its = routeform_rows(&wps).into_iter().map(|r| format!("  {}", rf_label(r, &wps, mode_label(&mode)))).collect();
+                ("ルート作成".to_string(), its, sel)
             } else if show_wps {
                 let n = wps.len();
                 let its = wps.iter().enumerate().map(|(i, (la, lo))| {
@@ -669,6 +715,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             Focus::PoiList => format!(" [{}] ↑↓選択 Enter=移動 s始 e終 v経由 P登録 f再検索 Esc閉 ", poi_label),
             Focus::RouteList => " お気に入り: ↑↓選択 Enter=読込 Esc=閉 ".to_string(),
             Focus::WaypointList => " 並べ替え: ↑↓/Tab 選択  [ ]移動  x削除  +/-拡縮  Esc閉 ".to_string(),
+            Focus::RouteForm { .. } => " ルート作成: ↑↓選択 Enter=実行 x削除(経由) [ ]並替 Esc戻る ".to_string(),
             Focus::Menu(MenuLevel::Categories) => " ↑↓カテゴリ Enter展開 / 文字キーで直接実行 Esc閉 ".to_string(),
             Focus::Menu(MenuLevel::Items(_)) => " ↑↓選択 Enter実行 / 右端キーでも実行 Esc戻る ".to_string(),
             Focus::Map => {
@@ -1245,6 +1292,42 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                 None => focus = Focus::Menu(MenuLevel::Items(ci)),
                             },
                             _ => focus = Focus::Menu(MenuLevel::Items(ci)),
+                        }
+                    }
+                    // ルート作成フォーム(左袖)。地図中心を始点/終点/経由に設定し、道路名追加やモード切替・引く/消去を一枚で。
+                    Focus::RouteForm { sel } => {
+                        let rows = routeform_rows(&wps);
+                        let mut s = sel.min(rows.len().saturating_sub(1));
+                        let row = rows.get(s).copied().unwrap_or(RfRow::Back);
+                        match k.code {
+                            KeyCode::Up => { s = s.saturating_sub(1); focus = Focus::RouteForm { sel: s }; }
+                            KeyCode::Down => { if s + 1 < rows.len() { s += 1; } focus = Focus::RouteForm { sel: s }; }
+                            KeyCode::Esc => {} // 閉じる → Map
+                            KeyCode::Enter => match row {
+                                RfRow::Start => { wp_set_start(&mut wps, (lat, lon)); let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; focus = Focus::RouteForm { sel: s }; }
+                                RfRow::End => { wp_set_end(&mut wps, (lat, lon)); let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; focus = Focus::RouteForm { sel: s }; }
+                                RfRow::Via(_) => { focus = Focus::RouteForm { sel: s }; } // 経由行のEnterは無操作(削除=x)
+                                RfRow::AddVia => { wp_add_via(&mut wps, (lat, lon)); let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; focus = Focus::RouteForm { sel: s }; }
+                                RfRow::AddRoad => { input_cur = 0; focus = Focus::RoadSearch(String::new()); } // 道路名はテキスト入力へ(追加後はMap)
+                                RfRow::Mode => { mode = match mode_label(&mode) { "下道" => "highway", "高速" => "short", _ => "surface" }.to_string(); let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; focus = Focus::RouteForm { sel: s }; }
+                                RfRow::Draw => { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; focus = Focus::RouteForm { sel: s }; }
+                                RfRow::Clear => { wps.clear(); wp_sel = 0; let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; focus = Focus::RouteForm { sel: 0 }; }
+                                RfRow::Back => {} // → Map
+                            },
+                            KeyCode::Char('x') => { // 経由行なら削除
+                                if let RfRow::Via(i) = row { if i < wps.len() { wps.remove(i); let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } }
+                                let len2 = routeform_rows(&wps).len(); if s >= len2 { s = len2.saturating_sub(1); }
+                                focus = Focus::RouteForm { sel: s };
+                            }
+                            KeyCode::Char('[') => { // 経由を前へ
+                                if let RfRow::Via(i) = row { if i > 1 { wps.swap(i, i - 1); let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; s = s.saturating_sub(1); } }
+                                focus = Focus::RouteForm { sel: s };
+                            }
+                            KeyCode::Char(']') => { // 経由を後へ
+                                if let RfRow::Via(i) = row { if i + 1 < wps.len().saturating_sub(1) { wps.swap(i, i + 1); let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; s += 1; } }
+                                focus = Focus::RouteForm { sel: s };
+                            }
+                            _ => focus = Focus::RouteForm { sel: s },
                         }
                     }
                     Focus::Map => {
