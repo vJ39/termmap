@@ -147,7 +147,7 @@ fn parse_args() -> Args {
             "--threshold" => a.threshold = Some(num!("--threshold")),
             "--image" => a.image = Some(val!("--image")),
             "--png" => a.png = Some(val!("--png")),
-            "-h" | "--help" => { eprintln!("usage: termmap (--place \"住所\" | --lat LAT --lon LON | --resume | --here) [--zoom Z] [--style osm|voyager|dark|light] [-i] [--braille] [--classify] [--edge] [--mono] [--range KM,..] [--home LAT,LON] [--route \"LAT,LON;LAT,LON\"] [--route-mode surface|highway|short] [--gpx OUT] [--load-route N] [--save-route N] [--routes] [--share] [--width N] [--png OUT] | --image PNG"); std::process::exit(0); }
+            "-h" | "--help" => { eprintln!("usage: termmap [位置] [options]   (引数なし=前回位置で対話起動 / 保存なしは東京中心)\n  位置: --place \"住所\" | --lat LAT --lon LON | --here | --resume | --load-route N\n  対話が既定。非対話(静止出力)になるのは --png OUT / --gpx OUT / --save-route N のみ。\n  options: [--zoom Z] [--style osm|voyager|dark|light] [--braille] [--classify] [--edge] [--mono] [--range KM,..] [--home LAT,LON] [--route \"LAT,LON;LAT,LON\"] [--route-mode surface|highway|short] [--routes] [--share] [--width N] | --image PNG"); std::process::exit(0); }
             _ => arg_err(&format!("unknown arg: {k}")),
         }
     }
@@ -412,21 +412,22 @@ fn main() {
         }
     } else if a.here {
         match gps_here() { Ok(v) => v, Err(e) => { eprintln!("{e}"); std::process::exit(1); } }
-    } else if a.resume && a.place.is_none() && a.lat.is_none() && a.lon.is_none() {
+    } else if let Some(p) = &a.place {
+        match geocode(p, None, "") { Ok(v) => v, Err(e) => { eprintln!("{e}"); std::process::exit(1); } }
+    } else if let (Some(la), Some(lo)) = (a.lat, a.lon) {
+        (la, lo)
+    } else if let Some(wps) = a.route.as_ref().filter(|w| !w.is_empty()) {
+        wps[0] // --route のみ指定時は始点を中心にする
+    } else {
+        // 位置指定なし: 既定で前回位置をresume。保存が無ければ東京中心で開く(エラーにしない)
         match load_state() {
             Some((la, lo, z, st)) => {
                 a.zoom = z; a.style = st;
                 if a.route.is_none() { if let Some((wps, m)) = load_route() { a.route = Some(wps); a.route_mode = m; } }
                 (la, lo)
             }
-            None => { eprintln!("保存された location がありません (--resume)"); std::process::exit(1); }
+            None => (35.681236, 139.767125), // 東京駅付近(初回・保存なし時のフォールバック)
         }
-    } else if let Some(p) = &a.place {
-        match geocode(p, None, "") { Ok(v) => v, Err(e) => { eprintln!("{e}"); std::process::exit(1); } }
-    } else if let Some(wps) = a.route.as_ref().filter(|w| !w.is_empty()) {
-        wps[0] // --route のみ指定時は始点を中心にする
-    } else {
-        match (a.lat, a.lon) { (Some(la), Some(lo)) => (la, lo), _ => { eprintln!("need --place \"住所\" or --lat/--lon or --image (or --resume)"); std::process::exit(2); } }
     };
     // 走りまくりモード: 峠/展望を経由する周回(or片道)を生成して a.route に載せる
     if a.wander {
@@ -467,7 +468,10 @@ fn main() {
         return;
     }
 
-    if a.interactive {
+    // 既定は対話モード。非対話(静止出力)になるのは --png / --gpx / --save-route のときだけ。
+    // (--share/--routes/--image は上流で処理済み。-i は既定なので実質no-op)
+    let want_static = a.png.is_some() || a.gpx.is_some() || a.save_route.is_some();
+    if !want_static {
         if let Err(e) = ui::interactive(cx, cy, a.zoom, &a) { eprintln!("interactive: {e}"); std::process::exit(1); }
         return;
     }
