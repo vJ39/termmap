@@ -144,34 +144,78 @@ const HELP: &[&str] = &[
     "   (任意のキーで閉じる)",
 ];
 
-// Space メニューの項目(ラベルとキー)。表示順は Focus::Menu の Enter ハンドラの menu_sel index と一致させること。
-// メニューは既存のキー操作を呼び出すだけで、挙動は各キーと同じ。
-const MENU: &[&str] = &[
-    "地名を検索 (/)",
-    "目的地カテゴリ (f)",
-    "中心の住所 (a)",
-    "始点 (s)",
-    "終点 (e)",
-    "経由地 (v)",
-    "道路名でルート (r)",
-    "走りまくり (W)",
-    "モード切替 (m)",
-    "代替ルート (n)",
-    "ルート消去 (c)",
-    "マイスポット (P)",
-    "スポット表示 (V)",
-    "標高 (E)",
-    "実写 (i)",
-    "ルート再生 (A)",
-    "ライブ現在地 (G)",
-    "おすすめ (@)",
-    "ルート保存 (S)",
-    "呼出 (L)",
-    "GPX保存 (g)",
-    "QR共有 (o)",
-    "設定 (,)",
-    "ヘルプ (?)",
+// Space メニュー。2階層(カテゴリ→項目)。項目は「操作として読める動詞ラベル」+ 単キー。
+// 実処理は run_action! マクロ(interactive 内)に集約し、各キーの直接操作と共通化している。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MenuAction {
+    SearchPlace, SearchPoi, ShowAddress, Recommend,                        // 検索・移動
+    SetStart, SetEnd, AddVia, RoadRoute, Wander, CycleMode, AltRoute, ClearRoute, // ルート作成
+    ManageSpots, ToggleSpots,                                              // スポット
+    ToggleElevation, StreetView, PlayRoute, ToggleGps,                     // ナビ・表示
+    SaveRoute, LoadRoute, SaveGpx, ShareQr,                                // 保存・共有
+    Settings, Help,                                                        // 設定・ヘルプ
+}
+struct MenuItem { label: &'static str, key: char, action: MenuAction }
+struct MenuCategory { label: &'static str, items: &'static [MenuItem] }
+
+const MENU_CATEGORIES: &[MenuCategory] = &[
+    MenuCategory { label: "検索・移動", items: &[
+        MenuItem { label: "地名を検索",        key: '/', action: MenuAction::SearchPlace },
+        MenuItem { label: "目的地を探す",      key: 'f', action: MenuAction::SearchPoi },
+        MenuItem { label: "中心の住所を見る",  key: 'a', action: MenuAction::ShowAddress },
+        MenuItem { label: "おすすめを出す",    key: '@', action: MenuAction::Recommend },
+    ]},
+    MenuCategory { label: "ルート作成", items: &[
+        MenuItem { label: "始点を設定",        key: 's', action: MenuAction::SetStart },
+        MenuItem { label: "終点を設定",        key: 'e', action: MenuAction::SetEnd },
+        MenuItem { label: "経由地を追加",      key: 'v', action: MenuAction::AddVia },
+        MenuItem { label: "道路名から追加",    key: 'r', action: MenuAction::RoadRoute },
+        MenuItem { label: "おまかせ周回",      key: 'W', action: MenuAction::Wander },
+        MenuItem { label: "移動モード切替",    key: 'm', action: MenuAction::CycleMode },
+        MenuItem { label: "別ルートを検索",    key: 'n', action: MenuAction::AltRoute },
+        MenuItem { label: "ルートを消去",      key: 'c', action: MenuAction::ClearRoute },
+    ]},
+    MenuCategory { label: "スポット", items: &[
+        MenuItem { label: "マイスポットを開く", key: 'P', action: MenuAction::ManageSpots },
+        MenuItem { label: "スポット表示を切替", key: 'V', action: MenuAction::ToggleSpots },
+    ]},
+    MenuCategory { label: "ナビ・表示", items: &[
+        MenuItem { label: "標高プロファイル",  key: 'E', action: MenuAction::ToggleElevation },
+        MenuItem { label: "実写を見る",        key: 'i', action: MenuAction::StreetView },
+        MenuItem { label: "ルートを再生",      key: 'A', action: MenuAction::PlayRoute },
+        MenuItem { label: "ライブ現在地",      key: 'G', action: MenuAction::ToggleGps },
+    ]},
+    MenuCategory { label: "保存・共有", items: &[
+        MenuItem { label: "ルートを保存",      key: 'S', action: MenuAction::SaveRoute },
+        MenuItem { label: "保存ルートを開く",  key: 'L', action: MenuAction::LoadRoute },
+        MenuItem { label: "GPXを書き出す",     key: 'g', action: MenuAction::SaveGpx },
+        MenuItem { label: "QRで共有",          key: 'o', action: MenuAction::ShareQr },
+    ]},
+    MenuCategory { label: "設定・ヘルプ", items: &[
+        MenuItem { label: "設定を開く",        key: ',', action: MenuAction::Settings },
+        MenuItem { label: "ヘルプ",            key: '?', action: MenuAction::Help },
+    ]},
 ];
+
+// メニューの階層。Categories=トップ(カテゴリ選択) / Items(cat)=そのカテゴリの項目選択。
+#[derive(Clone, Copy)]
+enum MenuLevel { Categories, Items(usize) }
+
+// トップメニューで押された文字キーを全カテゴリ横断で対応するアクションに引く(熟練者の直打ち用)。
+fn menu_action_for_key(c: char) -> Option<MenuAction> {
+    MENU_CATEGORIES.iter().flat_map(|cat| cat.items.iter()).find(|it| it.key == c).map(|it| it.action)
+}
+
+// 表示セル幅(fit_cells と同じ規則: ASCII=1 / 非ASCII=2)。
+fn disp_width(s: &str) -> usize { s.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum() }
+
+// メニュー項目1行。ラベルは左、キーは右端に揃える(幅 w セル内。行頭カーソル prefix の1セルは呼び出し側が足す)。
+fn menu_row(label: &str, key: char, w: usize) -> String {
+    let mut ks = [0u8; 4];
+    let key_s = key.encode_utf8(&mut ks);
+    let pad = w.saturating_sub(2 + disp_width(label) + disp_width(key_s));
+    format!("  {label}{}{key_s}", " ".repeat(pad))
+}
 
 // ---- 対話モード (crossterm) ----
 // 端末状態を RAII で復元する。パニック/早期return でも Drop で raw mode と代替スクリーンを必ず戻す。
@@ -194,7 +238,7 @@ impl Drop for TermGuard {
 
 pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Result<()> {
     use crossterm::event::{self, Event, KeyCode, KeyModifiers};
-    enum Focus { Map, Menu, Search(String), SaveName(String), NearSearch(String), PoiMenu, PoiList, RouteList, WaypointList,
+    enum Focus { Map, Menu(MenuLevel), Search(String), SaveName(String), NearSearch(String), PoiMenu, PoiList, RouteList, WaypointList,
                  NewCat(String), SpotForm { name: String, url: String, field: usize }, SpotList, SpotCatList, SpotRename(String, usize), Settings, RoadSearch(String), SpotEditName(String, usize), Recommend(String) }
     let _guard = TermGuard::enter()?; // Drop で必ず端末復元
     let mut cache: Cache = HashMap::new();
@@ -211,7 +255,8 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     if opts.style == "osm" { opts.style = cfg.style.clone(); }
     let mut set_sel: usize = 0;            // 設定画面の選択行
     let mut input_cur: usize = 0;          // テキスト入力欄のカーソル位置(文字単位)。テキストFocus開始時に該当バッファ末尾へ
-    let mut menu_sel: usize = 0;           // Space メニューの選択行
+    let mut menu_cat_sel: usize = 0;       // Space メニュー: トップのカテゴリ選択
+    let mut menu_item_sel: usize = 0;      // Space メニュー: 展開後の項目選択
     let mut poimenu_sel: usize = 0;        // 目的地カテゴリの選択行
     let mut street: Option<(RgbImage, i32, f64, f64)> = None; // 実写(画像, heading, lat, lon)
 
@@ -250,6 +295,88 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     let mut cat_sel: usize = 0;
     let mut cur_cat = String::new(); // スポット一覧で表示中のカテゴリ
     apply_spots(&mut spec, &spots, &spot_cats, show_spots);
+
+    // メニュー項目/直接キー どちらからでも同じ処理を走らせる。
+    // lat/lon/cols/tr は各ループで再計算されるフレーム値。マクロ衛生性のため引数で受け取る。
+    macro_rules! run_action { ($act:expr, $lat:expr, $lon:expr, $cols:expr, $tr:expr) => {{
+        match $act {
+            MenuAction::SearchPlace => { input_cur = 0; focus = Focus::Search(String::new()); }
+            MenuAction::SearchPoi => { focus = Focus::PoiMenu; }
+            MenuAction::ShowAddress => { addr = reverse_geocode($lat, $lon).unwrap_or_else(|e| format!("({e})")); }
+            MenuAction::Recommend => {
+                if !cfg.llm_recommend_enabled { addr = "おすすめ: 設定でOFF(,でON)".into(); }
+                else if !recommend::claude_available(&cfg.llm_command) { addr = "おすすめ: claudeが無い(設定のLLM/コマンド確認)".into(); }
+                else { input_cur = 0; focus = Focus::Recommend(String::new()); }
+            }
+            MenuAction::SetStart => { wp_set_start(&mut wps, ($lat, $lon)); let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; }
+            MenuAction::SetEnd => { wp_set_end(&mut wps, ($lat, $lon)); let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; }
+            MenuAction::AddVia => { wp_add_via(&mut wps, ($lat, $lon)); let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; }
+            MenuAction::RoadRoute => { input_cur = 0; focus = Focus::RoadSearch(String::new()); }
+            MenuAction::Wander => {
+                let dist = a.dist.unwrap_or(40.0);
+                match wander_route(($lat, $lon), dist, &a.shape) {
+                    Ok(w) => { wps = w; wp_sel = 0; let (nn, jj) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = nn; route_job = jj; }
+                    Err(e) => addr = format!("({e})"),
+                }
+            }
+            MenuAction::CycleMode => { mode = match mode_label(&mode) { "下道" => "highway", "高速" => "short", _ => "surface" }.to_string(); let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; }
+            MenuAction::AltRoute => {
+                if wps.len() >= 2 {
+                    route_alt = (route_alt + 1) % 4;
+                    let (nn, jj) = trigger_route(&mut spec, &wps, &pois, &mode, route_alt);
+                    route_note = nn; route_job = jj;
+                } else { addr = "ルート未確定".into(); }
+            }
+            MenuAction::ClearRoute => { wps.clear(); wp_sel = 0; let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; }
+            MenuAction::ManageSpots => { cat_sel = 0; focus = Focus::SpotCatList; }
+            MenuAction::ToggleSpots => { show_spots = !show_spots; apply_spots(&mut spec, &spots, &spot_cats, show_spots); addr = if show_spots { "マイスポット表示".into() } else { "マイスポット非表示".into() }; }
+            MenuAction::ToggleElevation => {
+                show_elev = !show_elev;
+                if show_elev && (spec.routes.is_empty() || !route_ele.iter().any(|&z| z != 0.0)) { addr = "標高: ルート確定後に表示".into(); }
+            }
+            MenuAction::StreetView => {
+                if !streetview::available(&cfg.streetview_api_key) { addr = "実写: APIキー未設定(config.toml [streetview])".into(); }
+                else {
+                    show_busy(&mut out, $cols, $tr, "実写取得中…");
+                    match streetview::fetch($lat, $lon, 0, 640, 480, &cfg.streetview_api_key) {
+                        Ok(img) => { street = Some((img, 0, $lat, $lon)); addr.clear(); }
+                        Err(e) => addr = format!("実写: {e}"),
+                    }
+                }
+            }
+            MenuAction::PlayRoute => {
+                if spec.routes.last().map_or(false, |r| r.pts.len() >= 2) {
+                    if play.is_some() { play = None; addr = "再生: 停止".into(); }
+                    else { play = Some(0.0); addr = "再生: 開始(Aで停止)".into(); }
+                } else { addr = "再生: ルート未確定".into(); }
+            }
+            MenuAction::ToggleGps => {
+                if gps_rx.is_some() { gps_rx = None; addr = "ライブ現在地: OFF".into(); }
+                else {
+                    let bin = if std::path::Path::new("/opt/homebrew/bin/CoreLocationCLI").exists() { "/opt/homebrew/bin/CoreLocationCLI" } else { "CoreLocationCLI" };
+                    if gpslive::available(bin) { gps_rx = Some(gpslive::start_poller(bin.to_string(), 5)); gps_trail.clear(); gps_pos = None; addr = "ライブ現在地: ON(5秒ごと)".into(); }
+                    else { addr = "ライブ: CoreLocationCLI無し(brew install corelocationcli)".into(); }
+                }
+            }
+            MenuAction::SaveRoute => { input_cur = 0; focus = Focus::SaveName(String::new()); }
+            MenuAction::LoadRoute => { route_names = list_named_routes(); rn_sel = 0; if route_names.is_empty() { addr = "お気に入り無し".into(); } else { focus = Focus::RouteList; } }
+            MenuAction::SaveGpx => match spec.routes.last() {
+                Some(rt) => addr = match write_gpx("termmap-route.gpx", &rt.pts) { Ok(_) => "GPX保存: termmap-route.gpx".into(), Err(e) => format!("({e})") },
+                None => addr = "ルート未確定".into(),
+            },
+            MenuAction::ShareQr => {
+                if wps.len() >= 2 {
+                    let (url, _) = gmaps_url(&wps);
+                    match qrcode::QrCode::with_error_correction_level(url.as_bytes(), qrcode::EcLevel::L) {
+                        Ok(c) => qr_view = Some(c.render::<qrcode::render::unicode::Dense1x2>().quiet_zone(false).build()),
+                        Err(_) => addr = "QR生成失敗".into(),
+                    }
+                } else { addr = "ルート未確定".into(); }
+            }
+            MenuAction::Settings => { set_sel = 0; focus = Focus::Settings; }
+            MenuAction::Help => { help = true; }
+        }
+    }};}
 
     let _ = write!(out, "\x1b[2J");
     loop {
@@ -312,7 +439,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         let show_splist = matches!(focus, Focus::SpotList);
         let show_catlist = matches!(focus, Focus::SpotCatList);
         let show_settings = matches!(focus, Focus::Settings);
-        let show_menu = matches!(focus, Focus::Menu);
+        let show_menu = matches!(focus, Focus::Menu(_));
         let show_poimenu = matches!(focus, Focus::PoiMenu);
         let gut: u32 = if !pois.is_empty() || show_routes || show_wps || show_splist || show_catlist || show_settings || show_menu || show_poimenu { 26 } else { 0 };
         let map_cols = cols.saturating_sub(gut).max(10);
@@ -377,21 +504,20 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         let glines: Vec<String> = if gut > 0 {
             let gw = gut as usize;
             let (header, items, sel): (String, Vec<String>, usize) = if show_menu {
-                // カテゴリ見出しを挟んで表示(見出しは選択不可)。menu_sel(0..MENU.len)は実項目のみを指す。
-                let groups: [(&str, usize, usize); 5] = [
-                    ("探す・移動", 0, 3), ("ルート", 3, 11), ("スポット", 11, 13),
-                    ("表示・AI", 13, 18), ("保存・共有・設定", 18, 24),
-                ];
-                let mut its: Vec<String> = Vec::new();
-                let mut sel_disp = 0usize;
-                for (gname, s, e) in groups {
-                    its.push(format!("── {gname} ──"));
-                    for i in s..e.min(MENU.len()) {
-                        if i == menu_sel { sel_disp = its.len(); }
-                        its.push(format!("  {}", MENU[i]));
+                match &focus {
+                    // トップ: カテゴリだけ(キー列なし)。文字キー直打ちも効く旨は下部に出す。
+                    Focus::Menu(MenuLevel::Categories) => {
+                        let its = MENU_CATEGORIES.iter().map(|c| format!("  {}", c.label)).collect();
+                        ("メニュー".to_string(), its, menu_cat_sel)
                     }
+                    // 展開: 選んだカテゴリの項目のみ。ラベル左・キー右端揃え。
+                    Focus::Menu(MenuLevel::Items(ci)) => {
+                        let cat = &MENU_CATEGORIES[*ci];
+                        let its = cat.items.iter().map(|it| menu_row(it.label, it.key, gw.saturating_sub(1))).collect();
+                        (format!("← {}", cat.label), its, menu_item_sel)
+                    }
+                    _ => ("メニュー".to_string(), Vec::new(), 0),
                 }
-                ("メニュー".to_string(), its, sel_disp)
             } else if show_wps {
                 let n = wps.len();
                 let its = wps.iter().enumerate().map(|(i, (la, lo))| {
@@ -518,7 +644,8 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             Focus::PoiList => format!(" [{}] ↑↓選択 Enter=移動 s始 e終 v経由 f再検索 Esc閉 ", poi_label),
             Focus::RouteList => " お気に入り: ↑↓選択 Enter=読込 Esc=閉 ".to_string(),
             Focus::WaypointList => " 並べ替え: ↑↓/Tab 選択  [ ]移動  x削除  +/-拡縮  Esc閉 ".to_string(),
-            Focus::Menu => " メニュー: ↑↓選択 Enter実行 Esc閉 ".to_string(),
+            Focus::Menu(MenuLevel::Categories) => " ↑↓カテゴリ Enter展開 / 文字キーで直接実行 Esc閉 ".to_string(),
+            Focus::Menu(MenuLevel::Items(_)) => " ↑↓選択 Enter実行 / 右端キーでも実行 Esc戻る ".to_string(),
             Focus::Map => {
                 let live = if gps_rx.is_some() { "●LIVE(Gで解除) " } else { "" };
                 let playing = if play.is_some() { "▶再生中(Aで停止) " } else { "" };
@@ -1026,91 +1153,33 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                         KeyCode::Esc | KeyCode::Enter => {} // 閉じる → Map
                         _ => focus = Focus::WaypointList,
                     },
-                    // Space メニュー: ↑↓で選び Enter で対応キーと同じ操作を実行(挙動は各キーと同一)
-                    Focus::Menu => match k.code {
-                        KeyCode::Up => { menu_sel = menu_sel.saturating_sub(1); focus = Focus::Menu; }
-                        KeyCode::Down => { if menu_sel + 1 < MENU.len() { menu_sel += 1; } focus = Focus::Menu; }
+                    // Space メニュー・トップ(カテゴリ選択)。文字キーは全カテゴリ横断で直接実行できる。
+                    Focus::Menu(MenuLevel::Categories) => match k.code {
+                        KeyCode::Up => { menu_cat_sel = menu_cat_sel.saturating_sub(1); focus = Focus::Menu(MenuLevel::Categories); }
+                        KeyCode::Down => { if menu_cat_sel + 1 < MENU_CATEGORIES.len() { menu_cat_sel += 1; } focus = Focus::Menu(MenuLevel::Categories); }
+                        KeyCode::Enter => { menu_item_sel = 0; focus = Focus::Menu(MenuLevel::Items(menu_cat_sel)); }
                         KeyCode::Esc => {} // 閉じる → Map
-                        KeyCode::Enter => match menu_sel {
-                            0 => { input_cur = 0; focus = Focus::Search(String::new()); }                    // 地名を検索 (/)
-                            1 => focus = Focus::PoiMenu,                                                    // 目的地カテゴリ (f)
-                            2 => addr = reverse_geocode(lat, lon).unwrap_or_else(|e| format!("({e})")),     // 中心の住所 (a)
-                            3 => { wp_set_start(&mut wps, (lat, lon)); let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } // 始点 (s)
-                            4 => { wp_set_end(&mut wps, (lat, lon)); let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; }   // 終点 (e)
-                            5 => { wp_add_via(&mut wps, (lat, lon)); let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; }   // 経由地 (v)
-                            6 => { input_cur = 0; focus = Focus::RoadSearch(String::new()); }                // 道路名でルート (r)
-                            7 => { // 走りまくり (W)
-                                let dist = a.dist.unwrap_or(40.0);
-                                match wander_route((lat, lon), dist, &a.shape) {
-                                    Ok(w) => { wps = w; wp_sel = 0; let (nn, jj) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = nn; route_job = jj; }
-                                    Err(e) => addr = format!("({e})"),
-                                }
-                            }
-                            8 => { mode = match mode_label(&mode) { "下道" => "highway", "高速" => "short", _ => "surface" }.to_string(); let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } // モード切替 (m)
-                            9 => { // 代替ルート (n)
-                                if wps.len() >= 2 {
-                                    route_alt = (route_alt + 1) % 4;
-                                    let (nn, jj) = trigger_route(&mut spec, &wps, &pois, &mode, route_alt);
-                                    route_note = nn; route_job = jj;
-                                } else { addr = "ルート未確定".into(); }
-                            }
-                            10 => { wps.clear(); wp_sel = 0; let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } // ルート消去 (c)
-                            11 => { cat_sel = 0; focus = Focus::SpotCatList; }                             // マイスポット (P)
-                            12 => { show_spots = !show_spots; apply_spots(&mut spec, &spots, &spot_cats, show_spots); addr = if show_spots { "マイスポット表示".into() } else { "マイスポット非表示".into() }; } // スポット表示 (V)
-                            13 => { // 標高 (E)
-                                show_elev = !show_elev;
-                                if show_elev && (spec.routes.is_empty() || !route_ele.iter().any(|&z| z != 0.0)) { addr = "標高: ルート確定後に表示".into(); }
-                            }
-                            14 => { // 実写 (i)
-                                if !streetview::available(&cfg.streetview_api_key) { addr = "実写: APIキー未設定(config.toml [streetview])".into(); }
-                                else {
-                                    show_busy(&mut out, cols, tr, "実写取得中…");
-                                    match streetview::fetch(lat, lon, 0, 640, 480, &cfg.streetview_api_key) {
-                                        Ok(img) => { street = Some((img, 0, lat, lon)); addr.clear(); }
-                                        Err(e) => addr = format!("実写: {e}"),
-                                    }
-                                }
-                            }
-                            15 => { // ルート再生 (A)
-                                if spec.routes.last().map_or(false, |r| r.pts.len() >= 2) {
-                                    if play.is_some() { play = None; addr = "再生: 停止".into(); }
-                                    else { play = Some(0.0); addr = "再生: 開始(Aで停止)".into(); }
-                                } else { addr = "再生: ルート未確定".into(); }
-                            }
-                            16 => { // ライブ現在地 (G)
-                                if gps_rx.is_some() { gps_rx = None; addr = "ライブ現在地: OFF".into(); }
-                                else {
-                                    let bin = if std::path::Path::new("/opt/homebrew/bin/CoreLocationCLI").exists() { "/opt/homebrew/bin/CoreLocationCLI" } else { "CoreLocationCLI" };
-                                    if gpslive::available(bin) { gps_rx = Some(gpslive::start_poller(bin.to_string(), 5)); gps_trail.clear(); gps_pos = None; addr = "ライブ現在地: ON(5秒ごと)".into(); }
-                                    else { addr = "ライブ: CoreLocationCLI無し(brew install corelocationcli)".into(); }
-                                }
-                            }
-                            17 => { // おすすめ (@)
-                                if !cfg.llm_recommend_enabled { addr = "おすすめ: 設定でOFF(,でON)".into(); }
-                                else if !recommend::claude_available(&cfg.llm_command) { addr = "おすすめ: claudeが無い(設定のLLM/コマンド確認)".into(); }
-                                else { input_cur = 0; focus = Focus::Recommend(String::new()); }
-                            }
-                            18 => { input_cur = 0; focus = Focus::SaveName(String::new()); }                // ルート保存 (S)
-                            19 => { route_names = list_named_routes(); rn_sel = 0; if route_names.is_empty() { addr = "お気に入り無し".into(); } else { focus = Focus::RouteList; } } // 呼出 (L)
-                            20 => match spec.routes.last() { // GPX保存 (g)
-                                Some(rt) => addr = match write_gpx("termmap-route.gpx", &rt.pts) { Ok(_) => "GPX保存: termmap-route.gpx".into(), Err(e) => format!("({e})") },
-                                None => addr = "ルート未確定".into(),
-                            },
-                            21 => { // QR共有 (o)
-                                if wps.len() >= 2 {
-                                    let (url, _) = gmaps_url(&wps);
-                                    match qrcode::QrCode::with_error_correction_level(url.as_bytes(), qrcode::EcLevel::L) {
-                                        Ok(c) => qr_view = Some(c.render::<qrcode::render::unicode::Dense1x2>().quiet_zone(false).build()),
-                                        Err(_) => addr = "QR生成失敗".into(),
-                                    }
-                                } else { addr = "ルート未確定".into(); }
-                            }
-                            22 => { set_sel = 0; focus = Focus::Settings; }                                // 設定 (,)
-                            23 => help = true,                                                             // ヘルプ (?)
-                            _ => {}
+                        KeyCode::Char(c) => match menu_action_for_key(c) {
+                            Some(act) => run_action!(act, lat, lon, cols, tr),
+                            None => focus = Focus::Menu(MenuLevel::Categories),
                         },
-                        _ => focus = Focus::Menu,
+                        _ => focus = Focus::Menu(MenuLevel::Categories),
                     },
+                    // Space メニュー・展開(項目選択)。キーはそのカテゴリ内だけ有効(スコープ限定)。
+                    Focus::Menu(MenuLevel::Items(ci)) => {
+                        let items = MENU_CATEGORIES[ci].items;
+                        match k.code {
+                            KeyCode::Up => { menu_item_sel = menu_item_sel.saturating_sub(1); focus = Focus::Menu(MenuLevel::Items(ci)); }
+                            KeyCode::Down => { if menu_item_sel + 1 < items.len() { menu_item_sel += 1; } focus = Focus::Menu(MenuLevel::Items(ci)); }
+                            KeyCode::Enter => run_action!(items[menu_item_sel].action, lat, lon, cols, tr),
+                            KeyCode::Esc => { focus = Focus::Menu(MenuLevel::Categories); } // 上位カテゴリへ戻る
+                            KeyCode::Char(c) => match items.iter().find(|it| it.key == c) {
+                                Some(it) => run_action!(it.action, lat, lon, cols, tr),
+                                None => focus = Focus::Menu(MenuLevel::Items(ci)),
+                            },
+                            _ => focus = Focus::Menu(MenuLevel::Items(ci)),
+                        }
+                    }
                     Focus::Map => {
                         let frac = if k.modifiers.contains(KeyModifiers::SHIFT) { 4.0 } else { 16.0 };
                         let step = (oh as f64 / frac).max(1.0);
@@ -1148,7 +1217,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             KeyCode::Char('e') => { wp_set_end(&mut wps, (lat, lon)); { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } }
                             KeyCode::Char('v') => { wp_add_via(&mut wps, (lat, lon)); { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } }
                             KeyCode::Tab | KeyCode::BackTab => { if !wps.is_empty() { focus = Focus::WaypointList; } } // 並べ替えパネル
-                            KeyCode::Char(' ') => { menu_sel = 0; focus = Focus::Menu; } // Space=メニュー(全操作をキー無しで選べる)
+                            KeyCode::Char(' ') => { menu_cat_sel = 0; focus = Focus::Menu(MenuLevel::Categories); } // Space=メニュー(カテゴリ→展開の2階層)
                             KeyCode::Char('?') => help = true,
                             KeyCode::Char('P') => { cat_sel = 0; focus = Focus::SpotCatList; } // マイスポット(カテゴリ一覧)
                             KeyCode::Char(',') => { set_sel = 0; focus = Focus::Settings; } // 設定画面
