@@ -371,6 +371,13 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0);
         (n_, j_)
     };
+    // ルート計算と同じ非同期パターンで、検索/周辺/実写/おすすめの通信もバックグラウンド化する。
+    // 新規spawn時に古いrxはdropされる=最新のみ採用(generation ID不要)。
+    let mut search_job: Option<std::sync::mpsc::Receiver<(String, String, Result<Vec<(f64, f64, String)>, String>)>> = None; // (ckey, query, geocode結果)
+    let mut near_job: Option<std::sync::mpsc::Receiver<(String, Vec<(f64, f64, String)>)>> = None; // (query, search_nearbyのosm結果)
+    let mut street_job: Option<std::sync::mpsc::Receiver<(f64, f64, i32, Result<image::RgbImage, String>)>> = None; // (lat, lon, heading, 実写画像)
+    let mut recommend_job: Option<std::sync::mpsc::Receiver<Result<Vec<(f64, f64, String)>, String>>> = None; // 実在確認済みスポット列
+    let mut spin: usize = 0; // 通信中スピナーのフレーム(毎ループ+1)
     let mut spots = load_spots();          // マイスポット
     let mut spot_cats = load_spot_cats();
     let mut show_spots = true;
@@ -425,11 +432,15 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             MenuAction::StreetView => {
                 if !streetview::available(&cfg.google_maps_api_key) { addr = "実写: APIキー未設定(config.toml [streetview])".into(); }
                 else {
-                    show_busy(&mut out, $cols, $tr, "実写取得中…");
-                    match streetview::fetch($lat, $lon, 0, 640, 480, &cfg.google_maps_api_key) {
-                        Ok(img) => { street = Some((img, 0, $lat, $lon)); addr.clear(); }
-                        Err(e) => addr = format!("実写: {e}"),
-                    }
+                    // 実写取得を別スレッドへ。focus は Map のまま(メニューは既に閉じている)でスピナーが回る。
+                    let (la, lo) = ($lat, $lon);
+                    let key = cfg.google_maps_api_key.clone();
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    std::thread::spawn(move || {
+                        let r = streetview::fetch(la, lo, 0, 640, 480, &key);
+                        let _ = tx.send((la, lo, 0, r));
+                    });
+                    street_job = Some(rx);
                 }
             }
             MenuAction::PlayRoute => {
@@ -468,6 +479,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
 
     let _ = write!(out, "\x1b[2J");
     loop {
+        spin = spin.wrapping_add(1); // 通信中スピナーのアニメ用(毎フレーム進める)
         let (tc, tr) = crossterm::terminal::size().unwrap_or((100, 40));
         let cols = tc.max(20) as u32;
         let map_rows = (tr.max(3) - 1) as u32;
@@ -757,11 +769,17 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             Focus::Menu(MenuLevel::Categories) => " ↑↓カテゴリ Enter展開 / 文字キーで直接実行 Esc閉 ".to_string(),
             Focus::Menu(MenuLevel::Items(_)) => " ↑↓選択 Enter実行 / 右端キーでも実行 Esc戻る ".to_string(),
             Focus::Map => {
+                // 通信中(いずれかのジョブがSome)はスピナー1文字＋案内を先頭に出す
+                let jobs_active = route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || recommend_job.is_some();
+                let spinner = if jobs_active {
+                    const FR: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+                    format!("{} 通信中…(Escで中断) ", FR[spin % FR.len()])
+                } else { String::new() };
                 let live = if gps_rx.is_some() { "●LIVE(Gで解除) " } else { "" };
                 let playing = if play.is_some() { "▶再生中(Aで停止) " } else { "" };
                 let msg = if addr.is_empty() { String::new() } else { format!("» {addr} « ") }; // 一時メッセージを先頭に(切れない)
                 // 下部バーは細く。全操作は Space メニューから選べる
-                let base = format!(" {msg}{live}{playing}位置 z{z} {lat:.4},{lon:.4} ｜ Space:メニュー ?ヘルプ q終了");
+                let base = format!(" {spinner}{msg}{live}{playing}位置 z{z} {lat:.4},{lon:.4} ｜ Space:メニュー ?ヘルプ q終了");
                 match &route_note { Some(rn) => format!("{base} | {rn} "), None => base }
             }
         };
@@ -908,8 +926,11 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         }
         out.flush()?;
 
-        // 入力待ち。ルート計算中(route_job)はポーリングして結果を取り込む
-        let ev: Option<Event> = if route_job.is_some() {
+        // バックグラウンドジョブの結果を毎フレーム取り込む(route/search/near/street/recommend)。
+        // Ok=適用しjob=None / Empty=保持 / Disconnected=None。結果を適用したフレームはブロックせず即再描画する。
+        use std::sync::mpsc::TryRecvError;
+        let mut got_result = false;
+        if route_job.is_some() {
             match route_job.as_ref().unwrap().try_recv() {
                 Ok(Ok(r)) => {
                     spec.routes.clear();
@@ -917,16 +938,96 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     route_ele = r.ele;
                     route_ascend = r.ascend_m;
                     spec.routes.push(Route { pts: r.pts, color: [0, 220, 255], thickness: 2 });
-                    route_job = None;
-                    None
+                    route_job = None; got_result = true;
                 }
-                Ok(Err(e)) => { route_note = Some(format!("({e})")); route_job = None; None }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    if event::poll(std::time::Duration::from_millis(80))? { Some(event::read()?) } else { None }
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => { route_job = None; None }
+                Ok(Err(e)) => { route_note = Some(format!("({e})")); route_job = None; got_result = true; }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => { route_job = None; got_result = true; }
             }
-        } else if gps_rx.is_some() || play.is_some() {
+        }
+        if search_job.is_some() {
+            match search_job.as_ref().unwrap().try_recv() {
+                Ok((ckey, q, res)) => {
+                    match res {
+                        Err(e) => addr = format!("検索できません（{e}）"),
+                        Ok(v) if v.is_empty() => addr = format!("見つからない: {q}"),
+                        Ok(v) => {
+                            scache.insert(ckey, v.clone()); let _ = searchcache::save(&scache);
+                            pois = v.into_iter().take(8).map(|(la, lo, nm)| (la, lo, nm, PoiCat::Waypoint)).collect();
+                            poi_sel = 0;
+                            poi_label = format!("検索:{q}");
+                            set_markers(&mut spec, &wps, &pois);
+                            if matches!(focus, Focus::Map) { focus = Focus::PoiList; } // 別画面へ移っていたら奪わない
+                        }
+                    }
+                    search_job = None; got_result = true;
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => { search_job = None; got_result = true; }
+            }
+        }
+        if near_job.is_some() {
+            match near_job.as_ref().unwrap().try_recv() {
+                Ok((q, osm)) => {
+                    // ローカルの★スポット一致(距離順)を先頭、Overpass結果(距離順)を後ろにマージ
+                    let ql = q.to_lowercase();
+                    let mut mine: Vec<(f64, f64, String, PoiCat)> = spots.iter()
+                        .filter(|s| s.name.to_lowercase().contains(&ql))
+                        .map(|s| (s.lat, s.lon, format!("★{}", s.name), PoiCat::Home)).collect();
+                    mine.sort_by(|p, r| haversine_km((lat, lon), (p.0, p.1)).partial_cmp(&haversine_km((lat, lon), (r.0, r.1))).unwrap_or(std::cmp::Ordering::Equal));
+                    let mut got: Vec<(f64, f64, String, PoiCat)> = osm.into_iter().map(|(a, b, nm)| (a, b, nm, PoiCat::Other)).collect();
+                    got.sort_by(|p, r| haversine_km((lat, lon), (p.0, p.1)).partial_cmp(&haversine_km((lat, lon), (r.0, r.1))).unwrap_or(std::cmp::Ordering::Equal));
+                    mine.extend(got);
+                    if mine.is_empty() { addr = format!("周辺に無し: {q}"); }
+                    else {
+                        pois = mine; poi_sel = 0; poi_label = format!("周辺:{q}");
+                        set_markers(&mut spec, &wps, &pois);
+                        if matches!(focus, Focus::Map) { focus = Focus::PoiList; }
+                    }
+                    near_job = None; got_result = true;
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => { near_job = None; got_result = true; }
+            }
+        }
+        if street_job.is_some() {
+            match street_job.as_ref().unwrap().try_recv() {
+                Ok((la, lo, hd, res)) => {
+                    match res {
+                        Ok(img) => { street = Some((img, hd, la, lo)); addr.clear(); }
+                        Err(e) => addr = format!("実写: {e}"),
+                    }
+                    street_job = None; got_result = true;
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => { street_job = None; got_result = true; }
+            }
+        }
+        if recommend_job.is_some() {
+            match recommend_job.as_ref().unwrap().try_recv() {
+                Ok(res) => {
+                    match res {
+                        Ok(v) if v.is_empty() => addr = "おすすめ: 実在確認できる地点なし".into(),
+                        Ok(v) => {
+                            pois = v.into_iter().map(|(la, lo, nm)| (la, lo, nm, PoiCat::Home)).collect();
+                            poi_sel = 0; poi_label = "おすすめ".into();
+                            set_markers(&mut spec, &wps, &pois);
+                            if matches!(focus, Focus::Map) { focus = Focus::PoiList; }
+                        }
+                        Err(e) => addr = format!("おすすめ: {e}"),
+                    }
+                    recommend_job = None; got_result = true;
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => { recommend_job = None; got_result = true; }
+            }
+        }
+
+        // 入力待ち。結果適用直後は即再描画(None)。ジョブ/GPS/再生いずれか進行中はポーリング。
+        let polling = route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || recommend_job.is_some() || gps_rx.is_some() || play.is_some();
+        let ev: Option<Event> = if got_result {
+            None
+        } else if polling {
             if event::poll(std::time::Duration::from_millis(80))? { Some(event::read()?) } else { None }
         } else {
             Some(event::read()?)
@@ -934,7 +1035,13 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         match ev {
             None => {} // 再描画のみ(計算待ち)
             Some(Event::Key(k)) if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) => {
-                if route_job.is_some() { route_job = None; route_note = Some("中断".to_string()); } // 計算中断(アプリは終了しない)
+                // Ctrl-C: 進行中の全ジョブを中断(アプリは終了しない)
+                let any = route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || recommend_job.is_some();
+                if any {
+                    if route_job.is_some() { route_note = Some("中断".to_string()); }
+                    route_job = None; search_job = None; near_job = None; street_job = None; recommend_job = None;
+                    addr = "中断".into();
+                }
             }
             Some(Event::Key(_)) if onboard => { // 初回案内を最初のキーで閉じ、既読マーカーを書く(以後出さない)
                 onboard = false;
@@ -942,6 +1049,13 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             }
             Some(Event::Key(_)) if qr_view.is_some() => qr_view = None, // ポップアップを閉じる
             Some(Event::Key(_)) if popup.is_some() => popup = None, // 名前ポップアップを閉じる
+            // Map表示中のEscは進行中ジョブの中断に使う(サブ画面のEscは各Focusの取消のまま)
+            Some(Event::Key(k)) if k.code == KeyCode::Esc && matches!(focus, Focus::Map)
+                && (route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || recommend_job.is_some()) => {
+                if route_job.is_some() { route_note = Some("中断".to_string()); }
+                route_job = None; search_job = None; near_job = None; street_job = None; recommend_job = None;
+                addr = "中断".into();
+            }
             Some(Event::Key(k)) => {
                 let cur = std::mem::replace(&mut focus, Focus::Map);
                 match cur {
@@ -950,27 +1064,26 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             let q = buf.trim().to_string();
                             if !q.is_empty() {
                                 let ckey = searchcache::make_key(&q, lat, lon);
-                                // キャッシュヒット=API叩かない。ミス時のみ検索し、通信/サーバ障害は0件と区別する。
-                                let outcome: Result<Vec<(f64, f64, String)>, String> = match scache.get(&ckey).cloned() {
-                                    Some(v) => Ok(v),
-                                    None => {
-                                        show_busy(&mut out, cols, tr, "検索中…");
-                                        match geocode_list(&q, Some((lat, lon)), &cfg.google_maps_api_key) {
-                                            Ok(r) => { if !r.is_empty() { scache.insert(ckey, r.clone()); let _ = searchcache::save(&scache); } Ok(r) }
-                                            Err(e) => Err(e.to_string()),
-                                        }
-                                    }
-                                };
-                                match outcome {
-                                    Err(e) => addr = format!("検索できません（{e}）"), // 通信/サーバ/解析の障害
-                                    Ok(v) if v.is_empty() => addr = format!("見つからない: {q}"),
-                                    Ok(v) => {
+                                // キャッシュヒットは即適用(同期)。ミス時のみ別スレッドで検索(通信/サーバ障害は0件と区別)。
+                                if let Some(v) = scache.get(&ckey).cloned() {
+                                    if v.is_empty() { addr = format!("見つからない: {q}"); }
+                                    else {
                                         pois = v.into_iter().take(8).map(|(la, lo, nm)| (la, lo, nm, PoiCat::Waypoint)).collect();
                                         poi_sel = 0;
                                         poi_label = format!("検索:{q}");
                                         set_markers(&mut spec, &wps, &pois);
                                         focus = Focus::PoiList;
                                     }
+                                } else {
+                                    let q2 = q.clone(); let ckey2 = ckey.clone();
+                                    let key = cfg.google_maps_api_key.clone();
+                                    let (tx, rx) = std::sync::mpsc::channel();
+                                    std::thread::spawn(move || {
+                                        let r = geocode_list(&q2, Some((lat, lon)), &key).map_err(|e| e.to_string());
+                                        let _ = tx.send((ckey2, q2, r));
+                                    });
+                                    search_job = Some(rx);
+                                    focus = Focus::Map; // UIは生きたまま(スピナー表示・Escで中断)
                                 }
                             }
                         }
@@ -1083,27 +1196,29 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                         KeyCode::Enter => {
                             let dir = buf.trim().to_string();
                             if !dir.is_empty() {
-                                show_busy(&mut out, cols, tr, "AI提案中…(数秒)");
-                                match recommend::recommend(&cfg.llm_command, &cfg.llm_model, &dir) {
-                                    Ok(recs) if !recs.is_empty() => {
-                                        let mut verified: Vec<(f64, f64, String)> = Vec::new();
-                                        for r in recs.iter().take(8) {
-                                            let q = if r.area.is_empty() { r.name.clone() } else { format!("{} {}", r.area, r.name) };
-                                            if let Ok((la, lo)) = geocode(&q, Some((lat, lon)), &cfg.google_maps_api_key) {
-                                                verified.push((la, lo, r.name.clone()));
+                                // AI提案→実在確認(geocode)ループを別スレッドで回し、検証済みスポット列を返す。
+                                let cmd = cfg.llm_command.clone();
+                                let model = cfg.llm_model.clone();
+                                let key = cfg.google_maps_api_key.clone();
+                                let (tx, rx) = std::sync::mpsc::channel();
+                                std::thread::spawn(move || {
+                                    let payload: Result<Vec<(f64, f64, String)>, String> = match recommend::recommend(&cmd, &model, &dir) {
+                                        Ok(recs) => {
+                                            let mut verified: Vec<(f64, f64, String)> = Vec::new();
+                                            for r in recs.iter().take(8) {
+                                                let q = if r.area.is_empty() { r.name.clone() } else { format!("{} {}", r.area, r.name) };
+                                                if let Ok((la, lo)) = geocode(&q, Some((lat, lon)), &key) {
+                                                    verified.push((la, lo, r.name.clone()));
+                                                }
                                             }
+                                            Ok(verified)
                                         }
-                                        if verified.is_empty() { addr = "おすすめ: 実在確認できる地点なし".into(); }
-                                        else {
-                                            pois = verified.into_iter().map(|(la, lo, nm)| (la, lo, nm, PoiCat::Home)).collect();
-                                            poi_sel = 0; poi_label = "おすすめ".into();
-                                            set_markers(&mut spec, &wps, &pois);
-                                            focus = Focus::PoiList;
-                                        }
-                                    }
-                                    Ok(_) => addr = "おすすめ: 提案が空だった".into(),
-                                    Err(e) => addr = format!("おすすめ: {e}"),
-                                }
+                                        Err(e) => Err(e),
+                                    };
+                                    let _ = tx.send(payload);
+                                });
+                                recommend_job = Some(rx);
+                                focus = Focus::Map; // UIは生きたまま(スピナー表示・Escで中断)
                             }
                         }
                         KeyCode::Esc => {}
@@ -1228,27 +1343,21 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                         KeyCode::Enter => {
                             let q = buf.trim().to_string();
                             if !q.is_empty() {
-                                show_busy(&mut out, cols, tr, "周辺を検索中…"); // Overpassは数秒かかるので進行表示
+                                // Overpass(遅い)を別スレッドへ。viewbox境界を先に確定して渡す。★マージは結果適用側で行う。
                                 let (vt, vl) = pixel_to_deg(cx - ow as f64 * 1.25, cy - oh as f64 * 1.25, z);
                                 let (vb, vr) = pixel_to_deg(cx + ow as f64 * 1.25, cy + oh as f64 * 1.25, z);
                                 let rlat = 2.0 / 111.0;
                                 let rlon = 2.0 / (111.0 * lat.to_radians().cos().abs().max(0.1));
-                                // お気に入りスポット優先: 名前一致(大小無視)を★付きで先頭に(距離順)
-                                let ql = q.to_lowercase();
-                                let mut mine: Vec<(f64, f64, String, PoiCat)> = spots.iter()
-                                    .filter(|s| s.name.to_lowercase().contains(&ql))
-                                    .map(|s| (s.lat, s.lon, format!("★{}", s.name), PoiCat::Home)).collect();
-                                mine.sort_by(|p, r| haversine_km((lat, lon), (p.0, p.1)).partial_cmp(&haversine_km((lat, lon), (r.0, r.1))).unwrap_or(std::cmp::Ordering::Equal));
-                                let v = search_nearby(&q, vb.min(lat - rlat), vl.min(lon - rlon), vt.max(lat + rlat), vr.max(lon + rlon));
-                                let mut osm: Vec<(f64, f64, String, PoiCat)> = v.into_iter().map(|(a, b, nm)| (a, b, nm, PoiCat::Other)).collect();
-                                osm.sort_by(|p, r| haversine_km((lat, lon), (p.0, p.1)).partial_cmp(&haversine_km((lat, lon), (r.0, r.1))).unwrap_or(std::cmp::Ordering::Equal));
-                                mine.extend(osm);
-                                if mine.is_empty() { addr = format!("周辺に無し: {q}"); }
-                                else {
-                                    pois = mine; poi_sel = 0; poi_label = format!("周辺:{q}");
-                                    set_markers(&mut spec, &wps, &pois);
-                                    focus = Focus::PoiList;
-                                }
+                                let (south, west) = (vb.min(lat - rlat), vl.min(lon - rlon));
+                                let (north, east) = (vt.max(lat + rlat), vr.max(lon + rlon));
+                                let q2 = q.clone();
+                                let (tx, rx) = std::sync::mpsc::channel();
+                                std::thread::spawn(move || {
+                                    let v = search_nearby(&q2, south, west, north, east);
+                                    let _ = tx.send((q2, v));
+                                });
+                                near_job = Some(rx);
+                                focus = Focus::Map; // UIは生きたまま(スピナー表示・Escで中断)
                             }
                         }
                         KeyCode::Esc => {}
@@ -1507,11 +1616,15 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                 if !cfg.streetview_enabled { addr = "実写: OFF(設定で有効化)".into(); }
                                 else if !streetview::available(&cfg.google_maps_api_key) { addr = "実写: Google APIキー未設定([google] maps_api_key)".into(); }
                                 else {
-                                    show_busy(&mut out, cols, tr, "実写取得中…");
-                                    match streetview::fetch(lat, lon, 0, 640, 480, &cfg.google_maps_api_key) {
-                                        Ok(img) => { street = Some((img, 0, lat, lon)); addr.clear(); }
-                                        Err(e) => addr = format!("実写: {e}"),
-                                    }
+                                    // 実写取得を別スレッドへ(focusはMapのまま=スピナーが回る)
+                                    let (la, lo) = (lat, lon);
+                                    let key = cfg.google_maps_api_key.clone();
+                                    let (tx, rx) = std::sync::mpsc::channel();
+                                    std::thread::spawn(move || {
+                                        let r = streetview::fetch(la, lo, 0, 640, 480, &key);
+                                        let _ = tx.send((la, lo, 0, r));
+                                    });
+                                    street_job = Some(rx);
                                 }
                             }
                             KeyCode::Char('n') => { // BRouter の代替ルート候補を巡回
