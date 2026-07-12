@@ -133,7 +133,7 @@ impl Drop for TermGuard {
 pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Result<()> {
     use crossterm::event::{self, Event, KeyCode, KeyModifiers};
     enum Focus { Map, Menu, Search(String), SaveName(String), NearSearch(String), PoiMenu, PoiList, RouteList, WaypointList,
-                 NewCat(String), SpotName(String, String), SpotList, SpotCatList, SpotRename(String, usize), Settings, RoadSearch(String), SpotEditName(String, usize), Recommend(String) }
+                 NewCat(String), SpotForm { name: String, url: String, field: usize }, SpotList, SpotCatList, SpotRename(String, usize), Settings, RoadSearch(String), SpotEditName(String, usize), Recommend(String) }
     let _guard = TermGuard::enter()?; // Drop で必ず端末復元
     let mut cache: Cache = HashMap::new();
     let mut out = std::io::stdout();
@@ -323,7 +323,11 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 }).collect();
                 ("並べ替え".to_string(), its, wp_sel)
             } else if show_splist {
-                let its = spots.iter().filter(|s| s.cat == cur_cat).map(|s| if s.name.is_empty() { "(無名)".to_string() } else { s.name.clone() }).collect();
+                let its = spots.iter().filter(|s| s.cat == cur_cat).map(|s| {
+                    let nm = if s.name.is_empty() { "(無名)" } else { s.name.as_str() };
+                    let d = haversine_km((lat, lon), (s.lat, s.lon)); // 現在地(中心)からの距離
+                    format!("{} {:.1}k", nm, d)
+                }).collect();
                 (format!("{cur_cat}"), its, sp_sel)
             } else if show_catlist {
                 let its = spot_cats.iter().map(|(n, i)| format!("{} 色{}", n, i)).collect();
@@ -410,10 +414,10 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             Focus::SaveName(buf) => format!(" ルート名: {buf}\u{2588}   Enter=保存 Esc=取消 "),
             Focus::NearSearch(buf) => format!(" 周辺検索: {buf}\u{2588}   Enter=検索 Esc=取消 "),
             Focus::NewCat(buf) => format!(" 新規カテゴリ: {buf}\u{2588}   Enter=作成 Esc=取消 "),
-            Focus::SpotName(buf, cat) => format!(" [{cat}] 名前 or GoogleマップURL: {buf}\u{2588}   Enter=保存 Esc=取消 "),
-            Focus::SpotList => format!(" [{cur_cat}] ↑↓ Enter移動 n新規 r改名 m位置を中心へ x削除 Esc戻る "),
+            Focus::SpotForm { .. } => " 新規スポット: ↑↓/Tab移動 入力/貼付 Enter=次/送信 Esc=取消 ".to_string(),
+            Focus::SpotList => format!(" [{cur_cat}] ↑↓ Enter移動 [ ]並替 n新規 r改名 m中心へ x削除 Esc戻る "),
             Focus::SpotEditName(buf, _) => format!(" スポット改名: {buf}\u{2588}   Enter=確定 Esc=取消 "),
-            Focus::SpotCatList => " カテゴリ: ↑↓選択 Enter=中へ n新規 r改名 c色 x削除(空のみ) Esc=閉 ".to_string(),
+            Focus::SpotCatList => " カテゴリ: ↑↓選択 [ ]並替 Enter=中へ n新規 r改名 c色 x削除(空のみ) Esc=閉 ".to_string(),
             Focus::Settings => {
                 let desc = match set_sel {
                     0 => "braille: 点字ドットで高精細描画(色は淡め)。OFFはハーフブロック",
@@ -486,6 +490,46 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             for k in 0..2 { let _ = write!(out, "\x1b[{};{c0}H\x1b[30;107m{hpad}\x1b[0m", r0 + 3 + lines.len() as u32 + k); }
             let _ = write!(out, "\x1b[{};1H\x1b[7m 任意のキーで閉じる \x1b[0m\x1b[K", tr);
         }
+
+        // 新規スポット登録フォーム(中央ボックス。qr_view/popup と同じ中央重畳手法)
+        if let Focus::SpotForm { name, url, field } = &focus {
+            const BG: &str = "\x1b[30;47m";   // 黒字・白地(ボックス地)
+            const SEL: &str = "\x1b[97;40m";  // 白字・黒地(選択中フィールドを反転表示)
+            const RST: &str = "\x1b[0m";
+            let iw = (cols as usize).saturating_sub(6).clamp(24, 60); // ボックス内容幅
+            let cur = |f: usize| if *field == f { "\u{2588}" } else { "" }; // 選択中の入力欄にカーソル
+            let header = format!("  新規スポット [{cur_cat}]");
+            let name_line = format!("  名称: {}{}", name, cur(0));
+            let url_line = format!("  GoogleマップURL(任意): {}{}", url, cur(1));
+            let blank = " ".repeat(iw);
+            // 行の並び(内容, その行が選択中フィールドか)
+            let rows: [(String, bool); 6] = [
+                (blank.clone(), false),
+                (fit_cells(&header, iw), false),
+                (fit_cells(&name_line, iw), *field == 0),
+                (fit_cells(&url_line, iw), *field == 1),
+                (blank.clone(), false),
+                (blank.clone(), false),
+            ];
+            // ボタン行([送信]/[戻る] を明示セグメントで組む。各6セル+前後余白)
+            let mut btn = String::new();
+            btn.push_str(BG); btn.push_str("  ");
+            btn.push_str(if *field == 2 { SEL } else { BG }); btn.push_str("[送信]");
+            btn.push_str(BG); btn.push_str("  ");
+            btn.push_str(if *field == 3 { SEL } else { BG }); btn.push_str("[戻る]");
+            btn.push_str(BG);
+            btn.push_str(&" ".repeat(iw.saturating_sub(2 + 6 + 2 + 6)));
+            btn.push_str(RST);
+            let total = rows.len() + 2; // + ボタン行 + 下余白
+            let r0 = ((map_rows as usize).saturating_sub(total) / 2).max(1) as u32;
+            let c0 = ((cols as usize).saturating_sub(iw) / 2).max(1) as u32;
+            for (i, (line, sel)) in rows.iter().enumerate() {
+                let style = if *sel { SEL } else { BG };
+                let _ = write!(out, "\x1b[{};{}H{}{}{}", r0 + i as u32, c0, style, line, RST);
+            }
+            let _ = write!(out, "\x1b[{};{}H{}", r0 + rows.len() as u32, c0, btn);
+            let _ = write!(out, "\x1b[{};{}H{}{}{}", r0 + rows.len() as u32 + 1, c0, BG, blank, RST);
+        }
         out.flush()?;
 
         // 入力待ち。ルート計算中(route_job)はポーリングして結果を取り込む
@@ -554,6 +598,14 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                         KeyCode::Up => { cat_sel = cat_sel.saturating_sub(1); focus = Focus::SpotCatList; }
                         KeyCode::Down => { if cat_sel + 1 < spot_cats.len() { cat_sel += 1; } focus = Focus::SpotCatList; }
                         KeyCode::Char('n') => focus = Focus::NewCat(String::new()),
+                        KeyCode::Char('[') => { // 選択カテゴリを上へ
+                            if cat_sel > 0 && cat_sel < spot_cats.len() { spot_cats.swap(cat_sel, cat_sel - 1); cat_sel -= 1; let _ = save_all_cats(&spot_cats); }
+                            focus = Focus::SpotCatList;
+                        }
+                        KeyCode::Char(']') => { // 選択カテゴリを下へ
+                            if cat_sel + 1 < spot_cats.len() { spot_cats.swap(cat_sel, cat_sel + 1); cat_sel += 1; let _ = save_all_cats(&spot_cats); }
+                            focus = Focus::SpotCatList;
+                        }
                         KeyCode::Char('r') => { if let Some((n, _)) = spot_cats.get(cat_sel) { focus = Focus::SpotRename(n.clone(), cat_sel); } else { focus = Focus::SpotCatList; } }
                         KeyCode::Char('c') => {
                             if let Some(e) = spot_cats.get_mut(cat_sel) { e.1 = (e.1 + 1) % SPOT_PALETTE.len() as u8; let _ = save_all_cats(&spot_cats); apply_spots(&mut spec, &spots, &spot_cats, show_spots); }
@@ -662,7 +714,17 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     Focus::SpotList => match k.code { // cur_cat のスポット一覧
                         KeyCode::Up => { sp_sel = sp_sel.saturating_sub(1); focus = Focus::SpotList; }
                         KeyCode::Down => { let n = spots.iter().filter(|s| s.cat == cur_cat).count(); if sp_sel + 1 < n { sp_sel += 1; } focus = Focus::SpotList; }
-                        KeyCode::Char('n') => focus = Focus::SpotName(String::new(), cur_cat.clone()), // 現在地を新規スポット
+                        KeyCode::Char('n') => focus = Focus::SpotForm { name: String::new(), url: String::new(), field: 0 }, // 新規スポット登録フォーム
+                        KeyCode::Char('[') => { // 選択スポットを同カテゴリ内で上へ
+                            let idxs: Vec<usize> = spots.iter().enumerate().filter(|(_, s)| s.cat == cur_cat).map(|(i, _)| i).collect();
+                            if sp_sel > 0 && sp_sel < idxs.len() { spots.swap(idxs[sp_sel], idxs[sp_sel - 1]); sp_sel -= 1; let _ = save_all_spots(&spots); }
+                            focus = Focus::SpotList;
+                        }
+                        KeyCode::Char(']') => { // 選択スポットを同カテゴリ内で下へ
+                            let idxs: Vec<usize> = spots.iter().enumerate().filter(|(_, s)| s.cat == cur_cat).map(|(i, _)| i).collect();
+                            if sp_sel + 1 < idxs.len() { spots.swap(idxs[sp_sel], idxs[sp_sel + 1]); sp_sel += 1; let _ = save_all_spots(&spots); }
+                            focus = Focus::SpotList;
+                        }
                         KeyCode::Char('r') => { // 選択スポットを改名
                             let idxs: Vec<usize> = spots.iter().enumerate().filter(|(_, s)| s.cat == cur_cat).map(|(i, _)| i).collect();
                             match idxs.get(sp_sel) { Some(&gi) => focus = Focus::SpotEditName(spots[gi].name.clone(), gi), None => focus = Focus::SpotList }
@@ -729,33 +791,44 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                         KeyCode::Char(c) => { buf.push(c); focus = Focus::SpotRename(buf, idx); }
                         _ => focus = Focus::SpotRename(buf, idx),
                     },
-                    Focus::SpotName(mut buf, cat) => match k.code {
-                        KeyCode::Enter => {
-                            let t = buf.trim().to_string();
-                            // 決定: 保存(座標,名前) / エラー / 入力継続。空・不正URL・短縮URLを弾く
-                            enum Act { Save(f64, f64, String), Err(String), Cont }
-                            let act = if t.is_empty() { Act::Cont }
-                                else if t.starts_with("http") {
-                                    if t.contains("goo.gl") || t.contains("maps.app") { Act::Err("短縮URLは不可。Googleマップの通常URL(…/@…/!3d…!4d…)を貼って".into()) }
-                                    else if let Some((la, lo, nm)) = parse_gmaps_place(&t) { Act::Save(la, lo, if nm.trim().is_empty() { "(無名)".into() } else { nm }) }
-                                    else { Act::Err("URLから位置を取得できません(GoogleマップのURLか確認)".into()) }
-                                } else { Act::Save(lat, lon, t.clone()) };
-                            match act {
-                                Act::Save(la, lo, name) => {
-                                    let s = Spot { lat: la, lon: lo, cat: cat.clone(), name };
-                                    let _ = ensure_spot_cat(&s.cat, &mut spot_cats);
-                                    addr = match append_spot(&s) { Ok(_) => format!("スポット保存: {}", s.name), Err(e) => format!("({e})") };
-                                    spots.push(s); show_spots = true; apply_spots(&mut spec, &spots, &spot_cats, show_spots);
-                                    focus = Focus::SpotList;
+                    Focus::SpotForm { mut name, mut url, mut field } => match k.code { // 新規スポット登録フォーム
+                        KeyCode::Up | KeyCode::BackTab => { field = (field + 3) % 4; focus = Focus::SpotForm { name, url, field }; }
+                        KeyCode::Down | KeyCode::Tab => { field = (field + 1) % 4; focus = Focus::SpotForm { name, url, field }; }
+                        KeyCode::Backspace => { if field == 0 { name.pop(); } else if field == 1 { url.pop(); } focus = Focus::SpotForm { name, url, field }; }
+                        KeyCode::Char(c) => { if field == 0 { name.push(c); } else if field == 1 { url.push(c); } focus = Focus::SpotForm { name, url, field }; }
+                        KeyCode::Esc => focus = Focus::SpotList, // 取消
+                        KeyCode::Enter => match field {
+                            0 => { field = 1; focus = Focus::SpotForm { name, url, field }; } // 次のフィールドへ
+                            1 => { field = 2; focus = Focus::SpotForm { name, url, field }; }
+                            3 => focus = Focus::SpotList, // [戻る]
+                            _ => { // 2 = [送信]
+                                let u = url.trim();
+                                let name_in = spot_clean(name.trim()); // 名称buf(整形済)
+                                // URL非空: parse_gmaps_placeで(lat,lon,店名)。空: 現在地(中心)+名称。両方空: 何もしない
+                                enum Act { Save(f64, f64, String), Err(String), Nop }
+                                let act = if u.is_empty() && name_in.is_empty() { Act::Nop }
+                                    else if u.is_empty() { Act::Save(lat, lon, if name_in.is_empty() { "(無名)".into() } else { name_in.clone() }) }
+                                    else if u.contains("goo.gl") || u.contains("maps.app") { Act::Err("短縮URLは不可。Googleマップの通常URL(…/@…/!3d…!4d…)を貼って".into()) }
+                                    else if let Some((la, lo, nm)) = parse_gmaps_place(u) {
+                                        let nm = spot_clean(&nm); // URLの名前
+                                        let final_name = if !name_in.is_empty() { name_in.clone() } // 名称buf優先
+                                            else if !nm.is_empty() { nm } else { "(無名)".into() };
+                                        Act::Save(la, lo, final_name)
+                                    } else { Act::Err("URLから位置を取得できません(GoogleマップのURLか確認)".into()) };
+                                match act {
+                                    Act::Save(la, lo, nm) => {
+                                        let s = Spot { lat: la, lon: lo, cat: cur_cat.clone(), name: nm };
+                                        let _ = ensure_spot_cat(&s.cat, &mut spot_cats);
+                                        addr = match append_spot(&s) { Ok(_) => format!("スポット保存: {}", s.name), Err(e) => format!("({e})") };
+                                        spots.push(s); show_spots = true; apply_spots(&mut spec, &spots, &spot_cats, show_spots);
+                                        focus = Focus::SpotList;
+                                    }
+                                    Act::Err(msg) => { addr = msg; focus = Focus::SpotForm { name, url, field }; }
+                                    Act::Nop => focus = Focus::SpotForm { name, url, field },
                                 }
-                                Act::Err(msg) => { addr = msg; focus = Focus::SpotName(t, cat); }
-                                Act::Cont => focus = Focus::SpotName(String::new(), cat),
                             }
-                        }
-                        KeyCode::Esc => focus = Focus::SpotList,
-                        KeyCode::Backspace => { buf.pop(); focus = Focus::SpotName(buf, cat); }
-                        KeyCode::Char(c) => { buf.push(c); focus = Focus::SpotName(buf, cat); }
-                        _ => focus = Focus::SpotName(buf, cat),
+                        },
+                        _ => focus = Focus::SpotForm { name, url, field },
                     },
                     Focus::NearSearch(mut buf) => match k.code {
                         KeyCode::Enter => {
@@ -1093,7 +1166,8 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             }
             Some(Event::Paste(s)) => { match &mut focus {
                 Focus::Search(buf) | Focus::SaveName(buf) | Focus::NearSearch(buf) | Focus::NewCat(buf) | Focus::RoadSearch(buf) | Focus::Recommend(buf) => buf.push_str(&s),
-                Focus::SpotName(buf, _) | Focus::SpotRename(buf, _) | Focus::SpotEditName(buf, _) => buf.push_str(&s),
+                Focus::SpotForm { name, url, field } => { if *field == 0 { name.push_str(&s); } else if *field == 1 { url.push_str(&s); } }
+                Focus::SpotRename(buf, _) | Focus::SpotEditName(buf, _) => buf.push_str(&s),
                 Focus::Settings if set_sel == 10 => { cfg.streetview_api_key = s.trim().to_string(); addr = "APIkey設定(sで保存)".into(); }
                 _ => {}
             } }
