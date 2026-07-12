@@ -27,7 +27,6 @@ mod config;
 #[allow(dead_code)]
 mod recommend;
 
-use std::collections::HashMap;
 use image::{RgbImage, imageops::FilterType};
 
 use geo::*;
@@ -454,7 +453,7 @@ fn main() {
 
     let mut spec = build_spec(&a, lat, lon);
     let route_note = match attach_route(&mut spec, &a) { Ok(s) => s, Err(e) => { eprintln!("{e}"); None } };
-    let mut cache: Cache = HashMap::new();
+    let mut cache: Cache = Cache::new();
     match build_window(cx, cy, a.zoom, a.win_px, a.win_px, &a.style, &mut cache) {
         Ok(src) => {
             save_state(lat, lon, a.zoom, &a.style, a.route.as_deref().unwrap_or(&[]), &a.route_mode);

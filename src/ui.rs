@@ -9,7 +9,6 @@ use crate::route::*;
 use crate::poi::*;
 use crate::spots::*;
 use crate::share::*;
-use std::collections::HashMap;
 use std::io::Write;
 use image::{RgbImage, imageops::FilterType};
 
@@ -265,7 +264,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     enum Focus { Map, Menu(MenuLevel), Search(String), SaveName(String), NearSearch(String), PoiMenu, PoiList, RouteList, WaypointList,
                  NewCat(String), SpotForm { name: String, url: String, field: usize }, SpotList, SpotCatList, SpotRename(String, usize), Settings, RoadSearch(String), SpotEditName(String, usize), Recommend(String) }
     let _guard = TermGuard::enter()?; // Drop で必ず端末復元
-    let mut cache: Cache = HashMap::new();
+    let mut cache: Cache = Cache::new();
     let mut out = std::io::stdout();
     let mut addr = String::new();          // 'a' 住所 / 一時メッセージ
     let mut focus = Focus::Map;

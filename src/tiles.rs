@@ -4,7 +4,36 @@ use std::io::Read;
 use image::RgbImage;
 use crate::geo::TILE;
 
-pub type Cache = HashMap<(u32, i64, i64), RgbImage>;
+// キャッシュキーは style を含む(style違いのタイルが混ざらない。以前は clear() 頼みで危うかった)。
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct TileKey { style: String, z: u32, x: i64, y: i64 }
+
+// タイルキャッシュ。上限(cap)超過時は最終アクセスが最古のものから捨てる簡易LRU。
+// 長時間パンし続けてもメモリが訪問範囲に比例して無制限に増えないようにする。
+pub struct Cache { map: HashMap<TileKey, (RgbImage, u64)>, tick: u64, cap: usize }
+
+impl Default for Cache { fn default() -> Self { Self::new() } }
+
+impl Cache {
+    pub fn new() -> Self { Cache { map: HashMap::new(), tick: 0, cap: 256 } }
+    pub fn clear(&mut self) { self.map.clear(); self.tick = 0; }
+    fn contains(&self, k: &TileKey) -> bool { self.map.contains_key(k) }
+    fn get(&mut self, k: &TileKey) -> Option<&RgbImage> {
+        self.tick += 1;
+        let t = self.tick;
+        match self.map.get_mut(k) { Some(e) => { e.1 = t; Some(&e.0) } None => None }
+    }
+    fn insert(&mut self, k: TileKey, img: RgbImage) {
+        if self.map.len() >= self.cap && !self.map.contains_key(&k) {
+            if let Some(old) = self.map.iter().min_by_key(|(_, (_, t))| *t).map(|(kk, _)| kk.clone()) {
+                self.map.remove(&old); // 最古を1つ退避
+            }
+        }
+        self.tick += 1;
+        let t = self.tick;
+        self.map.insert(k, (img, t));
+    }
+}
 
 // タイルスタイル → URL。voyager/dark/light は CartoDB の label-free 系(端末で見やすい)。
 fn tile_url(style: &str, z: u32, x: i64, y: i64) -> String {
@@ -42,7 +71,7 @@ pub fn build_window(cx: f64, cy: f64, z: u32, win_w: u32, win_h: u32, style: &st
         if ty < 0 || ty >= max_t { continue; }
         for tx in tx_min..=tx_max {
             let wx = ((tx % max_t) + max_t) % max_t;
-            if !cache.contains_key(&(z, wx, ty)) { missing.push((wx, ty)); }
+            if !cache.contains(&TileKey { style: style.to_string(), z, x: wx, y: ty }) { missing.push((wx, ty)); }
         }
     }
     missing.sort_unstable();
@@ -53,7 +82,7 @@ pub fn build_window(cx: f64, cy: f64, z: u32, win_w: u32, win_h: u32, style: &st
             let hs: Vec<_> = chunk.iter().map(|&(wx, ty)| s.spawn(move || ((wx, ty), fetch_tile(style, z, wx, ty)))).collect();
             hs.into_iter().map(|h| h.join().unwrap()).collect()
         });
-        for ((wx, ty), r) in got { cache.insert((z, wx, ty), r?); }
+        for ((wx, ty), r) in got { cache.insert(TileKey { style: style.to_string(), z, x: wx, y: ty }, r?); }
     }
 
     let cols = (tx_max - tx_min + 1) as u32;
@@ -64,7 +93,7 @@ pub fn build_window(cx: f64, cy: f64, z: u32, win_w: u32, win_h: u32, style: &st
         if ty < 0 || ty >= max_t { continue; }
         for tx in tx_min..=tx_max {
             let wx = ((tx % max_t) + max_t) % max_t;
-            if let Some(t) = cache.get(&(z, wx, ty)) {
+            if let Some(t) = cache.get(&TileKey { style: style.to_string(), z, x: wx, y: ty }) {
                 let ox = (tx - tx_min) as u32 * TILE;
                 let oy = (ty - ty_min) as u32 * TILE;
                 for (px, py, p) in t.enumerate_pixels() { canvas.put_pixel(ox + px, oy + py, *p); }
