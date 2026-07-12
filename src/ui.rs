@@ -314,7 +314,21 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         let glines: Vec<String> = if gut > 0 {
             let gw = gut as usize;
             let (header, items, sel): (String, Vec<String>, usize) = if show_menu {
-                ("メニュー".to_string(), MENU.iter().map(|s| s.to_string()).collect(), menu_sel)
+                // カテゴリ見出しを挟んで表示(見出しは選択不可)。menu_sel(0..MENU.len)は実項目のみを指す。
+                let groups: [(&str, usize, usize); 5] = [
+                    ("探す・移動", 0, 3), ("ルート", 3, 11), ("スポット", 11, 13),
+                    ("表示・AI", 13, 18), ("保存・共有・設定", 18, 24),
+                ];
+                let mut its: Vec<String> = Vec::new();
+                let mut sel_disp = 0usize;
+                for (gname, s, e) in groups {
+                    its.push(format!("── {gname} ──"));
+                    for i in s..e.min(MENU.len()) {
+                        if i == menu_sel { sel_disp = its.len(); }
+                        its.push(format!("  {}", MENU[i]));
+                    }
+                }
+                ("メニュー".to_string(), its, sel_disp)
             } else if show_wps {
                 let n = wps.len();
                 let its = wps.iter().enumerate().map(|(i, (la, lo))| {
