@@ -317,6 +317,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     let mut sp_sel: usize = 0;
     let mut cat_sel: usize = 0;
     let mut cur_cat = String::new(); // スポット一覧で表示中のカテゴリ
+    let mut pending_spot: Option<(f64, f64, String)> = None; // 検索結果からお気に入り登録する際の保留(座標+名前)。カテゴリ選択待ち
     apply_spots(&mut spec, &spots, &spot_cats, show_spots);
 
     // メニュー項目/直接キー どちらからでも同じ処理を走らせる。
@@ -643,6 +644,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             Focus::SpotForm { .. } => " 新規スポット: ↑↓/Tab移動 入力/貼付 Enter=次/送信 Esc=取消 ".to_string(),
             Focus::SpotList => format!(" [{cur_cat}] ↑↓ Enter移動 [ ]並替 n新規 r改名 m中心へ x削除 Esc戻る "),
             Focus::SpotEditName(_, _) => " 中央フォームに入力中 ".to_string(),
+            Focus::SpotCatList if pending_spot.is_some() => " 登録先カテゴリを選択: ↑↓ Enter=ここに登録 n新規 Esc取消 ".to_string(),
             Focus::SpotCatList => " カテゴリ: ↑↓選択 [ ]並替 Enter=中へ n新規 r改名 c色 x削除(空のみ) Esc=閉 ".to_string(),
             Focus::Settings => {
                 let desc = match set_sel {
@@ -664,7 +666,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             Focus::Recommend(_) => " 中央フォームに入力中 ".to_string(),
             Focus::SpotRename(_, _) => " 中央フォームに入力中 ".to_string(),
             Focus::PoiMenu => " 目的地カテゴリ: ↑↓選択 Enter=検索 (数字1-7も可 / キーワードは最終行かEnter) Esc=取消 ".to_string(),
-            Focus::PoiList => format!(" [{}] ↑↓選択 Enter=移動 s始 e終 v経由 f再検索 Esc閉 ", poi_label),
+            Focus::PoiList => format!(" [{}] ↑↓選択 Enter=移動 s始 e終 v経由 P登録 f再検索 Esc閉 ", poi_label),
             Focus::RouteList => " お気に入り: ↑↓選択 Enter=読込 Esc=閉 ".to_string(),
             Focus::WaypointList => " 並べ替え: ↑↓/Tab 選択  [ ]移動  x削除  +/-拡縮  Esc閉 ".to_string(),
             Focus::Menu(MenuLevel::Categories) => " ↑↓カテゴリ Enter展開 / 文字キーで直接実行 Esc閉 ".to_string(),
@@ -862,8 +864,24 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             }
                             focus = Focus::SpotCatList;
                         }
-                        KeyCode::Enter => { if let Some((name, _)) = spot_cats.get(cat_sel) { cur_cat = name.clone(); sp_sel = 0; focus = Focus::SpotList; } else { focus = Focus::SpotCatList; } }
-                        KeyCode::Esc => {}
+                        KeyCode::Enter => {
+                            let cat = spot_cats.get(cat_sel).map(|(c, _)| c.clone());
+                            if let Some((la, lo, nm)) = pending_spot.take() {
+                                // 検索結果からの登録: 選択カテゴリに新規スポットとして保存
+                                if let Some(cat) = cat {
+                                    let s = Spot { lat: la, lon: lo, cat: cat.clone(), name: spot_clean(&nm) };
+                                    let _ = append_spot(&s);
+                                    spots.push(s);
+                                    show_spots = true;
+                                    apply_spots(&mut spec, &spots, &spot_cats, show_spots);
+                                    addr = format!("★登録: {} [{}]", if nm.is_empty() { "(無名)" } else { nm.as_str() }, cat);
+                                }
+                                focus = Focus::Map;
+                            } else if let Some(cat) = cat {
+                                cur_cat = cat; sp_sel = 0; focus = Focus::SpotList;
+                            } else { focus = Focus::SpotCatList; }
+                        }
+                        KeyCode::Esc => { pending_spot = None; } // 登録キャンセル時も保留を消す→Mapへ
                         _ => focus = Focus::SpotCatList,
                     },
                     Focus::Settings => { let mut stay = true; match k.code { // 設定画面
@@ -1151,6 +1169,14 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             focus = Focus::PoiList;
                         }
                         KeyCode::Char('f') => focus = Focus::PoiMenu,
+                        KeyCode::Char('P') => { // 選択結果をお気に入りスポットに登録(カテゴリを選ばせる)
+                            if let Some(p) = pois.get(poi_sel) {
+                                if spot_cats.is_empty() { let _ = ensure_spot_cat("お気に入り", &mut spot_cats); }
+                                pending_spot = Some((p.0, p.1, p.2.clone()));
+                                cat_sel = 0;
+                                focus = Focus::SpotCatList;
+                            } else { focus = Focus::PoiList; }
+                        }
                         KeyCode::Esc => { pois.clear(); set_markers(&mut spec, &wps, &pois); }
                         _ => focus = Focus::PoiList,
                     },
