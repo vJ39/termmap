@@ -423,10 +423,10 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 if show_elev && (spec.routes.is_empty() || !route_ele.iter().any(|&z| z != 0.0)) { addr = "標高: ルート確定後に表示".into(); }
             }
             MenuAction::StreetView => {
-                if !streetview::available(&cfg.streetview_api_key) { addr = "実写: APIキー未設定(config.toml [streetview])".into(); }
+                if !streetview::available(&cfg.google_maps_api_key) { addr = "実写: APIキー未設定(config.toml [streetview])".into(); }
                 else {
                     show_busy(&mut out, $cols, $tr, "実写取得中…");
-                    match streetview::fetch($lat, $lon, 0, 640, 480, &cfg.streetview_api_key) {
+                    match streetview::fetch($lat, $lon, 0, 640, 480, &cfg.google_maps_api_key) {
                         Ok(img) => { street = Some((img, 0, $lat, $lon)); addr.clear(); }
                         Err(e) => addr = format!("実写: {e}"),
                     }
@@ -508,7 +508,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             KeyCode::Up => { let (a, b) = streetview::step(slat_c, slon_c, hd_c as f64, 20.0); (a, b, hd_c) }
                             _ => { let (a, b) = streetview::step(slat_c, slon_c, hd_c as f64 + 180.0, 20.0); (a, b, hd_c) }
                         };
-                        if let Ok(im) = streetview::fetch(nlat, nlon, nhd, 640, 480, &cfg.streetview_api_key) {
+                        if let Ok(im) = streetview::fetch(nlat, nlon, nhd, 640, 480, &cfg.google_maps_api_key) {
                             street = Some((im, nhd, nlat, nlon)); // Err時は現状維持(行き止まり等)
                         }
                     }
@@ -630,7 +630,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 ("カテゴリ".to_string(), its, cat_sel)
             } else if show_settings {
                 let onoff = |b: bool| if b { "ON" } else { "OFF" };
-                let keyset = if cfg.streetview_api_key.trim().is_empty() { "未設定" } else { "設定済" };
+                let keyset = if cfg.google_maps_api_key.trim().is_empty() { "未設定" } else { "設定済" };
                 let mode_ja = match cfg.route_profile.as_str() { "car-fast" => "高速", "moped" => "下道", "shortest" => "最短", o => o };
                 let model_ja = match cfg.llm_model.as_str() { "claude-sonnet-5" => "sonnet", "claude-haiku-4-5" => "haiku", "claude-opus-4-8" => "opus", o => o };
                 let its = vec![
@@ -644,7 +644,8 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     format!("スポット既定表示 {}", onoff(cfg.show_spots)),
                     format!("おすすめ {}", onoff(cfg.llm_recommend_enabled)),
                     format!("提案AIモデル {}", model_ja),
-                    format!("APIキー {}", keyset),
+                    format!("実写(StreetView) {}", onoff(cfg.streetview_enabled)),
+                    format!("Google APIキー {}", keyset),
                 ];
                 ("設定".to_string(), its, set_sel)
             } else if show_poimenu {
@@ -739,7 +740,8 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     7 => "spot既定: 起動時にお気に入りスポットを表示するか",
                     8 => "おすすめ: claude -p でツーリングスポットを提案する機能のON/OFF(未実装)",
                     9 => "LLM: おすすめに使うモデルを循環(claude-sonnet-5/haiku/opus)",
-                    _ => "APIkey: Google(Street View/検索)のキー。この行でCmd+V貼付→設定、sで保存",
+                    10 => "実写: iで中心地点のStreet Viewを開く機能のON/OFF(要Google APIキー)",
+                    _ => "Google APIキー: 検索(Geocoding)とStreet View共通。この行でCmd+V貼付→設定、sで保存。環境変数TERMMAP_GOOGLE_API_KEYでも可",
                 };
                 format!(" ▶ {desc}   [↑↓選択 Enter切替 s保存 Esc閉]")
             }
@@ -953,7 +955,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                     Some(v) => Ok(v),
                                     None => {
                                         show_busy(&mut out, cols, tr, "検索中…");
-                                        match geocode_list(&q, Some((lat, lon)), &cfg.streetview_api_key) {
+                                        match geocode_list(&q, Some((lat, lon)), &cfg.google_maps_api_key) {
                                             Ok(r) => { if !r.is_empty() { scache.insert(ckey, r.clone()); let _ = searchcache::save(&scache); } Ok(r) }
                                             Err(e) => Err(e.to_string()),
                                         }
@@ -1023,7 +1025,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     },
                     Focus::Settings => { let mut stay = true; match k.code { // 設定画面
                         KeyCode::Up => { set_sel = set_sel.saturating_sub(1); }
-                        KeyCode::Down => { if set_sel + 1 < 11 { set_sel += 1; } }
+                        KeyCode::Down => { if set_sel + 1 < 12 { set_sel += 1; } }
                         KeyCode::Left | KeyCode::Right => {
                             if set_sel == 6 { let d = if k.code == KeyCode::Left { -100.0 } else { 100.0 }; cfg.sample_interval_m = (cfg.sample_interval_m + d).clamp(100.0, 5000.0); }
                         }
@@ -1038,7 +1040,8 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             7 => { cfg.show_spots = !cfg.show_spots; show_spots = cfg.show_spots; apply_spots(&mut spec, &spots, &spot_cats, show_spots); }
                             8 => cfg.llm_recommend_enabled = !cfg.llm_recommend_enabled,
                             9 => cfg.llm_model = match cfg.llm_model.as_str() { "claude-sonnet-5" => "claude-haiku-4-5", "claude-haiku-4-5" => "claude-opus-4-8", _ => "claude-sonnet-5" }.to_string(),
-                            _ => addr = "APIkey: この行で貼り付け(Cmd+V)して設定".into(),
+                            10 => cfg.streetview_enabled = !cfg.streetview_enabled,
+                            _ => addr = "APIキー: この行で貼り付け(Cmd+V)して設定".into(),
                         },
                         KeyCode::Char('s') => {
                             cfg.braille = opts.braille; cfg.classify = opts.classify; cfg.edge = opts.edge; cfg.mono = opts.mono; cfg.style = opts.style.clone();
@@ -1086,7 +1089,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                         let mut verified: Vec<(f64, f64, String)> = Vec::new();
                                         for r in recs.iter().take(8) {
                                             let q = if r.area.is_empty() { r.name.clone() } else { format!("{} {}", r.area, r.name) };
-                                            if let Ok((la, lo)) = geocode(&q, Some((lat, lon)), &cfg.streetview_api_key) {
+                                            if let Ok((la, lo)) = geocode(&q, Some((lat, lon)), &cfg.google_maps_api_key) {
                                                 verified.push((la, lo, r.name.clone()));
                                             }
                                         }
@@ -1501,10 +1504,11 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                 }
                             }
                             KeyCode::Char('i') => { // 実写(Street View)を中心地点で開く
-                                if !streetview::available(&cfg.streetview_api_key) { addr = "実写: APIキー未設定(config.toml [streetview])".into(); }
+                                if !cfg.streetview_enabled { addr = "実写: OFF(設定で有効化)".into(); }
+                                else if !streetview::available(&cfg.google_maps_api_key) { addr = "実写: Google APIキー未設定([google] maps_api_key)".into(); }
                                 else {
                                     show_busy(&mut out, cols, tr, "実写取得中…");
-                                    match streetview::fetch(lat, lon, 0, 640, 480, &cfg.streetview_api_key) {
+                                    match streetview::fetch(lat, lon, 0, 640, 480, &cfg.google_maps_api_key) {
                                         Ok(img) => { street = Some((img, 0, lat, lon)); addr.clear(); }
                                         Err(e) => addr = format!("実写: {e}"),
                                     }
@@ -1556,7 +1560,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 Focus::Search(buf) | Focus::SaveName(buf) | Focus::NearSearch(buf) | Focus::NewCat(buf) | Focus::RoadSearch(buf) | Focus::Recommend(buf) => insert_str_at(buf, &mut input_cur, &s),
                 Focus::SpotForm { name, url, field } => { if *field == 0 { insert_str_at(name, &mut input_cur, &s); } else if *field == 1 { insert_str_at(url, &mut input_cur, &s); } }
                 Focus::SpotRename(buf, _) | Focus::SpotEditName(buf, _) => insert_str_at(buf, &mut input_cur, &s),
-                Focus::Settings if set_sel == 10 => { cfg.streetview_api_key = s.trim().to_string(); addr = "APIkey設定(sで保存)".into(); }
+                Focus::Settings if set_sel == 11 => { cfg.google_maps_api_key = s.trim().to_string(); addr = "APIキー設定(sで保存)".into(); }
                 _ => {}
             } }
             _ => {}

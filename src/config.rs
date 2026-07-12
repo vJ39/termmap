@@ -41,7 +41,8 @@ pub struct Config {
     pub classify: bool,
     pub edge: bool,
     pub mono: bool,
-    pub streetview_api_key: String,
+    pub google_maps_api_key: String, // Google Maps系(Geocoding検索/Street View)共通キー。旧streetview_api_keyから改名
+    pub streetview_enabled: bool,     // 実写(i)を使うか
 }
 
 impl Default for Config {
@@ -58,7 +59,8 @@ impl Default for Config {
             classify: false,
             edge: false,
             mono: false,
-            streetview_api_key: String::new(),
+            google_maps_api_key: String::new(),
+            streetview_enabled: true,
         }
     }
 }
@@ -152,9 +154,22 @@ pub fn load_config_from(path: &Path) -> Config {
             ("display", "classify") => { if let Some(b) = parse_bool(value) { cfg.classify = b; } }
             ("display", "edge") => { if let Some(b) = parse_bool(value) { cfg.edge = b; } }
             ("display", "mono") => { if let Some(b) = parse_bool(value) { cfg.mono = b; } }
-            ("streetview", "api_key") => {
+            ("google", "maps_api_key") => {
                 if let Some(s) = parse_string(value) {
-                    cfg.streetview_api_key = s;
+                    cfg.google_maps_api_key = s;
+                }
+            }
+            ("streetview", "enabled") => {
+                if let Some(b) = parse_bool(value) {
+                    cfg.streetview_enabled = b;
+                }
+            }
+            // 旧スキーマ後方互換: [streetview] api_key を google_maps_api_key に取り込む(未設定時のみ)
+            ("streetview", "api_key") => {
+                if cfg.google_maps_api_key.is_empty() {
+                    if let Some(s) = parse_string(value) {
+                        cfg.google_maps_api_key = s;
+                    }
                 }
             }
             _ => {}
@@ -192,8 +207,11 @@ pub fn save_config_to(path: &Path, c: &Config) -> Result<(), String> {
          edge = {}\n\
          mono = {}\n\
          \n\
+         [google]\n\
+         maps_api_key = \"{}\"\n\
+         \n\
          [streetview]\n\
-         api_key = \"{}\"\n",
+         enabled = {}\n",
         c.llm_recommend_enabled,
         c.llm_model,
         c.llm_command,
@@ -205,7 +223,8 @@ pub fn save_config_to(path: &Path, c: &Config) -> Result<(), String> {
         c.classify,
         c.edge,
         c.mono,
-        c.streetview_api_key,
+        c.google_maps_api_key,
+        c.streetview_enabled,
     );
 
     // APIキーを含むので unix では 0600。書込中クラッシュで壊さないよう atomic。
@@ -216,10 +235,18 @@ pub fn save_config_to(path: &Path, c: &Config) -> Result<(), String> {
 /// Loads the config from the standard location (`config_path()`), or
 /// `Config::default()` if the location cannot be determined.
 pub fn load_config() -> Config {
-    match config_path() {
+    let mut cfg = match config_path() {
         Some(p) => load_config_from(&p),
         None => Config::default(),
+    };
+    // 環境変数があればキーを上書き(configにキーを書かず運用できる)
+    if let Some(k) = std::env::var_os("TERMMAP_GOOGLE_API_KEY") {
+        let k = k.to_string_lossy().trim().to_string();
+        if !k.is_empty() {
+            cfg.google_maps_api_key = k;
+        }
     }
+    cfg
 }
 
 /// Saves `c` to the standard location (`config_path()`).
@@ -335,7 +362,7 @@ mod tests {
             classify: false,
             edge: true,
             mono: false,
-            streetview_api_key: "AIzaTESTKEY_example_123".to_string(),
+            google_maps_api_key: "AIzaTESTKEY_example_123".to_string(), streetview_enabled: true,
         };
         save_config_to(&path, &original).expect("save should succeed");
         let loaded = load_config_from(&path);
@@ -400,6 +427,27 @@ show_spots = maybe
         assert_eq!(cfg.sample_interval_m, Config::default().sample_interval_m);
         assert_eq!(cfg.show_spots, Config::default().show_spots);
 
+        cleanup(&path);
+    }
+
+    #[test]
+    fn legacy_streetview_api_key_migrates_to_google() {
+        // 旧スキーマ [streetview] api_key を google_maps_api_key に取り込む
+        let path = unique_temp_path("legacy_key");
+        std::fs::write(&path, "[streetview]\napi_key = \"LEGACYKEY\"\n").unwrap();
+        let cfg = load_config_from(&path);
+        assert_eq!(cfg.google_maps_api_key, "LEGACYKEY");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn new_google_key_takes_precedence_over_legacy() {
+        // [google] maps_api_key が優先され、[streetview] api_key は無視される
+        let path = unique_temp_path("google_key_precedence");
+        std::fs::write(&path, "[google]\nmaps_api_key = \"NEWKEY\"\n[streetview]\napi_key = \"OLDKEY\"\nenabled = false\n").unwrap();
+        let cfg = load_config_from(&path);
+        assert_eq!(cfg.google_maps_api_key, "NEWKEY");
+        assert!(!cfg.streetview_enabled);
         cleanup(&path);
     }
 
@@ -525,7 +573,7 @@ profile = "custom-profile"
             classify: true,
             edge: false,
             mono: true,
-            streetview_api_key: "k".to_string(),
+            google_maps_api_key: "k".to_string(), streetview_enabled: true,
         };
         save_config_to(&path, &cfg).unwrap();
         let loaded = load_config_from(&path);
