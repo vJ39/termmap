@@ -1,0 +1,81 @@
+name: CI
+
+# push と pull_request の両方で CI を回す
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Ubuntu: フォーマットチェック + ビルド + テスト（clippy は報告のみ）
+  ubuntu:
+    name: Ubuntu (fmt, build, test)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          # key は Cargo.lock のハッシュ。OS 別にキャッシュを分ける
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Build (release)
+        run: cargo build --release
+
+      - name: Test (release)
+        run: cargo test --release
+
+      # clippy は現状 warning で落ちうるため非ブロッキング（報告のみ）
+      - name: Clippy (report only)
+        continue-on-error: true
+        run: cargo clippy --all-targets
+
+  # macOS: ビルド + テストのみ
+  macos:
+    name: macOS (build, test)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build (release)
+        run: cargo build --release
+
+      - name: Test (release)
+        run: cargo test --release
