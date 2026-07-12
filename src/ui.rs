@@ -388,6 +388,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     let mut list_offset: usize = 0; // 左袖リストのスクロール開始位置(表示中の1リストで共有・ensure_visibleで追従)
     let mut color_sel: u8 = 0; // 色ピッカーで選択中のパレットindex
     let mut onboard = onboarded_marker().map_or(false, |p| !p.exists()); // 初回起動なら操作案内を出す
+    let mut spot_move_confirm: Option<usize> = None; // m(中心へ移動)の確認待ち。上書きは破壊的なのでy/nを挟む
     apply_spots(&mut spec, &spots, &spot_cats, show_spots);
 
     // メニュー項目/直接キー どちらからでも同じ処理を走らせる。
@@ -736,6 +737,10 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             Focus::NearSearch(_) => " 中央フォームに入力中 ".to_string(),
             Focus::NewCat(_) => " 中央フォームに入力中 ".to_string(),
             Focus::SpotForm { .. } => " 新規スポット: ↑↓/Tab移動 入力/貼付 Enter=次/送信 Esc=取消 ".to_string(),
+            Focus::SpotList if spot_move_confirm.is_some() => {
+                let nm = spot_move_confirm.and_then(|gi| spots.get(gi)).map(|s| if s.name.is_empty() { "(無名)" } else { s.name.as_str() }).unwrap_or("");
+                format!(" 「{nm}」をこの地図中心の位置へ移動する？ y=はい / 他キー=取消 ")
+            }
             Focus::SpotList => format!(" [{cur_cat}] ↑↓ Enter移動 [ ]並替 n新規 r改名 m中心へ x削除 Esc戻る "),
             Focus::SpotEditName(_, _) => " 中央フォームに入力中 ".to_string(),
             Focus::SpotCatList if pending_spot.is_some() => " 登録先カテゴリを選択: ↑↓ Enter=ここに登録 n新規 Esc取消 ".to_string(),
@@ -1049,6 +1054,14 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             }
             Some(Event::Key(_)) if qr_view.is_some() => qr_view = None, // ポップアップを閉じる
             Some(Event::Key(_)) if popup.is_some() => popup = None, // 名前ポップアップを閉じる
+            Some(Event::Key(k)) if spot_move_confirm.is_some() => { // 「中心へ移動」の確認(y=実行/他=取消)
+                let gi = spot_move_confirm.take().unwrap();
+                if let KeyCode::Char('y') = k.code {
+                    if let Some(s) = spots.get_mut(gi) { s.lat = lat; s.lon = lon; }
+                    let _ = save_all_spots(&spots); apply_spots(&mut spec, &spots, &spot_cats, show_spots);
+                    addr = "スポット位置を中心へ移動".into();
+                } else { addr = "移動を取消".into(); }
+            }
             // Map表示中のEscは進行中ジョブの中断に使う(サブ画面のEscは各Focusの取消のまま)
             Some(Event::Key(k)) if k.code == KeyCode::Esc && matches!(focus, Focus::Map)
                 && (route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || recommend_job.is_some()) => {
@@ -1242,9 +1255,9 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             let idxs: Vec<usize> = spots.iter().enumerate().filter(|(_, s)| s.cat == cur_cat).map(|(i, _)| i).collect();
                             match idxs.get(sp_sel) { Some(&gi) => { input_cur = spots[gi].name.chars().count(); focus = Focus::SpotEditName(spots[gi].name.clone(), gi); } None => focus = Focus::SpotList }
                         }
-                        KeyCode::Char('m') => { // 選択スポットを現在の中心へ移動
+                        KeyCode::Char('m') => { // 選択スポットを現在の中心へ移動(破壊的なので確認待ちにするだけ)
                             let idxs: Vec<usize> = spots.iter().enumerate().filter(|(_, s)| s.cat == cur_cat).map(|(i, _)| i).collect();
-                            if let Some(&gi) = idxs.get(sp_sel) { spots[gi].lat = lat; spots[gi].lon = lon; let _ = save_all_spots(&spots); apply_spots(&mut spec, &spots, &spot_cats, show_spots); addr = "スポット位置を中心へ移動".into(); }
+                            if let Some(&gi) = idxs.get(sp_sel) { spot_move_confirm = Some(gi); }
                             focus = Focus::SpotList;
                         }
                         KeyCode::Enter => {
