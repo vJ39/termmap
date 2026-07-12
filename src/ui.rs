@@ -241,6 +241,21 @@ fn menu_row(label: &str, key: char, w: usize) -> String {
     format!("  {label}{}{key_s}", " ".repeat(pad))
 }
 
+// 左袖リストの表示開始位置(offset)を、選択(sel)が viewport 内に入るよう最小移動で更新する。
+// 項目数(count)が viewport を超えたときにスクロール追従させ、選択が画面外に消えないようにする。
+fn ensure_visible(offset: &mut usize, sel: usize, count: usize, viewport: usize) {
+    if viewport == 0 {
+        *offset = 0;
+        return;
+    }
+    if sel < *offset {
+        *offset = sel; // 上へはみ出た → 選択を先頭に
+    } else if sel >= *offset + viewport {
+        *offset = sel + 1 - viewport; // 下へはみ出た → 選択を末尾に
+    }
+    *offset = (*offset).min(count.saturating_sub(viewport)); // 末尾側の空きを詰める
+}
+
 // ルート作成フォーム(左袖パネル)の行。地図は見えたまま＝中心基準の設定が効く。
 #[derive(Clone, Copy)]
 enum RfRow { Start, End, Via(usize), AddVia, AddRoad, Mode, Draw, Clear, Back }
@@ -358,6 +373,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     let mut cat_sel: usize = 0;
     let mut cur_cat = String::new(); // スポット一覧で表示中のカテゴリ
     let mut pending_spot: Option<(f64, f64, String)> = None; // 検索結果からお気に入り登録する際の保留(座標+名前)。カテゴリ選択待ち
+    let mut list_offset: usize = 0; // 左袖リストのスクロール開始位置(表示中の1リストで共有・ensure_visibleで追従)
     apply_spots(&mut spec, &spots, &spot_cats, show_spots);
 
     // メニュー項目/直接キー どちらからでも同じ処理を走らせる。
@@ -637,10 +653,22 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 }).collect();
                 (poi_label.clone(), its, poi_sel)
             };
+            // 見出し1行を除いた表示可能行数ぶんだけ、選択に追従してウィンドウ表示する
+            let sel = sel.min(items.len().saturating_sub(1)); // sel が範囲外でも位置表示/添字を破綻させない
+            let vh = (map_rows as usize).saturating_sub(1).max(1);
+            ensure_visible(&mut list_offset, sel, items.len(), vh);
+            let end = (list_offset + vh).min(items.len());
+            let (more_up, more_dn) = (list_offset > 0, end < items.len());
             let mut gl = Vec::with_capacity(map_rows as usize);
-            gl.push(fit_cells(&format!("[{} {}]", header, items.len()), gw));
-            for (idx, it) in items.iter().enumerate() {
-                let cell = fit_cells(&format!("{}{}", if idx == sel { ">" } else { " " }, it), gw);
+            let hdr = if items.len() > vh {
+                // 画面に収まらない時は 位置(sel+1/総数) と上下の続き矢印を出す
+                format!("[{} {}/{}]{}{}", header, sel + 1, items.len(), if more_up { " ↑" } else { "" }, if more_dn { "↓" } else { "" })
+            } else {
+                format!("[{} {}]", header, items.len())
+            };
+            gl.push(fit_cells(&hdr, gw));
+            for idx in list_offset..end {
+                let cell = fit_cells(&format!("{}{}", if idx == sel { ">" } else { " " }, items[idx]), gw);
                 gl.push(if idx == sel { format!("\x1b[7m{cell}\x1b[0m") } else { cell });
             }
             gl
@@ -1467,6 +1495,32 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
 mod tests {
     use super::*;
     use crossterm::event::KeyCode;
+
+    // 左袖リストのスクロール追従
+    #[test]
+    fn ensure_visible_follows_selection() {
+        let vh = 5; // 表示5行
+        // 収まる場合は offset=0 のまま
+        let mut o = 0;
+        ensure_visible(&mut o, 3, 4, vh);
+        assert_eq!(o, 0);
+        // 下へはみ出す: 20件・選択10 → 選択が末尾に来る位置(10+1-5=6)
+        let mut o = 0;
+        ensure_visible(&mut o, 10, 20, vh);
+        assert_eq!(o, 6);
+        assert!(10 >= o && 10 < o + vh, "選択が窓内");
+        // そこから上へ戻る: 選択2 → 先頭に
+        ensure_visible(&mut o, 2, 20, vh);
+        assert_eq!(o, 2);
+        // 末尾選択は末尾側の空きが詰まる(offset=count-vh)
+        let mut o = 0;
+        ensure_visible(&mut o, 19, 20, vh);
+        assert_eq!(o, 15);
+        // viewport=0 は安全に0
+        let mut o = 7;
+        ensure_visible(&mut o, 3, 20, 0);
+        assert_eq!(o, 0);
+    }
 
     // 文字位置→byte offset(マルチバイト含む)
     #[test]
