@@ -41,6 +41,7 @@ pub struct Config {
     pub classify: bool,
     pub edge: bool,
     pub mono: bool,
+    pub image_mode: bool,            // インライン画像(iTerm2 OSC1337)で実画像を描画。既定OFF(AA描画)
     pub google_maps_api_key: String, // Google Maps系(Geocoding検索/Street View)共通キー。旧streetview_api_keyから改名
     pub streetview_enabled: bool,     // 実写(i)を使うか
 }
@@ -59,6 +60,7 @@ impl Default for Config {
             classify: false,
             edge: false,
             mono: false,
+            image_mode: false,
             google_maps_api_key: String::new(),
             streetview_enabled: true,
         }
@@ -154,6 +156,7 @@ pub fn load_config_from(path: &Path) -> Config {
             ("display", "classify") => { if let Some(b) = parse_bool(value) { cfg.classify = b; } }
             ("display", "edge") => { if let Some(b) = parse_bool(value) { cfg.edge = b; } }
             ("display", "mono") => { if let Some(b) = parse_bool(value) { cfg.mono = b; } }
+            ("display", "image_mode") => { if let Some(b) = parse_bool(value) { cfg.image_mode = b; } }
             ("google", "maps_api_key") => {
                 if let Some(s) = parse_string(value) {
                     cfg.google_maps_api_key = s;
@@ -206,6 +209,7 @@ pub fn save_config_to(path: &Path, c: &Config) -> Result<(), String> {
          classify = {}\n\
          edge = {}\n\
          mono = {}\n\
+         image_mode = {}\n\
          \n\
          [google]\n\
          maps_api_key = \"{}\"\n\
@@ -223,6 +227,7 @@ pub fn save_config_to(path: &Path, c: &Config) -> Result<(), String> {
         c.classify,
         c.edge,
         c.mono,
+        c.image_mode,
         c.google_maps_api_key,
         c.streetview_enabled,
     );
@@ -362,6 +367,7 @@ mod tests {
             classify: false,
             edge: true,
             mono: false,
+            image_mode: true,
             google_maps_api_key: "AIzaTESTKEY_example_123".to_string(), streetview_enabled: true,
         };
         save_config_to(&path, &original).expect("save should succeed");
@@ -573,6 +579,7 @@ profile = "custom-profile"
             classify: true,
             edge: false,
             mono: true,
+            image_mode: false,
             google_maps_api_key: "k".to_string(), streetview_enabled: true,
         };
         save_config_to(&path, &cfg).unwrap();

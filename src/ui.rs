@@ -156,6 +156,9 @@ const HELP: &[&str] = &[
     "   i              中心地点の実写(Street View)を全画面表示  ←→向き ↑↓前後移動 Esc/q戻る",
     "                   要 config.toml [streetview] api_key",
     "",
+    " [実画像表示] (iTerm2 / WezTerm のみ)",
+    "   I              地図・実写をAA↔実画像でトグル (, の設定でも切替)",
+    "",
     " [起動オプション]  --range KM,.. 航続リング / --route / --load-route 名前",
     "",
     "",
@@ -497,13 +500,19 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         if street.is_some() { // 実写(Street View)全画面。←→で向き、Esc/qで戻る
             { // 描画(不変借用のスコープ)
                 let (img, heading, slat, slon) = street.as_ref().unwrap();
-                let rs = image::imageops::resize(img, cols.max(10), map_rows * 2, FilterType::Triangle);
-                let art = render_halfblock(&rs);
-                let sv_lines: Vec<&str> = art.split("\r\n").collect();
-                let _ = write!(out, "\x1b[H");
-                for i in 0..map_rows as usize {
-                    let ln = sv_lines.get(i).copied().unwrap_or("");
-                    let _ = write!(out, "\x1b[{};1H{}\x1b[K", i + 1, ln);
+                if cfg.image_mode && image_capable() {
+                    // 実画像モード: 実写を全幅×map_rows のインライン画像で表示
+                    let _ = write!(out, "\x1b[H");
+                    let _ = emit_iterm2_image(&mut out, img, cols, map_rows);
+                } else {
+                    let rs = image::imageops::resize(img, cols.max(10), map_rows * 2, FilterType::Triangle);
+                    let art = render_halfblock(&rs);
+                    let sv_lines: Vec<&str> = art.split("\r\n").collect();
+                    let _ = write!(out, "\x1b[H");
+                    for i in 0..map_rows as usize {
+                        let ln = sv_lines.get(i).copied().unwrap_or("");
+                        let _ = write!(out, "\x1b[{};1H{}\x1b[K", i + 1, ln);
+                    }
                 }
                 let hd = ((heading % 360) + 360) % 360;
                 let st = fit_cells(&format!(" 実写 h{hd}°  ←→向き ↑↓移動  Esc/q戻る  {slat:.4},{slon:.4} "), cols as usize);
@@ -569,7 +578,9 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             } else { play = None; }
         }
         let (lat, lon) = pixel_to_deg(cx, cy, z);
+        let img_inline = cfg.image_mode && image_capable(); // 実画像モード(iTerm2系端末のみ)
 
+        let mut map_img: Option<RgbImage> = None; // 実画像モードで描く overlay 合成済み画像
         let body = match build_window(cx, cy, z, ow, oh, &opts.style, &mut cache) {
             Ok(img) => {
                 let mut ov = build_overlay(&spec, cx, cy, z, ow, oh, 1.0, 1.0, ow, oh);
@@ -597,7 +608,15 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     let iy = (gy - (cy - oh as f64 / 2.0)).floor() as i32;
                     draw_ring(&mut ov, ix, iy, 3, [255, 255, 255], 1);
                 }
-                render(&img, &opts, Some(&ov))
+                if img_inline {
+                    // 実画像モード: renderに渡すのと同じ画像に overlay を焼き込んで保持。AA文字列は空。
+                    let mut c = img.clone();
+                    composite(&mut c, &ov);
+                    map_img = Some(c);
+                    String::new()
+                } else {
+                    render(&img, &opts, Some(&ov))
+                }
             }
             Err(e) => format!("取得失敗: {e}\r\n"),
         };
@@ -658,6 +677,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     format!("おすすめ {}", onoff(cfg.llm_recommend_enabled)),
                     format!("提案AIモデル {}", model_ja),
                     format!("実写(StreetView) {}", onoff(cfg.streetview_enabled)),
+                    format!("画像表示(iTerm2) {}", onoff(cfg.image_mode)),
                     format!("Google APIキー {}", keyset),
                 ];
                 ("設定".to_string(), its, set_sel)
@@ -707,6 +727,10 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             } else {
                 write!(out, "\x1b[{};1H{}", i + 1, ln)?;
             }
+        }
+        if let Some(mi) = &map_img { // 実画像モード: 地図領域の左上セルへ移動してインライン画像を出力
+            let _ = write!(out, "\x1b[1;{}H", gut + 1);
+            let _ = emit_iterm2_image(&mut out, mi, map_cols, map_rows);
         }
         if elev_h > 0 { // 標高プロファイル帯(地図の下・ステータスの上)
             let (mn, mx, _asc) = elevation::elevation_stats(&route_ele);
@@ -758,6 +782,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     8 => "おすすめ: claude -p でツーリングスポットを提案する機能のON/OFF(未実装)",
                     9 => "LLM: おすすめに使うモデルを循環(claude-sonnet-5/haiku/opus)",
                     10 => "実写: iで中心地点のStreet Viewを開く機能のON/OFF(要Google APIキー)",
+                    11 => if image_capable() { "画像表示: 地図と実写をiTerm2インライン画像で実画像表示(AAでなく実画像)。Iキーでも切替" } else { "画像表示: この端末は画像非対応(iTerm2/WezTermで有効)" },
                     _ => "Google APIキー: 検索(Geocoding)とStreet View共通。この行でCmd+V貼付→設定、sで保存。環境変数TERMMAP_GOOGLE_API_KEYでも可",
                 };
                 format!(" ▶ {desc}   [↑↓選択 Enter切替 s保存 Esc閉]")
@@ -1151,7 +1176,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     },
                     Focus::Settings => { let mut stay = true; match k.code { // 設定画面
                         KeyCode::Up => { set_sel = set_sel.saturating_sub(1); }
-                        KeyCode::Down => { if set_sel + 1 < 12 { set_sel += 1; } }
+                        KeyCode::Down => { if set_sel + 1 < 13 { set_sel += 1; } }
                         KeyCode::Left | KeyCode::Right => {
                             if set_sel == 6 { let d = if k.code == KeyCode::Left { -100.0 } else { 100.0 }; cfg.sample_interval_m = (cfg.sample_interval_m + d).clamp(100.0, 5000.0); }
                         }
@@ -1167,6 +1192,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             8 => cfg.llm_recommend_enabled = !cfg.llm_recommend_enabled,
                             9 => cfg.llm_model = match cfg.llm_model.as_str() { "claude-sonnet-5" => "claude-haiku-4-5", "claude-haiku-4-5" => "claude-opus-4-8", _ => "claude-sonnet-5" }.to_string(),
                             10 => cfg.streetview_enabled = !cfg.streetview_enabled,
+                            11 => cfg.image_mode = !cfg.image_mode,
                             _ => addr = "APIキー: この行で貼り付け(Cmd+V)して設定".into(),
                         },
                         KeyCode::Char('s') => {
@@ -1640,6 +1666,12 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                     street_job = Some(rx);
                                 }
                             }
+                            KeyCode::Char('I') => { // 実画像モード(iTerm2インライン画像)の ON/OFF
+                                cfg.image_mode = !cfg.image_mode;
+                                addr = if cfg.image_mode {
+                                    if image_capable() { "実画像モード: ON".into() } else { "実画像モード: ON(この端末は非対応・AA継続)".into() }
+                                } else { "実画像モード: OFF".into() };
+                            }
                             KeyCode::Char('n') => { // BRouter の代替ルート候補を巡回
                                 if wps.len() >= 2 {
                                     route_alt = (route_alt + 1) % 4;
@@ -1686,7 +1718,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 Focus::Search(buf) | Focus::SaveName(buf) | Focus::NearSearch(buf) | Focus::NewCat(buf) | Focus::RoadSearch(buf) | Focus::Recommend(buf) => insert_str_at(buf, &mut input_cur, &s),
                 Focus::SpotForm { name, url, field } => { if *field == 0 { insert_str_at(name, &mut input_cur, &s); } else if *field == 1 { insert_str_at(url, &mut input_cur, &s); } }
                 Focus::SpotRename(buf, _) | Focus::SpotEditName(buf, _) => insert_str_at(buf, &mut input_cur, &s),
-                Focus::Settings if set_sel == 11 => { cfg.google_maps_api_key = s.trim().to_string(); addr = "APIキー設定(sで保存)".into(); }
+                Focus::Settings if set_sel == 12 => { cfg.google_maps_api_key = s.trim().to_string(); addr = "APIキー設定(sで保存)".into(); }
                 _ => {}
             } }
             _ => {}

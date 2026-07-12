@@ -219,3 +219,132 @@ pub fn composite(img: &mut RgbImage, ov: &OverlayLayer) {
         if let Some(c) = ov.get(x, y) { img.put_pixel(x, y, image::Rgb(c)); }
     }}
 }
+
+// ---- インライン画像出力 (iTerm2 OSC 1337) ----
+// AA(ハーフブロック/braille)ではなく、端末のインライン画像プロトコルで実画像を表示する。
+
+// 端末がインライン画像(iTerm2 OSC1337)に対応しているか。iTerm2 / WezTerm を対応とみなす。
+// Terminal.app 等は非対応。tmux は対象外(パススルーが必要なため判定しない)。
+pub fn image_capable() -> bool {
+    if let Ok(tp) = std::env::var("TERM_PROGRAM") {
+        if tp == "iTerm.app" || tp == "WezTerm" { return true; }
+    }
+    if std::env::var("LC_TERMINAL").map(|v| v == "iTerm2").unwrap_or(false) { return true; }
+    std::env::var_os("ITERM_SESSION_ID").is_some()
+}
+
+// 標準base64符号化(依存追加なしのため自前実装)。パディングは '=' で埋める。
+fn base64_encode(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(T[((n >> 18) & 63) as usize] as char);
+        out.push(T[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { T[((n >> 6) & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+    }
+    out
+}
+
+// RgbImage を PNG 化 → 自前base64 → iTerm2 インライン画像(OSC1337)として out へ出力する。
+// cell_w / cell_h は表示セル数(端末セル単位)。カーソルは呼び出し側で左上セルへ移動済みが前提。
+// preserveAspectRatio=0 で指定セル矩形にちょうど収める。PNG符号化に失敗した場合は何も出力しない。
+pub fn emit_iterm2_image<W: std::io::Write>(out: &mut W, rgb: &RgbImage, cell_w: u32, cell_h: u32) -> std::io::Result<()> {
+    use image::ImageEncoder;
+    let mut png: Vec<u8> = Vec::new();
+    if image::codecs::png::PngEncoder::new(&mut png)
+        .write_image(rgb.as_raw(), rgb.width(), rgb.height(), image::ExtendedColorType::Rgb8)
+        .is_err()
+    {
+        return Ok(());
+    }
+    let b64 = base64_encode(&png);
+    write!(out, "\x1b]1337;File=inline=1;width={cell_w};height={cell_h};preserveAspectRatio=0:{b64}\x07")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base64_matches_known_vectors() {
+        // RFC 4648 テストベクタ
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn base64_all_bytes_roundtrip_length() {
+        // 全256バイトを符号化しても長さは4の倍数・パディング規則に従う
+        let data: Vec<u8> = (0u16..256).map(|b| b as u8).collect();
+        let enc = base64_encode(&data);
+        assert_eq!(enc.len() % 4, 0);
+        assert_eq!(enc.len(), data.len().div_ceil(3) * 4);
+    }
+
+    #[test]
+    fn emit_iterm2_image_wraps_osc1337() {
+        let img = RgbImage::from_pixel(2, 2, image::Rgb([10, 20, 30]));
+        let mut buf: Vec<u8> = Vec::new();
+        emit_iterm2_image(&mut buf, &img, 4, 3).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.starts_with("\x1b]1337;File=inline=1;width=4;height=3;preserveAspectRatio=0:"));
+        assert!(s.ends_with('\x07'));
+    }
+
+    // テスト検証用の base64 復号(標準アルファベット・パディング対応)。
+    fn base64_decode(s: &str) -> Vec<u8> {
+        fn val(c: u8) -> u32 {
+            match c {
+                b'A'..=b'Z' => (c - b'A') as u32,
+                b'a'..=b'z' => (c - b'a' + 26) as u32,
+                b'0'..=b'9' => (c - b'0' + 52) as u32,
+                b'+' => 62,
+                b'/' => 63,
+                _ => 0, // '=' 等
+            }
+        }
+        let bytes: Vec<u8> = s.bytes().collect();
+        let mut out = Vec::new();
+        for chunk in bytes.chunks(4) {
+            let n = (val(chunk[0]) << 18)
+                | (val(*chunk.get(1).unwrap_or(&b'A')) << 12)
+                | (val(*chunk.get(2).unwrap_or(&b'A')) << 6)
+                | val(*chunk.get(3).unwrap_or(&b'A'));
+            out.push((n >> 16) as u8);
+            if chunk.get(2).map_or(false, |&c| c != b'=') { out.push((n >> 8) as u8); }
+            if chunk.get(3).map_or(false, |&c| c != b'=') { out.push(n as u8); }
+        }
+        out
+    }
+
+    #[test]
+    fn emit_iterm2_image_produces_decodable_png() {
+        // emit した base64 を復号 → 実PNGとしてデコードでき、画素が保存されることを確認
+        let mut img = RgbImage::new(3, 2);
+        img.put_pixel(0, 0, image::Rgb([255, 0, 0]));
+        img.put_pixel(2, 1, image::Rgb([0, 128, 255]));
+        let mut buf: Vec<u8> = Vec::new();
+        emit_iterm2_image(&mut buf, &img, 3, 2).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        let b64 = s
+            .strip_prefix("\x1b]1337;File=inline=1;width=3;height=2;preserveAspectRatio=0:")
+            .unwrap()
+            .strip_suffix('\x07')
+            .unwrap();
+        let png = base64_decode(b64);
+        let decoded = image::load_from_memory(&png).unwrap().to_rgb8();
+        assert_eq!(decoded.dimensions(), (3, 2));
+        assert_eq!(decoded.get_pixel(0, 0), &image::Rgb([255, 0, 0]));
+        assert_eq!(decoded.get_pixel(2, 1), &image::Rgb([0, 128, 255]));
+    }
+}
