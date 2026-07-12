@@ -231,7 +231,7 @@ fn menu_action_for_key(c: char) -> Option<MenuAction> {
 }
 
 // 表示セル幅(fit_cells と同じ規則: ASCII=1 / 非ASCII=2)。
-fn disp_width(s: &str) -> usize { s.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum() }
+fn disp_width(s: &str) -> usize { unicode_width::UnicodeWidthStr::width(s) }
 
 // メニュー項目1行。ラベルは左、キーは右端に揃える(幅 w セル内。行頭カーソル prefix の1セルは呼び出し側が足す)。
 fn menu_row(label: &str, key: char, w: usize) -> String {

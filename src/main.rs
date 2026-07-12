@@ -351,7 +351,7 @@ fn wander_route(origin: (f64, f64), dist_km: f64, shape: &str) -> Result<Vec<(f6
 fn fit_cells(s: &str, cells: usize) -> String {
     let (mut w, mut o) = (0usize, String::new());
     for ch in s.chars() {
-        let cw = if ch.is_ascii() { 1 } else { 2 };
+        let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0); // 絵文字/全角=2, 半角=1, 結合文字=0
         if w + cw > cells { break; }
         o.push(ch); w += cw;
     }
