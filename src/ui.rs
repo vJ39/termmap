@@ -811,22 +811,27 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             let q = buf.trim().to_string();
                             if !q.is_empty() {
                                 let ckey = searchcache::make_key(&q, lat, lon);
-                                let results: Vec<(f64, f64, String)> = match scache.get(&ckey) {
-                                    Some(v) => v.clone(), // キャッシュヒット=API叩かない
+                                // キャッシュヒット=API叩かない。ミス時のみ検索し、通信/サーバ障害は0件と区別する。
+                                let outcome: Result<Vec<(f64, f64, String)>, String> = match scache.get(&ckey).cloned() {
+                                    Some(v) => Ok(v),
                                     None => {
                                         show_busy(&mut out, cols, tr, "検索中…");
-                                        let r = geocode_list(&q, Some((lat, lon)), &cfg.streetview_api_key);
-                                        if !r.is_empty() { scache.insert(ckey, r.clone()); let _ = searchcache::save(&scache); }
-                                        r
+                                        match geocode_list(&q, Some((lat, lon)), &cfg.streetview_api_key) {
+                                            Ok(r) => { if !r.is_empty() { scache.insert(ckey, r.clone()); let _ = searchcache::save(&scache); } Ok(r) }
+                                            Err(e) => Err(e.to_string()),
+                                        }
                                     }
                                 };
-                                if results.is_empty() { addr = format!("見つからない: {q}"); }
-                                else {
-                                    pois = results.into_iter().take(8).map(|(la, lo, nm)| (la, lo, nm, PoiCat::Waypoint)).collect();
-                                    poi_sel = 0;
-                                    poi_label = format!("検索:{q}");
-                                    set_markers(&mut spec, &wps, &pois);
-                                    focus = Focus::PoiList;
+                                match outcome {
+                                    Err(e) => addr = format!("検索できません（{e}）"), // 通信/サーバ/解析の障害
+                                    Ok(v) if v.is_empty() => addr = format!("見つからない: {q}"),
+                                    Ok(v) => {
+                                        pois = v.into_iter().take(8).map(|(la, lo, nm)| (la, lo, nm, PoiCat::Waypoint)).collect();
+                                        poi_sel = 0;
+                                        poi_label = format!("検索:{q}");
+                                        set_markers(&mut spec, &wps, &pois);
+                                        focus = Focus::PoiList;
+                                    }
                                 }
                             }
                         }

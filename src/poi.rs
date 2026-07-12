@@ -1,5 +1,47 @@
 // ジオコーディング(Nominatim) と 目的地検索(Overpass)
 use crate::render::PoiCat;
+use serde::Deserialize;
+
+// 外部API呼び出しの失敗種別。「通信/サーバ障害」と「結果0件」を呼び出し側で区別するため。
+// (0件は Ok(空Vec) で表す。ApiError は障害のみ)
+#[derive(Debug)]
+pub enum ApiError {
+    Transport(String), // 接続失敗・タイムアウト等
+    Http(u16),         // 4xx/5xx
+    Decode(String),    // JSON パース失敗
+}
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            ApiError::Transport(e) => write!(f, "通信失敗: {e}"),
+            ApiError::Http(c) => write!(f, "サーバ応答エラー({c})"),
+            ApiError::Decode(e) => write!(f, "応答解析失敗: {e}"),
+        }
+    }
+}
+
+// ureq リクエストを実行し本文文字列を得る。status(4xx/5xx)/transport/decode を型で区別する。
+fn call_text(req: ureq::Request) -> Result<String, ApiError> {
+    match req.call() {
+        Ok(r) => r.into_string().map_err(|e| ApiError::Transport(e.to_string())),
+        Err(ureq::Error::Status(code, _)) => Err(ApiError::Http(code)),
+        Err(ureq::Error::Transport(t)) => Err(ApiError::Transport(t.to_string())),
+    }
+}
+
+// Nominatim /search の1件。lat/lon は文字列で返るので後段でパースする。
+#[derive(Deserialize)]
+struct NomItem { lat: String, lon: String, #[serde(default)] display_name: String }
+
+// Google Geocoding の応答(必要なフィールドのみ)。
+#[derive(Deserialize)]
+struct GLoc { lat: f64, lng: f64 }
+#[derive(Deserialize)]
+struct GGeom { location: GLoc }
+#[derive(Deserialize)]
+struct GResult { geometry: GGeom, #[serde(default)] formatted_address: String }
+#[derive(Deserialize)]
+struct GResp { #[serde(default)] results: Vec<GResult> }
 
 fn urlencode(s: &str) -> String {
     let mut o = String::new();
@@ -20,35 +62,40 @@ pub fn json_first(body: &str, key: &str) -> Option<String> {
 // 地名/施設名を座標に。near があれば現在地周辺を優先し、他県へ飛ぶのを防ぐ。
 // 優先順: ① Google Geocoding(キーあり・現在地bounds) → ② Nominatim(near周辺viewbox) → ③ Nominatim(全国)
 pub fn geocode(place: &str, near: Option<(f64, f64)>, google_key: &str) -> Result<(f64, f64), String> {
-    geocode_list(place, near, google_key)
-        .into_iter().next().map(|(la, lo, _)| (la, lo))
-        .ok_or_else(|| format!("住所が見つかりません: {place}"))
+    match geocode_list(place, near, google_key) {
+        Ok(v) => v.into_iter().next().map(|(la, lo, _)| (la, lo))
+            .ok_or_else(|| format!("住所が見つかりません: {place}")),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 // 候補を最大8件返す。まずフル住所で検索し、0件なら末尾の地番を落として大字/町名レベルで再検索する。
 // (Nominatim=OSMは日本の地番/建物レベルの住所を持たないため、番地付き文字列は round-trip しない)
-pub fn geocode_list(place: &str, near: Option<(f64, f64)>, google_key: &str) -> Vec<(f64, f64, String)> {
-    let r = geocode_once(place, near, google_key);
-    if !r.is_empty() { return r; }
+// Ok(空)=該当なし / Err=通信・サーバ・解析の障害、として呼び出し側で区別できる。
+pub fn geocode_list(place: &str, near: Option<(f64, f64)>, google_key: &str) -> Result<Vec<(f64, f64, String)>, ApiError> {
+    let r = geocode_once(place, near, google_key)?;
+    if !r.is_empty() { return Ok(r); }
     let trimmed = strip_trailing_banchi(place);
     if trimmed != place && !trimmed.trim().is_empty() {
         return geocode_once(&trimmed, near, google_key);
     }
-    Vec::new()
+    Ok(Vec::new())
 }
 
 // 1回分の検索。①Google(現在地bounds) → ②Nominatim(near周辺viewbox) → ③Nominatim(全国)
-fn geocode_once(place: &str, near: Option<(f64, f64)>, google_key: &str) -> Vec<(f64, f64, String)> {
+fn geocode_once(place: &str, near: Option<(f64, f64)>, google_key: &str) -> Result<Vec<(f64, f64, String)>, ApiError> {
     if !google_key.trim().is_empty() {
-        let g = google_geocode_list(place, near, google_key);
-        if !g.is_empty() { return g; }
+        // Google が障害でも Nominatim にフォールバックする(検索全体を落とさない)。0件なら次へ。
+        if let Ok(g) = google_geocode_list(place, near, google_key) {
+            if !g.is_empty() { return Ok(g); }
+        }
     }
     if let Some((lat, lon)) = near {
         let d = 0.35; // ≈ ±35km
         let vb = format!("{},{},{},{}", lon - d, lat - d, lon + d, lat + d);
         let url = format!("https://nominatim.openstreetmap.org/search?format=json&limit=8&accept-language=ja&bounded=1&viewbox={}&q={}", vb, urlencode(place));
-        let l = nominatim_list(&url);
-        if !l.is_empty() { return l; }
+        let l = nominatim_list(&url)?;
+        if !l.is_empty() { return Ok(l); }
     }
     let url = format!("https://nominatim.openstreetmap.org/search?format=json&limit=8&accept-language=ja&q={}", urlencode(place));
     nominatim_list(&url)
@@ -73,63 +120,31 @@ fn strip_trailing_banchi(s: &str) -> String {
     t
 }
 
-fn nominatim_list(url: &str) -> Vec<(f64, f64, String)> {
-    let body = match ureq::get(url)
+fn nominatim_list(url: &str) -> Result<Vec<(f64, f64, String)>, ApiError> {
+    let req = ureq::get(url)
         .set("User-Agent", "termmap/0.1 (personal experiment)")
-        .timeout(std::time::Duration::from_secs(20)).call() {
-        Ok(r) => r.into_string().unwrap_or_default(),
-        Err(_) => return Vec::new(),
-    };
-    let mut out = Vec::new();
-    for chunk in body.split("\"place_id\"").skip(1) {
-        let lat = json_first(chunk, "\"lat\":\"").and_then(|s| s.parse::<f64>().ok());
-        let lon = json_first(chunk, "\"lon\":\"").and_then(|s| s.parse::<f64>().ok());
-        if let (Some(la), Some(lo)) = (lat, lon) {
-            out.push((la, lo, json_str(chunk, "display_name").unwrap_or_default()));
-        }
-        if out.len() >= 8 { break; }
-    }
-    out
+        .timeout(std::time::Duration::from_secs(20));
+    let body = call_text(req)?;
+    let items: Vec<NomItem> = serde_json::from_str(&body).map_err(|e| ApiError::Decode(e.to_string()))?;
+    Ok(items.into_iter().filter_map(|it| {
+        let la = it.lat.parse::<f64>().ok()?;
+        let lo = it.lon.parse::<f64>().ok()?;
+        Some((la, lo, it.display_name))
+    }).take(8).collect())
 }
 
-fn google_geocode_list(place: &str, near: Option<(f64, f64)>, key: &str) -> Vec<(f64, f64, String)> {
+fn google_geocode_list(place: &str, near: Option<(f64, f64)>, key: &str) -> Result<Vec<(f64, f64, String)>, ApiError> {
     let mut url = format!("https://maps.googleapis.com/maps/api/geocode/json?language=ja&region=jp&address={}&key={}", urlencode(place), key);
     if let Some((lat, lon)) = near {
         let d = 0.3;
         url.push_str(&format!("&bounds={},{}|{},{}", lat - d, lon - d, lat + d, lon + d)); // sw|ne
     }
-    let body = match ureq::get(&url).timeout(std::time::Duration::from_secs(20)).call() {
-        Ok(r) => r.into_string().unwrap_or_default(),
-        Err(_) => return Vec::new(),
-    };
-    let mut out = Vec::new();
-    for chunk in body.split("\"formatted_address\"").skip(1) {
-        if let Some((la, lo)) = parse_google_latlng(chunk) {
-            let name = chunk.splitn(3, '"').nth(1).unwrap_or("").to_string();
-            out.push((la, lo, name));
-        }
-        if out.len() >= 8 { break; }
-    }
-    out
-}
-
-// Google Geocoding応答から最初の geometry.location の (lat,lng) を拾う。数値形式("lat" : 35.6)。
-fn parse_google_latlng(body: &str) -> Option<(f64, f64)> {
-    let loc = body.find("\"location\"")?;
-    let s = &body[loc..];
-    let lat = num_after_key(s, "\"lat\"")?;
-    let lng = num_after_key(s, "\"lng\"")?;
-    Some((lat, lng))
-}
-
-fn num_after_key(s: &str, key: &str) -> Option<f64> {
-    let i = s.find(key)?;
-    let b = s[i + key.len()..].as_bytes();
-    let mut a = 0;
-    while a < b.len() && !(b[a].is_ascii_digit() || b[a] == b'-' || b[a] == b'.') { a += 1; }
-    let mut e = a;
-    while e < b.len() && (b[e].is_ascii_digit() || b[e] == b'-' || b[e] == b'.') { e += 1; }
-    std::str::from_utf8(&b[a..e]).ok()?.parse().ok()
+    let body = call_text(ureq::get(&url).timeout(std::time::Duration::from_secs(20)))?;
+    // status が REQUEST_DENIED 等でも results が空なら Ok(空)。Nominatim にフォールバックさせる。
+    let resp: GResp = serde_json::from_str(&body).map_err(|e| ApiError::Decode(e.to_string()))?;
+    Ok(resp.results.into_iter().take(8)
+        .map(|r| (r.geometry.location.lat, r.geometry.location.lng, r.formatted_address))
+        .collect())
 }
 
 // 逆ジオコーディング (Nominatim reverse) → 住所文字列(display_name)
@@ -291,11 +306,24 @@ mod tests {
     }
 
     #[test]
-    fn google_latlng_from_geometry() {
-        let body = r#"{"results":[{"geometry":{"location":{"lat":35.6094,"lng":139.7402}}}],"status":"OK"}"#;
-        let (la, lo) = parse_google_latlng(body).unwrap();
-        assert!((la - 35.6094).abs() < 1e-6 && (lo - 139.7402).abs() < 1e-6);
-        // REQUEST_DENIED等 location無しは None
-        assert!(parse_google_latlng(r#"{"status":"REQUEST_DENIED"}"#).is_none());
+    fn google_resp_parses_via_serde() {
+        let body = r#"{"results":[{"geometry":{"location":{"lat":35.6094,"lng":139.7402}},"formatted_address":"日本、東京"}],"status":"OK"}"#;
+        let resp: GResp = serde_json::from_str(body).unwrap();
+        assert_eq!(resp.results.len(), 1);
+        assert!((resp.results[0].geometry.location.lat - 35.6094).abs() < 1e-6);
+        // REQUEST_DENIED 等 results 無しは空(status は無視)
+        let denied: GResp = serde_json::from_str(r#"{"status":"REQUEST_DENIED"}"#).unwrap();
+        assert!(denied.results.is_empty());
+    }
+
+    #[test]
+    fn nominatim_item_parses_escaped_and_unicode() {
+        // エスケープされた引用符・Unicode escape を含む display_name を serde が正しく復元する
+        // (手書き切り出しだと壊れやすかったケース)
+        let body = r#"[{"lat":"35.68","lon":"139.76","display_name":"ラーメン\"横綱\""}]"#;
+        let items: Vec<NomItem> = serde_json::from_str(body).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].display_name, "ラーメン\"横綱\"");
+        assert_eq!(items[0].lat, "35.68");
     }
 }
