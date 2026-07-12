@@ -1,7 +1,8 @@
 // roadsearch: Overpassで道路名/refを検索し、線分断片(点列+oneway)を取得する。
 // roadtrace::assemble_polyline に渡す前段。座標は (f64, f64) = (lat, lon)。
 // このファイルは ureq(外部crate)を使うため、cargo経由でしかビルド/テストできない
-// (parse_road_fragments のロジック自体は自前JSON走査でstdのみ)。
+// (parse_road_fragments は serde_json でデシリアライズする)。
+use serde::Deserialize;
 
 fn urlencode(s: &str) -> String {
     let mut o = String::new();
@@ -46,155 +47,40 @@ fn escape_regex(s: &str) -> String {
     o
 }
 
-/// s の中で open_idx にある開き括弧(open)に対応する閉じ括弧(close)のindexを、
-/// 文字列リテラル内を無視して探す。深さは open/close の種類だけをカウントするので、
-/// 内部に異種の括弧(例: [...]の中の{...})が混在しても正しく対応点を見つけられる。
-fn matching_bracket(s: &str, open_idx: usize, open: u8, close: u8) -> Option<usize> {
-    let bytes = s.as_bytes();
-    if bytes.get(open_idx) != Some(&open) {
-        return None;
-    }
-    let mut depth = 0i32;
-    let mut in_str = false;
-    let mut esc = false;
-    let mut i = open_idx;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if in_str {
-            if esc {
-                esc = false;
-            } else if b == b'\\' {
-                esc = true;
-            } else if b == b'"' {
-                in_str = false;
-            }
-        } else if b == b'"' {
-            in_str = true;
-        } else if b == open {
-            depth += 1;
-        } else if b == close {
-            depth -= 1;
-            if depth == 0 {
-                return Some(i);
-            }
-        }
-        i += 1;
-    }
-    None
+// Overpass `out geom` 応答の要素。geometry=点列、tags.oneway で一方通行を判定する。
+#[derive(Deserialize)]
+struct RoadPoint { lat: f64, lon: f64 }
+#[derive(Deserialize)]
+struct RoadTags { #[serde(default)] oneway: Option<String> }
+#[derive(Deserialize)]
+struct RoadElement {
+    #[serde(default)] geometry: Option<Vec<RoadPoint>>,
+    #[serde(default)] tags: Option<RoadTags>,
 }
-
-/// s の中にある「深さ0の {...} オブジェクト」を出現順に全て切り出す(スライスの参照を返す)。
-/// 文字列リテラル内の波括弧は無視する。ネストしたオブジェクトの内側は個別には返さない。
-fn top_level_objects(s: &str) -> Vec<&str> {
-    let bytes = s.as_bytes();
-    let mut out = Vec::new();
-    let mut depth = 0i32;
-    let mut start = 0usize;
-    let mut in_str = false;
-    let mut esc = false;
-    let mut i = 0usize;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if in_str {
-            if esc {
-                esc = false;
-            } else if b == b'\\' {
-                esc = true;
-            } else if b == b'"' {
-                in_str = false;
-            }
-        } else {
-            match b {
-                b'"' => in_str = true,
-                b'{' => {
-                    if depth == 0 {
-                        start = i;
-                    }
-                    depth += 1;
-                }
-                b'}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        out.push(&s[start..=i]);
-                    }
-                }
-                _ => {}
-            }
-        }
-        i += 1;
-    }
-    out
-}
-
-/// `"key": 数値` の数値を取り出す(コロン前後の空白を許容)。
-fn json_num(s: &str, key: &str) -> Option<f64> {
-    let pat = format!("\"{key}\"");
-    let i = s.find(&pat)? + pat.len();
-    let rest = s[i..].trim_start();
-    let rest = rest.strip_prefix(':')?.trim_start();
-    let end = rest
-        .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-' || c == '+' || c == 'e' || c == 'E'))
-        .unwrap_or(rest.len());
-    rest[..end].parse().ok()
-}
-
-/// `"key":"value"` の文字列値を取り出す(コロン前後の空白を許容)。
-fn json_str(s: &str, key: &str) -> Option<String> {
-    let pat = format!("\"{key}\"");
-    let i = s.find(&pat)? + pat.len();
-    let rest = s[i..].trim_start();
-    let rest = rest.strip_prefix(':')?.trim_start();
-    let rest = rest.strip_prefix('"')?;
-    let end = rest.find('"')?;
-    Some(rest[..end].to_string())
-}
-
-/// 1つの要素("way"等)オブジェクトから、geometryの点列とoneway("yes"のときtrue)を取り出す。
-/// geometryキーが無い/点が1つも取れない要素は None (呼び出し側でスキップする)。
-fn parse_element(obj: &str) -> Option<(Vec<(f64, f64)>, bool)> {
-    let gi = obj.find("\"geometry\"")?;
-    let bracket_off = obj[gi..].find('[')?;
-    let open = gi + bracket_off;
-    let close = matching_bracket(obj, open, b'[', b']')?;
-    let geom = &obj[open + 1..close];
-
-    let mut pts = Vec::new();
-    for point_obj in top_level_objects(geom) {
-        if let (Some(lat), Some(lon)) = (json_num(point_obj, "lat"), json_num(point_obj, "lon")) {
-            pts.push((lat, lon));
-        }
-    }
-    if pts.is_empty() {
-        return None;
-    }
-
-    let oneway = json_str(obj, "oneway").as_deref() == Some("yes");
-    Some((pts, oneway))
-}
+#[derive(Deserialize)]
+struct RoadResp { #[serde(default)] elements: Vec<RoadElement> }
 
 /// Overpassの `out geom` 応答
 /// (`{"elements":[{"geometry":[{"lat":..,"lon":..},...],"tags":{"oneway":"yes",...}},...]}`)
-/// から、道路断片ごとの点列(lat,lon)とonewayフラグを取り出す。serde不使用の自前JSON走査。
+/// から、道路断片ごとの点列(lat,lon)とonewayフラグを取り出す。serde_json でデシリアライズする。
 /// 壊れたJSON・elementsキー無し・空配列はすべて空Vecを返す(panicしない)。
+/// geometryキーが無い/点が1つも無い要素はスキップする。
 pub fn parse_road_fragments(overpass_json: &str) -> Vec<(Vec<(f64, f64)>, bool)> {
-    let ei = match overpass_json.find("\"elements\"") {
-        Some(i) => i,
-        None => return Vec::new(),
+    let resp: RoadResp = match serde_json::from_str(overpass_json) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
     };
-    let bracket_off = match overpass_json[ei..].find('[') {
-        Some(off) => off,
-        None => return Vec::new(),
-    };
-    let open = ei + bracket_off;
-    let close = match matching_bracket(overpass_json, open, b'[', b']') {
-        Some(c) => c,
-        None => return Vec::new(),
-    };
-    let elements = &overpass_json[open + 1..close];
-
-    top_level_objects(elements)
+    resp.elements
         .into_iter()
-        .filter_map(parse_element)
+        .filter_map(|el| {
+            let pts: Vec<(f64, f64)> = el.geometry?.into_iter().map(|p| (p.lat, p.lon)).collect();
+            if pts.is_empty() {
+                return None;
+            }
+            // oneway="yes" のときだけ true(no / -1 / タグ無しは false)。
+            let oneway = el.tags.and_then(|t| t.oneway).as_deref() == Some("yes");
+            Some((pts, oneway))
+        })
         .collect()
 }
 

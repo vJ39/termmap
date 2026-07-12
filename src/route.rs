@@ -1,8 +1,33 @@
 // ルーティング (BRouter 公開API)・高速料金/expressway 計算・GPX 出力
 use crate::render::{OverlaySpec, Poi, PoiCat};
-use crate::poi::json_first;
+use serde::Deserialize;
 
 pub struct RouteResult { pub pts: Vec<(f64, f64)>, pub ele: Vec<f64>, pub dist_m: f64, pub time_s: f64, pub hw_m: f64, pub ascend_m: f64 }
+
+// BRouter geojson の応答。features[0] の geometry.coordinates([[lon,lat,ele?],...]) と
+// properties(track-length/total-time/filtered ascend は全て文字列, messages は文字列表)を読む。
+#[derive(Deserialize)]
+struct BrGeometry { #[serde(default)] coordinates: Vec<Vec<f64>> }
+#[derive(Deserialize)]
+struct BrProperties {
+    #[serde(rename = "track-length", default)] track_length: Option<String>,
+    #[serde(rename = "total-time", default)] total_time: Option<String>,
+    #[serde(rename = "filtered ascend", default)] filtered_ascend: Option<String>,
+    #[serde(default)] messages: Vec<Vec<String>>,
+}
+#[derive(Deserialize)]
+struct BrFeature {
+    #[serde(default)] geometry: Option<BrGeometry>,
+    #[serde(default)] properties: Option<BrProperties>,
+}
+#[derive(Deserialize)]
+struct BrResp { #[serde(default)] features: Vec<BrFeature> }
+// 応答本文を serde でパース。壊れていれば None(各パーサが既定値を返せるように)。
+fn parse_brouter(body: &str) -> Option<BrResp> { serde_json::from_str(body).ok() }
+// features から最初の geometry.coordinates を取り出す。
+fn first_coords(body: &str) -> Option<Vec<Vec<f64>>> {
+    parse_brouter(body)?.features.into_iter().find_map(|f| f.geometry.map(|g| g.coordinates))
+}
 // short=最短 / highway=高速OK(car-fast) / それ以外=下道(高速回避, moped). 既知名は透過。
 fn route_profile(mode: &str) -> &str {
     match mode {
@@ -28,45 +53,19 @@ pub fn route_summary(mode: &str, r: &RouteResult) -> String {
     }
     s
 }
-// BRouter geojson の messages([[headers],[row..]]) を文字列行に分解(値は全て文字列)
-fn parse_message_rows(body: &str) -> Vec<Vec<String>> {
-    let mut rows = Vec::new();
-    let mi = match body.find("\"messages\"") { Some(i) => i, None => return rows };
-    let after = &body[mi..];
-    let start = match after.find('[') { Some(i) => i, None => return rows };
-    let (mut depth, mut in_str, mut esc) = (0i32, false, false);
-    let (mut cur, mut field): (Vec<String>, String) = (Vec::new(), String::new());
-    for b in after[start..].chars() {
-        if in_str {
-            if esc { field.push(b); esc = false; }
-            else if b == '\\' { esc = true; }
-            else if b == '"' { in_str = false; }
-            else { field.push(b); }
-        } else {
-            match b {
-                '"' => in_str = true,
-                '[' => { depth += 1; if depth == 2 { cur = Vec::new(); field.clear(); } }
-                ',' => { if depth == 2 { cur.push(std::mem::take(&mut field)); } }
-                ']' => {
-                    if depth == 2 { cur.push(std::mem::take(&mut field)); rows.push(std::mem::take(&mut cur)); }
-                    depth -= 1;
-                    if depth == 0 { break; }
-                }
-                _ => {}
-            }
-        }
-    }
-    rows
-}
 // 高速(motorway=有料道)区間の総メートル。料金概算に使う。
+// properties.messages([[headers],[row..]] は全て文字列)から Distance/WayTags 列を引く。
 fn expressway_meters(body: &str) -> f64 {
-    let rows = parse_message_rows(body);
-    if rows.is_empty() { return 0.0; }
-    let di = rows[0].iter().position(|h| h == "Distance");
-    let wi = rows[0].iter().position(|h| h == "WayTags");
+    let messages = match parse_brouter(body) {
+        Some(r) => r.features.into_iter().find_map(|f| f.properties.map(|p| p.messages)).unwrap_or_default(),
+        None => return 0.0,
+    };
+    if messages.is_empty() { return 0.0; }
+    let di = messages[0].iter().position(|h| h == "Distance");
+    let wi = messages[0].iter().position(|h| h == "WayTags");
     let (di, wi) = match (di, wi) { (Some(d), Some(w)) => (d, w), _ => return 0.0 };
     let mut m = 0.0;
-    for r in &rows[1..] {
+    for r in &messages[1..] {
         if let (Some(d), Some(w)) = (r.get(di), r.get(wi)) {
             if w.contains("highway=motorway") {
                 if let Ok(v) = d.parse::<f64>() { m += v; }
@@ -75,64 +74,37 @@ fn expressway_meters(body: &str) -> f64 {
     }
     m
 }
-// geojson の LineString coordinates([[lon,lat,elev],...]) を (lat,lon) 列へ。
-// BRouter は整形済み(空白/改行あり)なのでブラケット深さで走査する。
+// geojson の LineString coordinates([[lon,lat,elev?],...]) を (lat,lon) 列へ。
+// lon/lat のどちらかを欠く点があれば None(既存挙動: 点が壊れていれば全体失敗)。
 fn parse_geojson_line(body: &str) -> Option<Vec<(f64, f64)>> {
-    let ci = body.find("\"coordinates\"")?;
-    let after = &body[ci..];
-    let open = after.find('[')?; // 外側配列の開始
-    let mut depth = 0i32;
-    let mut close = None;
-    for (i, &b) in after.as_bytes().iter().enumerate().skip(open) {
-        match b {
-            b'[' => depth += 1,
-            b']' => { depth -= 1; if depth == 0 { close = Some(i); break; } }
-            _ => {}
-        }
-    }
-    let inner = &after[open + 1..close?]; // 各点 [lon, lat, elev], ...
-    let mut pts = Vec::new();
-    let mut rest = inner;
-    while let Some(o) = rest.find('[') {
-        let c = rest[o..].find(']')? + o;
-        let mut it = rest[o + 1..c].split(',');
-        let lon: f64 = it.next()?.trim().parse().ok()?;
-        let lat: f64 = it.next()?.trim().parse().ok()?;
-        pts.push((lat, lon));
-        rest = &rest[c + 1..];
+    let coords = first_coords(body)?;
+    let mut pts = Vec::with_capacity(coords.len());
+    for c in &coords {
+        let lon = *c.first()?;
+        let lat = *c.get(1)?;
+        pts.push((lat, lon)); // (lat, lon)順に格納
     }
     if pts.is_empty() { None } else { Some(pts) }
 }
 // geojson の各点 [lon,lat,elev] の3つ目(標高m)を pts と並行に収集する。
-// 欠損点は 0.0 を入れて pts と件数を一致させる。pts parse とは独立(既存の parse は変えない)。
+// 欠損点(elev無し)は 0.0 を入れて pts と件数を一致させる。
 fn parse_geojson_ele(body: &str) -> Vec<f64> {
-    let mut ele = Vec::new();
-    let ci = match body.find("\"coordinates\"") { Some(i) => i, None => return ele };
-    let after = &body[ci..];
-    let open = match after.find('[') { Some(i) => i, None => return ele };
-    let mut depth = 0i32;
-    let mut close = None;
-    for (i, &b) in after.as_bytes().iter().enumerate().skip(open) {
-        match b {
-            b'[' => depth += 1,
-            b']' => { depth -= 1; if depth == 0 { close = Some(i); break; } }
-            _ => {}
+    match first_coords(body) {
+        Some(coords) => coords.iter().map(|c| c.get(2).copied().unwrap_or(0.0)).collect(),
+        None => Vec::new(),
+    }
+}
+// geojson properties の track-length/total-time/filtered ascend(全て文字列)を数値化して返す。
+// 欠損・非数は 0.0。
+fn parse_geojson_props(body: &str) -> (f64, f64, f64) {
+    let props = parse_brouter(body).and_then(|r| r.features.into_iter().find_map(|f| f.properties));
+    match props {
+        Some(p) => {
+            let num = |o: &Option<String>| o.as_deref().and_then(|s| s.trim().parse::<f64>().ok()).unwrap_or(0.0);
+            (num(&p.track_length), num(&p.total_time), num(&p.filtered_ascend))
         }
+        None => (0.0, 0.0, 0.0),
     }
-    let close = match close { Some(c) => c, None => return ele };
-    let inner = &after[open + 1..close];
-    let mut rest = inner;
-    while let Some(o) = rest.find('[') {
-        let c = match rest[o..].find(']') { Some(c) => c + o, None => break };
-        let mut it = rest[o + 1..c].split(',');
-        // 1つ目=lon, 2つ目=lat を読み飛ばし、3つ目=標高
-        let _ = it.next();
-        let _ = it.next();
-        let z = it.next().and_then(|s| s.trim().parse::<f64>().ok()).unwrap_or(0.0);
-        ele.push(z);
-        rest = &rest[c + 1..];
-    }
-    ele
 }
 // mode: "short"=最短(shortest) / それ以外=裏道(safety)。wps は (lat,lon) 列。
 pub fn fetch_route(wps: &[(f64, f64)], mode: &str, alt: u32) -> Result<RouteResult, String> {
@@ -147,10 +119,7 @@ pub fn fetch_route(wps: &[(f64, f64)], mode: &str, alt: u32) -> Result<RouteResu
         .into_string().map_err(|e| e.to_string())?;
     let pts = parse_geojson_line(&body).ok_or("route: geometry parse失敗")?;
     let ele = parse_geojson_ele(&body);
-    let num = |k: &str| json_first(body.as_str(), k).and_then(|s| s.trim().parse::<f64>().ok());
-    let dist_m = num("\"track-length\": \"").or_else(|| num("\"track-length\":\"")).unwrap_or(0.0);
-    let time_s = num("\"total-time\": \"").or_else(|| num("\"total-time\":\"")).unwrap_or(0.0);
-    let ascend_m = num("\"filtered ascend\": \"").or_else(|| num("\"filtered ascend\":\"")).unwrap_or(0.0);
+    let (dist_m, time_s, ascend_m) = parse_geojson_props(&body);
     let hw_m = expressway_meters(&body);
     Ok(RouteResult { pts, ele, dist_m, time_s, hw_m, ascend_m })
 }
@@ -216,6 +185,7 @@ pub fn wp_swap(wps: &mut [(f64, f64)], sel: &mut usize, back: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::poi::json_first; // fetch_route_parses_ele_and_ascend の整合確認用
 
     #[test]
     fn waypoint_ops() {
@@ -270,6 +240,30 @@ mod tests {
             .and_then(|s| s.trim().parse::<f64>().ok())
             .unwrap_or(0.0);
         assert!((asc - 123.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_props_reads_hyphenated_string_values() {
+        // properties のハイフン/空白入りキーを serde(rename)で読み、文字列値を数値化する
+        let body = r#"{"features":[{"properties":{"track-length":"12345","total-time":"600","filtered ascend":"78"}}]}"#;
+        let (dist, time, asc) = parse_geojson_props(body);
+        assert!((dist - 12345.0).abs() < 1e-9);
+        assert!((time - 600.0).abs() < 1e-9);
+        assert!((asc - 78.0).abs() < 1e-9);
+        // properties 欠損は全て 0.0
+        assert_eq!(parse_geojson_props(r#"{"features":[{}]}"#), (0.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn parse_geojson_line_handles_missing_elevation() {
+        // 標高(3要素目)が無い点でも lat/lon は取れ、ele は 0.0 で件数一致
+        let body = r#"{"features":[{"geometry":{"coordinates":[[139.7,35.7],[139.71,35.71,10.0]]}}]}"#;
+        let pts = parse_geojson_line(body).unwrap();
+        let ele = parse_geojson_ele(body);
+        assert_eq!(pts.len(), 2);
+        assert_eq!(ele.len(), 2);
+        assert!((ele[0] - 0.0).abs() < 1e-9); // 欠損→0.0
+        assert!((ele[1] - 10.0).abs() < 1e-9);
     }
 
     #[test]
