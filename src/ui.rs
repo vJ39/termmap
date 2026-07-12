@@ -1070,6 +1070,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                         KeyCode::Enter => {
                             let q = buf.trim().to_string();
                             if !q.is_empty() {
+                                show_busy(&mut out, cols, tr, "周辺を検索中…"); // Overpassは数秒かかるので進行表示
                                 let (vt, vl) = pixel_to_deg(cx - ow as f64 * 1.25, cy - oh as f64 * 1.25, z);
                                 let (vb, vr) = pixel_to_deg(cx + ow as f64 * 1.25, cy + oh as f64 * 1.25, z);
                                 let rlat = 2.0 / 111.0;
