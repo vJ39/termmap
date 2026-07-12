@@ -193,52 +193,34 @@ pub const POI_KINDS: [PoiKind; 7] = [
     PoiKind { key: '6', label: "公園", filter: "nwr[\"leisure\"=\"park\"]", cat: PoiCat::Other },
     PoiKind { key: '7', label: "峠道", filter: "nwr[\"mountain_pass\"=\"yes\"]", cat: PoiCat::Danger },
 ];
-// 文字列フィールド抽出。key は裸のキー名("name" 等)。コロン後の空白を許容。
-fn json_str(s: &str, key: &str) -> Option<String> {
-    let pat = format!("\"{key}\"");
-    let i = s.find(&pat)? + pat.len();
-    let rest = &s[i..];
-    let colon = rest.find(':')?;
-    let after = &rest[colon + 1..];
-    let q1 = after.find('"')?;
-    let q2 = after[q1 + 1..].find('"')?;
-    Some(after[q1 + 1..q1 + 1 + q2].to_string())
+// Overpass out:json の要素。node は lat/lon、way/relation は center を使う。
+#[derive(Deserialize)]
+struct OverLatLon { lat: f64, lon: f64 }
+#[derive(Deserialize)]
+struct OverTags { #[serde(default)] name: String }
+#[derive(Deserialize)]
+struct OverElement {
+    #[serde(default)] lat: Option<f64>,
+    #[serde(default)] lon: Option<f64>,
+    #[serde(default)] center: Option<OverLatLon>,
+    #[serde(default)] tags: Option<OverTags>,
 }
-// 数値フィールド抽出("lat": 35.7 のような)
-fn json_num(s: &str, key: &str) -> Option<f64> {
-    let i = s.find(key)? + key.len();
-    let rest = s[i..].trim_start();
-    let end = rest.find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-' || c == '+' || c == 'e' || c == 'E')).unwrap_or(rest.len());
-    rest[..end].parse().ok()
-}
-// Overpass out:json の elements から (lat,lon,name) を取り出す。文字列内の括弧を無視する走査。
+#[derive(Deserialize)]
+struct OverResp { #[serde(default)] elements: Vec<OverElement> }
+// Overpass out:json の elements から (lat,lon,name) を取り出す。
+// node は自身の lat/lon、way は center の lat/lon を使う(既存挙動を維持)。
+// パース不能な応答は空Vec(呼び出し側で0件として扱う)。
 fn parse_overpass(body: &str) -> Vec<(f64, f64, String)> {
+    let resp: OverResp = match serde_json::from_str(body) { Ok(r) => r, Err(_) => return Vec::new() };
     let mut out = Vec::new();
-    let ei = match body.find("\"elements\"") { Some(i) => i, None => return out };
-    let bytes = body.as_bytes();
-    let mut i = ei;
-    while i < bytes.len() && bytes[i] != b'[' { i += 1; }
-    let (mut depth, mut obj_start, mut in_obj, mut in_str, mut esc) = (0i32, 0usize, false, false, false);
-    while i < bytes.len() {
-        let b = bytes[i];
-        if in_str {
-            if esc { esc = false; } else if b == b'\\' { esc = true; } else if b == b'"' { in_str = false; }
-        } else {
-            match b {
-                b'"' => in_str = true,
-                b'{' => { if depth == 0 { obj_start = i; in_obj = true; } depth += 1; }
-                b'}' => { depth -= 1; if depth == 0 && in_obj {
-                    let obj = &body[obj_start..=i];
-                    if let (Some(la), Some(lo)) = (json_num(obj, "\"lat\":"), json_num(obj, "\"lon\":")) {
-                        out.push((la, lo, json_str(obj, "name").unwrap_or_default()));
-                    }
-                    in_obj = false;
-                }}
-                b']' => { if depth == 0 { break; } }
-                _ => {}
-            }
-        }
-        i += 1;
+    for el in resp.elements {
+        // node=自身の lat/lon / way=center。どちらも無ければスキップ。
+        let (la, lo) = match (el.lat, el.lon) {
+            (Some(la), Some(lo)) => (la, lo),
+            _ => match el.center { Some(c) => (c.lat, c.lon), None => continue },
+        };
+        let name = el.tags.map(|t| t.name).unwrap_or_default();
+        out.push((la, lo, name));
     }
     out
 }
@@ -281,14 +263,23 @@ mod tests {
         ]}"#;
         let v = parse_overpass(body);
         assert_eq!(v.len(), 2);
-        assert_eq!(v[0].2, "あ店"); // 空白後コロンでも名前を取れる
+        assert_eq!(v[0].2, "あ店"); // node は自身の lat/lon
         assert!((v[1].0 - 35.76).abs() < 1e-9); // wayはcenter
     }
 
     #[test]
-    fn json_helpers() {
-        assert_eq!(json_str(r#"{"name": "王子駅"}"#, "name").as_deref(), Some("王子駅"));
-        assert!((json_num(r#"{"lat": 35.7}"#, "\"lat\":").unwrap() - 35.7).abs() < 1e-9);
+    fn parse_overpass_edge_cases() {
+        // tags 無しの要素は name 空。center も lat/lon も無い要素はスキップ。
+        let body = r#"{"elements":[
+          {"type":"node","lat":35.0,"lon":139.0},
+          {"type":"relation","tags":{"name":"座標なし"}}
+        ]}"#;
+        let v = parse_overpass(body);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].2, ""); // tags 無し → 空名
+        // パース不能な応答は空Vec(panicしない)
+        assert!(parse_overpass("not json").is_empty());
+        assert!(parse_overpass(r#"{"version":0.6}"#).is_empty()); // elements キー無し
     }
 
     #[test]
