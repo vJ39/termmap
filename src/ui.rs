@@ -301,7 +301,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     let mut route_ele: Vec<f64> = Vec::new(); // 直近ルートの標高列(pts と同数)
     let mut route_ascend: f64 = 0.0;          // 直近ルートの累積登り(m)
     let mut show_elev = false;                // E で標高プロファイル表示
-    let mut gps_rx: Option<std::sync::mpsc::Receiver<(f64, f64)>> = None; // G ライブ現在地の受信
+    let mut gps_rx: Option<gpslive::GpsPoller> = None; // G ライブ現在地(drop で停止)
     let mut gps_pos: Option<(f64, f64)> = None; // 最新の自位置
     let mut gps_trail: Vec<(f64, f64)> = Vec::new(); // 通過ブレッドクラム
     let mut play: Option<f64> = None; // A ルート再生(先頭からの距離m。Noneで停止)
@@ -468,8 +468,8 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         let gut: u32 = if !pois.is_empty() || show_routes || show_wps || show_splist || show_catlist || show_settings || show_menu || show_poimenu { 26 } else { 0 };
         let map_cols = cols.saturating_sub(gut).max(10);
         let (ow, oh) = if opts.braille || opts.edge { (map_cols * 2, map_rows * 4) } else { (map_cols, map_rows * 2) };
-        if let Some(rx) = &gps_rx { // ライブ現在地を取り込み、自位置に追従
-            while let Ok((la, lo)) = rx.try_recv() {
+        if let Some(p) = &gps_rx { // ライブ現在地を取り込み、自位置に追従
+            while let Ok((la, lo)) = p.rx.try_recv() {
                 gps_pos = Some((la, lo));
                 gps_trail.push((la, lo));
                 if gps_trail.len() > 300 { gps_trail.remove(0); }
