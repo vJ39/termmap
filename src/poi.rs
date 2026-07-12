@@ -208,6 +208,21 @@ pub fn fetch_pois(kind: &PoiKind, s: f64, w: f64, n: f64, e: f64) -> Result<Vec<
     Ok(parse_overpass(&body))
 }
 
+// 中心付近(表示範囲2.5倍と半径2kmの広い方)で kind を検索し、名前重複除去・中心から近い順・最大50件で返す。
+pub fn poi_search(kind: &PoiKind, cx: f64, cy: f64, z: u32, ow: u32, oh: u32, lat: f64, lon: f64) -> Result<Vec<(f64, f64, String, PoiCat)>, String> {
+    let (vt, vl) = crate::geo::pixel_to_deg(cx - ow as f64 * 1.25, cy - oh as f64 * 1.25, z);
+    let (vb, vr) = crate::geo::pixel_to_deg(cx + ow as f64 * 1.25, cy + oh as f64 * 1.25, z);
+    let rlat = 2.0 / 111.0;
+    let rlon = 2.0 / (111.0 * lat.to_radians().cos().abs().max(0.1));
+    let v = fetch_pois(kind, vb.min(lat - rlat), vl.min(lon - rlon), vt.max(lat + rlat), vr.max(lon + rlon))?;
+    let mut items: Vec<(f64, f64, String, PoiCat)> = v.into_iter().map(|(la, lo, nm)| (la, lo, nm, kind.cat)).collect();
+    items.sort_by(|p, q| p.2.cmp(&q.2));
+    items.dedup_by(|p, q| !p.2.is_empty() && p.2 == q.2);
+    items.sort_by(|p, q| crate::geo::haversine_km((lat, lon), (p.0, p.1)).partial_cmp(&crate::geo::haversine_km((lat, lon), (q.0, q.1))).unwrap_or(std::cmp::Ordering::Equal));
+    items.truncate(50);
+    Ok(items)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

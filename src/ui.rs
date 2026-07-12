@@ -149,6 +149,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     if opts.style == "osm" { opts.style = cfg.style.clone(); }
     let mut set_sel: usize = 0;            // 設定画面の選択行
     let mut menu_sel: usize = 0;           // Space メニューの選択行
+    let mut poimenu_sel: usize = 0;        // 目的地カテゴリの選択行
     let mut street: Option<(RgbImage, i32, f64, f64)> = None; // 実写(画像, heading, lat, lon)
 
     let (home_lat, home_lon) = pixel_to_deg(cx, cy, z);
@@ -249,7 +250,8 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         let show_catlist = matches!(focus, Focus::SpotCatList);
         let show_settings = matches!(focus, Focus::Settings);
         let show_menu = matches!(focus, Focus::Menu);
-        let gut: u32 = if !pois.is_empty() || show_routes || show_wps || show_splist || show_catlist || show_settings || show_menu { 26 } else { 0 };
+        let show_poimenu = matches!(focus, Focus::PoiMenu);
+        let gut: u32 = if !pois.is_empty() || show_routes || show_wps || show_splist || show_catlist || show_settings || show_menu || show_poimenu { 26 } else { 0 };
         let map_cols = cols.saturating_sub(gut).max(10);
         let (ow, oh) = if opts.braille || opts.edge { (map_cols * 2, map_rows * 4) } else { (map_cols, map_rows * 2) };
         if let Some(rx) = &gps_rx { // ライブ現在地を取り込み、自位置に追従
@@ -345,6 +347,10 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     format!("APIキー {}", keyset),
                 ];
                 ("設定".to_string(), its, set_sel)
+            } else if show_poimenu {
+                let mut its: Vec<String> = POI_KINDS.iter().map(|k| k.label.to_string()).collect();
+                its.push("キーワードで周辺検索".to_string());
+                ("目的地".to_string(), its, poimenu_sel)
             } else if show_routes {
                 ("お気に入り".to_string(), route_names.clone(), rn_sel)
             } else {
@@ -427,7 +433,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             Focus::RoadSearch(buf) => format!(" 道路名/ref: {buf}\u{2588}   Enter=view内を経路に追加(複数連結可・cで全消去) Esc=取消 "),
             Focus::Recommend(buf) => format!(" おすすめ方向性: {buf}\u{2588}   例:海沿い気持ちいい峠  Enter=提案(数秒) Esc=取消 "),
             Focus::SpotRename(buf, _) => format!(" カテゴリ改名: {buf}\u{2588}   Enter=確定 Esc=取消 "),
-            Focus::PoiMenu => " 目的地: 1ガソスタ 2カフェ 3コンビニ 4道の駅 5展望 6公園 7峠道  / キーワード周辺検索  Esc=取消 ".to_string(),
+            Focus::PoiMenu => " 目的地カテゴリ: ↑↓選択 Enter=検索 (数字1-7も可 / キーワードは最終行かEnter) Esc=取消 ".to_string(),
             Focus::PoiList => format!(" [{}] ↑↓選択 Enter=移動 s始 e終 v経由 f再検索 Esc閉 ", poi_label),
             Focus::RouteList => " お気に入り: ↑↓選択 Enter=読込 Esc=閉 ".to_string(),
             Focus::WaypointList => " 並べ替え: ↑↓/Tab 選択  [ ]移動  x削除  +/-拡縮  Esc閉 ".to_string(),
@@ -784,27 +790,24 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     },
                     Focus::PoiMenu => match k.code {
                         KeyCode::Esc => {}
+                        KeyCode::Up => { poimenu_sel = poimenu_sel.saturating_sub(1); focus = Focus::PoiMenu; }
+                        KeyCode::Down => { if poimenu_sel + 1 <= POI_KINDS.len() { poimenu_sel += 1; } focus = Focus::PoiMenu; }
                         KeyCode::Char('/') => focus = Focus::NearSearch(String::new()),
-                        KeyCode::Char(c) => {
-                            if let Some(kind) = POI_KINDS.iter().find(|kk| kk.key == c) {
-                                // 表示範囲(2.5倍)と 半径2kmの箱 の広い方で検索(高ズームでも駅前を拾えるように)
-                                let (vt, vl) = pixel_to_deg(cx - ow as f64 * 1.25, cy - oh as f64 * 1.25, z);
-                                let (vb, vr) = pixel_to_deg(cx + ow as f64 * 1.25, cy + oh as f64 * 1.25, z);
-                                let rlat = 2.0 / 111.0;
-                                let rlon = 2.0 / (111.0 * lat.to_radians().cos().abs().max(0.1));
-                                match fetch_pois(kind, vb.min(lat - rlat), vl.min(lon - rlon), vt.max(lat + rlat), vr.max(lon + rlon)) {
-                                    Ok(v) => {
-                                        let mut items: Vec<(f64, f64, String, PoiCat)> = v.into_iter().map(|(la, lo, nm)| (la, lo, nm, kind.cat)).collect();
-                                        items.sort_by(|p, q| p.2.cmp(&q.2));
-                                        items.dedup_by(|p, q| !p.2.is_empty() && p.2 == q.2);
-                                        items.sort_by(|p, q| haversine_km((lat, lon), (p.0, p.1)).partial_cmp(&haversine_km((lat, lon), (q.0, q.1))).unwrap_or(std::cmp::Ordering::Equal));
-                                        items.truncate(50);
-                                        if items.is_empty() { addr = format!("周辺2kmに{}無し", kind.label); }
-                                        else { pois = items; poi_sel = 0; poi_label = kind.label.to_string(); set_markers(&mut spec, &wps, &pois); focus = Focus::PoiList; }
+                        KeyCode::Enter | KeyCode::Char(_) => {
+                            // Enter=選択行 / 数字キー1-7=対応カテゴリ。最終行(=POI_KINDS.len())はキーワード周辺検索。
+                            let idx = if let KeyCode::Char(c) = k.code { POI_KINDS.iter().position(|kk| kk.key == c) } else { Some(poimenu_sel) };
+                            match idx {
+                                Some(i) if i >= POI_KINDS.len() => focus = Focus::NearSearch(String::new()),
+                                Some(i) => {
+                                    show_busy(&mut out, cols, tr, "検索中…");
+                                    match poi_search(&POI_KINDS[i], cx, cy, z, ow, oh, lat, lon) {
+                                        Ok(items) if !items.is_empty() => { pois = items; poi_sel = 0; poi_label = POI_KINDS[i].label.to_string(); set_markers(&mut spec, &wps, &pois); focus = Focus::PoiList; }
+                                        Ok(_) => { addr = format!("周辺2kmに{}無し", POI_KINDS[i].label); focus = Focus::PoiMenu; }
+                                        Err(e) => { addr = format!("({e})"); focus = Focus::PoiMenu; }
                                     }
-                                    Err(e) => addr = format!("({e})"),
                                 }
-                            } else { focus = Focus::PoiMenu; }
+                                None => focus = Focus::PoiMenu,
+                            }
                         }
                         _ => focus = Focus::PoiMenu,
                     },
