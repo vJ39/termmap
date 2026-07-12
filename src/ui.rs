@@ -256,6 +256,11 @@ fn ensure_visible(offset: &mut usize, sel: usize, count: usize, viewport: usize)
     *offset = (*offset).min(count.saturating_sub(viewport)); // 末尾側の空きを詰める
 }
 
+// 初回起動オンボーディングの既読マーカー(~/.config/termmap/onboarded)。存在すれば以後は出さない。
+fn onboarded_marker() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".config/termmap/onboarded"))
+}
+
 // ルート作成フォーム(左袖パネル)の行。地図は見えたまま＝中心基準の設定が効く。
 #[derive(Clone, Copy)]
 enum RfRow { Start, End, Via(usize), AddVia, AddRoad, Mode, Draw, Clear, Back }
@@ -375,6 +380,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     let mut pending_spot: Option<(f64, f64, String)> = None; // 検索結果からお気に入り登録する際の保留(座標+名前)。カテゴリ選択待ち
     let mut list_offset: usize = 0; // 左袖リストのスクロール開始位置(表示中の1リストで共有・ensure_visibleで追従)
     let mut color_sel: u8 = 0; // 色ピッカーで選択中のパレットindex
+    let mut onboard = onboarded_marker().map_or(false, |p| !p.exists()); // 初回起動なら操作案内を出す
     apply_spots(&mut spec, &spots, &spot_cats, show_spots);
 
     // メニュー項目/直接キー どちらからでも同じ処理を走らせる。
@@ -878,6 +884,26 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             let _ = write!(out, "\x1b[{};{}H{}{}{}", r0 + 4, c0, BG, hint, RST);
             let _ = write!(out, "\x1b[{};{}H{}{}{}", r0 + 5, c0, BG, blank, RST);
         }
+        // 初回起動の操作案内(中央パネル・何かキーで消える)
+        if onboard {
+            const BG: &str = "\x1b[97;44m"; // 白字・青地(目立たせる)
+            const RST: &str = "\x1b[0m";
+            let iw = 34usize;
+            let lines = [
+                "  termmap へようこそ",
+                "",
+                "  Space   メニューを開く",
+                "  ?       ヘルプ",
+                "  q       終了",
+                "",
+                "  何かキーを押して開始",
+            ];
+            let r0 = ((map_rows as usize).saturating_sub(lines.len()) / 2).max(1) as u32;
+            let c0 = ((cols as usize).saturating_sub(iw) / 2).max(1) as u32;
+            for (i, ln) in lines.iter().enumerate() {
+                let _ = write!(out, "\x1b[{};{}H{}{}{}", r0 + i as u32, c0, BG, fit_cells(ln, iw), RST);
+            }
+        }
         out.flush()?;
 
         // 入力待ち。ルート計算中(route_job)はポーリングして結果を取り込む
@@ -907,6 +933,10 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             None => {} // 再描画のみ(計算待ち)
             Some(Event::Key(k)) if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) => {
                 if route_job.is_some() { route_job = None; route_note = Some("中断".to_string()); } // 計算中断(アプリは終了しない)
+            }
+            Some(Event::Key(_)) if onboard => { // 初回案内を最初のキーで閉じ、既読マーカーを書く(以後出さない)
+                onboard = false;
+                if let Some(p) = onboarded_marker() { let _ = crate::fsutil::write_atomic(&p, b"1", None); }
             }
             Some(Event::Key(_)) if qr_view.is_some() => qr_view = None, // ポップアップを閉じる
             Some(Event::Key(_)) if popup.is_some() => popup = None, // 名前ポップアップを閉じる
