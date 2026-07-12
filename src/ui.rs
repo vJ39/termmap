@@ -13,6 +13,68 @@ use std::collections::HashMap;
 use std::io::Write;
 use image::{RgbImage, imageops::FilterType};
 
+// ---- テキスト1行編集ヘルパ(全テキスト入力欄で共有) ----
+// cur は「文字単位」のカーソル位置(0..=文字数)。byte offset は char_indices で都度求めるのでマルチバイト安全。
+
+// 文字位置 char_idx の byte offset を返す(末尾なら文字列長)。
+fn char_byte(s: &str, char_idx: usize) -> usize {
+    s.char_indices().nth(char_idx).map(|(b, _)| b).unwrap_or(s.len())
+}
+
+// cur 位置に文字列 s を挿入し、cur を挿入文字数ぶん進める(ペースト用)。
+fn insert_str_at(buf: &mut String, cur: &mut usize, s: &str) {
+    let at = char_byte(buf, *cur);
+    buf.insert_str(at, s);
+    *cur += s.chars().count();
+}
+
+// SpotForm のフィールド切替時、移動先フィールドのバッファ文字数(末尾)を返す。ボタン欄は0。
+fn form_cur(name: &str, url: &str, field: usize) -> usize {
+    match field { 0 => name.chars().count(), 1 => url.chars().count(), _ => 0 }
+}
+
+// 1行入力の編集。対象キー(←→ Home/End 文字入力 Backspace Delete)を処理したら true、非対象は false。
+fn edit_line(buf: &mut String, cur: &mut usize, code: crossterm::event::KeyCode) -> bool {
+    use crossterm::event::KeyCode;
+    let n = buf.chars().count();
+    if *cur > n { *cur = n; } // 念のため範囲に丸める
+    match code {
+        KeyCode::Left  => { *cur = cur.saturating_sub(1); true }
+        KeyCode::Right => { *cur = (*cur + 1).min(n); true }
+        KeyCode::Home  => { *cur = 0; true }
+        KeyCode::End   => { *cur = n; true }
+        KeyCode::Char(c) => { let at = char_byte(buf, *cur); buf.insert(at, c); *cur += 1; true } // cur の文字位置に挿入
+        KeyCode::Backspace => {
+            if *cur > 0 { // cur-1 の1文字を削除
+                let s = char_byte(buf, *cur - 1);
+                let e = char_byte(buf, *cur);
+                buf.replace_range(s..e, "");
+                *cur -= 1;
+            }
+            true
+        }
+        KeyCode::Delete => {
+            if *cur < n { // cur 位置の1文字を削除(cur据え置き)
+                let s = char_byte(buf, *cur);
+                let e = char_byte(buf, *cur + 1);
+                buf.replace_range(s..e, "");
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+// cur 位置にブロックカーソル █ を挟んで表示(末尾なら末尾に付く)。
+// ANSI を含めない(表示は fit_cells が幅計算するため、エスケープを入れると桁がずれる)。
+fn render_with_cursor(buf: &str, cur: usize) -> String {
+    let chars: Vec<char> = buf.chars().collect();
+    let cur = cur.min(chars.len());
+    let before: String = chars[..cur].iter().collect();
+    let after: String = chars[cur..].iter().collect();
+    format!("{before}\u{2588}{after}")
+}
+
 // 同期API待ちの間、中央に「通信中…」を出す(呼び出し直前にflushして表示)。
 // 同期処理なのでアニメーションはしないが、待ちが起きていることを示す。
 fn show_busy<W: std::io::Write>(out: &mut W, cols: u32, rows: u16, msg: &str) {
@@ -148,6 +210,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     opts.mono = opts.mono || cfg.mono;
     if opts.style == "osm" { opts.style = cfg.style.clone(); }
     let mut set_sel: usize = 0;            // 設定画面の選択行
+    let mut input_cur: usize = 0;          // テキスト入力欄のカーソル位置(文字単位)。テキストFocus開始時に該当バッファ末尾へ
     let mut menu_sel: usize = 0;           // Space メニューの選択行
     let mut poimenu_sel: usize = 0;        // 目的地カテゴリの選択行
     let mut street: Option<(RgbImage, i32, f64, f64)> = None; // 実写(画像, heading, lat, lon)
@@ -424,13 +487,13 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             }
         }
         let status = match &focus {
-            Focus::Search(buf) => format!(" 検索: {buf}\u{2588}   Enter=移動 Esc=取消 "),
-            Focus::SaveName(buf) => format!(" ルート名: {buf}\u{2588}   Enter=保存 Esc=取消 "),
-            Focus::NearSearch(buf) => format!(" 周辺検索: {buf}\u{2588}   Enter=検索 Esc=取消 "),
-            Focus::NewCat(buf) => format!(" 新規カテゴリ: {buf}\u{2588}   Enter=作成 Esc=取消 "),
+            Focus::Search(buf) => format!(" 検索: {}   Enter=移動 Esc=取消 ", render_with_cursor(buf, input_cur)),
+            Focus::SaveName(buf) => format!(" ルート名: {}   Enter=保存 Esc=取消 ", render_with_cursor(buf, input_cur)),
+            Focus::NearSearch(buf) => format!(" 周辺検索: {}   Enter=検索 Esc=取消 ", render_with_cursor(buf, input_cur)),
+            Focus::NewCat(buf) => format!(" 新規カテゴリ: {}   Enter=作成 Esc=取消 ", render_with_cursor(buf, input_cur)),
             Focus::SpotForm { .. } => " 新規スポット: ↑↓/Tab移動 入力/貼付 Enter=次/送信 Esc=取消 ".to_string(),
             Focus::SpotList => format!(" [{cur_cat}] ↑↓ Enter移動 [ ]並替 n新規 r改名 m中心へ x削除 Esc戻る "),
-            Focus::SpotEditName(buf, _) => format!(" スポット改名: {buf}\u{2588}   Enter=確定 Esc=取消 "),
+            Focus::SpotEditName(buf, _) => format!(" スポット改名: {}   Enter=確定 Esc=取消 ", render_with_cursor(buf, input_cur)),
             Focus::SpotCatList => " カテゴリ: ↑↓選択 [ ]並替 Enter=中へ n新規 r改名 c色 x削除(空のみ) Esc=閉 ".to_string(),
             Focus::Settings => {
                 let desc = match set_sel {
@@ -448,9 +511,9 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 };
                 format!(" ▶ {desc}   [↑↓選択 Enter切替 s保存 Esc閉]")
             }
-            Focus::RoadSearch(buf) => format!(" 道路名/ref: {buf}\u{2588}   Enter=view内を経路に追加(複数連結可・cで全消去) Esc=取消 "),
-            Focus::Recommend(buf) => format!(" おすすめ方向性: {buf}\u{2588}   例:海沿い気持ちいい峠  Enter=提案(数秒) Esc=取消 "),
-            Focus::SpotRename(buf, _) => format!(" カテゴリ改名: {buf}\u{2588}   Enter=確定 Esc=取消 "),
+            Focus::RoadSearch(buf) => format!(" 道路名/ref: {}   Enter=view内を経路に追加(複数連結可・cで全消去) Esc=取消 ", render_with_cursor(buf, input_cur)),
+            Focus::Recommend(buf) => format!(" おすすめ方向性: {}   例:海沿い気持ちいい峠  Enter=提案(数秒) Esc=取消 ", render_with_cursor(buf, input_cur)),
+            Focus::SpotRename(buf, _) => format!(" カテゴリ改名: {}   Enter=確定 Esc=取消 ", render_with_cursor(buf, input_cur)),
             Focus::PoiMenu => " 目的地カテゴリ: ↑↓選択 Enter=検索 (数字1-7も可 / キーワードは最終行かEnter) Esc=取消 ".to_string(),
             Focus::PoiList => format!(" [{}] ↑↓選択 Enter=移動 s始 e終 v経由 f再検索 Esc閉 ", poi_label),
             Focus::RouteList => " お気に入り: ↑↓選択 Enter=読込 Esc=閉 ".to_string(),
@@ -511,10 +574,12 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             const SEL: &str = "\x1b[97;40m";  // 白字・黒地(選択中フィールドを反転表示)
             const RST: &str = "\x1b[0m";
             let iw = (cols as usize).saturating_sub(6).clamp(24, 60); // ボックス内容幅
-            let cur = |f: usize| if *field == f { "\u{2588}" } else { "" }; // 選択中の入力欄にカーソル
+            // 選択中の入力欄は cur 位置にカーソルを出す。非選択欄はそのまま表示。
+            let name_disp = if *field == 0 { render_with_cursor(name, input_cur) } else { name.clone() };
+            let url_disp = if *field == 1 { render_with_cursor(url, input_cur) } else { url.clone() };
             let header = format!("  新規スポット [{cur_cat}]");
-            let name_line = format!("  名称: {}{}", name, cur(0));
-            let url_line = format!("  GoogleマップURL(任意): {}{}", url, cur(1));
+            let name_line = format!("  名称: {}", name_disp);
+            let url_line = format!("  GoogleマップURL(任意): {}", url_disp);
             let blank = " ".repeat(iw);
             // 行の並び(内容, その行が選択中フィールドか)
             let rows: [(String, bool); 6] = [
@@ -604,14 +669,12 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             }
                         }
                         KeyCode::Esc => {}
-                        KeyCode::Backspace => { buf.pop(); focus = Focus::Search(buf); }
-                        KeyCode::Char(c) => { buf.push(c); focus = Focus::Search(buf); }
-                        _ => focus = Focus::Search(buf),
+                        other => { edit_line(&mut buf, &mut input_cur, other); focus = Focus::Search(buf); } // ←→/文字/BS/Del/Home/End
                     },
                     Focus::SpotCatList => match k.code { // カテゴリ一覧(P)
                         KeyCode::Up => { cat_sel = cat_sel.saturating_sub(1); focus = Focus::SpotCatList; }
                         KeyCode::Down => { if cat_sel + 1 < spot_cats.len() { cat_sel += 1; } focus = Focus::SpotCatList; }
-                        KeyCode::Char('n') => focus = Focus::NewCat(String::new()),
+                        KeyCode::Char('n') => { input_cur = 0; focus = Focus::NewCat(String::new()); }
                         KeyCode::Char('[') => { // 選択カテゴリを上へ
                             if cat_sel > 0 && cat_sel < spot_cats.len() { spot_cats.swap(cat_sel, cat_sel - 1); cat_sel -= 1; let _ = save_all_cats(&spot_cats); }
                             focus = Focus::SpotCatList;
@@ -620,7 +683,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             if cat_sel + 1 < spot_cats.len() { spot_cats.swap(cat_sel, cat_sel + 1); cat_sel += 1; let _ = save_all_cats(&spot_cats); }
                             focus = Focus::SpotCatList;
                         }
-                        KeyCode::Char('r') => { if let Some((n, _)) = spot_cats.get(cat_sel) { focus = Focus::SpotRename(n.clone(), cat_sel); } else { focus = Focus::SpotCatList; } }
+                        KeyCode::Char('r') => { if let Some((n, _)) = spot_cats.get(cat_sel) { input_cur = n.chars().count(); focus = Focus::SpotRename(n.clone(), cat_sel); } else { focus = Focus::SpotCatList; } }
                         KeyCode::Char('c') => {
                             if let Some(e) = spot_cats.get_mut(cat_sel) { e.1 = (e.1 + 1) % SPOT_PALETTE.len() as u8; let _ = save_all_cats(&spot_cats); apply_spots(&mut spec, &spots, &spot_cats, show_spots); }
                             focus = Focus::SpotCatList;
@@ -689,9 +752,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             }
                         }
                         KeyCode::Esc => {}
-                        KeyCode::Backspace => { buf.pop(); focus = Focus::RoadSearch(buf); }
-                        KeyCode::Char(c) => { buf.push(c); focus = Focus::RoadSearch(buf); }
-                        _ => focus = Focus::RoadSearch(buf),
+                        other => { edit_line(&mut buf, &mut input_cur, other); focus = Focus::RoadSearch(buf); }
                     },
                     Focus::Recommend(mut buf) => match k.code { // おすすめ: 方向性→claude -p→実在確認→候補一覧
                         KeyCode::Enter => {
@@ -721,14 +782,12 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             }
                         }
                         KeyCode::Esc => {}
-                        KeyCode::Backspace => { buf.pop(); focus = Focus::Recommend(buf); }
-                        KeyCode::Char(c) => { buf.push(c); focus = Focus::Recommend(buf); }
-                        _ => focus = Focus::Recommend(buf),
+                        other => { edit_line(&mut buf, &mut input_cur, other); focus = Focus::Recommend(buf); }
                     },
                     Focus::SpotList => match k.code { // cur_cat のスポット一覧
                         KeyCode::Up => { sp_sel = sp_sel.saturating_sub(1); focus = Focus::SpotList; }
                         KeyCode::Down => { let n = spots.iter().filter(|s| s.cat == cur_cat).count(); if sp_sel + 1 < n { sp_sel += 1; } focus = Focus::SpotList; }
-                        KeyCode::Char('n') => focus = Focus::SpotForm { name: String::new(), url: String::new(), field: 0 }, // 新規スポット登録フォーム
+                        KeyCode::Char('n') => { input_cur = 0; focus = Focus::SpotForm { name: String::new(), url: String::new(), field: 0 }; } // 新規スポット登録フォーム
                         KeyCode::Char('[') => { // 選択スポットを同カテゴリ内で上へ
                             let idxs: Vec<usize> = spots.iter().enumerate().filter(|(_, s)| s.cat == cur_cat).map(|(i, _)| i).collect();
                             if sp_sel > 0 && sp_sel < idxs.len() { spots.swap(idxs[sp_sel], idxs[sp_sel - 1]); sp_sel -= 1; let _ = save_all_spots(&spots); }
@@ -741,7 +800,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                         }
                         KeyCode::Char('r') => { // 選択スポットを改名
                             let idxs: Vec<usize> = spots.iter().enumerate().filter(|(_, s)| s.cat == cur_cat).map(|(i, _)| i).collect();
-                            match idxs.get(sp_sel) { Some(&gi) => focus = Focus::SpotEditName(spots[gi].name.clone(), gi), None => focus = Focus::SpotList }
+                            match idxs.get(sp_sel) { Some(&gi) => { input_cur = spots[gi].name.chars().count(); focus = Focus::SpotEditName(spots[gi].name.clone(), gi); } None => focus = Focus::SpotList }
                         }
                         KeyCode::Char('m') => { // 選択スポットを現在の中心へ移動
                             let idxs: Vec<usize> = spots.iter().enumerate().filter(|(_, s)| s.cat == cur_cat).map(|(i, _)| i).collect();
@@ -775,16 +834,12 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             focus = Focus::SpotList;
                         }
                         KeyCode::Esc => focus = Focus::SpotList,
-                        KeyCode::Backspace => { buf.pop(); focus = Focus::SpotEditName(buf, gi); }
-                        KeyCode::Char(c) => { buf.push(c); focus = Focus::SpotEditName(buf, gi); }
-                        _ => focus = Focus::SpotEditName(buf, gi),
+                        other => { edit_line(&mut buf, &mut input_cur, other); focus = Focus::SpotEditName(buf, gi); }
                     },
                     Focus::NewCat(mut buf) => match k.code {
                         KeyCode::Enter => { let name = buf.trim().to_string(); if !name.is_empty() { let _ = ensure_spot_cat(&name, &mut spot_cats); } focus = Focus::SpotCatList; }
                         KeyCode::Esc => focus = Focus::SpotCatList,
-                        KeyCode::Backspace => { buf.pop(); focus = Focus::NewCat(buf); }
-                        KeyCode::Char(c) => { buf.push(c); focus = Focus::NewCat(buf); }
-                        _ => focus = Focus::NewCat(buf),
+                        other => { edit_line(&mut buf, &mut input_cur, other); focus = Focus::NewCat(buf); }
                     },
                     Focus::SpotRename(mut buf, idx) => match k.code {
                         KeyCode::Enter => {
@@ -801,19 +856,15 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             focus = Focus::SpotCatList;
                         }
                         KeyCode::Esc => focus = Focus::SpotCatList,
-                        KeyCode::Backspace => { buf.pop(); focus = Focus::SpotRename(buf, idx); }
-                        KeyCode::Char(c) => { buf.push(c); focus = Focus::SpotRename(buf, idx); }
-                        _ => focus = Focus::SpotRename(buf, idx),
+                        other => { edit_line(&mut buf, &mut input_cur, other); focus = Focus::SpotRename(buf, idx); }
                     },
                     Focus::SpotForm { mut name, mut url, mut field } => match k.code { // 新規スポット登録フォーム
-                        KeyCode::Up | KeyCode::BackTab => { field = (field + 3) % 4; focus = Focus::SpotForm { name, url, field }; }
-                        KeyCode::Down | KeyCode::Tab => { field = (field + 1) % 4; focus = Focus::SpotForm { name, url, field }; }
-                        KeyCode::Backspace => { if field == 0 { name.pop(); } else if field == 1 { url.pop(); } focus = Focus::SpotForm { name, url, field }; }
-                        KeyCode::Char(c) => { if field == 0 { name.push(c); } else if field == 1 { url.push(c); } focus = Focus::SpotForm { name, url, field }; }
+                        KeyCode::Up | KeyCode::BackTab => { field = (field + 3) % 4; input_cur = form_cur(&name, &url, field); focus = Focus::SpotForm { name, url, field }; }
+                        KeyCode::Down | KeyCode::Tab => { field = (field + 1) % 4; input_cur = form_cur(&name, &url, field); focus = Focus::SpotForm { name, url, field }; }
                         KeyCode::Esc => focus = Focus::SpotList, // 取消
                         KeyCode::Enter => match field {
-                            0 => { field = 1; focus = Focus::SpotForm { name, url, field }; } // 次のフィールドへ
-                            1 => { field = 2; focus = Focus::SpotForm { name, url, field }; }
+                            0 => { field = 1; input_cur = url.chars().count(); focus = Focus::SpotForm { name, url, field }; } // 次のフィールドへ
+                            1 => { field = 2; input_cur = 0; focus = Focus::SpotForm { name, url, field }; }
                             3 => focus = Focus::SpotList, // [戻る]
                             _ => { // 2 = [送信]
                                 let u = url.trim();
@@ -842,7 +893,11 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                 }
                             }
                         },
-                        _ => focus = Focus::SpotForm { name, url, field },
+                        other => { // ←→/文字/BS/Del/Home/End は選択中フィールドを編集(ボタン欄では無視)
+                            if field == 0 { edit_line(&mut name, &mut input_cur, other); }
+                            else if field == 1 { edit_line(&mut url, &mut input_cur, other); }
+                            focus = Focus::SpotForm { name, url, field };
+                        }
                     },
                     Focus::NearSearch(mut buf) => match k.code {
                         KeyCode::Enter => {
@@ -871,20 +926,18 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             }
                         }
                         KeyCode::Esc => {}
-                        KeyCode::Backspace => { buf.pop(); focus = Focus::NearSearch(buf); }
-                        KeyCode::Char(c) => { buf.push(c); focus = Focus::NearSearch(buf); }
-                        _ => focus = Focus::NearSearch(buf),
+                        other => { edit_line(&mut buf, &mut input_cur, other); focus = Focus::NearSearch(buf); }
                     },
                     Focus::PoiMenu => match k.code {
                         KeyCode::Esc => {}
                         KeyCode::Up => { poimenu_sel = poimenu_sel.saturating_sub(1); focus = Focus::PoiMenu; }
                         KeyCode::Down => { if poimenu_sel + 1 <= POI_KINDS.len() { poimenu_sel += 1; } focus = Focus::PoiMenu; }
-                        KeyCode::Char('/') => focus = Focus::NearSearch(String::new()),
+                        KeyCode::Char('/') => { input_cur = 0; focus = Focus::NearSearch(String::new()); }
                         KeyCode::Enter | KeyCode::Char(_) => {
                             // Enter=選択行 / 数字キー1-7=対応カテゴリ。最終行(=POI_KINDS.len())はキーワード周辺検索。
                             let idx = if let KeyCode::Char(c) = k.code { POI_KINDS.iter().position(|kk| kk.key == c) } else { Some(poimenu_sel) };
                             match idx {
-                                Some(i) if i >= POI_KINDS.len() => focus = Focus::NearSearch(String::new()),
+                                Some(i) if i >= POI_KINDS.len() => { input_cur = 0; focus = Focus::NearSearch(String::new()); }
                                 Some(i) => {
                                     show_busy(&mut out, cols, tr, "検索中…");
                                     match poi_search(&POI_KINDS[i], cx, cy, z, ow, oh, lat, lon) {
@@ -941,9 +994,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             }
                         }
                         KeyCode::Esc => {}
-                        KeyCode::Backspace => { buf.pop(); focus = Focus::SaveName(buf); }
-                        KeyCode::Char(c) => { buf.push(c); focus = Focus::SaveName(buf); }
-                        _ => focus = Focus::SaveName(buf),
+                        other => { edit_line(&mut buf, &mut input_cur, other); focus = Focus::SaveName(buf); }
                     },
                     Focus::RouteList => match k.code {
                         KeyCode::Up => { rn_sel = rn_sel.saturating_sub(1); focus = Focus::RouteList; }
@@ -981,13 +1032,13 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                         KeyCode::Down => { if menu_sel + 1 < MENU.len() { menu_sel += 1; } focus = Focus::Menu; }
                         KeyCode::Esc => {} // 閉じる → Map
                         KeyCode::Enter => match menu_sel {
-                            0 => focus = Focus::Search(String::new()),                                     // 地名を検索 (/)
+                            0 => { input_cur = 0; focus = Focus::Search(String::new()); }                    // 地名を検索 (/)
                             1 => focus = Focus::PoiMenu,                                                    // 目的地カテゴリ (f)
                             2 => addr = reverse_geocode(lat, lon).unwrap_or_else(|e| format!("({e})")),     // 中心の住所 (a)
                             3 => { wp_set_start(&mut wps, (lat, lon)); let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } // 始点 (s)
                             4 => { wp_set_end(&mut wps, (lat, lon)); let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; }   // 終点 (e)
                             5 => { wp_add_via(&mut wps, (lat, lon)); let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; }   // 経由地 (v)
-                            6 => focus = Focus::RoadSearch(String::new()),                                 // 道路名でルート (r)
+                            6 => { input_cur = 0; focus = Focus::RoadSearch(String::new()); }                // 道路名でルート (r)
                             7 => { // 走りまくり (W)
                                 let dist = a.dist.unwrap_or(40.0);
                                 match wander_route((lat, lon), dist, &a.shape) {
@@ -1037,9 +1088,9 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             17 => { // おすすめ (@)
                                 if !cfg.llm_recommend_enabled { addr = "おすすめ: 設定でOFF(,でON)".into(); }
                                 else if !recommend::claude_available(&cfg.llm_command) { addr = "おすすめ: claudeが無い(設定のLLM/コマンド確認)".into(); }
-                                else { focus = Focus::Recommend(String::new()); }
+                                else { input_cur = 0; focus = Focus::Recommend(String::new()); }
                             }
-                            18 => focus = Focus::SaveName(String::new()),                                  // ルート保存 (S)
+                            18 => { input_cur = 0; focus = Focus::SaveName(String::new()); }                // ルート保存 (S)
                             19 => { route_names = list_named_routes(); rn_sel = 0; if route_names.is_empty() { addr = "お気に入り無し".into(); } else { focus = Focus::RouteList; } } // 呼出 (L)
                             20 => match spec.routes.last() { // GPX保存 (g)
                                 Some(rt) => addr = match write_gpx("termmap-route.gpx", &rt.pts) { Ok(_) => "GPX保存: termmap-route.gpx".into(), Err(e) => format!("({e})") },
@@ -1089,9 +1140,9 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                 }
                             }
                             KeyCode::Char('a') => addr = reverse_geocode(lat, lon).unwrap_or_else(|e| format!("({e})")),
-                            KeyCode::Char('/') => focus = Focus::Search(String::new()),
+                            KeyCode::Char('/') => { input_cur = 0; focus = Focus::Search(String::new()); }
                             KeyCode::Char('f') => focus = Focus::PoiMenu,
-                            KeyCode::Char('S') => focus = Focus::SaveName(String::new()),
+                            KeyCode::Char('S') => { input_cur = 0; focus = Focus::SaveName(String::new()); }
                             KeyCode::Char('L') => { route_names = list_named_routes(); rn_sel = 0; if route_names.is_empty() { addr = "お気に入り無し".into(); } else { focus = Focus::RouteList; } }
                             KeyCode::Char('s') => { wp_set_start(&mut wps, (lat, lon)); { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } }
                             KeyCode::Char('e') => { wp_set_end(&mut wps, (lat, lon)); { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } }
@@ -1101,11 +1152,11 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             KeyCode::Char('?') => help = true,
                             KeyCode::Char('P') => { cat_sel = 0; focus = Focus::SpotCatList; } // マイスポット(カテゴリ一覧)
                             KeyCode::Char(',') => { set_sel = 0; focus = Focus::Settings; } // 設定画面
-                            KeyCode::Char('r') => focus = Focus::RoadSearch(String::new()), // 道路名でルート(現在view内)
+                            KeyCode::Char('r') => { input_cur = 0; focus = Focus::RoadSearch(String::new()); } // 道路名でルート(現在view内)
                             KeyCode::Char('@') => { // おすすめツーリングスポット提案(claude -p)
                                 if !cfg.llm_recommend_enabled { addr = "おすすめ: 設定でOFF(,でON)".into(); }
                                 else if !recommend::claude_available(&cfg.llm_command) { addr = "おすすめ: claudeが無い(設定のLLM/コマンド確認)".into(); }
-                                else { focus = Focus::Recommend(String::new()); }
+                                else { input_cur = 0; focus = Focus::Recommend(String::new()); }
                             }
                             KeyCode::Char('V') => { show_spots = !show_spots; apply_spots(&mut spec, &spots, &spot_cats, show_spots); addr = if show_spots { "マイスポット表示".into() } else { "マイスポット非表示".into() }; }
                             KeyCode::Char('E') => { // 標高プロファイルの表示/非表示
@@ -1179,9 +1230,9 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 }
             }
             Some(Event::Paste(s)) => { match &mut focus {
-                Focus::Search(buf) | Focus::SaveName(buf) | Focus::NearSearch(buf) | Focus::NewCat(buf) | Focus::RoadSearch(buf) | Focus::Recommend(buf) => buf.push_str(&s),
-                Focus::SpotForm { name, url, field } => { if *field == 0 { name.push_str(&s); } else if *field == 1 { url.push_str(&s); } }
-                Focus::SpotRename(buf, _) | Focus::SpotEditName(buf, _) => buf.push_str(&s),
+                Focus::Search(buf) | Focus::SaveName(buf) | Focus::NearSearch(buf) | Focus::NewCat(buf) | Focus::RoadSearch(buf) | Focus::Recommend(buf) => insert_str_at(buf, &mut input_cur, &s),
+                Focus::SpotForm { name, url, field } => { if *field == 0 { insert_str_at(name, &mut input_cur, &s); } else if *field == 1 { insert_str_at(url, &mut input_cur, &s); } }
+                Focus::SpotRename(buf, _) | Focus::SpotEditName(buf, _) => insert_str_at(buf, &mut input_cur, &s),
                 Focus::Settings if set_sel == 10 => { cfg.streetview_api_key = s.trim().to_string(); addr = "APIkey設定(sで保存)".into(); }
                 _ => {}
             } }
@@ -1191,5 +1242,139 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     let (lat, lon) = pixel_to_deg(cx, cy, z);
     save_state(lat, lon, z, &opts.style, &wps, &mode); // 終了時の位置とルートを --resume 用に保存
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyCode;
+
+    // 文字位置→byte offset(マルチバイト含む)
+    #[test]
+    fn char_byte_multibyte() {
+        assert_eq!(char_byte("abc", 0), 0);
+        assert_eq!(char_byte("abc", 2), 2);
+        assert_eq!(char_byte("abc", 3), 3);   // 末尾
+        assert_eq!(char_byte("あい", 0), 0);
+        assert_eq!(char_byte("あい", 1), 3);  // 'あ'=3byte
+        assert_eq!(char_byte("あい", 2), 6);  // 末尾
+        assert_eq!(char_byte("あい", 9), 6);  // 範囲外は末尾扱い
+    }
+
+    // 途中挿入(ASCII)
+    #[test]
+    fn edit_insert_middle_ascii() {
+        let mut b = "ac".to_string();
+        let mut c = 1;
+        assert!(edit_line(&mut b, &mut c, KeyCode::Char('b')));
+        assert_eq!(b, "abc");
+        assert_eq!(c, 2);
+    }
+
+    // 途中挿入(マルチバイト)。byte offset ずれで壊れないこと
+    #[test]
+    fn edit_insert_middle_multibyte() {
+        let mut b = "あう".to_string();
+        let mut c = 1; // 'あ'の後ろ
+        assert!(edit_line(&mut b, &mut c, KeyCode::Char('い')));
+        assert_eq!(b, "あいう");
+        assert_eq!(c, 2);
+    }
+
+    // 左右移動とクランプ
+    #[test]
+    fn edit_left_right_clamp() {
+        let mut b = "abc".to_string();
+        let mut c = 0;
+        assert!(edit_line(&mut b, &mut c, KeyCode::Left)); // 0で止まる
+        assert_eq!(c, 0);
+        edit_line(&mut b, &mut c, KeyCode::Right);
+        edit_line(&mut b, &mut c, KeyCode::Right);
+        edit_line(&mut b, &mut c, KeyCode::Right);
+        edit_line(&mut b, &mut c, KeyCode::Right); // 文字数3で止まる
+        assert_eq!(c, 3);
+    }
+
+    // Home/End
+    #[test]
+    fn edit_home_end() {
+        let mut b = "あいう".to_string();
+        let mut c = 1;
+        assert!(edit_line(&mut b, &mut c, KeyCode::End));
+        assert_eq!(c, 3);
+        assert!(edit_line(&mut b, &mut c, KeyCode::Home));
+        assert_eq!(c, 0);
+    }
+
+    // Backspace は cur-1 の文字を消す(マルチバイト)
+    #[test]
+    fn edit_backspace_multibyte() {
+        let mut b = "あいう".to_string();
+        let mut c = 2; // 'い'の後ろ
+        assert!(edit_line(&mut b, &mut c, KeyCode::Backspace));
+        assert_eq!(b, "あう");
+        assert_eq!(c, 1);
+        // cur=0 では何もしない
+        let mut c0 = 0;
+        let mut b0 = "x".to_string();
+        edit_line(&mut b0, &mut c0, KeyCode::Backspace);
+        assert_eq!(b0, "x");
+        assert_eq!(c0, 0);
+    }
+
+    // Delete は cur 位置の文字を消す(cur据え置き)
+    #[test]
+    fn edit_delete_multibyte() {
+        let mut b = "あいう".to_string();
+        let mut c = 1; // 'い'を消す
+        assert!(edit_line(&mut b, &mut c, KeyCode::Delete));
+        assert_eq!(b, "あう");
+        assert_eq!(c, 1);
+        // 末尾では何もしない
+        let mut cend = 2;
+        edit_line(&mut b, &mut cend, KeyCode::Delete);
+        assert_eq!(b, "あう");
+    }
+
+    // 非対象キーは false
+    #[test]
+    fn edit_ignores_other_keys() {
+        let mut b = "ab".to_string();
+        let mut c = 1;
+        assert!(!edit_line(&mut b, &mut c, KeyCode::Enter));
+        assert!(!edit_line(&mut b, &mut c, KeyCode::Tab));
+        assert!(!edit_line(&mut b, &mut c, KeyCode::Up));
+        assert_eq!(b, "ab"); // 変化なし
+        assert_eq!(c, 1);
+    }
+
+    // ペースト挿入
+    #[test]
+    fn insert_str_at_middle() {
+        let mut b = "あZ".to_string();
+        let mut c = 1;
+        insert_str_at(&mut b, &mut c, "XY");
+        assert_eq!(b, "あXYZ");
+        assert_eq!(c, 3);
+    }
+
+    // 表示: cur 位置にブロック █
+    #[test]
+    fn render_cursor_positions() {
+        assert_eq!(render_with_cursor("abc", 0), "\u{2588}abc");
+        assert_eq!(render_with_cursor("abc", 1), "a\u{2588}bc");
+        assert_eq!(render_with_cursor("abc", 3), "abc\u{2588}"); // 末尾
+        assert_eq!(render_with_cursor("あい", 1), "あ\u{2588}い");
+        assert_eq!(render_with_cursor("ab", 9), "ab\u{2588}"); // 範囲外は末尾
+    }
+
+    // SpotForm フィールド切替時のカーソル位置
+    #[test]
+    fn form_cur_by_field() {
+        assert_eq!(form_cur("あい", "http://x", 0), 2); // 名称の文字数
+        assert_eq!(form_cur("あい", "http://x", 1), 8); // URLの文字数
+        assert_eq!(form_cur("あい", "http://x", 2), 0); // ボタン欄
+        assert_eq!(form_cur("あい", "http://x", 3), 0);
+    }
 }
 
