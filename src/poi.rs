@@ -25,8 +25,20 @@ pub fn geocode(place: &str, near: Option<(f64, f64)>, google_key: &str) -> Resul
         .ok_or_else(|| format!("住所が見つかりません: {place}"))
 }
 
-// 候補を最大8件返す。①Google(現在地bounds) → ②Nominatim(near周辺viewbox) → ③Nominatim(全国)
+// 候補を最大8件返す。まずフル住所で検索し、0件なら末尾の地番を落として大字/町名レベルで再検索する。
+// (Nominatim=OSMは日本の地番/建物レベルの住所を持たないため、番地付き文字列は round-trip しない)
 pub fn geocode_list(place: &str, near: Option<(f64, f64)>, google_key: &str) -> Vec<(f64, f64, String)> {
+    let r = geocode_once(place, near, google_key);
+    if !r.is_empty() { return r; }
+    let trimmed = strip_trailing_banchi(place);
+    if trimmed != place && !trimmed.trim().is_empty() {
+        return geocode_once(&trimmed, near, google_key);
+    }
+    Vec::new()
+}
+
+// 1回分の検索。①Google(現在地bounds) → ②Nominatim(near周辺viewbox) → ③Nominatim(全国)
+fn geocode_once(place: &str, near: Option<(f64, f64)>, google_key: &str) -> Vec<(f64, f64, String)> {
     if !google_key.trim().is_empty() {
         let g = google_geocode_list(place, near, google_key);
         if !g.is_empty() { return g; }
@@ -40,6 +52,25 @@ pub fn geocode_list(place: &str, near: Option<(f64, f64)>, google_key: &str) -> 
     }
     let url = format!("https://nominatim.openstreetmap.org/search?format=json&limit=8&accept-language=ja&q={}", urlencode(place));
     nominatim_list(&url)
+}
+
+// 末尾の地番(丁目/番地/番/号 と 数字・ハイフン・「の」)を落として大字/町名レベルへ丸める。
+// 例: 「山梨県南都留郡山中湖村山中23」→「山梨県南都留郡山中湖村山中」/「港区六本木6丁目10-1」→「港区六本木」
+fn strip_trailing_banchi(s: &str) -> String {
+    let mut t = s.trim().to_string();
+    loop {
+        let before = t.len();
+        for suf in ["丁目", "番地", "番", "号"] {
+            if t.ends_with(suf) { let n = t.len() - suf.len(); t.truncate(n); }
+        }
+        while let Some(c) = t.chars().last() {
+            let is_banchi = c.is_ascii_digit() || ('０'..='９').contains(&c)
+                || c == '-' || c == 'ー' || c == '－' || c == 'の' || c.is_whitespace();
+            if is_banchi { t.pop(); } else { break; }
+        }
+        if t.len() == before { break; }
+    }
+    t
 }
 
 fn nominatim_list(url: &str) -> Vec<(f64, f64, String)> {
@@ -243,6 +274,20 @@ mod tests {
     fn json_helpers() {
         assert_eq!(json_str(r#"{"name": "王子駅"}"#, "name").as_deref(), Some("王子駅"));
         assert!((json_num(r#"{"lat": 35.7}"#, "\"lat\":").unwrap() - 35.7).abs() < 1e-9);
+    }
+
+    #[test]
+    fn strip_banchi_drops_trailing_address_number() {
+        // 番地23を落として大字レベルへ(Nominatimはこの粗さでヒットする)
+        assert_eq!(strip_trailing_banchi("山梨県南都留郡山中湖村山中23"), "山梨県南都留郡山中湖村山中");
+        // 丁目+ハイフン地番
+        assert_eq!(strip_trailing_banchi("港区六本木6丁目10-1"), "港区六本木");
+        // 全角数字・番地表記
+        assert_eq!(strip_trailing_banchi("渋谷区神南１番地"), "渋谷区神南");
+        // 地番が無ければそのまま
+        assert_eq!(strip_trailing_banchi("山中湖"), "山中湖");
+        // 施設名(末尾が数字でない)は不変
+        assert_eq!(strip_trailing_banchi("東京駅"), "東京駅");
     }
 
     #[test]
