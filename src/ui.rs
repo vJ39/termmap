@@ -796,8 +796,9 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 ("道路".to_string(), its, road_sel)
             } else {
                 let its = pois.iter().map(|(la, lo, nm, _)| {
+                    // OSMにnameタグが無いPOI(駐車場等に多い)は「(無名)」の連発でなく検索カテゴリ名で埋める
                     let d = haversine_km((lat, lon), (*la, *lo));
-                    format!("{} {:.1}k", if nm.is_empty() { "(無名)" } else { nm }, d)
+                    format!("{} {:.1}k", if nm.is_empty() { poi_label.as_str() } else { nm.as_str() }, d)
                 }).collect();
                 (poi_label.clone(), its, poi_sel)
             };
