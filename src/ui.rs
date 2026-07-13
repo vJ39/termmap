@@ -603,7 +603,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         // 機能なので、再生中は「動いている」扱いにせず常に設定解像度を使う。
         if prev_render_cxyz != Some((cx, cy, z)) { moved_at = Some(std::time::Instant::now()); }
         prev_render_cxyz = Some((cx, cy, z));
-        let settling = img_inline && play.is_none() && moved_at.map_or(false, |t| t.elapsed() < std::time::Duration::from_millis(350));
+        let settling = img_inline && cfg.image_settle_low_res && play.is_none() && moved_at.map_or(false, |t| t.elapsed() < std::time::Duration::from_millis(350));
 
         // 実画像モードの描画寸法とズーム。AAと同じ地理範囲を、深いズーム段(タイルの上限z18まで)
         // で取得して高精細化する。scale=2^Δ で、地図領域のセル数×(横scale/縦2*scale px)の実ピクセル
@@ -770,6 +770,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     format!("実写(StreetView) {}", onoff(cfg.streetview_enabled)),
                     format!("画像表示(iTerm2) {}", onoff(cfg.image_mode)),
                     format!("画像解像度 {}", match cfg.image_res.as_str() { "high" => "高", "low" => "低", _ => "中" }),
+                    format!("移動中の低解像度化 {}", onoff(cfg.image_settle_low_res)),
                     format!("サウンド {}", onoff(cfg.sound_enabled)),
                     format!("オンボーディング {}", if onboarded_marker().map_or(false, |p| p.exists()) { "非表示" } else { "毎回表示" }),
                     format!("Google APIキー {}", keyset),
@@ -889,9 +890,10 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     9 => "LLM: おすすめに使うモデルを循環(claude-sonnet-5/haiku/opus)",
                     10 => "実写: iで中心地点のStreet Viewを開く機能のON/OFF(要Google APIキー)",
                     11 => if image_capable() { "画像表示: 地図と実写をiTerm2インライン画像で実画像表示(AAでなく実画像)。Iキーでも切替" } else { "画像表示: この端末は画像非対応(iTerm2/WezTermで有効)" },
-                    12 => "画像解像度: 実画像モードの精細さを循環(高=scale4/中=scale2/低=scale1)。移動中は自動で低解像度",
-                    13 => "サウンド: 操作音のON/OFF(macOSのafplayで再生)",
-                    14 => "オンボーディング: 毎回表示/非表示を切替(dキーでも次回から非表示にできる)",
+                    12 => "画像解像度: 実画像モードの精細さを循環(高=scale4/中=scale2/低=scale1)",
+                    13 => "移動中の低解像度化: ONなら地図移動中(動いた直後〜静止350ms)は自動で低解像度にして速く描く。OFFなら常に設定解像度",
+                    14 => "サウンド: 操作音のON/OFF(macOSのafplayで再生)",
+                    15 => "オンボーディング: 毎回表示/非表示を切替(dキーでも次回から非表示にできる)",
                     _ => "Google APIキー: 検索(Geocoding)とStreet View共通。Enterで入力欄を開く(Cmd+V貼付も可)。環境変数TERMMAP_GOOGLE_API_KEYでも可",
                 };
                 format!(" ▶ {desc}   [↑↓選択 Enter切替/編集 Esc閉(自動保存)]")
@@ -1503,7 +1505,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     },
                     Focus::Settings => { let mut stay = true; let mut changed = false; match k.code { // 設定画面
                         KeyCode::Up => { set_sel = set_sel.saturating_sub(1); }
-                        KeyCode::Down => { if set_sel + 1 < 16 { set_sel += 1; } }
+                        KeyCode::Down => { if set_sel + 1 < 17 { set_sel += 1; } }
                         KeyCode::Left | KeyCode::Right => {
                             if set_sel == 6 { let d = if k.code == KeyCode::Left { -100.0 } else { 100.0 }; cfg.sample_interval_m = (cfg.sample_interval_m + d).clamp(100.0, 5000.0); changed = true; }
                         }
@@ -1513,10 +1515,10 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                 input_cur = b.chars().count();
                                 focus = Focus::SettingsEdit(6, b);
                                 stay = false;
-                            } else if set_sel == 15 { // Google APIキー: インラインテキスト編集を開く(Cmd+V貼付も引き続き可)
+                            } else if set_sel == 16 { // Google APIキー: インラインテキスト編集を開く(Cmd+V貼付も引き続き可)
                                 let b = cfg.google_maps_api_key.clone();
                                 input_cur = b.chars().count();
-                                focus = Focus::SettingsEdit(15, b);
+                                focus = Focus::SettingsEdit(16, b);
                                 stay = false;
                             } else {
                                 changed = true;
@@ -1533,8 +1535,9 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                     10 => cfg.streetview_enabled = !cfg.streetview_enabled,
                                     11 => { cfg.image_mode = !cfg.image_mode; force_reemit = true; }
                                     12 => { cfg.image_res = match cfg.image_res.as_str() { "high" => "low", "low" => "mid", _ => "high" }.to_string(); force_reemit = true; }
-                                    13 => { cfg.sound_enabled = !cfg.sound_enabled; snd = sound::Sound::new(cfg.sound_enabled); snd.play("confirm"); }
-                                    14 => { // オンボーディング: マーカーの削除=毎回表示 / 作成=次回から非表示
+                                    13 => cfg.image_settle_low_res = !cfg.image_settle_low_res,
+                                    14 => { cfg.sound_enabled = !cfg.sound_enabled; snd = sound::Sound::new(cfg.sound_enabled); snd.play("confirm"); }
+                                    15 => { // オンボーディング: マーカーの削除=毎回表示 / 作成=次回から非表示
                                         if let Some(p) = onboarded_marker() {
                                             if p.exists() { let _ = std::fs::remove_file(&p); addr = "オンボーディング: 毎回表示に戻した".into(); }
                                             else { let _ = crate::fsutil::write_atomic(&p, b"1", None); addr = "オンボーディング: 次回から非表示".into(); }
@@ -2226,7 +2229,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     };
                     insert_str_at(buf, &mut input_cur, &filtered);
                 }
-                Focus::Settings if set_sel == 15 => { cfg.google_maps_api_key = s.trim().to_string(); let _ = config::save_config(&cfg); addr = "APIキー設定(自動保存)".into(); }
+                Focus::Settings if set_sel == 16 => { cfg.google_maps_api_key = s.trim().to_string(); let _ = config::save_config(&cfg); addr = "APIキー設定(自動保存)".into(); }
                 _ => {}
             } }
             Some(Event::Resize(..)) => { let _ = write!(out, "\x1b[2J"); force_reemit = true; } // 端末サイズ変更: 全消去して次フレームで再描画(インライン画像の残像防止)

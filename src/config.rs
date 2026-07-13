@@ -43,6 +43,7 @@ pub struct Config {
     pub mono: bool,
     pub image_mode: bool,            // インライン画像(iTerm2 OSC1337)で実画像を描画。既定OFF(AA描画)
     pub image_res: String,           // 実画像モードの解像度: "high"(scale4)/"mid"(scale2)/"low"(scale1)。既定mid
+    pub image_settle_low_res: bool,  // 実画像モードで地図移動中は低解像度に落とすか。既定true(OFFなら常に設定解像度を維持)
     pub google_maps_api_key: String, // Google Maps系(Geocoding検索/Street View)共通キー。旧streetview_api_keyから改名
     pub streetview_enabled: bool,     // 実写(i)を使うか
     pub sound_enabled: bool,          // 操作UI効果音(macOS afplay)を鳴らすか
@@ -64,6 +65,7 @@ impl Default for Config {
             mono: false,
             image_mode: false,
             image_res: "mid".to_string(),
+            image_settle_low_res: true,
             google_maps_api_key: String::new(),
             streetview_enabled: true,
             sound_enabled: true,
@@ -166,6 +168,7 @@ pub fn load_config_from(path: &Path) -> Config {
                     if matches!(s.as_str(), "high" | "mid" | "low") { cfg.image_res = s; }
                 }
             }
+            ("display", "image_settle_low_res") => { if let Some(b) = parse_bool(value) { cfg.image_settle_low_res = b; } }
             ("google", "maps_api_key") => {
                 if let Some(s) = parse_string(value) {
                     cfg.google_maps_api_key = s;
@@ -225,6 +228,7 @@ pub fn save_config_to(path: &Path, c: &Config) -> Result<(), String> {
          mono = {}\n\
          image_mode = {}\n\
          image_res = \"{}\"\n\
+         image_settle_low_res = {}\n\
          \n\
          [google]\n\
          maps_api_key = \"{}\"\n\
@@ -247,6 +251,7 @@ pub fn save_config_to(path: &Path, c: &Config) -> Result<(), String> {
         c.mono,
         c.image_mode,
         c.image_res,
+        c.image_settle_low_res,
         c.google_maps_api_key,
         c.streetview_enabled,
         c.sound_enabled,
@@ -389,6 +394,7 @@ mod tests {
             mono: false,
             image_mode: true,
             image_res: "low".to_string(),
+            image_settle_low_res: false,
             google_maps_api_key: "AIzaTESTKEY_example_123".to_string(), streetview_enabled: true,
             sound_enabled: false,
         };
@@ -603,6 +609,7 @@ profile = "custom-profile"
             mono: true,
             image_mode: false,
             image_res: "high".to_string(),
+            image_settle_low_res: true,
             google_maps_api_key: "k".to_string(), streetview_enabled: true,
             sound_enabled: true,
         };
