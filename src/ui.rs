@@ -336,6 +336,17 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     let mut road_segs: Vec<RoadSeg> = Vec::new(); // 道路名検索(r)で追加した道路の塊(別色レイヤ・spec.roadsへ同期)
     let mut road_sel: usize = 0;           // 道路一覧(RoadList)の選択行
     let mut grab = false;                  // 並べ替えビューで地点を「掴んで」移動中か
+    let mut route_sel: usize = 0;          // Map左袖ルートパネルの選択(0..n=点 / 以降=操作行)
+    // ルートパネルの操作行。Enterで既存のMenuActionを実行(ロジック再利用)。
+    let route_acts: [(&str, MenuAction); 7] = [
+        ("▶ 保存", MenuAction::SaveRoute),
+        ("▶ GPX書き出し", MenuAction::SaveGpx),
+        ("▶ QRでスマホ共有", MenuAction::ShareQr),
+        ("▶ プレビュー走行", MenuAction::PlayRoute),
+        ("▶ 標高プロファイル", MenuAction::ToggleElevation),
+        ("▶ 代替ルート", MenuAction::AltRoute),
+        ("✕ ルート消去", MenuAction::ClearRoute),
+    ];
     let mut mode = a.route_mode.clone();
     let mut pois: Vec<(f64, f64, String, PoiCat)> = Vec::new(); // 目的地検索結果
     let mut poi_sel: usize = 0;
@@ -700,13 +711,23 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     }
                     _ => ("メニュー".to_string(), Vec::new(), 0),
                 }
-            } else if show_wps || show_route {
+            } else if show_route {
+                // Map左袖: 点(#1..#n) + 操作行(保存/GPX/QR/再生/標高/代替/消去)。Tabで縦断・Enterで実行。
+                let n = wps.len();
+                let mut its: Vec<String> = wps.iter().enumerate().map(|(i, (la, lo))| {
+                    let role = if i == 0 { "始点" } else if i + 1 == n { "終点" } else { "経由" };
+                    format!("#{} {} {:.3},{:.3}", i + 1, role, la, lo)
+                }).collect();
+                for (label, _) in route_acts.iter() { its.push((*label).to_string()); }
+                let sel = route_sel.min(its.len().saturating_sub(1));
+                ("ルート".to_string(), its, sel)
+            } else if show_wps {
                 let n = wps.len();
                 let its = wps.iter().enumerate().map(|(i, (la, lo))| {
                     let role = if i == 0 { "始点" } else if i + 1 == n { "終点" } else { "経由" };
                     format!("#{} {} {:.3},{:.3}", i + 1, role, la, lo)
                 }).collect();
-                let hdr = if show_wps && grab { "並べ替え:掴".to_string() } else if show_wps { "並べ替え".to_string() } else { "ルート".to_string() };
+                let hdr = if grab { "並べ替え:掴".to_string() } else { "並べ替え".to_string() };
                 (hdr, its, wp_sel)
             } else if show_splist {
                 let its = spots.iter().filter(|s| s.cat == cur_cat).map(|s| {
@@ -876,7 +897,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 // 一時メッセージが無い時は底面にロゴを常時表示。メッセージ発生時はそちらを優先。
                 let msg = if addr.is_empty() { "◉╌╌╌► termmap · terminal touring map   ".to_string() } else { format!("» {addr} « ") };
                 // 下部バーは細く。全操作は Space メニューから選べる
-                let route_hint = if wps.is_empty() { "v=地点を置く".to_string() } else { format!("{}点 v足す Tab/ws選択 [ ]動 x消", wps.len()) };
+                let route_hint = if wps.is_empty() { "v=地点を置く".to_string() } else { format!("{}点 v足す Tab選択→Enter実行 [ ]動 x消", wps.len()) };
                 let base = format!(" {spinner}{msg}{live}{playing}z{z} {lat:.4},{lon:.4} ｜ {route_hint} ｜ Space:メニュー ?ヘルプ q終了");
                 match &route_note { Some(rn) => format!("{base} | {rn} "), None => base }
             }
@@ -1737,21 +1758,32 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             KeyCode::Down => { cy += step; addr.clear(); }
                             KeyCode::Char('+') | KeyCode::Char('=') => if z < 19 { z += 1; cx *= 2.0; cy *= 2.0; addr.clear(); },
                             KeyCode::Char('-') | KeyCode::Char('_') => if z > 2 { z -= 1; cx /= 2.0; cy /= 2.0; addr.clear(); },
-                            KeyCode::Enter => { // 中心付近の最寄りお気に入りにスナップ＋名前表示
-                                let mut best: Option<(f64, usize)> = None;
-                                for (i, s) in spots.iter().enumerate() {
-                                    let (gx, gy) = deg_to_pixel(s.lat, s.lon, z);
-                                    let dpx = ((gx - cx).powi(2) + (gy - cy).powi(2)).sqrt();
-                                    if best.map_or(true, |(bd, _)| dpx < bd) { best = Some((dpx, i)); }
-                                }
-                                match best {
-                                    Some((dpx, i)) if dpx <= (ow.min(oh) as f64) * 0.25 => {
-                                        let s = &spots[i];
-                                        let (nx, ny) = deg_to_pixel(s.lat, s.lon, z); cx = nx; cy = ny;
-                                        popup = Some(if s.name.is_empty() { "★ (無名スポット)".into() } else { format!("★ {} [{}]", s.name, s.cat) });
+                            KeyCode::Enter => {
+                                if !wps.is_empty() && route_sel >= wps.len() {
+                                    // ルートパネルの操作行を実行(既存MenuActionを再利用)
+                                    let ai = route_sel - wps.len();
+                                    if ai < route_acts.len() { let act = route_acts[ai].1; run_action!(act, lat, lon, cols, tr); }
+                                } else if !wps.is_empty() {
+                                    // 点を選択中: その点へ地図を寄せる
+                                    let i = route_sel.min(wps.len() - 1);
+                                    let (la, lo) = wps[i]; let (nx, ny) = deg_to_pixel(la, lo, z); cx = nx; cy = ny;
+                                } else {
+                                    // ルート未作成: 中心付近の最寄りお気に入りにスナップ＋名前表示
+                                    let mut best: Option<(f64, usize)> = None;
+                                    for (i, s) in spots.iter().enumerate() {
+                                        let (gx, gy) = deg_to_pixel(s.lat, s.lon, z);
+                                        let dpx = ((gx - cx).powi(2) + (gy - cy).powi(2)).sqrt();
+                                        if best.map_or(true, |(bd, _)| dpx < bd) { best = Some((dpx, i)); }
                                     }
-                                    Some(_) => addr = "近くにお気に入り無し".into(),
-                                    None => addr = "お気に入り未登録".into(),
+                                    match best {
+                                        Some((dpx, i)) if dpx <= (ow.min(oh) as f64) * 0.25 => {
+                                            let s = &spots[i];
+                                            let (nx, ny) = deg_to_pixel(s.lat, s.lon, z); cx = nx; cy = ny;
+                                            popup = Some(if s.name.is_empty() { "★ (無名スポット)".into() } else { format!("★ {} [{}]", s.name, s.cat) });
+                                        }
+                                        Some(_) => addr = "近くにお気に入り無し".into(),
+                                        None => addr = "お気に入り未登録".into(),
+                                    }
                                 }
                             }
                             KeyCode::Char('a') => addr = reverse_geocode(lat, lon).unwrap_or_else(|e| format!("({e})")),
@@ -1764,8 +1796,8 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                 let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_;
                                 addr = format!("地点を追加 #{}", wps.len());
                             }
-                            KeyCode::Tab | KeyCode::Char('s') => { if !wps.is_empty() { wp_sel = (wp_sel + 1) % wps.len(); let (la, lo) = wps[wp_sel]; let (nx, ny) = deg_to_pixel(la, lo, z); cx = nx; cy = ny; } } // 一覧の選択を回す(選択点へ寄る)。s=次
-                            KeyCode::BackTab | KeyCode::Char('w') => { if !wps.is_empty() { wp_sel = (wp_sel + wps.len() - 1) % wps.len(); let (la, lo) = wps[wp_sel]; let (nx, ny) = deg_to_pixel(la, lo, z); cx = nx; cy = ny; } } // w=前
+                            KeyCode::Tab | KeyCode::Char('s') => { if !wps.is_empty() { let total = wps.len() + route_acts.len(); route_sel = (route_sel + 1) % total; if route_sel < wps.len() { wp_sel = route_sel; let (la, lo) = wps[wp_sel]; let (nx, ny) = deg_to_pixel(la, lo, z); cx = nx; cy = ny; } } } // ルートパネル: 点→操作行を縦断(点なら地図が寄る)。s=次
+                            KeyCode::BackTab | KeyCode::Char('w') => { if !wps.is_empty() { let total = wps.len() + route_acts.len(); route_sel = (route_sel + total - 1) % total; if route_sel < wps.len() { wp_sel = route_sel; let (la, lo) = wps[wp_sel]; let (nx, ny) = deg_to_pixel(la, lo, z); cx = nx; cy = ny; } } } // w=前
                             KeyCode::Char(' ') => { snd.play("click"); menu_cat_sel = 0; focus = Focus::Menu(MenuLevel::Categories); } // Space=メニュー(カテゴリ→展開の2階層)
                             KeyCode::Char('?') => help = true,
                             KeyCode::Char('P') => { cat_sel = 0; focus = Focus::SpotCatList; } // マイスポット(カテゴリ一覧)
