@@ -363,6 +363,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     let mut gps_pos: Option<(f64, f64)> = None; // 最新の自位置
     let mut gps_trail: Vec<(f64, f64)> = Vec::new(); // 通過ブレッドクラム
     let mut play: Option<f64> = None; // A ルート再生(先頭からの距離m。Noneで停止)
+    let mut play_speed: f64 = 1.0;    // 再生速度倍率(再生中に [ ] で 0.25〜8x)
     let mut scache = searchcache::load(); // 検索結果キャッシュ(キーワード+位置→結果。API節約)
     let mut popup: Option<String> = None; // 中央に出す一時ポップアップ(スポット名等・任意キーで閉じる)
     // ルート計算のバックグラウンド受信(マーカーは即時、ルート線は別スレッド)
@@ -582,7 +583,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             if let Some(rt) = spec.routes.last().map(|r| r.pts.clone()) {
                 if rt.len() >= 2 {
                     let total = roadtrace::polyline_len(&rt);
-                    let d = play.unwrap() + (total / 250.0).max(1.0);
+                    let d = play.unwrap() + (total / 500.0).max(0.5) * play_speed;
                     if d >= total { play = None; addr = "再生: 終了".into(); }
                     else {
                         play = Some(d);
@@ -893,7 +894,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     format!("{} 通信中…(Escで中断) ", FR[spin % FR.len()])
                 } else { String::new() };
                 let live = if gps_rx.is_some() { "●LIVE(Gで解除) " } else { "" };
-                let playing = if play.is_some() { "▶再生中(Aで停止) " } else { "" };
+                let playing = if play.is_some() { format!("▶再生{play_speed:.2}x([ ]変速/A停止) ") } else { String::new() };
                 // 一時メッセージが無い時は底面にロゴを常時表示。メッセージ発生時はそちらを優先。
                 let msg = if addr.is_empty() { "◉╌╌╌► termmap · terminal touring map   ".to_string() } else { format!("» {addr} « ") };
                 // 下部バーは細く。全操作は Space メニューから選べる
@@ -1873,8 +1874,8 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                 } else { snd.play("error"); addr = "ルート未確定".into(); }
                             }
                             KeyCode::Char('x') => { wp_remove(&mut wps, &mut wp_sel); { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } }
-                            KeyCode::Char('[') => { wp_swap(&mut wps, &mut wp_sel, true); { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } }
-                            KeyCode::Char(']') => { wp_swap(&mut wps, &mut wp_sel, false); { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } }
+                            KeyCode::Char('[') => { if play.is_some() { play_speed = (play_speed / 1.5).max(0.25); addr = format!("再生速度 {:.2}x", play_speed); } else { wp_swap(&mut wps, &mut wp_sel, true); { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } } }
+                            KeyCode::Char(']') => { if play.is_some() { play_speed = (play_speed * 1.5).min(8.0); addr = format!("再生速度 {:.2}x", play_speed); } else { wp_swap(&mut wps, &mut wp_sel, false); { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } } }
                             KeyCode::Char('m') => { mode = match mode_label(&mode) { "下道" => "highway", "高速" => "short", _ => "surface" }.to_string(); { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } }
                             KeyCode::Char('c') => { wps.clear(); wp_sel = 0; road_segs.clear(); spec.roads.clear(); { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } }
                             KeyCode::Char('g') => match spec.routes.last() {
