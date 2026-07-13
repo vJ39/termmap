@@ -15,8 +15,6 @@ const SFX: &[(&str, &[u8])] = &[
     ("error", include_bytes!("../assets/sfx/sfx_error.wav")),
     ("confirm", include_bytes!("../assets/sfx/sfx_confirm.wav")),
     ("back", include_bytes!("../assets/sfx/sfx_back.wav")),
-    ("click", include_bytes!("../assets/sfx/sfx_click.wav")),
-    ("coro", include_bytes!("../assets/sfx/sfx_coro.wav")),
 ];
 
 pub struct Sound {

@@ -157,14 +157,9 @@ pub fn trigger_route(spec: &mut OverlaySpec, wps: &[(f64, f64)], pois: &[(f64, f
 }
 
 // ---- waypoint 操作(純粋・テスト対象。route再計算は呼び出し側) ----
-pub fn wp_set_start(wps: &mut Vec<(f64, f64)>, p: (f64, f64)) {
-    if wps.is_empty() { wps.push(p); } else { wps[0] = p; }
-}
-pub fn wp_set_end(wps: &mut Vec<(f64, f64)>, p: (f64, f64)) {
-    if wps.len() >= 2 { let l = wps.len() - 1; wps[l] = p; } else { wps.push(p); }
-}
-pub fn wp_add_via(wps: &mut Vec<(f64, f64)>, p: (f64, f64)) {
-    if wps.len() < 2 { wps.push(p); } else { let i = wps.len() - 1; wps.insert(i, p); }
+// 地点を末尾に追加する。役割(始点/終点)は並び順で決まる(先頭=始点・末尾=終点)。
+pub fn wp_add(wps: &mut Vec<(f64, f64)>, p: (f64, f64)) {
+    wps.push(p);
 }
 pub fn wp_remove(wps: &mut Vec<(f64, f64)>, sel: &mut usize) {
     if !wps.is_empty() {
@@ -190,16 +185,10 @@ mod tests {
     #[test]
     fn waypoint_ops() {
         let mut w: Vec<(f64, f64)> = Vec::new();
-        wp_set_start(&mut w, (1.0, 1.0)); // 空→push
-        assert_eq!(w, vec![(1.0, 1.0)]);
-        wp_set_end(&mut w, (2.0, 2.0)); // len<2→push
-        assert_eq!(w, vec![(1.0, 1.0), (2.0, 2.0)]);
-        wp_add_via(&mut w, (1.5, 1.5)); // 終点手前へ
-        assert_eq!(w, vec![(1.0, 1.0), (1.5, 1.5), (2.0, 2.0)]);
-        wp_set_start(&mut w, (0.0, 0.0)); // 先頭置換
-        assert_eq!(w[0], (0.0, 0.0));
-        wp_set_end(&mut w, (9.0, 9.0)); // 末尾置換
-        assert_eq!(*w.last().unwrap(), (9.0, 9.0));
+        wp_add(&mut w, (1.0, 1.0)); // 追加した順に並ぶ(先頭=始点/末尾=終点)
+        wp_add(&mut w, (2.0, 2.0));
+        wp_add(&mut w, (3.0, 3.0));
+        assert_eq!(w, vec![(1.0, 1.0), (2.0, 2.0), (3.0, 3.0)]);
         let mut sel = 1usize;
         wp_swap(&mut w, &mut sel, false); // 後ろへ
         assert_eq!(sel, 2);

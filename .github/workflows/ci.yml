@@ -9,7 +9,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Ubuntu: フォーマットチェック + ビルド + テスト（clippy は報告のみ）
+  # Ubuntu: ビルド/テストはブロッキング、fmt/clippy は報告のみ(このリポは意図的に非rustfmtの密スタイル)
   ubuntu:
     name: Ubuntu (fmt, build, test)
     runs-on: ubuntu-latest
@@ -35,18 +35,21 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      # 既存コードは密な独自スタイルで rustfmt 未整形のため、fmt は報告のみ（非ブロッキング）
+      # 整形差分は報告のみ(ブロックしない)。整形を入れる決断をしたら --check をブロッキング化
       - name: Format check (report only)
         continue-on-error: true
         run: cargo fmt --all -- --check
 
       - name: Build (release)
-        run: cargo build --release
+        run: cargo build --release --locked
+
+      - name: Test (all targets)
+        run: cargo test --all-targets --locked
 
       - name: Test (release)
-        run: cargo test --release
+        run: cargo test --release --locked
 
-      # clippy は現状 warning で落ちうるため非ブロッキング（報告のみ）
+      # clippy は現状 warning が残りうるので報告のみ(緑にできたら -D warnings でブロック化)
       - name: Clippy (report only)
         continue-on-error: true
         run: cargo clippy --all-targets
@@ -77,7 +80,10 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Build (release)
-        run: cargo build --release
+        run: cargo build --release --locked
+
+      - name: Test (all targets)
+        run: cargo test --all-targets --locked
 
       - name: Test (release)
-        run: cargo test --release
+        run: cargo test --release --locked

@@ -1,8 +1,9 @@
 // termmap — mapscii 風の端末地図レンダラ
+//   引数なし   : 前回終了位置から対話起動(保存が無ければ東京中心)。対話が既定。
 //   halfblock (既定): ▀ + truecolor / braille: 点字ドット(--mono でプレーン)
 //   --classify : 地物カテゴリ(水域/緑地/幹線道路/線路?/建物)を色分け(ラスタ色からの推定)
 //   --place    : 日本語住所などをジオコーディング(Nominatim)して中心に
-//   --interactive(-i): カーソルキーでパン、+/- でズーム、q で終了
+//   --interactive(-i): 対話モードのエイリアス(対話は既定なので付けても付けなくても同じ)
 //   --png PATH : カテゴリ色PNGを書き出す(確認用)  --image PNG : 既存画像を描画
 
 mod fsutil;
@@ -148,7 +149,7 @@ fn parse_args() -> Args {
             "--threshold" => a.threshold = Some(num!("--threshold")),
             "--image" => a.image = Some(val!("--image")),
             "--png" => a.png = Some(val!("--png")),
-            "-h" | "--help" => { eprintln!("usage: termmap [位置] [options]   (引数なし=前回位置で対話起動 / 保存なしは東京中心)\n  位置: --place \"住所\" | --lat LAT --lon LON | --here | --resume | --load-route N\n  対話が既定。非対話(静止出力)になるのは --png OUT / --gpx OUT / --save-route N のみ。\n  options: [--zoom Z] [--style osm|voyager|dark|light] [--braille] [--classify] [--edge] [--mono] [--range KM,..] [--home LAT,LON] [--route \"LAT,LON;LAT,LON\"] [--route-mode surface|highway|short] [--routes] [--share] [--width N] | --image PNG"); std::process::exit(0); }
+            "-h" | "--help" => { eprintln!("usage: termmap                    引数なし=前回位置から対話起動(保存が無ければ東京中心)\n       termmap [位置] [options]\n  位置: --place \"住所\" | --lat LAT --lon LON | --here | --resume | --load-route N\n  対話が既定。-i/--interactive はその後方互換エイリアス(付けても付けなくても対話で起動)。\n  非対話(静止出力)になるのは --png OUT / --gpx OUT / --save-route N のみ。\n  options: [--zoom Z] [--style osm|voyager|dark|light] [--braille] [--classify] [--edge] [--mono] [--range KM,..] [--home LAT,LON] [--route \"LAT,LON;LAT,LON\"] [--route-mode surface|highway|short] [--routes] [--share] [--width N] | --image PNG"); std::process::exit(0); }
             _ => arg_err(&format!("unknown arg: {k}")),
         }
     }
