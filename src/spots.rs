@@ -30,40 +30,45 @@ pub fn append_spot(s: &Spot) -> Result<(), String> {
     let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&p).map_err(|e| e.to_string())?;
     writeln!(f, "{},{},{},{}", s.lat, s.lon, spot_clean(&s.cat), spot_clean(&s.name)).map_err(|e| e.to_string())
 }
-pub fn load_spot_cats() -> Vec<(String, u8)> {
+// カテゴリは (名前, 色index, 形状index)。形状は色とは独立に選べる(M で形状ピッカー)。
+pub fn load_spot_cats() -> Vec<(String, u8, u8)> {
     let mut v = Vec::new();
     if let Some(s) = spot_cats_path().and_then(|p| std::fs::read_to_string(p).ok()) {
         for l in s.lines() {
-            let mut it = l.splitn(2, '\t');
+            let mut it = l.splitn(3, '\t');
             if let (Some(n), Some(i)) = (it.next(), it.next()) {
-                if let Ok(idx) = i.trim().parse::<u8>() { v.push((n.to_string(), idx)); }
+                if let Ok(idx) = i.trim().parse::<u8>() {
+                    // 3列目(形状)は後方互換で欠落時 0=四角
+                    let shape = it.next().and_then(|s| s.trim().parse::<u8>().ok()).unwrap_or(0);
+                    v.push((n.to_string(), idx, shape));
+                }
             }
         }
     }
     v
 }
-pub fn ensure_spot_cat(name: &str, cats: &mut Vec<(String, u8)>) -> u8 {
+pub fn ensure_spot_cat(name: &str, cats: &mut Vec<(String, u8, u8)>) -> u8 {
     use std::io::Write;
     let name = spot_clean(name);
-    if let Some((_, c)) = cats.iter().find(|(n, _)| *n == name) { return *c; }
+    if let Some((_, c, _)) = cats.iter().find(|(n, _, _)| *n == name) { return *c; }
     let idx = (cats.len() % SPOT_PALETTE.len()) as u8;
-    cats.push((name.clone(), idx));
+    let shape = 0u8; // 新規カテゴリの既定形状=四角(M で変更)
+    cats.push((name.clone(), idx, shape));
     if let Some(p) = spot_cats_path() {
         if let Some(d) = p.parent() { let _ = std::fs::create_dir_all(d); }
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) { let _ = writeln!(f, "{name}\t{idx}"); }
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) { let _ = writeln!(f, "{name}\t{idx}\t{shape}"); }
     }
     idx
 }
-fn spot_color_of(cat: &str, cats: &[(String, u8)]) -> [u8; 3] {
-    let idx = cats.iter().find(|(n, _)| n == cat).map(|(_, c)| *c).unwrap_or(9);
+fn spot_color_of(cat: &str, cats: &[(String, u8, u8)]) -> [u8; 3] {
+    let idx = cats.iter().find(|(n, _, _)| n == cat).map(|(_, c, _)| *c).unwrap_or(9);
     SPOT_PALETTE[(idx as usize) % SPOT_PALETTE.len()]
 }
-// カテゴリの色indexから形状を導出(色ごとに異なる形＝カテゴリ別に見分けやすい)。v2で独立ピッカー化予定。
-fn spot_shape_of(cat: &str, cats: &[(String, u8)]) -> u8 {
-    let idx = cats.iter().find(|(n, _)| n == cat).map(|(_, c)| *c).unwrap_or(0);
-    idx % crate::render::NUM_MARKER_SHAPES
+// カテゴリに保存された形状indexを返す(見つからなければ 0=四角)。描画側で範囲外は四角にフォールバックする。
+fn spot_shape_of(cat: &str, cats: &[(String, u8, u8)]) -> u8 {
+    cats.iter().find(|(n, _, _)| n == cat).map(|(_, _, s)| *s).unwrap_or(0)
 }
-pub fn apply_spots(spec: &mut OverlaySpec, spots: &[Spot], cats: &[(String, u8)], show: bool) {
+pub fn apply_spots(spec: &mut OverlaySpec, spots: &[Spot], cats: &[(String, u8, u8)], show: bool) {
     spec.spots.clear();
     if show { for s in spots { spec.spots.push((s.lat, s.lon, spot_color_of(&s.cat, cats), spot_shape_of(&s.cat, cats))); } }
 }
@@ -73,9 +78,9 @@ pub fn save_all_spots(spots: &[Spot]) -> Result<(), String> {
     let s: String = spots.iter().map(|s| format!("{},{},{},{}\n", s.lat, s.lon, spot_clean(&s.cat), spot_clean(&s.name))).collect();
     std::fs::write(p, s).map_err(|e| e.to_string())
 }
-pub fn save_all_cats(cats: &[(String, u8)]) -> Result<(), String> {
+pub fn save_all_cats(cats: &[(String, u8, u8)]) -> Result<(), String> {
     let p = spot_cats_path().ok_or("HOME不明")?;
     if let Some(d) = p.parent() { let _ = std::fs::create_dir_all(d); }
-    let s: String = cats.iter().map(|(n, i)| format!("{n}\t{i}\n")).collect();
+    let s: String = cats.iter().map(|(n, i, sh)| format!("{n}\t{i}\t{sh}\n")).collect();
     std::fs::write(p, s).map_err(|e| e.to_string())
 }
