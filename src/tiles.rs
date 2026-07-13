@@ -1,8 +1,16 @@
 // タイル取得 (OSM/Carto) と表示窓の合成
 use std::collections::HashMap;
 use std::io::Read;
+use std::path::{Path, PathBuf};
 use image::RgbImage;
 use crate::geo::TILE;
+
+// タイルのディスクキャッシュ先: ~/.config/termmap/tiles/<style>/<z>/<x>/<y>.png
+// 一度取得したタイルはここに残り、パン再訪・再起動でも再DLせず読み出す(通信最小化)。
+fn tile_cache_path(style: &str, z: u32, x: i64, y: i64) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(Path::new(&home).join(".config/termmap/tiles").join(style).join(z.to_string()).join(x.to_string()).join(format!("{y}.png")))
+}
 
 // キャッシュキーは style を含む(style違いのタイルが混ざらない。以前は clear() 頼みで危うかった)。
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -45,13 +53,28 @@ fn tile_url(style: &str, z: u32, x: i64, y: i64) -> String {
     }
 }
 pub fn fetch_tile(style: &str, z: u32, x: i64, y: i64) -> Result<RgbImage, String> {
+    // 1) ディスクキャッシュを先に見る(在ればネット無しで読む)
+    let cache_path = tile_cache_path(style, z, x, y);
+    if let Some(p) = &cache_path {
+        if let Ok(buf) = std::fs::read(p) {
+            if let Ok(img) = image::load_from_memory(&buf) { return Ok(img.to_rgb8()); }
+            // 壊れたキャッシュは無視して取り直す
+        }
+    }
+    // 2) ネットワーク取得
     let url = tile_url(style, z, x, y);
     let resp = ureq::get(&url)
         .set("User-Agent", "termmap/0.1 (personal experiment)")
         .timeout(std::time::Duration::from_secs(20)).call().map_err(|e| format!("fetch tile {z}/{x}/{y}: {e}"))?;
     let mut buf = Vec::new();
     resp.into_reader().read_to_end(&mut buf).map_err(|e| e.to_string())?;
-    Ok(image::load_from_memory(&buf).map_err(|e| format!("decode tile {z}/{x}/{y}: {e}"))?.to_rgb8())
+    let img = image::load_from_memory(&buf).map_err(|e| format!("decode tile {z}/{x}/{y}: {e}"))?.to_rgb8();
+    // 3) ディスクへ保存(元PNGバイトのまま・ベストエフォート)
+    if let Some(p) = &cache_path {
+        if let Some(d) = p.parent() { let _ = std::fs::create_dir_all(d); }
+        let _ = std::fs::write(p, &buf);
+    }
+    Ok(img)
 }
 
 // 中心(cx,cy グローバルpx)から win_w×win_h の矩形窓を組み立てる。タイルは cache 経由。
