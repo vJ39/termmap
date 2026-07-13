@@ -174,7 +174,7 @@ const HELP: &[&str] = &[
     " [設定]  , で設定画面 (braille/classify/edge/mono/style を実行中に切替・sで保存)",
     "         config.toml で既定を指定可 ([display]/[streetview])",
     "",
-    "   ?  ヘルプ   q  終了   Esc  サブモード取消   Ctrl+C  計算の中断(終了はq)",
+    "   ?  ヘルプ   q  即終了   Esc  サブモード取消(地図では終了確認 y/n)   Ctrl+C  計算の中断",
     "",
     "   (任意のキーで閉じる)",
 ];
@@ -390,6 +390,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     let mut shape_sel: u8 = 0; // 形状ピッカーで選択中の形状index
     let mut onboard = onboarded_marker().map_or(false, |p| !p.exists()); // 初回起動なら操作案内を出す
     let mut spot_move_confirm: Option<usize> = None; // m(中心へ移動)の確認待ち。上書きは破壊的なのでy/nを挟む
+    let mut quit_confirm = false; // Map で Esc → 終了確認(y=終了/他=取消)
     apply_spots(&mut spec, &spots, &spot_cats, show_spots);
     // 操作UI効果音(macOS afplay)。設定OFF/非macOS/afplay不在なら no-op。設定トグルで作り直す。
     let mut snd = sound::Sound::new(cfg.sound_enabled);
@@ -931,6 +932,16 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         let status = fit_cells(&status, cols as usize);
         write!(out, "\x1b[{};1H\x1b[7m{status}\x1b[0m", tr)?;
 
+        if quit_confirm { // 中央に終了確認(y=終了/他=取消)
+            let text = "  termmapを終了しますか？ (y/n)  ";
+            let w = text.chars().count();
+            let c0 = ((cols as usize).saturating_sub(w) / 2).max(1);
+            let r0 = (map_rows / 2).max(1);
+            let pad = " ".repeat(w);
+            let _ = write!(out, "\x1b[{};{}H\x1b[30;43m{}\x1b[0m", r0, c0, pad);
+            let _ = write!(out, "\x1b[{};{}H\x1b[30;43m{}\x1b[0m", r0 + 1, c0, text);
+            let _ = write!(out, "\x1b[{};{}H\x1b[30;43m{}\x1b[0m", r0 + 2, c0, pad);
+        }
         if let Some(msg) = &popup { // 中央に名前ポップアップ(任意キーで閉じる)
             let text = format!("  {}  ", msg);
             let w = text.chars().count();
@@ -1103,7 +1114,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         }
         // 地図矩形を覆う中央オーバーレイ/パネルが「閉じた」フレーム(エッジ)でだけ画像を再emitして
         // 残像を消す。覆われている間(検索文字入力中など)は毎打鍵で強制再emitしない(メモリ/負荷対策)。
-        let map_covered = popup.is_some() || qr_view.is_some() || onboard
+        let map_covered = popup.is_some() || qr_view.is_some() || onboard || quit_confirm
             || matches!(focus,
                 Focus::SpotForm { .. } | Focus::Search(_) | Focus::SaveName(_) | Focus::NearSearch(_)
                 | Focus::NewCat(_) | Focus::RoadSearch(_) | Focus::Recommend(_)
@@ -1239,6 +1250,10 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     addr = "オンボーディング: 次回から非表示(設定で再表示)".into();
                 }
                 onboard = false;
+            }
+            Some(Event::Key(k)) if quit_confirm => { // 終了確認: y=終了/他=取消
+                if let KeyCode::Char('y') | KeyCode::Char('Y') = k.code { break; }
+                quit_confirm = false;
             }
             Some(Event::Key(_)) if qr_view.is_some() => qr_view = None, // ポップアップを閉じる
             Some(Event::Key(_)) if popup.is_some() => popup = None, // 名前ポップアップを閉じる
@@ -1954,7 +1969,8 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                 Some(rt) => addr = match write_gpx("termmap-route.gpx", &rt.pts) { Ok(_) => "GPX保存: termmap-route.gpx".into(), Err(e) => format!("({e})") },
                                 None => { snd.play("error"); addr = "ルート未確定".into(); }
                             },
-                            KeyCode::Char('q') => quit = true, // Esc はサブモードの取消専用(Mapでは終了しない)
+                            KeyCode::Char('q') => quit = true, // qは確認なしで即終了
+                            KeyCode::Esc => { quit_confirm = true; } // Escは確認を挟む(誤爆防止)
                             _ => {}
                         }
                         if quit { break; }
