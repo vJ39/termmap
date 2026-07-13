@@ -725,6 +725,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     format!("実写(StreetView) {}", onoff(cfg.streetview_enabled)),
                     format!("画像表示(iTerm2) {}", onoff(cfg.image_mode)),
                     format!("サウンド {}", onoff(cfg.sound_enabled)),
+                    format!("オンボーディング {}", if onboarded_marker().map_or(false, |p| p.exists()) { "非表示" } else { "毎回表示" }),
                     format!("Google APIキー {}", keyset),
                 ];
                 ("設定".to_string(), its, set_sel)
@@ -1019,26 +1020,26 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         }
         // 初回起動の操作案内(中央パネル・何かキーで消える)
         if onboard {
-            const BG: &str = "\x1b[97;44m"; // 白字・青地(目立たせる)
             const RST: &str = "\x1b[0m";
-            let iw = 34usize;
-            let lines = [
-                "",
-                "   ╺┳╸┏━╸┏━┓┏┳┓┏┳┓┏━┓┏━┓",
-                "    ┃ ┣╸ ┣┳┛┃┃┃┃┃┃┣━┫┣━┛",
-                "    ╹ ┗━╸╹┗╸╹╹╹╹╹╹╹ ╹╹",
-                "   terminal touring map",
-                "",
-                "  Space   メニューを開く",
-                "  ?       ヘルプ",
-                "  q       終了",
-                "",
-                "  何かキーを押して開始",
+            let iw = 40usize;
+            // 緑グラデのワードマーク(端末=Term を意識)。背景は塗らない。(ANSI色, 文字)
+            let rows: [(&str, &str); 11] = [
+                ("", ""),
+                ("\x1b[1;38;2;130;255;150m", "   ╺┳╸┏━╸┏━┓┏┳┓┏┳┓┏━┓┏━┓"),
+                ("\x1b[1;38;2;80;220;110m",  "    ┃ ┣╸ ┣┳┛┃┃┃┃┃┃┣━┫┣━┛"),
+                ("\x1b[1;38;2;40;175;80m",   "    ╹ ┗━╸╹┗╸╹╹╹╹╹╹╹ ╹╹"),
+                ("\x1b[38;2;110;170;120m",   "   terminal touring map"),
+                ("", ""),
+                ("\x1b[38;2;190;235;200m",   "  Space  メニュー   ?  ヘルプ   q  終了"),
+                ("", ""),
+                ("\x1b[38;2;150;205;160m",   "  何かキーを押して開始"),
+                ("\x1b[38;2;110;150;120m",   "  d = 次回から表示しない (設定で再表示)"),
+                ("", ""),
             ];
-            let r0 = ((map_rows as usize).saturating_sub(lines.len()) / 2).max(1) as u32;
+            let r0 = ((map_rows as usize).saturating_sub(rows.len()) / 2).max(1) as u32;
             let c0 = ((cols as usize).saturating_sub(iw) / 2).max(1) as u32;
-            for (i, ln) in lines.iter().enumerate() {
-                let _ = write!(out, "\x1b[{};{}H{}{}{}", r0 + i as u32, c0, BG, fit_cells(ln, iw), RST);
+            for (i, (col, ln)) in rows.iter().enumerate() {
+                let _ = write!(out, "\x1b[{};{}H{}{}{}", r0 + i as u32, c0, col, fit_cells(ln, iw), RST);
             }
         }
         // このフレームで地図矩形を覆う中央オーバーレイ/パネルを出したら、次フレームで画像を
@@ -1170,9 +1171,12 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     addr = "中断".into();
                 }
             }
-            Some(Event::Key(_)) if onboard => { // 初回案内を最初のキーで閉じ、既読マーカーを書く(以後出さない)
+            Some(Event::Key(k)) if onboard => { // 何かキーで閉じる。d のときだけ「次回から非表示」マーカーを書く(既定は毎回表示)
+                if matches!(k.code, KeyCode::Char('d') | KeyCode::Char('D')) {
+                    if let Some(p) = onboarded_marker() { let _ = crate::fsutil::write_atomic(&p, b"1", None); }
+                    addr = "オンボーディング: 次回から非表示(設定で再表示)".into();
+                }
                 onboard = false;
-                if let Some(p) = onboarded_marker() { let _ = crate::fsutil::write_atomic(&p, b"1", None); }
             }
             Some(Event::Key(_)) if qr_view.is_some() => qr_view = None, // ポップアップを閉じる
             Some(Event::Key(_)) if popup.is_some() => popup = None, // 名前ポップアップを閉じる
@@ -1285,7 +1289,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     },
                     Focus::Settings => { let mut stay = true; match k.code { // 設定画面
                         KeyCode::Up => { set_sel = set_sel.saturating_sub(1); }
-                        KeyCode::Down => { if set_sel + 1 < 14 { set_sel += 1; } }
+                        KeyCode::Down => { if set_sel + 1 < 15 { set_sel += 1; } }
                         KeyCode::Left | KeyCode::Right => {
                             if set_sel == 6 { let d = if k.code == KeyCode::Left { -100.0 } else { 100.0 }; cfg.sample_interval_m = (cfg.sample_interval_m + d).clamp(100.0, 5000.0); }
                         }
@@ -1303,6 +1307,12 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             10 => cfg.streetview_enabled = !cfg.streetview_enabled,
                             11 => { cfg.image_mode = !cfg.image_mode; force_reemit = true; }
                             12 => { cfg.sound_enabled = !cfg.sound_enabled; snd = sound::Sound::new(cfg.sound_enabled); snd.play("confirm"); }
+                            13 => { // オンボーディング: マーカーの削除=毎回表示 / 作成=次回から非表示
+                                if let Some(p) = onboarded_marker() {
+                                    if p.exists() { let _ = std::fs::remove_file(&p); addr = "オンボーディング: 毎回表示に戻した".into(); }
+                                    else { let _ = crate::fsutil::write_atomic(&p, b"1", None); addr = "オンボーディング: 次回から非表示".into(); }
+                                }
+                            }
                             _ => addr = "APIキー: この行で貼り付け(Cmd+V)して設定".into(),
                         },
                         KeyCode::Char('s') => {
