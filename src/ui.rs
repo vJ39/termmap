@@ -975,7 +975,9 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                         Err(e) => { snd.play("error"); addr = format!("検索できません（{e}）"); }
                         Ok(v) if v.is_empty() => { snd.play("error"); addr = format!("見つからない: {q}"); }
                         Ok(v) => {
-                            scache.insert(ckey, v.clone()); let _ = searchcache::save(&scache);
+                            let now = searchcache::now_secs();
+                            scache.insert(ckey, searchcache::CacheEntry { results: v.clone(), created_at: now, last_used_at: now });
+                            let _ = searchcache::save(&scache);
                             pois = v.into_iter().take(8).map(|(la, lo, nm)| (la, lo, nm, PoiCat::Waypoint)).collect();
                             poi_sel = 0;
                             poi_label = format!("検索:{q}");
@@ -1095,9 +1097,13 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                         KeyCode::Enter => { // 候補を一覧表示(左袖)。Enterで移動/s e vで経路点
                             let q = buf.trim().to_string();
                             if !q.is_empty() {
-                                let ckey = searchcache::make_key(&q, lat, lon);
+                                // provider は Google キーの有無で分ける(キーあり=Google優先"g"/無し=Nominatim"n")。言語は ja 固定。
+                                let provider = if cfg.google_maps_api_key.trim().is_empty() { "n" } else { "g" };
+                                let ckey = searchcache::make_key(provider, "ja", &q, lat, lon);
                                 // キャッシュヒットは即適用(同期)。ミス時のみ別スレッドで検索(通信/サーバ障害は0件と区別)。
-                                if let Some(v) = scache.get(&ckey).cloned() {
+                                // ヒット時は last_used を更新(LRU破棄の基準。次回 save 時に永続化される)。
+                                let hit = scache.get_mut(&ckey).map(|e| { e.last_used_at = searchcache::now_secs(); e.results.clone() });
+                                if let Some(v) = hit {
                                     if v.is_empty() { snd.play("error"); addr = format!("見つからない: {q}"); }
                                     else {
                                         pois = v.into_iter().take(8).map(|(la, lo, nm)| (la, lo, nm, PoiCat::Waypoint)).collect();
