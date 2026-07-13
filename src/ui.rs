@@ -148,7 +148,7 @@ const HELP: &[&str] = &[
     "",
     " [マイスポット] (ラーメン等をカテゴリ別に色分け保存)",
     "   P              カテゴリ一覧を開く",
-    "                   カテゴリ: ↑↓ Enter=中へ n新規 r改名 c色 x削除(空のみ)",
+    "                   カテゴリ: ↑↓ Enter=中へ n新規 r改名 c色 M形 x削除(空のみ)",
     "                   スポット: ↑↓ Enter=移動 n新規(現在地) r改名 m位置を中心へ移動 x削除 Esc戻る",
     "   V              マイスポットの表示 / 非表示",
     "   o              スマホ共有(GoogleマップのQRをポップアップ表示)",
@@ -299,7 +299,7 @@ impl Drop for TermGuard {
 pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Result<()> {
     use crossterm::event::{self, Event, KeyCode, KeyModifiers};
     enum Focus { Map, Menu(MenuLevel), Search(String), SaveName(String), NearSearch(String), PoiMenu, PoiList, RouteList, WaypointList, RoadList,
-                 NewCat(String), SpotForm { name: String, url: String, field: usize }, SpotList, SpotCatList, SpotRename(String, usize), Settings, RoadSearch(String), SpotEditName(String, usize), Recommend(String), ColorPick { cat: usize } }
+                 NewCat(String), SpotForm { name: String, url: String, field: usize }, SpotList, SpotCatList, SpotRename(String, usize), Settings, RoadSearch(String), SpotEditName(String, usize), Recommend(String), ColorPick { cat: usize }, ShapePick { cat: usize } }
     let _guard = TermGuard::enter()?; // Drop で必ず端末復元
     let mut cache: Cache = Cache::new();
     let mut out = std::io::stdout();
@@ -367,6 +367,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     let mut pending_spot: Option<(f64, f64, String)> = None; // 検索結果からお気に入り登録する際の保留(座標+名前)。カテゴリ選択待ち
     let mut list_offset: usize = 0; // 左袖リストのスクロール開始位置(表示中の1リストで共有・ensure_visibleで追従)
     let mut color_sel: u8 = 0; // 色ピッカーで選択中のパレットindex
+    let mut shape_sel: u8 = 0; // 形状ピッカーで選択中の形状index
     let mut onboard = onboarded_marker().map_or(false, |p| !p.exists()); // 初回起動なら操作案内を出す
     let mut spot_move_confirm: Option<usize> = None; // m(中心へ移動)の確認待ち。上書きは破壊的なのでy/nを挟む
     apply_spots(&mut spec, &spots, &spot_cats, show_spots);
@@ -639,7 +640,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 }).collect();
                 (format!("{cur_cat}"), its, sp_sel)
             } else if show_catlist {
-                let its = spot_cats.iter().map(|(n, _)| n.clone()).collect(); // 色は c で実色スウォッチから選ぶ(番号表示はやめた)
+                let its = spot_cats.iter().map(|(n, _, _)| n.clone()).collect(); // 色は c、形は M で選ぶ(番号表示はやめた)
                 ("カテゴリ".to_string(), its, cat_sel)
             } else if show_settings {
                 let onoff = |b: bool| if b { "ON" } else { "OFF" };
@@ -754,7 +755,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             Focus::SpotList => format!(" [{cur_cat}] ↑↓ Enter移動 [ ]並替 n新規 r改名 m中心へ x削除 Esc戻る "),
             Focus::SpotEditName(_, _) => " 中央フォームに入力中 ".to_string(),
             Focus::SpotCatList if pending_spot.is_some() => " 登録先カテゴリを選択: ↑↓ Enter=ここに登録 n新規 Esc取消 ".to_string(),
-            Focus::SpotCatList => " カテゴリ: ↑↓選択 [ ]並替 Enter=中へ n新規 r改名 c色 x削除(空のみ) Esc=閉 ".to_string(),
+            Focus::SpotCatList => " カテゴリ: ↑↓選択 [ ]並替 Enter=中へ n新規 r改名 c色 M形 x削除(空のみ) Esc=閉 ".to_string(),
             Focus::Settings => {
                 let desc = match set_sel {
                     0 => "braille: 点字ドットで高精細描画(色は淡め)。OFFはハーフブロック",
@@ -783,6 +784,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             Focus::RoadList => " 道路: ↑↓選択 x削除 Esc戻る ".to_string(),
             Focus::WaypointList => " 並べ替え: ↑↓/ws選択(地図追従)  Space掴む↔置く(掴み中↑↓/wsで移動)  x削除  +/-拡縮  Esc閉 ".to_string(),
             Focus::ColorPick { .. } => " 色を選択: ←→ Enter=決定 Esc=取消 ".to_string(),
+            Focus::ShapePick { .. } => " 形を選択: ←→ Enter=決定 Esc=取消 ".to_string(),
             Focus::Menu(MenuLevel::Categories) => " ↑↓カテゴリ Enter展開 / 文字キーで直接実行 Esc閉 ".to_string(),
             Focus::Menu(MenuLevel::Items(_)) => " ↑↓選択 Enter実行 / 右端キーでも実行 Esc戻る ".to_string(),
             Focus::Map => {
@@ -913,6 +915,34 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             }
             sw.push_str(RST);
             let title = fit_cells("  色を選択", iw);
+            let hint = fit_cells("  ←→ 選択   Enter 決定   Esc 取消", iw);
+            let r0 = ((map_rows as usize).saturating_sub(6) / 2).max(1) as u32;
+            let c0 = ((cols as usize).saturating_sub(iw) / 2).max(1) as u32;
+            let _ = write!(out, "\x1b[{};{}H{}{}{}", r0, c0, BG, blank, RST);
+            let _ = write!(out, "\x1b[{};{}H{}{}{}", r0 + 1, c0, BG, title, RST);
+            let _ = write!(out, "\x1b[{};{}H{}", r0 + 2, c0, sw);
+            let _ = write!(out, "\x1b[{};{}H{}{}{}", r0 + 3, c0, BG, blank, RST);
+            let _ = write!(out, "\x1b[{};{}H{}{}{}", r0 + 4, c0, BG, hint, RST);
+            let _ = write!(out, "\x1b[{};{}H{}{}{}", r0 + 5, c0, BG, blank, RST);
+        }
+        // 形状ピッカー(中央パネル・実際の形グリフ)。選択中は [ ] で囲む
+        if let Focus::ShapePick { .. } = &focus {
+            const BG: &str = "\x1b[30;47m";
+            const RST: &str = "\x1b[0m";
+            // 形状index順のグリフ(0四角 1三角 2丸 3菱形 4十字 5星)。描画実体は render の marker_inside。
+            const GLYPHS: [&str; NUM_MARKER_SHAPES as usize] = ["■", "▲", "●", "◆", "＋", "✦"];
+            let iw = NUM_MARKER_SHAPES as usize * 4 + 2; // 各形4セル(枠含む)+左余白2
+            let blank = " ".repeat(iw);
+            let mut sw = String::from(BG);
+            sw.push_str("  ");
+            for (i, g) in GLYPHS.iter().enumerate() {
+                let s = i as u8 == shape_sel;
+                sw.push(if s { '[' } else { ' ' });
+                sw.push_str(g);
+                sw.push(if s { ']' } else { ' ' });
+            }
+            sw.push_str(RST);
+            let title = fit_cells("  形を選択", iw);
             let hint = fit_cells("  ←→ 選択   Enter 決定   Esc 取消", iw);
             let r0 = ((map_rows as usize).saturating_sub(6) / 2).max(1) as u32;
             let c0 = ((cols as usize).saturating_sub(iw) / 2).max(1) as u32;
@@ -1140,22 +1170,28 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             if cat_sel + 1 < spot_cats.len() { spot_cats.swap(cat_sel, cat_sel + 1); cat_sel += 1; let _ = save_all_cats(&spot_cats); }
                             focus = Focus::SpotCatList;
                         }
-                        KeyCode::Char('r') => { if let Some((n, _)) = spot_cats.get(cat_sel) { input_cur = n.chars().count(); focus = Focus::SpotRename(n.clone(), cat_sel); } else { focus = Focus::SpotCatList; } }
+                        KeyCode::Char('r') => { if let Some((n, _, _)) = spot_cats.get(cat_sel) { input_cur = n.chars().count(); focus = Focus::SpotRename(n.clone(), cat_sel); } else { focus = Focus::SpotCatList; } }
                         KeyCode::Char('c') => {
                             match spot_cats.get(cat_sel) {
-                                Some((_, ci)) => { color_sel = *ci; focus = Focus::ColorPick { cat: cat_sel }; }
+                                Some((_, ci, _)) => { color_sel = *ci; focus = Focus::ColorPick { cat: cat_sel }; }
+                                None => focus = Focus::SpotCatList,
+                            }
+                        }
+                        KeyCode::Char('M') => { // 形状ピッカー(色 c とは独立に形を選ぶ)
+                            match spot_cats.get(cat_sel) {
+                                Some((_, _, sh)) => { shape_sel = *sh; focus = Focus::ShapePick { cat: cat_sel }; }
                                 None => focus = Focus::SpotCatList,
                             }
                         }
                         KeyCode::Char('x') => {
-                            if let Some((name, _)) = spot_cats.get(cat_sel).cloned() {
+                            if let Some((name, _, _)) = spot_cats.get(cat_sel).cloned() {
                                 if spots.iter().any(|s| s.cat == name) { addr = format!("使用中: {name}(先に空に)"); }
                                 else { spot_cats.remove(cat_sel); if cat_sel >= spot_cats.len() && cat_sel > 0 { cat_sel -= 1; } let _ = save_all_cats(&spot_cats); }
                             }
                             focus = Focus::SpotCatList;
                         }
                         KeyCode::Enter => {
-                            let cat = spot_cats.get(cat_sel).map(|(c, _)| c.clone());
+                            let cat = spot_cats.get(cat_sel).map(|(c, _, _)| c.clone());
                             if let Some((la, lo, nm)) = pending_spot.take() {
                                 // 検索結果からの登録: 選択カテゴリに新規スポットとして保存
                                 if let Some(cat) = cat {
@@ -1327,7 +1363,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                         KeyCode::Enter => {
                             let new = spot_clean(buf.trim());
                             if !new.is_empty() {
-                                if let Some(old) = spot_cats.get(idx).map(|(n, _)| n.clone()) {
+                                if let Some(old) = spot_cats.get(idx).map(|(n, _, _)| n.clone()) {
                                     for s in spots.iter_mut() { if s.cat == old { s.cat = new.clone(); } }
                                     if let Some(e) = spot_cats.get_mut(idx) { e.0 = new; }
                                     let _ = save_all_spots(&spots);
@@ -1578,6 +1614,19 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             }
                             KeyCode::Esc => { snd.play("back"); focus = Focus::SpotCatList; }
                             _ => focus = Focus::ColorPick { cat },
+                        }
+                    }
+                    Focus::ShapePick { cat } => { // 形状ピッカー(色とは独立に形を選ぶ)
+                        let n = NUM_MARKER_SHAPES;
+                        match k.code {
+                            KeyCode::Left => { shape_sel = (shape_sel + n - 1) % n; focus = Focus::ShapePick { cat }; }
+                            KeyCode::Right => { shape_sel = (shape_sel + 1) % n; focus = Focus::ShapePick { cat }; }
+                            KeyCode::Enter => {
+                                if let Some(e) = spot_cats.get_mut(cat) { e.2 = shape_sel; let _ = save_all_cats(&spot_cats); apply_spots(&mut spec, &spots, &spot_cats, show_spots); }
+                                focus = Focus::SpotCatList;
+                            }
+                            KeyCode::Esc => { snd.play("back"); focus = Focus::SpotCatList; }
+                            _ => focus = Focus::ShapePick { cat },
                         }
                     }
                     Focus::Map => {
