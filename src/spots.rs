@@ -58,9 +58,14 @@ fn spot_color_of(cat: &str, cats: &[(String, u8)]) -> [u8; 3] {
     let idx = cats.iter().find(|(n, _)| n == cat).map(|(_, c)| *c).unwrap_or(9);
     SPOT_PALETTE[(idx as usize) % SPOT_PALETTE.len()]
 }
+// カテゴリの色indexから形状を導出(色ごとに異なる形＝カテゴリ別に見分けやすい)。v2で独立ピッカー化予定。
+fn spot_shape_of(cat: &str, cats: &[(String, u8)]) -> u8 {
+    let idx = cats.iter().find(|(n, _)| n == cat).map(|(_, c)| *c).unwrap_or(0);
+    idx % crate::render::NUM_MARKER_SHAPES
+}
 pub fn apply_spots(spec: &mut OverlaySpec, spots: &[Spot], cats: &[(String, u8)], show: bool) {
     spec.spots.clear();
-    if show { for s in spots { spec.spots.push((s.lat, s.lon, spot_color_of(&s.cat, cats))); } }
+    if show { for s in spots { spec.spots.push((s.lat, s.lon, spot_color_of(&s.cat, cats), spot_shape_of(&s.cat, cats))); } }
 }
 pub fn save_all_spots(spots: &[Spot]) -> Result<(), String> {
     let p = spots_path().ok_or("HOME不明")?;

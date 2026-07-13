@@ -127,7 +127,7 @@ pub struct Route { pub pts: Vec<(f64, f64)>, pub color: [u8; 3], pub thickness: 
 pub struct Ring { pub lat: f64, pub lon: f64, pub radii_km: Vec<f64>, pub color: [u8; 3], pub thickness: u32 }
 // roads は道路名検索(r)で追加した道路の「塊」を保持する別レイヤ。routes(BRouterルート)とは
 // 独立で、trigger_route の routes.clear() では消えない。個別追加・個別削除できる。
-pub struct OverlaySpec { pub pois: Vec<Poi>, pub routes: Vec<Route>, pub roads: Vec<Route>, pub rings: Vec<Ring>, pub spots: Vec<(f64, f64, [u8; 3])> }
+pub struct OverlaySpec { pub pois: Vec<Poi>, pub routes: Vec<Route>, pub roads: Vec<Route>, pub rings: Vec<Ring>, pub spots: Vec<(f64, f64, [u8; 3], u8)> }
 impl OverlaySpec {
     pub fn is_empty(&self) -> bool { self.pois.is_empty() && self.routes.is_empty() && self.roads.is_empty() && self.rings.is_empty() && self.spots.is_empty() }
 }
@@ -145,12 +145,27 @@ impl OverlayLayer {
         self.ink[(y as usize) * (self.w as usize) + x as usize]
     }
 }
-fn draw_marker(ov: &mut OverlayLayer, ix: i32, iy: i32, color: [u8; 3], size: i32) {
+// マーカー形状。0=四角 1=三角(上向) 2=丸 3=菱形 4=十字 5=星(8方向)。カテゴリ別の識別用。
+pub const NUM_MARKER_SHAPES: u8 = 6;
+fn marker_inside(dx: i32, dy: i32, half: i32, shape: u8) -> bool {
+    match shape {
+        1 => dx.abs() <= dy + half,                    // 三角(頂点上)
+        2 => dx * dx + dy * dy <= half * half + 1,      // 丸
+        3 => dx.abs() + dy.abs() <= half,               // 菱形
+        4 => dx == 0 || dy == 0,                        // 十字
+        5 => dx == 0 || dy == 0 || dx.abs() == dy.abs(), // 星(8方向)
+        _ => true,                                      // 四角
+    }
+}
+fn draw_marker(ov: &mut OverlayLayer, ix: i32, iy: i32, color: [u8; 3], size: i32, shape: u8) {
     let half = size / 2;
+    // ハロー: 形状を1px膨張させた暗色
     for dy in -half - 1..=half + 1 { for dx in -half - 1..=half + 1 {
-        if dx.abs() > half || dy.abs() > half { ov.put(ix + dx, iy + dy, [20, 20, 20]); } // ハロー
+        if marker_inside(dx, dy, half + 1, shape) { ov.put(ix + dx, iy + dy, [20, 20, 20]); }
     }}
-    for dy in -half..=half { for dx in -half..=half { ov.put(ix + dx, iy + dy, color); }}
+    for dy in -half..=half { for dx in -half..=half {
+        if marker_inside(dx, dy, half, shape) { ov.put(ix + dx, iy + dy, color); }
+    }}
 }
 pub fn draw_line(ov: &mut OverlayLayer, mut x0: i32, mut y0: i32, x1: i32, y1: i32, color: [u8; 3], thickness: u32) {
     let dx = (x1 - x0).abs(); let sx = if x0 < x1 { 1 } else { -1 };
@@ -210,12 +225,12 @@ pub fn build_overlay(spec: &OverlaySpec, cx: f64, cy: f64, z: u32, win_w: u32, w
     for p in &spec.pois { // マーカー(最前面)
         let (ix, iy) = to_img(p.lat, p.lon);
         if ix < -4 || iy < -4 || ix > out_w as i32 + 4 || iy > out_h as i32 + 4 { continue; }
-        draw_marker(&mut ov, ix, iy, poi_color(p.cat), 3);
+        draw_marker(&mut ov, ix, iy, poi_color(p.cat), 3, 0);
     }
-    for (la, lo, col) in &spec.spots { // マイスポット(カテゴリ色)
+    for (la, lo, col, shape) in &spec.spots { // マイスポット(カテゴリ色＋形状)
         let (ix, iy) = to_img(*la, *lo);
         if ix < -4 || iy < -4 || ix > out_w as i32 + 4 || iy > out_h as i32 + 4 { continue; }
-        draw_marker(&mut ov, ix, iy, *col, 3);
+        draw_marker(&mut ov, ix, iy, *col, 4, *shape); // size 4=5x5で形状を判別可能に
     }
     ov
 }
