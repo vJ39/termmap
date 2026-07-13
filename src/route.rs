@@ -129,24 +129,50 @@ pub fn fetch_route(wps: &[(f64, f64)], mode: &str, alt: u32) -> Result<RouteResu
             if let Ok(r) = serde_json::from_str::<RouteResult>(&s) { return Ok(r); }
         }
     }
-    let profile = route_profile(mode);
-    let lonlats = wps.iter().map(|(la, lo)| format!("{lo},{la}")).collect::<Vec<_>>().join("|");
-    let url = format!("https://brouter.de/brouter?lonlats={lonlats}&profile={profile}&alternativeidx={alt}&format=geojson");
-    let body = ureq::get(&url)
-        .set("User-Agent", "termmap/0.1 (personal experiment)")
-        .timeout(std::time::Duration::from_secs(20)).call().map_err(|e| format!("route: {e}"))?
-        .into_string().map_err(|e| e.to_string())?;
-    let pts = parse_geojson_line(&body).ok_or("route: geometry parse失敗")?;
-    let ele = parse_geojson_ele(&body);
-    let (dist_m, time_s, ascend_m) = parse_geojson_props(&body);
-    let hw_m = expressway_meters(&body);
-    let result = RouteResult { pts, ele, dist_m, time_s, hw_m, ascend_m };
+    let primary = route_profile(mode);
+    // まず希望プロファイルで。target island(その道路網に点が繋がらない)なら car-fast で必ず線を出す。
+    let result = match fetch_route_once(wps, primary, alt) {
+        Ok(r) => r,
+        Err(e) if e == "ISLAND" => {
+            if primary == "car-fast" {
+                return Err("この点は道路網に繋がらない(点を道路上へ動かして)".to_string());
+            }
+            match fetch_route_once(wps, "car-fast", alt) {
+                Ok(r) => r, // 下道で繋がらないので車道優先で表示
+                Err(e2) if e2 == "ISLAND" => return Err("この点は道路網に繋がらない(点を道路上へ動かして)".to_string()),
+                Err(e2) => return Err(e2),
+            }
+        }
+        Err(e) => return Err(e),
+    };
     // 成功時のみ保存(ベストエフォート)
     if let Some(p) = &cpath {
         if let Some(d) = p.parent() { let _ = std::fs::create_dir_all(d); }
         if let Ok(s) = serde_json::to_string(&result) { let _ = std::fs::write(p, s); }
     }
     Ok(result)
+}
+
+// 1プロファイル分の取得。target island は sentinel "ISLAND" を返し、呼び出し側でフォールバック判定する。
+fn fetch_route_once(wps: &[(f64, f64)], profile: &str, alt: u32) -> Result<RouteResult, String> {
+    let lonlats = wps.iter().map(|(la, lo)| format!("{lo},{la}")).collect::<Vec<_>>().join("|");
+    let url = format!("https://brouter.de/brouter?lonlats={lonlats}&profile={profile}&alternativeidx={alt}&format=geojson");
+    let body = match ureq::get(&url)
+        .set("User-Agent", "termmap/0.1 (personal experiment)")
+        .timeout(std::time::Duration::from_secs(20)).call() {
+        Ok(r) => r.into_string().map_err(|e| e.to_string())?,
+        Err(ureq::Error::Status(_, r)) => {
+            let msg = r.into_string().unwrap_or_default();
+            if msg.contains("target island") { return Err("ISLAND".to_string()); }
+            return Err(format!("ルート取得失敗: {}", msg.trim()));
+        }
+        Err(e) => return Err(format!("ルート取得失敗: {e}")),
+    };
+    let pts = parse_geojson_line(&body).ok_or("route: geometry parse失敗")?;
+    let ele = parse_geojson_ele(&body);
+    let (dist_m, time_s, ascend_m) = parse_geojson_props(&body);
+    let hw_m = expressway_meters(&body);
+    Ok(RouteResult { pts, ele, dist_m, time_s, hw_m, ascend_m })
 }
 pub fn write_gpx(path: &str, pts: &[(f64, f64)]) -> Result<(), String> {
     let mut s = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<gpx version=\"1.1\" creator=\"termmap\" xmlns=\"http://www.topografix.com/GPX/1/1\">\n<trk><name>termmap route</name><trkseg>\n");
