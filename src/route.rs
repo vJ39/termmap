@@ -2,6 +2,7 @@
 use crate::render::{OverlaySpec, Poi, PoiCat};
 use serde::Deserialize;
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct RouteResult { pub pts: Vec<(f64, f64)>, pub ele: Vec<f64>, pub dist_m: f64, pub time_s: f64, pub hw_m: f64, pub ascend_m: f64 }
 
 // BRouter geojson の応答。features[0] の geometry.coordinates([[lon,lat,ele?],...]) と
@@ -106,11 +107,29 @@ fn parse_geojson_props(body: &str) -> (f64, f64, f64) {
         None => (0.0, 0.0, 0.0),
     }
 }
+// ルート結果のディスクキャッシュ先。キーは (profile, alt, 丸めたwps列) の FNV-1a ハッシュ。
+// profile で正規化するので 下道/surface/quiet 等は同一ルートを共有。プロット不変なら再起動後も再利用。
+fn route_cache_path(wps: &[(f64, f64)], mode: &str, alt: u32) -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    let mut key = format!("{}|{}", route_profile(mode), alt);
+    for (la, lo) in wps { key.push_str(&format!("|{la:.6},{lo:.6}")); }
+    let mut h: u64 = 0xcbf29ce4_84222325;
+    for b in key.as_bytes() { h ^= *b as u64; h = h.wrapping_mul(0x100000001b3); }
+    Some(std::path::Path::new(&home).join(".config/termmap/route-cache").join(format!("{h:016x}.json")))
+}
+
 // mode: "short"=最短(shortest) / それ以外=裏道(safety)。wps は (lat,lon) 列。
 pub fn fetch_route(wps: &[(f64, f64)], mode: &str, alt: u32) -> Result<RouteResult, String> {
     if wps.len() < 2 { return Err("--route は始点と終点(2点以上)が必要".into()); }
-    let profile = route_profile(mode);
     let alt = alt.min(3); // BRouter の代替ルートは 0..=3
+    // ディスクキャッシュ: 同じプロット(wps,profile,alt)なら BRouter を叩かず再利用(再起動後も)
+    let cpath = route_cache_path(wps, mode, alt);
+    if let Some(p) = &cpath {
+        if let Ok(s) = std::fs::read_to_string(p) {
+            if let Ok(r) = serde_json::from_str::<RouteResult>(&s) { return Ok(r); }
+        }
+    }
+    let profile = route_profile(mode);
     let lonlats = wps.iter().map(|(la, lo)| format!("{lo},{la}")).collect::<Vec<_>>().join("|");
     let url = format!("https://brouter.de/brouter?lonlats={lonlats}&profile={profile}&alternativeidx={alt}&format=geojson");
     let body = ureq::get(&url)
@@ -121,7 +140,13 @@ pub fn fetch_route(wps: &[(f64, f64)], mode: &str, alt: u32) -> Result<RouteResu
     let ele = parse_geojson_ele(&body);
     let (dist_m, time_s, ascend_m) = parse_geojson_props(&body);
     let hw_m = expressway_meters(&body);
-    Ok(RouteResult { pts, ele, dist_m, time_s, hw_m, ascend_m })
+    let result = RouteResult { pts, ele, dist_m, time_s, hw_m, ascend_m };
+    // 成功時のみ保存(ベストエフォート)
+    if let Some(p) = &cpath {
+        if let Some(d) = p.parent() { let _ = std::fs::create_dir_all(d); }
+        if let Ok(s) = serde_json::to_string(&result) { let _ = std::fs::write(p, s); }
+    }
+    Ok(result)
 }
 pub fn write_gpx(path: &str, pts: &[(f64, f64)]) -> Result<(), String> {
     let mut s = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<gpx version=\"1.1\" creator=\"termmap\" xmlns=\"http://www.topografix.com/GPX/1/1\">\n<trk><name>termmap route</name><trkseg>\n");
