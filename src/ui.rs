@@ -768,7 +768,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 let playing = if play.is_some() { "▶再生中(Aで停止) " } else { "" };
                 let msg = if addr.is_empty() { String::new() } else { format!("» {addr} « ") }; // 一時メッセージを先頭に(切れない)
                 // 下部バーは細く。全操作は Space メニューから選べる
-                let route_hint = if wps.is_empty() { "v=地点を置く".to_string() } else { format!("{}点 v足す Tab選択 [ ]動 x消", wps.len()) };
+                let route_hint = if wps.is_empty() { "v=地点を置く".to_string() } else { format!("{}点 v足す Tab/ws選択 [ ]動 x消", wps.len()) };
                 let base = format!(" {spinner}{msg}{live}{playing}z{z} {lat:.4},{lon:.4} ｜ {route_hint} ｜ Space:メニュー ?ヘルプ q終了");
                 match &route_note { Some(rn) => format!("{base} | {rn} "), None => base }
             }
@@ -1560,8 +1560,8 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                 let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_;
                                 addr = format!("地点を追加 #{}", wps.len());
                             }
-                            KeyCode::Tab => { if !wps.is_empty() { wp_sel = (wp_sel + 1) % wps.len(); let (la, lo) = wps[wp_sel]; let (nx, ny) = deg_to_pixel(la, lo, z); cx = nx; cy = ny; } } // 一覧の選択を回す(選択点へ寄る)
-                            KeyCode::BackTab => { if !wps.is_empty() { wp_sel = (wp_sel + wps.len() - 1) % wps.len(); let (la, lo) = wps[wp_sel]; let (nx, ny) = deg_to_pixel(la, lo, z); cx = nx; cy = ny; } }
+                            KeyCode::Tab | KeyCode::Char('s') => { if !wps.is_empty() { wp_sel = (wp_sel + 1) % wps.len(); let (la, lo) = wps[wp_sel]; let (nx, ny) = deg_to_pixel(la, lo, z); cx = nx; cy = ny; } } // 一覧の選択を回す(選択点へ寄る)。s=次
+                            KeyCode::BackTab | KeyCode::Char('w') => { if !wps.is_empty() { wp_sel = (wp_sel + wps.len() - 1) % wps.len(); let (la, lo) = wps[wp_sel]; let (nx, ny) = deg_to_pixel(la, lo, z); cx = nx; cy = ny; } } // w=前
                             KeyCode::Char(' ') => { snd.play("blip"); menu_cat_sel = 0; focus = Focus::Menu(MenuLevel::Categories); } // Space=メニュー(カテゴリ→展開の2階層)
                             KeyCode::Char('?') => help = true,
                             KeyCode::Char('P') => { cat_sel = 0; focus = Focus::SpotCatList; } // マイスポット(カテゴリ一覧)
