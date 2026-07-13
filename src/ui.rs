@@ -157,7 +157,7 @@ const HELP: &[&str] = &[
     " [起動オプション]  --range KM,.. 航続リング / --route / --load-route 名前",
     "",
     "",
-    " [設定]  , で設定画面 (braille/classify/edge/mono/style を実行中に切替・sで保存)",
+    " [設定]  , で設定画面 (braille/classify/edge/mono/style を実行中に切替・変更は自動保存)",
     "         config.toml で既定を指定可 ([display]/[streetview])",
     "",
     "   ?  ヘルプ   q  即終了   Esc  サブモード取消(地図では終了確認 y/n)   Ctrl+C  計算の中断",
@@ -294,7 +294,7 @@ impl Drop for TermGuard {
 pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Result<()> {
     use crossterm::event::{self, Event, KeyCode, KeyModifiers};
     enum Focus { Map, RoutePanel, Menu(MenuLevel), Search(String), SaveName(String), NearSearch(String), PoiMenu, PoiList, RouteList, WaypointList, RoadList,
-                 NewCat(String), SpotForm { name: String, url: String, field: usize }, SpotList, SpotCatList, SpotRename(String, usize), Settings, RoadSearch(String), SpotEditName(String, usize), Recommend(String), ColorPick { cat: usize }, ShapePick { cat: usize } }
+                 NewCat(String), SpotForm { name: String, url: String, field: usize }, SpotList, SpotCatList, SpotRename(String, usize), Settings, SettingsEdit(usize, String), RoadSearch(String), SpotEditName(String, usize), Recommend(String), ColorPick { cat: usize }, ShapePick { cat: usize } }
     let _guard = TermGuard::enter()?; // Drop で必ず端末復元
     let mut cache: Cache = Cache::new();
     let mut out = std::io::stdout();
@@ -871,6 +871,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             }
             Focus::SpotList => format!(" [{cur_cat}] ↑↓ Enter移動 [ ]並替 n新規 r改名 m中心へ x削除 Esc戻る "),
             Focus::SpotEditName(_, _) => " 中央フォームに入力中 ".to_string(),
+            Focus::SettingsEdit(..) => " 中央フォームに入力中 ".to_string(),
             Focus::SpotCatList if pending_spot.is_some() => " 登録先カテゴリを選択: ↑↓ Enter=ここに登録 n新規 Esc取消 ".to_string(),
             Focus::SpotCatList => " カテゴリ: ↑↓選択 [ ]並替 Enter=中へ n新規 r改名 c色 M形 x削除(空のみ) Esc=閉 ".to_string(),
             Focus::Settings => {
@@ -881,16 +882,18 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     3 => "mono: 単色描画(色を使わない)",
                     4 => "style: タイル種別を循環(osm=標準/voyager/dark=暗/light=淡)",
                     5 => "既定mode: 起動時のルート種別。car-fast=高速優先 / moped=下道(高速回避) / shortest=最短距離",
-                    6 => "道路の点間隔: rの道路名ルートで、その道を何mおきの点でなぞるか(小=忠実で点多/大=粗い)。←→で調整",
+                    6 => "道路の点間隔: rの道路名ルートで、その道を何mおきの点でなぞるか(小=忠実で点多/大=粗い)。Enterで数値入力/←→で微調整",
                     7 => "spot既定: 起動時にお気に入りスポットを表示するか",
                     8 => "おすすめ: claude -p でツーリングスポットを提案する機能のON/OFF(未実装)",
                     9 => "LLM: おすすめに使うモデルを循環(claude-sonnet-5/haiku/opus)",
                     10 => "実写: iで中心地点のStreet Viewを開く機能のON/OFF(要Google APIキー)",
                     11 => if image_capable() { "画像表示: 地図と実写をiTerm2インライン画像で実画像表示(AAでなく実画像)。Iキーでも切替" } else { "画像表示: この端末は画像非対応(iTerm2/WezTermで有効)" },
-                    12 => "サウンド: 操作音のON/OFF(macOSのafplayで再生)。切替は次回起動から確実に反映",
-                    _ => "Google APIキー: 検索(Geocoding)とStreet View共通。この行でCmd+V貼付→設定、sで保存。環境変数TERMMAP_GOOGLE_API_KEYでも可",
+                    12 => "画像解像度: 実画像モードの精細さを循環(高=scale4/中=scale2/低=scale1)。移動中は自動で低解像度",
+                    13 => "サウンド: 操作音のON/OFF(macOSのafplayで再生)",
+                    14 => "オンボーディング: 毎回表示/非表示を切替(dキーでも次回から非表示にできる)",
+                    _ => "Google APIキー: 検索(Geocoding)とStreet View共通。Enterで入力欄を開く(Cmd+V貼付も可)。環境変数TERMMAP_GOOGLE_API_KEYでも可",
                 };
-                format!(" ▶ {desc}   [↑↓選択 Enter切替 s保存 Esc閉]")
+                format!(" ▶ {desc}   [↑↓選択 Enter切替/編集 Esc閉(自動保存)]")
             }
             Focus::RoadSearch(_) => " 中央フォームに入力中 ".to_string(),
             Focus::Recommend(_) => " 中央フォームに入力中 ".to_string(),
@@ -1023,6 +1026,11 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             Focus::Recommend(b) => draw_input_panel(&mut out, cols, map_rows, "おすすめの方向性 (例: 海沿い / 峠)", "Enter=提案(数秒)  Esc=取消", b, input_cur),
             Focus::SpotRename(b, _) => draw_input_panel(&mut out, cols, map_rows, "カテゴリ名を変更", "Enter=確定  Esc=取消", b, input_cur),
             Focus::SpotEditName(b, _) => draw_input_panel(&mut out, cols, map_rows, "スポット名を変更", "Enter=確定  Esc=取消", b, input_cur),
+            Focus::SettingsEdit(idx, b) => {
+                let (title, hint) = if *idx == 6 { ("道路の点間隔(m)", "数字のみ・100〜5000にクランプ  Enter=確定(自動保存)  Esc=取消") }
+                    else { ("Google APIキー", "印字可能ASCIIのみ(制御文字/改行不可)  Enter=確定(自動保存)  Esc=取消") };
+                draw_input_panel(&mut out, cols, map_rows, title, hint, b, input_cur);
+            }
             _ => {}
         }
         // 色ピッカー(中央パネル・実色スウォッチ)。選択中は [ ] で囲む
@@ -1111,7 +1119,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             || matches!(focus,
                 Focus::SpotForm { .. } | Focus::Search(_) | Focus::SaveName(_) | Focus::NearSearch(_)
                 | Focus::NewCat(_) | Focus::RoadSearch(_) | Focus::Recommend(_)
-                | Focus::SpotRename(..) | Focus::SpotEditName(..) | Focus::ColorPick { .. });
+                | Focus::SpotRename(..) | Focus::SpotEditName(..) | Focus::ColorPick { .. } | Focus::SettingsEdit(..));
         if prev_map_covered && !map_covered { force_reemit = true; }
         prev_map_covered = map_covered;
         out.flush()?;
@@ -1417,29 +1425,43 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                         KeyCode::Left | KeyCode::Right => {
                             if set_sel == 6 { let d = if k.code == KeyCode::Left { -100.0 } else { 100.0 }; cfg.sample_interval_m = (cfg.sample_interval_m + d).clamp(100.0, 5000.0); changed = true; }
                         }
-                        KeyCode::Enter | KeyCode::Char(' ') => { changed = true; match set_sel {
-                            0 => opts.braille = !opts.braille,
-                            1 => opts.classify = !opts.classify,
-                            2 => opts.edge = !opts.edge,
-                            3 => opts.mono = !opts.mono,
-                            4 => { opts.style = match opts.style.as_str() { "osm" => "voyager", "voyager" => "dark", "dark" => "light", _ => "osm" }.to_string(); cache.clear(); }
-                            5 => cfg.route_profile = match cfg.route_profile.as_str() { "car-fast" => "moped", "moped" => "shortest", _ => "car-fast" }.to_string(),
-                            6 => {} // ←→で調整
-                            7 => { cfg.show_spots = !cfg.show_spots; show_spots = cfg.show_spots; apply_spots(&mut spec, &spots, &spot_cats, show_spots); }
-                            8 => cfg.llm_recommend_enabled = !cfg.llm_recommend_enabled,
-                            9 => cfg.llm_model = match cfg.llm_model.as_str() { "claude-sonnet-5" => "claude-haiku-4-5", "claude-haiku-4-5" => "claude-opus-4-8", _ => "claude-sonnet-5" }.to_string(),
-                            10 => cfg.streetview_enabled = !cfg.streetview_enabled,
-                            11 => { cfg.image_mode = !cfg.image_mode; force_reemit = true; }
-                            12 => { cfg.image_res = match cfg.image_res.as_str() { "high" => "low", "low" => "mid", _ => "high" }.to_string(); force_reemit = true; }
-                            13 => { cfg.sound_enabled = !cfg.sound_enabled; snd = sound::Sound::new(cfg.sound_enabled); snd.play("confirm"); }
-                            14 => { // オンボーディング: マーカーの削除=毎回表示 / 作成=次回から非表示
-                                if let Some(p) = onboarded_marker() {
-                                    if p.exists() { let _ = std::fs::remove_file(&p); addr = "オンボーディング: 毎回表示に戻した".into(); }
-                                    else { let _ = crate::fsutil::write_atomic(&p, b"1", None); addr = "オンボーディング: 次回から非表示".into(); }
+                        KeyCode::Enter | KeyCode::Char(' ') => {
+                            if set_sel == 6 { // 道路の点間隔: インライン数値編集を開く
+                                let b = format!("{}", cfg.sample_interval_m as i64);
+                                input_cur = b.chars().count();
+                                focus = Focus::SettingsEdit(6, b);
+                                stay = false;
+                            } else if set_sel == 15 { // Google APIキー: インラインテキスト編集を開く(Cmd+V貼付も引き続き可)
+                                let b = cfg.google_maps_api_key.clone();
+                                input_cur = b.chars().count();
+                                focus = Focus::SettingsEdit(15, b);
+                                stay = false;
+                            } else {
+                                changed = true;
+                                match set_sel {
+                                    0 => opts.braille = !opts.braille,
+                                    1 => opts.classify = !opts.classify,
+                                    2 => opts.edge = !opts.edge,
+                                    3 => opts.mono = !opts.mono,
+                                    4 => { opts.style = match opts.style.as_str() { "osm" => "voyager", "voyager" => "dark", "dark" => "light", _ => "osm" }.to_string(); cache.clear(); }
+                                    5 => cfg.route_profile = match cfg.route_profile.as_str() { "car-fast" => "moped", "moped" => "shortest", _ => "car-fast" }.to_string(),
+                                    7 => { cfg.show_spots = !cfg.show_spots; show_spots = cfg.show_spots; apply_spots(&mut spec, &spots, &spot_cats, show_spots); }
+                                    8 => cfg.llm_recommend_enabled = !cfg.llm_recommend_enabled,
+                                    9 => cfg.llm_model = match cfg.llm_model.as_str() { "claude-sonnet-5" => "claude-haiku-4-5", "claude-haiku-4-5" => "claude-opus-4-8", _ => "claude-sonnet-5" }.to_string(),
+                                    10 => cfg.streetview_enabled = !cfg.streetview_enabled,
+                                    11 => { cfg.image_mode = !cfg.image_mode; force_reemit = true; }
+                                    12 => { cfg.image_res = match cfg.image_res.as_str() { "high" => "low", "low" => "mid", _ => "high" }.to_string(); force_reemit = true; }
+                                    13 => { cfg.sound_enabled = !cfg.sound_enabled; snd = sound::Sound::new(cfg.sound_enabled); snd.play("confirm"); }
+                                    14 => { // オンボーディング: マーカーの削除=毎回表示 / 作成=次回から非表示
+                                        if let Some(p) = onboarded_marker() {
+                                            if p.exists() { let _ = std::fs::remove_file(&p); addr = "オンボーディング: 毎回表示に戻した".into(); }
+                                            else { let _ = crate::fsutil::write_atomic(&p, b"1", None); addr = "オンボーディング: 次回から非表示".into(); }
+                                        }
+                                    }
+                                    _ => {}
                                 }
                             }
-                            _ => addr = "APIキー: この行でCmd+V貼付で設定(自動保存)".into(),
-                        } }
+                        }
                         KeyCode::Char('s') => { changed = true; addr = "設定を保存".into(); }
                         KeyCode::Esc => { snd.play("back"); stay = false; }
                         _ => {}
@@ -1449,6 +1471,27 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                         let _ = config::save_config(&cfg);
                     }
                     if stay { focus = Focus::Settings; } },
+                    Focus::SettingsEdit(idx, mut buf) => match k.code {
+                        KeyCode::Enter => {
+                            if idx == 6 {
+                                match buf.trim().parse::<f64>() {
+                                    Ok(v) => { cfg.sample_interval_m = v.clamp(100.0, 5000.0); let _ = config::save_config(&cfg); addr = format!("道路の点間隔: {}m", cfg.sample_interval_m as i64); }
+                                    Err(_) => { snd.play("error"); addr = "数値を入力してください(例: 800)".into(); }
+                                }
+                            } else if idx == 15 {
+                                let v = buf.trim().to_string();
+                                if v.chars().all(|c| c.is_ascii_graphic() || c == ' ') {
+                                    cfg.google_maps_api_key = v; let _ = config::save_config(&cfg); addr = "APIキー設定(自動保存)".into();
+                                } else { snd.play("error"); addr = "APIキーに使えない文字が含まれています".into(); }
+                            }
+                            focus = Focus::Settings;
+                        }
+                        KeyCode::Esc => { snd.play("back"); focus = Focus::Settings; } // 編集を破棄
+                        // 数値欄(道路の点間隔)は数字/小数点/マイナスのみ受け付ける。APIキー欄は制御文字・改行を弾く。
+                        KeyCode::Char(c) if idx == 6 && !(c.is_ascii_digit() || c == '.' || c == '-') => {}
+                        KeyCode::Char(c) if idx == 15 && !(c.is_ascii_graphic() || c == ' ') => {}
+                        other => { edit_line(&mut buf, &mut input_cur, other); focus = Focus::SettingsEdit(idx, buf); }
+                    },
                     Focus::RoadSearch(mut buf) => match k.code { // 道路名/ref で現在view内をルート化
                         KeyCode::Enter => {
                             let name = buf.trim().to_string();
@@ -2022,6 +2065,14 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 Focus::Search(buf) | Focus::SaveName(buf) | Focus::NearSearch(buf) | Focus::NewCat(buf) | Focus::RoadSearch(buf) | Focus::Recommend(buf) => insert_str_at(buf, &mut input_cur, &s),
                 Focus::SpotForm { name, url, field } => { if *field == 0 { insert_str_at(name, &mut input_cur, &s); } else if *field == 1 { insert_str_at(url, &mut input_cur, &s); } }
                 Focus::SpotRename(buf, _) | Focus::SpotEditName(buf, _) => insert_str_at(buf, &mut input_cur, &s),
+                Focus::SettingsEdit(idx, buf) => {
+                    let filtered: String = if *idx == 6 {
+                        s.chars().filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-').collect()
+                    } else {
+                        s.chars().filter(|c| c.is_ascii_graphic() || *c == ' ').collect()
+                    };
+                    insert_str_at(buf, &mut input_cur, &filtered);
+                }
                 Focus::Settings if set_sel == 15 => { cfg.google_maps_api_key = s.trim().to_string(); let _ = config::save_config(&cfg); addr = "APIキー設定(自動保存)".into(); }
                 _ => {}
             } }
