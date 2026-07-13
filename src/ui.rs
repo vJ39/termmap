@@ -131,7 +131,7 @@ const HELP: &[&str] = &[
     "   W              走りまくり: 峠/展望を巡る周回を自動生成(連打で別案)",
     "",
     " [目的地・お気に入り]",
-    "   f              カテゴリ検索 1ｶﾞｿ 2ｶﾌｪ 3ｺﾝﾋﾞﾆ 4道の駅 5展望 6公園 7峠道",
+    "   f              カテゴリ検索(既定: ｶﾞｿ/ｶﾌｪ/ｺﾝﾋﾞﾆ/道の駅/展望/公園/峠道/ﾊﾞｲｸ駐輪場)。一覧でn新規 x削除 [ ]並替",
     "                   / でキーワード周辺検索(現在範囲) → リスト",
     "                   → リスト: ↑↓選択(地図追従) v=地点追加 Enter移動 f再検索 Esc閉",
     "   S / L          ルートを お気に入り保存 / 呼び出し",
@@ -294,7 +294,7 @@ impl Drop for TermGuard {
 pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Result<()> {
     use crossterm::event::{self, Event, KeyCode, KeyModifiers};
     enum Focus { Map, RoutePanel, Menu(MenuLevel), Search(String), SaveName(String), NearSearch(String), PoiMenu, PoiList, RouteList, WaypointList, RoadList,
-                 NewCat(String), SpotForm { name: String, url: String, field: usize }, SpotList, SpotCatList, SpotRename(String, usize), Settings, SettingsEdit(usize, String), RoadSearch(String), SpotEditName(String, usize), Recommend(String), ColorPick { cat: usize }, ShapePick { cat: usize } }
+                 NewCat(String), SpotForm { name: String, url: String, field: usize }, SpotList, SpotCatList, SpotRename(String, usize), Settings, SettingsEdit(usize, String), RoadSearch(String), SpotEditName(String, usize), Recommend(String), ColorPick { cat: usize }, ShapePick { cat: usize }, PoiKindForm { label: String, tag: String, field: usize } }
     let _guard = TermGuard::enter()?; // Drop で必ず端末復元
     let mut cache: Cache = Cache::new();
     let mut out = std::io::stdout();
@@ -365,8 +365,9 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     let mut street_job: Option<std::sync::mpsc::Receiver<(f64, f64, i32, Result<image::RgbImage, String>)>> = None; // (lat, lon, heading, 実写画像)
     let mut recommend_job: Option<std::sync::mpsc::Receiver<Result<Vec<(f64, f64, String)>, String>>> = None; // 実在確認済みスポット列
     let mut road_job: Option<std::sync::mpsc::Receiver<(String, Result<Vec<(Vec<(f64, f64)>, bool)>, String>)>> = None; // (道路名, roadsearch::fetch結果)
-    let mut catpoi_job: Option<std::sync::mpsc::Receiver<(usize, Result<Vec<(f64, f64, String, PoiCat)>, ApiError>)>> = None; // (POI_KINDSのindex, poi_search結果)
+    let mut catpoi_job: Option<std::sync::mpsc::Receiver<(String, Result<Vec<(f64, f64, String, PoiCat)>, ApiError>)>> = None; // (カテゴリ名, poi_search結果)。ラベルは起動時に確定して送るので途中でpoi_kindsを編集されても安全
     let mut spin: usize = 0; // 通信中スピナーのフレーム(毎ループ+1)
+    let mut poi_kinds: Vec<PoiKind> = load_poi_kinds(); // 目的地カテゴリ(並べ替え/追加/削除可・~/.config/termmap/poi-kinds.txt)
     let mut spots = load_spots();          // マイスポット
     let mut spot_cats = load_spot_cats();
     let mut show_spots = true;
@@ -777,9 +778,9 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 ];
                 ("設定".to_string(), its, set_sel)
             } else if show_poimenu {
-                let mut its: Vec<String> = POI_KINDS.iter().map(|k| k.label.to_string()).collect();
+                let mut its: Vec<String> = poi_kinds.iter().map(|k| format!("{} {}", k.key, k.label)).collect();
                 its.push("キーワードで周辺検索".to_string());
-                ("目的地".to_string(), its, poimenu_sel)
+                ("目的地(n新規 x削除 [ ]並替)".to_string(), its, poimenu_sel)
             } else if show_routes {
                 ("お気に入り".to_string(), route_names.clone(), rn_sel)
             } else if show_roadlist {
@@ -865,6 +866,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             Focus::NearSearch(_) => " 中央フォームに入力中 ".to_string(),
             Focus::NewCat(_) => " 中央フォームに入力中 ".to_string(),
             Focus::SpotForm { .. } => " 新規スポット: ↑↓/Tab移動 入力/貼付 Enter=次/送信 Esc=取消 ".to_string(),
+            Focus::PoiKindForm { .. } => " 新規カテゴリ: ↑↓/Tab移動 入力 Enter=次/追加 Esc=取消 ".to_string(),
             Focus::SpotList if spot_move_confirm.is_some() => {
                 let nm = spot_move_confirm.and_then(|gi| spots.get(gi)).map(|s| if s.name.is_empty() { "(無名)" } else { s.name.as_str() }).unwrap_or("");
                 format!(" 「{nm}」をこの地図中心の位置へ移動する？ y=はい / 他キー=取消 ")
@@ -898,7 +900,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             Focus::RoadSearch(_) => " 中央フォームに入力中 ".to_string(),
             Focus::Recommend(_) => " 中央フォームに入力中 ".to_string(),
             Focus::SpotRename(_, _) => " 中央フォームに入力中 ".to_string(),
-            Focus::PoiMenu => " 目的地カテゴリ: ↑↓選択 Enter=検索 (数字1-7も可 / キーワードは最終行かEnter) Esc=取消 ".to_string(),
+            Focus::PoiMenu => " 目的地カテゴリ: ↑↓選択 Enter=検索(キー直打ちも可) n新規 x削除 [ ]並替 / キーワードは最終行 Esc=取消 ".to_string(),
             Focus::PoiList => format!(" [{}] ↑↓選択(追従) ←→地図 +/-拡縮 v追加 Enter移動 P登録 f再検索 Esc閉 ", poi_label),
             Focus::RouteList => " お気に入り: ↑↓選択 Enter=読込 Esc=閉 ".to_string(),
             Focus::RoutePanel => " ルート一覧: ↑↓選択 Enter実行 [ ]並替 x削除 v追加 +/-拡縮 Esc/Tabで地図へ ".to_string(),
@@ -1016,6 +1018,43 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             let _ = write!(out, "\x1b[{};{}H{}", r0 + rows.len() as u32, c0, btn);
             let _ = write!(out, "\x1b[{};{}H{}{}{}", r0 + rows.len() as u32 + 1, c0, BG, blank, RST);
         }
+        if let Focus::PoiKindForm { label, tag, field } = &focus { // 目的地カテゴリの新規追加フォーム
+            const BG: &str = "\x1b[30;47m";
+            const SEL: &str = "\x1b[97;40m";
+            const RST: &str = "\x1b[0m";
+            let iw = (cols as usize).saturating_sub(6).clamp(24, 60);
+            let label_disp = if *field == 0 { render_with_cursor(label, input_cur) } else { label.clone() };
+            let tag_disp = if *field == 1 { render_with_cursor(tag, input_cur) } else { tag.clone() };
+            let header = "  新しい目的地カテゴリ";
+            let label_line = format!("  表示名: {}", label_disp);
+            let tag_line = format!("  OSMタグ(key=value 例 shop=bakery): {}", tag_disp);
+            let blank = " ".repeat(iw);
+            let rows: [(String, bool); 6] = [
+                (blank.clone(), false),
+                (fit_cells(header, iw), false),
+                (fit_cells(&label_line, iw), *field == 0),
+                (fit_cells(&tag_line, iw), *field == 1),
+                (blank.clone(), false),
+                (blank.clone(), false),
+            ];
+            let mut btn = String::new();
+            btn.push_str(BG); btn.push_str("  ");
+            btn.push_str(if *field == 2 { SEL } else { BG }); btn.push_str("[追加]");
+            btn.push_str(BG); btn.push_str("  ");
+            btn.push_str(if *field == 3 { SEL } else { BG }); btn.push_str("[戻る]");
+            btn.push_str(BG);
+            btn.push_str(&" ".repeat(iw.saturating_sub(2 + 6 + 2 + 6)));
+            btn.push_str(RST);
+            let total = rows.len() + 2;
+            let r0 = ((map_rows as usize).saturating_sub(total) / 2).max(1) as u32;
+            let c0 = ((cols as usize).saturating_sub(iw) / 2).max(1) as u32;
+            for (i, (line, sel)) in rows.iter().enumerate() {
+                let style = if *sel { SEL } else { BG };
+                let _ = write!(out, "\x1b[{};{}H{}{}{}", r0 + i as u32, c0, style, line, RST);
+            }
+            let _ = write!(out, "\x1b[{};{}H{}", r0 + rows.len() as u32, c0, btn);
+            let _ = write!(out, "\x1b[{};{}H{}{}{}", r0 + rows.len() as u32 + 1, c0, BG, blank, RST);
+        }
         // 単一テキスト入力は地図中央のフォームで受ける(底面バーで完結させない)
         match &focus {
             Focus::Search(b) => draw_input_panel(&mut out, cols, map_rows, "地名・住所で検索", "Enter=検索  Esc=取消  (住所も入力OK)", b, input_cur),
@@ -1119,7 +1158,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             || matches!(focus,
                 Focus::SpotForm { .. } | Focus::Search(_) | Focus::SaveName(_) | Focus::NearSearch(_)
                 | Focus::NewCat(_) | Focus::RoadSearch(_) | Focus::Recommend(_)
-                | Focus::SpotRename(..) | Focus::SpotEditName(..) | Focus::ColorPick { .. } | Focus::SettingsEdit(..));
+                | Focus::SpotRename(..) | Focus::SpotEditName(..) | Focus::ColorPick { .. } | Focus::SettingsEdit(..) | Focus::PoiKindForm { .. });
         if prev_map_covered && !map_covered { force_reemit = true; }
         prev_map_covered = map_covered;
         out.flush()?;
@@ -1232,10 +1271,10 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         }
         if catpoi_job.is_some() {
             match catpoi_job.as_ref().unwrap().try_recv() {
-                Ok((i, res)) => {
+                Ok((label, res)) => {
                     match res {
-                        Ok(items) if !items.is_empty() => { pois = items; poi_sel = 0; poi_label = POI_KINDS[i].label.to_string(); set_markers(&mut spec, &wps, &pois); focus = Focus::PoiList; }
-                        Ok(_) => { snd.play("error"); addr = format!("周辺2kmに{}無し", POI_KINDS[i].label); if matches!(focus, Focus::Map) { focus = Focus::PoiMenu; } }
+                        Ok(items) if !items.is_empty() => { pois = items; poi_sel = 0; poi_label = label; set_markers(&mut spec, &wps, &pois); focus = Focus::PoiList; }
+                        Ok(_) => { snd.play("error"); addr = format!("周辺2kmに{label}無し"); if matches!(focus, Focus::Map) { focus = Focus::PoiMenu; } }
                         Err(e) => { addr = format!("({e})"); if matches!(focus, Focus::Map) { focus = Focus::PoiMenu; } }
                     }
                     catpoi_job = None; got_result = true;
@@ -1660,6 +1699,41 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             focus = Focus::SpotForm { name, url, field };
                         }
                     },
+                    Focus::PoiKindForm { mut label, mut tag, mut field } => match k.code { // 目的地カテゴリの新規追加フォーム
+                        KeyCode::Up | KeyCode::BackTab => { field = (field + 3) % 4; input_cur = form_cur(&label, &tag, field); focus = Focus::PoiKindForm { label, tag, field }; }
+                        KeyCode::Down | KeyCode::Tab => { field = (field + 1) % 4; input_cur = form_cur(&label, &tag, field); focus = Focus::PoiKindForm { label, tag, field }; }
+                        KeyCode::Esc => { snd.play("back"); focus = Focus::PoiMenu; }
+                        KeyCode::Enter => match field {
+                            0 => { field = 1; input_cur = tag.chars().count(); focus = Focus::PoiKindForm { label, tag, field }; }
+                            1 => { field = 2; input_cur = 0; focus = Focus::PoiKindForm { label, tag, field }; }
+                            3 => focus = Focus::PoiMenu, // [戻る]
+                            _ => { // 2 = [追加]
+                                let label_in = poi_kind_clean(label.trim());
+                                let t = tag.trim();
+                                let parts: Vec<&str> = t.splitn(2, '=').collect();
+                                let bad_char = |s: &str| s.contains('"') || s.contains('\\') || s.contains('\n');
+                                if label_in.is_empty() { addr = "表示名を入力してください".into(); focus = Focus::PoiKindForm { label, tag, field }; }
+                                else if parts.len() != 2 || parts[0].trim().is_empty() || parts[1].trim().is_empty() || bad_char(t) {
+                                    addr = "OSMタグは key=value 形式(例: shop=bakery)".into();
+                                    focus = Focus::PoiKindForm { label, tag, field };
+                                } else {
+                                    let (tk, tv) = (parts[0].trim(), parts[1].trim());
+                                    let key = next_free_key(&poi_kinds);
+                                    let kind = PoiKind { key, label: label_in.clone(), filter: format!("nwr[\"{tk}\"=\"{tv}\"]"), cat: PoiCat::Other };
+                                    poi_kinds.push(kind);
+                                    let _ = save_poi_kinds(&poi_kinds);
+                                    snd.play("confirm");
+                                    addr = format!("カテゴリ追加: {label_in} ({key})");
+                                    focus = Focus::PoiMenu;
+                                }
+                            }
+                        },
+                        other => {
+                            if field == 0 { edit_line(&mut label, &mut input_cur, other); }
+                            else if field == 1 { edit_line(&mut tag, &mut input_cur, other); }
+                            focus = Focus::PoiKindForm { label, tag, field };
+                        }
+                    },
                     Focus::NearSearch(mut buf) => match k.code {
                         KeyCode::Enter => {
                             let q = buf.trim().to_string();
@@ -1687,18 +1761,38 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     Focus::PoiMenu => match k.code {
                         KeyCode::Esc => {}
                         KeyCode::Up => { poimenu_sel = poimenu_sel.saturating_sub(1); focus = Focus::PoiMenu; }
-                        KeyCode::Down => { if poimenu_sel + 1 <= POI_KINDS.len() { poimenu_sel += 1; } focus = Focus::PoiMenu; }
+                        KeyCode::Down => { if poimenu_sel + 1 <= poi_kinds.len() { poimenu_sel += 1; } focus = Focus::PoiMenu; }
                         KeyCode::Char('/') => { input_cur = 0; focus = Focus::NearSearch(String::new()); }
+                        KeyCode::Char('n') => { input_cur = 0; focus = Focus::PoiKindForm { label: String::new(), tag: String::new(), field: 0 }; } // 新規カテゴリ追加
+                        KeyCode::Char('[') if poimenu_sel > 0 && poimenu_sel < poi_kinds.len() => {
+                            poi_kinds.swap(poimenu_sel, poimenu_sel - 1); poimenu_sel -= 1;
+                            let _ = save_poi_kinds(&poi_kinds);
+                            focus = Focus::PoiMenu;
+                        }
+                        KeyCode::Char(']') if poimenu_sel + 1 < poi_kinds.len() => {
+                            poi_kinds.swap(poimenu_sel, poimenu_sel + 1); poimenu_sel += 1;
+                            let _ = save_poi_kinds(&poi_kinds);
+                            focus = Focus::PoiMenu;
+                        }
+                        KeyCode::Char('x') if poimenu_sel < poi_kinds.len() => {
+                            let removed = poi_kinds.remove(poimenu_sel);
+                            if poimenu_sel >= poi_kinds.len() && poimenu_sel > 0 { poimenu_sel -= 1; }
+                            let _ = save_poi_kinds(&poi_kinds);
+                            addr = format!("カテゴリ削除: {}", removed.label);
+                            focus = Focus::PoiMenu;
+                        }
                         KeyCode::Enter | KeyCode::Char(_) => {
-                            // Enter=選択行 / 数字キー1-7=対応カテゴリ。最終行(=POI_KINDS.len())はキーワード周辺検索。
-                            let idx = if let KeyCode::Char(c) = k.code { POI_KINDS.iter().position(|kk| kk.key == c) } else { Some(poimenu_sel) };
+                            // Enter=選択行 / キー1文字=対応カテゴリ。最終行(=poi_kinds.len())はキーワード周辺検索。
+                            let idx = if let KeyCode::Char(c) = k.code { poi_kinds.iter().position(|kk| kk.key == c) } else { Some(poimenu_sel) };
                             match idx {
-                                Some(i) if i >= POI_KINDS.len() => { input_cur = 0; focus = Focus::NearSearch(String::new()); }
+                                Some(i) if i >= poi_kinds.len() => { input_cur = 0; focus = Focus::NearSearch(String::new()); }
                                 Some(i) => {
+                                    let kind = poi_kinds[i].clone();
+                                    let label = kind.label.clone();
                                     let (tx, rx) = std::sync::mpsc::channel();
                                     std::thread::spawn(move || {
-                                        let r = poi_search(&POI_KINDS[i], cx, cy, z, ow, oh, lat, lon);
-                                        let _ = tx.send((i, r));
+                                        let r = poi_search(&kind, cx, cy, z, ow, oh, lat, lon);
+                                        let _ = tx.send((label, r));
                                     });
                                     catpoi_job = Some(rx);
                                     focus = Focus::Map; // UIは生きたまま(スピナー表示・Escで中断)

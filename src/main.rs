@@ -312,7 +312,9 @@ fn wander_route(origin: (f64, f64), dist_km: f64, shape: &str) -> Result<Vec<(f6
     let dlon = r_km / (111.0 * origin.0.to_radians().cos().abs().max(0.1));
     let (s, w, n, e) = (origin.0 - dlat, origin.1 - dlon, origin.0 + dlat, origin.1 + dlon);
     let mut cands: Vec<(f64, f64, f64, f64)> = Vec::new(); // lat,lon,距離km,方位角
-    for kind in POI_KINDS.iter().filter(|k| k.label == "峠道" || k.label == "展望") {
+    // ユーザーがカテゴリを並べ替え/追加/削除しても、走りまくり生成は既定の峠/展望を使う(挙動を変えない)
+    let default_kinds = poi::poi_kind_defaults();
+    for kind in default_kinds.iter().filter(|k| k.label == "峠道" || k.label == "展望") {
         if let Ok(v) = fetch_pois(kind, s, w, n, e) {
             for (la, lo, _) in v { cands.push((la, lo, haversine_km(origin, (la, lo)), bearing(origin, (la, lo)))); }
         }

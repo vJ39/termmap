@@ -182,18 +182,73 @@ pub fn search_nearby(q: &str, s: f64, w: f64, n: f64, e: f64) -> Result<Vec<(f64
 }
 
 // ---- 目的地検索 (Overpass) ----
-pub struct PoiKind { pub key: char, pub label: &'static str, pub filter: &'static str, pub cat: PoiCat }
-pub const POI_KINDS: [PoiKind; 8] = [
-    PoiKind { key: '1', label: "ガソスタ", filter: "nwr[\"amenity\"=\"fuel\"]", cat: PoiCat::Fuel },
-    PoiKind { key: '2', label: "カフェ", filter: "nwr[\"amenity\"=\"cafe\"]", cat: PoiCat::Food },
-    PoiKind { key: '3', label: "コンビニ", filter: "nwr[\"shop\"=\"convenience\"]", cat: PoiCat::Shop },
-    PoiKind { key: '4', label: "道の駅", filter: "nwr[\"name\"~\"道の駅\"][\"highway\"!~\"traffic_signals|bus_stop\"]", cat: PoiCat::Waypoint },
-    PoiKind { key: '5', label: "展望", filter: "nwr[\"tourism\"=\"viewpoint\"]", cat: PoiCat::Other },
-    PoiKind { key: '6', label: "公園", filter: "nwr[\"leisure\"=\"park\"]", cat: PoiCat::Other },
-    PoiKind { key: '7', label: "峠道", filter: "nwr[\"mountain_pass\"=\"yes\"]", cat: PoiCat::Danger },
-    // 二輪/バイク駐車場。OSMは名称に依らず amenity=motorcycle_parking でタグ付けされる
-    PoiKind { key: '8', label: "バイク駐車場", filter: "nwr[\"amenity\"=\"motorcycle_parking\"]", cat: PoiCat::Other },
-];
+// label/filterは所有String(ユーザーが並べ替え/追加できるよう永続化するため&'static strから変更)。
+#[derive(Clone)]
+pub struct PoiKind { pub key: char, pub label: String, pub filter: String, pub cat: PoiCat }
+
+// 既定の目的地カテゴリ8種。初回起動(永続ファイル未作成)はこれを使う。
+pub fn poi_kind_defaults() -> Vec<PoiKind> {
+    vec![
+        PoiKind { key: '1', label: "ガソスタ".into(), filter: "nwr[\"amenity\"=\"fuel\"]".into(), cat: PoiCat::Fuel },
+        PoiKind { key: '2', label: "カフェ".into(), filter: "nwr[\"amenity\"=\"cafe\"]".into(), cat: PoiCat::Food },
+        PoiKind { key: '3', label: "コンビニ".into(), filter: "nwr[\"shop\"=\"convenience\"]".into(), cat: PoiCat::Shop },
+        PoiKind { key: '4', label: "道の駅".into(), filter: "nwr[\"name\"~\"道の駅\"][\"highway\"!~\"traffic_signals|bus_stop\"]".into(), cat: PoiCat::Waypoint },
+        PoiKind { key: '5', label: "展望".into(), filter: "nwr[\"tourism\"=\"viewpoint\"]".into(), cat: PoiCat::Other },
+        PoiKind { key: '6', label: "公園".into(), filter: "nwr[\"leisure\"=\"park\"]".into(), cat: PoiCat::Other },
+        PoiKind { key: '7', label: "峠道".into(), filter: "nwr[\"mountain_pass\"=\"yes\"]".into(), cat: PoiCat::Danger },
+        // 二輪/バイク駐車場。OSMは名称に依らず amenity=motorcycle_parking でタグ付けされる
+        PoiKind { key: '8', label: "バイク駐車場".into(), filter: "nwr[\"amenity\"=\"motorcycle_parking\"]".into(), cat: PoiCat::Other },
+    ]
+}
+
+fn poi_cat_to_str(c: PoiCat) -> &'static str {
+    match c { PoiCat::Home => "home", PoiCat::Food => "food", PoiCat::Fuel => "fuel", PoiCat::Shop => "shop", PoiCat::Danger => "danger", PoiCat::Waypoint => "waypoint", PoiCat::Other => "other" }
+}
+fn poi_cat_from_str(s: &str) -> PoiCat {
+    match s { "home" => PoiCat::Home, "food" => PoiCat::Food, "fuel" => PoiCat::Fuel, "shop" => PoiCat::Shop, "danger" => PoiCat::Danger, "waypoint" => PoiCat::Waypoint, _ => PoiCat::Other }
+}
+// ラベル/タグにタブ・改行を入れない(永続ファイルの区切りと衝突するため)
+pub fn poi_kind_clean(s: &str) -> String { s.trim().replace(['\t', '\n'], " ") }
+
+fn poi_kinds_path() -> Option<std::path::PathBuf> {
+    Some(std::path::PathBuf::from(std::env::var("HOME").ok()?).join(".config/termmap/poi-kinds.txt"))
+}
+// 行形式: key\tlabel\tfilter\tcat。パース不能な行は読み飛ばす(壊れたファイルでpanicしない)。
+fn parse_poi_kinds_text(s: &str) -> Vec<PoiKind> {
+    let mut v = Vec::new();
+    for l in s.lines() {
+        let mut it = l.splitn(4, '\t');
+        if let (Some(k), Some(label), Some(filter), Some(cat)) = (it.next(), it.next(), it.next(), it.next()) {
+            if let Some(key) = k.chars().next() {
+                v.push(PoiKind { key, label: label.to_string(), filter: filter.to_string(), cat: poi_cat_from_str(cat.trim()) });
+            }
+        }
+    }
+    v
+}
+fn format_poi_kinds_text(v: &[PoiKind]) -> String {
+    v.iter().map(|k| format!("{}\t{}\t{}\t{}\n", k.key, k.label, k.filter, poi_cat_to_str(k.cat))).collect()
+}
+// 永続ファイルが無ければ既定8種を返す(ファイルは触らない=カスタマイズするまで挙動不変)。
+pub fn load_poi_kinds() -> Vec<PoiKind> {
+    let Some(p) = poi_kinds_path() else { return poi_kind_defaults(); };
+    let Ok(s) = std::fs::read_to_string(&p) else { return poi_kind_defaults(); };
+    let v = parse_poi_kinds_text(&s);
+    if v.is_empty() { poi_kind_defaults() } else { v }
+}
+pub fn save_poi_kinds(v: &[PoiKind]) -> Result<(), String> {
+    let p = poi_kinds_path().ok_or("HOME不明")?;
+    if let Some(d) = p.parent() { let _ = std::fs::create_dir_all(d); }
+    std::fs::write(p, format_poi_kinds_text(v)).map_err(|e| e.to_string())
+}
+// 未使用のキー(数字優先→英小文字)を1つ選ぶ。n/xはメニュー操作(新規/削除)の予約キーなので外す。
+// 全て埋まっていたら'?'を返す(表示上の目印)。
+pub fn next_free_key(v: &[PoiKind]) -> char {
+    for c in "1234567890abcdefghijklmopqrstuvwyz".chars() {
+        if !v.iter().any(|k| k.key == c) { return c; }
+    }
+    '?'
+}
 // Overpass out:json の要素。node は lat/lon、way/relation は center を使う。
 #[derive(Deserialize)]
 struct OverLatLon { lat: f64, lon: f64 }
@@ -288,6 +343,35 @@ mod tests {
             Err(ApiError::Decode(_)) => {}
             other => panic!("expected Decode error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn poi_kinds_text_round_trip_preserves_order_and_fields() {
+        // 並べ替え/追加後の保存→読込で順序・key・label・filter・catが保たれる(カスタムカテゴリ永続化)
+        let v = vec![
+            PoiKind { key: '2', label: "カフェ".to_string(), filter: "nwr[\"amenity\"=\"cafe\"]".to_string(), cat: PoiCat::Food },
+            PoiKind { key: '1', label: "ガソスタ".to_string(), filter: "nwr[\"amenity\"=\"fuel\"]".to_string(), cat: PoiCat::Fuel },
+            PoiKind { key: 'b', label: "パン屋".to_string(), filter: "nwr[\"shop\"=\"bakery\"]".to_string(), cat: PoiCat::Other },
+        ];
+        let text = format_poi_kinds_text(&v);
+        let back = parse_poi_kinds_text(&text);
+        assert_eq!(back.len(), 3);
+        assert_eq!(back[0].key, '2'); // 並び順が保たれる(並べ替えの結果を表す)
+        assert_eq!(back[1].key, '1');
+        assert_eq!(back[2].label, "パン屋");
+        assert_eq!(back[2].filter, "nwr[\"shop\"=\"bakery\"]");
+        assert!(matches!(back[2].cat, PoiCat::Other));
+        assert!(matches!(back[0].cat, PoiCat::Food));
+    }
+
+    #[test]
+    fn next_free_key_skips_reserved_and_used() {
+        // n/x はメニュー操作(新規/削除)の予約キーなので割り当てない
+        let v = vec![PoiKind { key: '1', label: "a".into(), filter: "f".into(), cat: PoiCat::Other }];
+        let k = next_free_key(&v);
+        assert_ne!(k, '1'); // 使用済み
+        assert_ne!(k, 'n');
+        assert_ne!(k, 'x');
     }
 
     #[test]
