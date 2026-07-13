@@ -51,8 +51,6 @@ struct Args {
     mono: bool,
     classify: bool,
     edge: bool,
-    interactive: bool,
-    resume: bool,
     here: bool,
     threshold: Option<u8>,
     range: Vec<f64>,
@@ -90,7 +88,7 @@ fn parse_point(raw: &str) -> Result<(f64, f64), String> {
 fn parse_args() -> Args {
     let mut a = Args { lat: None, lon: None, place: None, zoom: 14, width: None, win_px: 640,
                        style: "osm".to_string(), braille: false, mono: false, classify: false,
-                       edge: false, interactive: false, resume: false, here: false, threshold: None,
+                       edge: false, here: false, threshold: None,
                        range: Vec::new(), home: None, route: None, route_mode: "surface".to_string(),
                        gpx: None, load_route: None, save_route: None, list_routes: false, share: false,
                        wander: false, dist: None, shape: "loop".to_string(), image: None, png: None };
@@ -109,8 +107,8 @@ fn parse_args() -> Args {
             "--mono" => a.mono = true,
             "--classify" => a.classify = true,
             "--edge" => a.edge = true,
-            "-i" | "--interactive" => a.interactive = true,
-            "--resume" | "--last" => a.resume = true,
+            // 後方互換エイリアス: 対話は既定の挙動なので何もしない(値を保持するフィールドは持たない)
+            "-i" | "--interactive" | "--resume" | "--last" => {}
             "--here" => a.here = true,
             "--range" => {
                 let v = val!("--range");
