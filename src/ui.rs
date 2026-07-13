@@ -753,7 +753,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             Focus::PoiMenu => " 目的地カテゴリ: ↑↓選択 Enter=検索 (数字1-7も可 / キーワードは最終行かEnter) Esc=取消 ".to_string(),
             Focus::PoiList => format!(" [{}] ↑↓選択(地図追従) ←→地図 v=地点追加 Enter移動 P登録 f再検索 Esc閉 ", poi_label),
             Focus::RouteList => " お気に入り: ↑↓選択 Enter=読込 Esc=閉 ".to_string(),
-            Focus::WaypointList => " 並べ替え: ↑↓選択(地図追従)  Space掴む↔置く(掴み中↑↓で移動)  x削除  +/-拡縮  Esc閉 ".to_string(),
+            Focus::WaypointList => " 並べ替え: ↑↓/ws選択(地図追従)  Space掴む↔置く(掴み中↑↓/wsで移動)  x削除  +/-拡縮  Esc閉 ".to_string(),
             Focus::ColorPick { .. } => " 色を選択: ←→ Enter=決定 Esc=取消 ".to_string(),
             Focus::Menu(MenuLevel::Categories) => " ↑↓カテゴリ Enter展開 / 文字キーで直接実行 Esc閉 ".to_string(),
             Focus::Menu(MenuLevel::Items(_)) => " ↑↓選択 Enter実行 / 右端キーでも実行 Esc戻る ".to_string(),
@@ -1447,7 +1447,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     },
                     // 並べ替えビュー: ↑↓で選択(地図が追従)、Spaceで掴む↔置く、掴み中は↑↓で地点を移動
                     Focus::WaypointList => match k.code {
-                        KeyCode::Up | KeyCode::BackTab => {
+                        KeyCode::Up | KeyCode::BackTab | KeyCode::Char('w') => {
                             if !wps.is_empty() {
                                 if grab && wp_sel > 0 { wps.swap(wp_sel, wp_sel - 1); wp_sel -= 1; let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; }
                                 else { wp_sel = (wp_sel + wps.len() - 1) % wps.len(); }
@@ -1455,7 +1455,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             }
                             focus = Focus::WaypointList;
                         }
-                        KeyCode::Down | KeyCode::Tab => {
+                        KeyCode::Down | KeyCode::Tab | KeyCode::Char('s') => {
                             if !wps.is_empty() {
                                 if grab && wp_sel + 1 < wps.len() { wps.swap(wp_sel, wp_sel + 1); wp_sel += 1; let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; }
                                 else { wp_sel = (wp_sel + 1) % wps.len(); }
