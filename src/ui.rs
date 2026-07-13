@@ -1520,6 +1520,15 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             grab = false;
                             if !wps.is_empty() { if let Some(&(la, lo)) = wps.get(wp_sel) { let (nx, ny) = deg_to_pixel(la, lo, z); cx = nx; cy = ny; } focus = Focus::WaypointList; } // 空になったら閉じる
                         }
+                        KeyCode::Char('v') => { // 中心に地点を追加し、追加した点を選択(リストは wps から即再生成される)
+                            snd.play("pop");
+                            wp_add(&mut wps, (lat, lon));
+                            wp_sel = wps.len().saturating_sub(1);
+                            grab = false;
+                            let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_;
+                            addr = format!("地点を追加 #{}", wps.len());
+                            focus = Focus::WaypointList;
+                        }
                         KeyCode::Esc | KeyCode::Enter => { grab = false; } // 閉じる → Map
                         _ => focus = Focus::WaypointList,
                     },
