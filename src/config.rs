@@ -44,6 +44,7 @@ pub struct Config {
     pub image_mode: bool,            // インライン画像(iTerm2 OSC1337)で実画像を描画。既定OFF(AA描画)
     pub image_res: String,           // 実画像モードの解像度: "high"(scale4)/"mid"(scale2)/"low"(scale1)。既定mid
     pub image_settle_low_res: bool,  // 実画像モードで地図移動中は低解像度に落とすか。既定true(OFFなら常に設定解像度を維持)
+    pub cross_color_idx: u8,         // 中心十字(クロスヘア)の色。spots::SPOT_PALETTEのindex(0..10循環)。既定2(金/従来の黄に近い)
     pub google_maps_api_key: String, // Google Maps系(Geocoding検索/Street View)共通キー。旧streetview_api_keyから改名
     pub streetview_enabled: bool,     // 実写(i)を使うか
     pub sound_enabled: bool,          // 操作UI効果音(macOS afplay)を鳴らすか
@@ -66,6 +67,7 @@ impl Default for Config {
             image_mode: false,
             image_res: "mid".to_string(),
             image_settle_low_res: true,
+            cross_color_idx: 2,
             google_maps_api_key: String::new(),
             streetview_enabled: true,
             sound_enabled: true,
@@ -169,6 +171,7 @@ pub fn load_config_from(path: &Path) -> Config {
                 }
             }
             ("display", "image_settle_low_res") => { if let Some(b) = parse_bool(value) { cfg.image_settle_low_res = b; } }
+            ("display", "cross_color_idx") => { if let Some(n) = parse_number(value) { cfg.cross_color_idx = (n as u8).min(9); } }
             ("google", "maps_api_key") => {
                 if let Some(s) = parse_string(value) {
                     cfg.google_maps_api_key = s;
@@ -229,6 +232,7 @@ pub fn save_config_to(path: &Path, c: &Config) -> Result<(), String> {
          image_mode = {}\n\
          image_res = \"{}\"\n\
          image_settle_low_res = {}\n\
+         cross_color_idx = {}\n\
          \n\
          [google]\n\
          maps_api_key = \"{}\"\n\
@@ -252,6 +256,7 @@ pub fn save_config_to(path: &Path, c: &Config) -> Result<(), String> {
         c.image_mode,
         c.image_res,
         c.image_settle_low_res,
+        c.cross_color_idx,
         c.google_maps_api_key,
         c.streetview_enabled,
         c.sound_enabled,
@@ -395,6 +400,7 @@ mod tests {
             image_mode: true,
             image_res: "low".to_string(),
             image_settle_low_res: false,
+            cross_color_idx: 5,
             google_maps_api_key: "AIzaTESTKEY_example_123".to_string(), streetview_enabled: true,
             sound_enabled: false,
         };
@@ -610,6 +616,7 @@ profile = "custom-profile"
             image_mode: false,
             image_res: "high".to_string(),
             image_settle_low_res: true,
+            cross_color_idx: 0,
             google_maps_api_key: "k".to_string(), streetview_enabled: true,
             sound_enabled: true,
         };

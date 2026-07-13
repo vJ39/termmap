@@ -99,6 +99,9 @@ fn draw_input_panel<W: std::io::Write>(out: &mut W, cols: u32, map_rows: u32, ti
 }
 
 // 緑グラデのワードマーク(オンボーディング/ヘルプ共用)。(ANSI色, 文字)
+// SPOT_PALETTE(spots.rs)と同じ並びの色名。設定画面での表示用。
+const PALETTE_NAMES: [&str; 10] = ["赤", "橙", "金", "黄緑", "水色", "紫", "桃", "緑青", "茶", "灰"];
+
 const LOGO: [(&str, &str); 4] = [
     ("\x1b[1;38;2;130;255;150m", "   ╺┳╸┏━╸┏━┓┏┳┓┏┳┓┏━┓┏━┓"),
     ("\x1b[1;38;2;80;220;110m",  "    ┃ ┣╸ ┣┳┛┃┃┃┃┃┃┣━┫┣━┛"),
@@ -661,9 +664,10 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             match build_window(rcx, rcy, rz, rw, rh, &opts.style, &mut cache) {
                 Ok(img) => {
                     let mut ov = build_overlay(&spec, rcx, rcy, rz, rw, rh, 1.0, 1.0, rw, rh);
-                    let (mx, my) = (rw as i32 / 2, rh as i32 / 2); // 中心クロスヘア(黄)
-                    draw_line(&mut ov, mx - 6, my, mx + 6, my, [255, 255, 0], 1);
-                    draw_line(&mut ov, mx, my - 6, mx, my + 6, [255, 255, 0], 1);
+                    let (mx, my) = (rw as i32 / 2, rh as i32 / 2); // 中心クロスヘア(色は設定で選択可)
+                    let cross = SPOT_PALETTE[cfg.cross_color_idx as usize % SPOT_PALETTE.len()];
+                    draw_line(&mut ov, mx - 6, my, mx + 6, my, cross, 1);
+                    draw_line(&mut ov, mx, my - 6, mx, my + 6, cross, 1);
                     if gps_pos.is_some() { // ライブ現在地: トレイル(薄青)+自位置(赤)
                         for (tla, tlo) in &gps_trail {
                             let (gx, gy) = deg_to_pixel(*tla, *tlo, rz);
@@ -773,6 +777,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     format!("移動中の低解像度化 {}", onoff(cfg.image_settle_low_res)),
                     format!("サウンド {}", onoff(cfg.sound_enabled)),
                     format!("オンボーディング {}", if onboarded_marker().map_or(false, |p| p.exists()) { "非表示" } else { "毎回表示" }),
+                    format!("中心十字の色 {}", PALETTE_NAMES[cfg.cross_color_idx as usize % PALETTE_NAMES.len()]),
                     format!("Google APIキー {}", keyset),
                 ];
                 ("設定".to_string(), its, set_sel)
@@ -894,6 +899,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     13 => "移動中の低解像度化: ONなら地図移動中(動いた直後〜静止350ms)は自動で低解像度にして速く描く。OFFなら常に設定解像度",
                     14 => "サウンド: 操作音のON/OFF(macOSのafplayで再生)",
                     15 => "オンボーディング: 毎回表示/非表示を切替(dキーでも次回から非表示にできる)",
+                    16 => "中心十字の色: 地図中心のクロスヘアの色を循環(spots.rsの配色から選択)",
                     _ => "Google APIキー: 検索(Geocoding)とStreet View共通。Enterで入力欄を開く(Cmd+V貼付も可)。環境変数TERMMAP_GOOGLE_API_KEYでも可",
                 };
                 format!(" ▶ {desc}   [↑↓選択 Enter切替/編集 Esc閉(自動保存)]")
@@ -1505,7 +1511,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     },
                     Focus::Settings => { let mut stay = true; let mut changed = false; match k.code { // 設定画面
                         KeyCode::Up => { set_sel = set_sel.saturating_sub(1); }
-                        KeyCode::Down => { if set_sel + 1 < 17 { set_sel += 1; } }
+                        KeyCode::Down => { if set_sel + 1 < 18 { set_sel += 1; } }
                         KeyCode::Left | KeyCode::Right => {
                             if set_sel == 6 { let d = if k.code == KeyCode::Left { -100.0 } else { 100.0 }; cfg.sample_interval_m = (cfg.sample_interval_m + d).clamp(100.0, 5000.0); changed = true; }
                         }
@@ -1515,10 +1521,10 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                 input_cur = b.chars().count();
                                 focus = Focus::SettingsEdit(6, b);
                                 stay = false;
-                            } else if set_sel == 16 { // Google APIキー: インラインテキスト編集を開く(Cmd+V貼付も引き続き可)
+                            } else if set_sel == 17 { // Google APIキー: インラインテキスト編集を開く(Cmd+V貼付も引き続き可)
                                 let b = cfg.google_maps_api_key.clone();
                                 input_cur = b.chars().count();
-                                focus = Focus::SettingsEdit(16, b);
+                                focus = Focus::SettingsEdit(17, b);
                                 stay = false;
                             } else {
                                 changed = true;
@@ -1543,6 +1549,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                             else { let _ = crate::fsutil::write_atomic(&p, b"1", None); addr = "オンボーディング: 次回から非表示".into(); }
                                         }
                                     }
+                                    16 => { cfg.cross_color_idx = (cfg.cross_color_idx + 1) % PALETTE_NAMES.len() as u8; force_reemit = true; }
                                     _ => {}
                                 }
                             }
@@ -2229,7 +2236,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     };
                     insert_str_at(buf, &mut input_cur, &filtered);
                 }
-                Focus::Settings if set_sel == 16 => { cfg.google_maps_api_key = s.trim().to_string(); let _ = config::save_config(&cfg); addr = "APIキー設定(自動保存)".into(); }
+                Focus::Settings if set_sel == 17 => { cfg.google_maps_api_key = s.trim().to_string(); let _ = config::save_config(&cfg); addr = "APIキー設定(自動保存)".into(); }
                 _ => {}
             } }
             Some(Event::Resize(..)) => { let _ = write!(out, "\x1b[2J"); force_reemit = true; } // 端末サイズ変更: 全消去して次フレームで再描画(インライン画像の残像防止)
