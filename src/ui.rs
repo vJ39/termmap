@@ -527,7 +527,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     }
                 }
                 let hd = ((heading % 360) + 360) % 360;
-                let st = fit_cells(&format!(" 実写 h{hd}°  ←→向き ↑↓移動  Esc/q戻る  {slat:.4},{slon:.4} "), cols as usize);
+                let st = fit_cells(&format!(" 実写 h{hd}°  ←→向き ↑↓移動 (Shiftで微調整)  Esc/q戻る  {slat:.4},{slon:.4} "), cols as usize);
                 let _ = write!(out, "\x1b[{};1H\x1b[7m{st}\x1b[0m\x1b[K", tr);
                 let _ = out.flush();
             }
@@ -535,12 +535,15 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             if let Event::Key(k) = event::read()? {
                 match k.code {
                     KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down => {
-                        // ←→=向き回転 / ↑↓=向き方向に前後移動(隣パノラマへスナップ)
+                        // ←→=向き回転(既定45°/Shiftで10°の微調整) / ↑↓=向き方向に前後移動(既定20m/Shiftで5m)
+                        let fine = k.modifiers.contains(KeyModifiers::SHIFT);
+                        let rot = if fine { 10 } else { 45 };
+                        let dist = if fine { 5.0 } else { 20.0 };
                         let (nlat, nlon, nhd) = match k.code {
-                            KeyCode::Left => (slat_c, slon_c, hd_c - 45),
-                            KeyCode::Right => (slat_c, slon_c, hd_c + 45),
-                            KeyCode::Up => { let (a, b) = streetview::step(slat_c, slon_c, hd_c as f64, 20.0); (a, b, hd_c) }
-                            _ => { let (a, b) = streetview::step(slat_c, slon_c, hd_c as f64 + 180.0, 20.0); (a, b, hd_c) }
+                            KeyCode::Left => (slat_c, slon_c, hd_c - rot),
+                            KeyCode::Right => (slat_c, slon_c, hd_c + rot),
+                            KeyCode::Up => { let (a, b) = streetview::step(slat_c, slon_c, hd_c as f64, dist); (a, b, hd_c) }
+                            _ => { let (a, b) = streetview::step(slat_c, slon_c, hd_c as f64 + 180.0, dist); (a, b, hd_c) }
                         };
                         if let Ok(im) = streetview::fetch(nlat, nlon, nhd, 640, 480, &cfg.google_maps_api_key) {
                             street = Some((im, nhd, nlat, nlon)); // Err時は現状維持(行き止まり等)
