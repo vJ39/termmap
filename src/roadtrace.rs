@@ -230,6 +230,40 @@ pub fn point_at(poly: &[(f64, f64)], dist_m: f64) -> (f64, f64) {
     *poly.last().unwrap()
 }
 
+/// poly を「連続点間距離 > gap_m」で分割し、center に最も近い点を含むサブセグメントだけを返す。
+/// assemble_polyline は散らばった断片も貪欲連結で1本にするため大ジャンプが混じることがある。
+/// これを gap_m でぶった切り、view中心に一番近い連結成分(=いま見ている道)だけを塊として残す。
+/// poly が空なら空Vecを返す。
+pub fn nearest_segment(poly: &[(f64, f64)], center: (f64, f64), gap_m: f64) -> Vec<(f64, f64)> {
+    if poly.is_empty() {
+        return Vec::new();
+    }
+    // 連続点間距離が gap_m を超えた所で新しいサブセグメントに分ける
+    let mut segments: Vec<Vec<(f64, f64)>> = Vec::new();
+    let mut cur: Vec<(f64, f64)> = vec![poly[0]];
+    for i in 1..poly.len() {
+        if haversine_m(poly[i - 1], poly[i]) > gap_m {
+            segments.push(std::mem::take(&mut cur));
+        }
+        cur.push(poly[i]);
+    }
+    segments.push(cur);
+
+    // center に最も近い点を含むサブセグメントを選ぶ
+    let mut best_seg = 0usize;
+    let mut best_d = f64::INFINITY;
+    for (si, seg) in segments.iter().enumerate() {
+        for &p in seg {
+            let d = haversine_m(center, p);
+            if d < best_d {
+                best_d = d;
+                best_seg = si;
+            }
+        }
+    }
+    segments.into_iter().nth(best_seg).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,5 +409,32 @@ mod tests {
         assert!((mid.0 - 35.005).abs() < 1e-4 && (mid.1 - 139.0).abs() < 1e-9);
         assert_eq!(point_at(&poly, 0.0), poly[0]); // 先頭
         assert_eq!(point_at(&poly, total * 2.0), poly[1]); // 範囲外→末尾
+    }
+
+    #[test]
+    fn nearest_segment_handles_empty_and_single() {
+        let empty: Vec<(f64, f64)> = Vec::new();
+        assert!(nearest_segment(&empty, (35.0, 139.0), 500.0).is_empty());
+
+        let single = vec![(35.0, 139.0)];
+        assert_eq!(nearest_segment(&single, (0.0, 0.0), 500.0), single);
+    }
+
+    #[test]
+    fn nearest_segment_keeps_center_cluster() {
+        // 2つの塊を大ジャンプ(gap超え)で繋いだポリライン。
+        // クラスタA(35.0付近)とクラスタB(36.0付近)は約111km離れており、
+        // 各塊内の連続点間は約111m(gap 500m未満)で繋がっている。
+        let poly = vec![
+            (35.000, 139.0), (35.001, 139.0), (35.002, 139.0), // A
+            (36.000, 139.0), (36.001, 139.0), (36.002, 139.0), // B(Aから大ジャンプ)
+        ];
+        let cluster_a = vec![(35.000, 139.0), (35.001, 139.0), (35.002, 139.0)];
+        let cluster_b = vec![(36.000, 139.0), (36.001, 139.0), (36.002, 139.0)];
+
+        // 中心をA側に置く → A の塊だけ残る
+        assert_eq!(nearest_segment(&poly, (35.001, 139.0), 500.0), cluster_a);
+        // 中心をB側に置く → B の塊だけ残る
+        assert_eq!(nearest_segment(&poly, (36.001, 139.0), 500.0), cluster_b);
     }
 }

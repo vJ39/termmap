@@ -170,16 +170,28 @@ const HELP: &[&str] = &[
     "   (任意のキーで閉じる)",
 ];
 
+// 道路の塊(RoadSeg)ごとの表示色。BRouterルートの cyan [0,220,255] と被らない色を len で循環。
+const ROAD_PALETTE: &[[u8; 3]] = &[
+    [180, 80, 255],  // 紫
+    [255, 140, 0],   // 橙
+    [0, 200, 120],   // 緑
+    [255, 80, 180],  // 桃
+    [230, 200, 0],   // 黄
+];
+
+// 道路名検索(r)で追加した道路1本ぶんの塊。個別に色を持ち、一覧から個別削除できる。
+struct RoadSeg { name: String, color: [u8; 3], pts: Vec<(f64, f64)> }
+
 // Space メニュー。2階層(カテゴリ→項目)。項目は「操作として読める動詞ラベル」+ 単キー。
 // 実処理は run_action! マクロ(interactive 内)に集約し、各キーの直接操作と共通化している。
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MenuAction {
-    SearchPlace, SearchPoi, ShowAddress, Recommend,                        // 検索・移動
-    RouteForm, AddVia, RoadRoute, Wander, CycleMode, AltRoute, ClearRoute, // ルート作成(RouteForm=並べ替えを開く / AddVia=中心に地点を置く)
-    ManageSpots, ToggleSpots,                                              // スポット
-    ToggleElevation, StreetView, PlayRoute, ToggleGps,                     // ナビ・表示
-    SaveRoute, LoadRoute, SaveGpx, ShareQr,                                // 保存・共有
-    Settings, Help,                                                        // 設定・ヘルプ
+    SearchPlace, SearchPoi, ShowAddress, Recommend,                                    // 検索・移動
+    RouteForm, AddVia, RoadRoute, ManageRoads, Wander, CycleMode, AltRoute, ClearRoute, // ルート作成(RouteForm=並べ替えを開く / AddVia=中心に地点を置く / ManageRoads=道路の塊を管理)
+    ManageSpots, ToggleSpots,                                                          // スポット
+    ToggleElevation, StreetView, PlayRoute, ToggleGps,                                 // ナビ・表示
+    SaveRoute, LoadRoute, SaveGpx, ShareQr,                                            // 保存・共有
+    Settings, Help,                                                                    // 設定・ヘルプ
 }
 struct MenuItem { label: &'static str, key: char, action: MenuAction }
 struct MenuCategory { label: &'static str, items: &'static [MenuItem] }
@@ -195,6 +207,7 @@ const MENU_CATEGORIES: &[MenuCategory] = &[
         MenuItem { label: "地点を置く(中心)",  key: 'v', action: MenuAction::AddVia },
         MenuItem { label: "並べ替え・編集",    key: 'R', action: MenuAction::RouteForm },
         MenuItem { label: "道路名から追加",    key: 'r', action: MenuAction::RoadRoute },
+        MenuItem { label: "道路の塊を管理",    key: 'D', action: MenuAction::ManageRoads },
         MenuItem { label: "おまかせ周回",      key: 'W', action: MenuAction::Wander },
         MenuItem { label: "移動モード切替",    key: 'm', action: MenuAction::CycleMode },
         MenuItem { label: "別ルートを検索",    key: 'n', action: MenuAction::AltRoute },
@@ -284,7 +297,7 @@ impl Drop for TermGuard {
 
 pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Result<()> {
     use crossterm::event::{self, Event, KeyCode, KeyModifiers};
-    enum Focus { Map, Menu(MenuLevel), Search(String), SaveName(String), NearSearch(String), PoiMenu, PoiList, RouteList, WaypointList,
+    enum Focus { Map, Menu(MenuLevel), Search(String), SaveName(String), NearSearch(String), PoiMenu, PoiList, RouteList, WaypointList, RoadList,
                  NewCat(String), SpotForm { name: String, url: String, field: usize }, SpotList, SpotCatList, SpotRename(String, usize), Settings, RoadSearch(String), SpotEditName(String, usize), Recommend(String), ColorPick { cat: usize } }
     let _guard = TermGuard::enter()?; // Drop で必ず端末復元
     let mut cache: Cache = Cache::new();
@@ -311,6 +324,8 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
 
     let mut wps: Vec<(f64, f64)> = a.route.clone().unwrap_or_default(); // 始点..終点
     let mut wp_sel: usize = 0;             // Tab で巡回する選択 waypoint
+    let mut road_segs: Vec<RoadSeg> = Vec::new(); // 道路名検索(r)で追加した道路の塊(別色レイヤ・spec.roadsへ同期)
+    let mut road_sel: usize = 0;           // 道路一覧(RoadList)の選択行
     let mut grab = false;                  // 並べ替えビューで地点を「掴んで」移動中か
     let mut mode = a.route_mode.clone();
     let mut pois: Vec<(f64, f64, String, PoiCat)> = Vec::new(); // 目的地検索結果
@@ -387,7 +402,8 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     route_note = nn; route_job = jj;
                 } else { snd.play("error"); addr = "ルート未確定".into(); }
             }
-            MenuAction::ClearRoute => { wps.clear(); wp_sel = 0; let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; }
+            MenuAction::ClearRoute => { wps.clear(); wp_sel = 0; road_segs.clear(); spec.roads.clear(); let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; }
+            MenuAction::ManageRoads => { if road_segs.is_empty() { snd.play("error"); addr = "道路の塊がまだ無い(rで道路を追加)".into(); } else { road_sel = 0; focus = Focus::RoadList; } }
             MenuAction::ManageSpots => { cat_sel = 0; focus = Focus::SpotCatList; }
             MenuAction::ToggleSpots => { show_spots = !show_spots; apply_spots(&mut spec, &spots, &spot_cats, show_spots); addr = if show_spots { "マイスポット表示".into() } else { "マイスポット非表示".into() }; }
             MenuAction::ToggleElevation => {
@@ -441,6 +457,11 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             MenuAction::Help => { help = true; }
         }
     }};}
+
+    // road_segs の変更後に描画用の spec.roads を作り直す(trigger_route等では消えない別レイヤ)。
+    macro_rules! sync_roads { () => {
+        spec.roads = road_segs.iter().map(|r| Route { pts: r.pts.clone(), color: r.color, thickness: 2 }).collect();
+    };}
 
     let _ = write!(out, "\x1b[2J");
     loop {
@@ -513,7 +534,8 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         let show_settings = matches!(focus, Focus::Settings);
         let show_menu = matches!(focus, Focus::Menu(_));
         let show_poimenu = matches!(focus, Focus::PoiMenu);
-        let gut: u32 = if !pois.is_empty() || show_routes || show_wps || show_route || show_splist || show_catlist || show_settings || show_menu || show_poimenu { 28 } else { 0 };
+        let show_roadlist = matches!(focus, Focus::RoadList);
+        let gut: u32 = if !pois.is_empty() || show_routes || show_wps || show_route || show_splist || show_catlist || show_settings || show_menu || show_poimenu || show_roadlist { 28 } else { 0 };
         let map_cols = cols.saturating_sub(gut).max(10);
         let (ow, oh) = if opts.braille || opts.edge { (map_cols * 2, map_rows * 4) } else { (map_cols, map_rows * 2) };
         if let Some(p) = &gps_rx { // ライブ現在地を取り込み、自位置に追従
@@ -646,6 +668,10 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 ("目的地".to_string(), its, poimenu_sel)
             } else if show_routes {
                 ("お気に入り".to_string(), route_names.clone(), rn_sel)
+            } else if show_roadlist {
+                // 各行を塊マーカー │ + 道路名で。色はマップ側の別色で区別(gutterはfit_cells制約でANSI不可)
+                let its = road_segs.iter().map(|r| format!("│ {}", if r.name.is_empty() { "(無名)" } else { r.name.as_str() })).collect();
+                ("道路".to_string(), its, road_sel)
             } else {
                 let its = pois.iter().map(|(la, lo, nm, _)| {
                     let d = haversine_km((lat, lon), (*la, *lo));
@@ -753,6 +779,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             Focus::PoiMenu => " 目的地カテゴリ: ↑↓選択 Enter=検索 (数字1-7も可 / キーワードは最終行かEnter) Esc=取消 ".to_string(),
             Focus::PoiList => format!(" [{}] ↑↓選択(地図追従) ←→地図 v=地点追加 Enter移動 P登録 f再検索 Esc閉 ", poi_label),
             Focus::RouteList => " お気に入り: ↑↓選択 Enter=読込 Esc=閉 ".to_string(),
+            Focus::RoadList => " 道路: ↑↓選択 x削除 Esc戻る ".to_string(),
             Focus::WaypointList => " 並べ替え: ↑↓/ws選択(地図追従)  Space掴む↔置く(掴み中↑↓/wsで移動)  x削除  +/-拡縮  Esc閉 ".to_string(),
             Focus::ColorPick { .. } => " 色を選択: ←→ Enter=決定 Esc=取消 ".to_string(),
             Focus::Menu(MenuLevel::Categories) => " ↑↓カテゴリ Enter展開 / 文字キーで直接実行 Esc閉 ".to_string(),
@@ -1180,14 +1207,14 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                     Ok(frags) if !frags.is_empty() => {
                                         let rf: Vec<roadtrace::RoadFrag> = frags.into_iter().map(|(pts, oneway)| roadtrace::RoadFrag { pts, oneway }).collect();
                                         let poly = roadtrace::assemble_polyline(&rf);
-                                        let samp = roadtrace::sample_every(&poly, cfg.sample_interval_m.max(100.0));
-                                        if samp.len() >= 2 {
-                                            wps.extend(samp); // 複数の道路名を順に繋げる(cで全消去してから始めると綺麗)
-                                            if wps.len() > 150 { wps.truncate(150); } // BRouter過負荷防止の上限
-                                            wp_sel = 0;
-                                            let (nn, jj) = trigger_route(&mut spec, &wps, &pois, &mode, 0);
-                                            route_note = nn; route_job = jj;
-                                            addr = format!("道路: {name} 追加 (計{}点/連結は次のrで続けて指定)", wps.len());
+                                        // view中心に近い連結成分だけを塊として残す(大ジャンプで繋がった飛び地を捨てる)
+                                        let seg = roadtrace::nearest_segment(&poly, (lat, lon), 500.0);
+                                        if seg.len() >= 2 {
+                                            // BRouterでは縫わず(wpsには入れない)、別色レイヤの塊として保持する
+                                            let color = ROAD_PALETTE[road_segs.len() % ROAD_PALETTE.len()];
+                                            road_segs.push(RoadSeg { name: name.clone(), color, pts: seg });
+                                            sync_roads!();
+                                            addr = format!("道路: {name} を塊で追加(計{}本)", road_segs.len());
                                         } else { addr = "道路: 点が足りない(拡大/移動して再検索)".into(); }
                                     }
                                     Ok(_) => addr = format!("道路が見つからない: {name}(view内に無い)"),
@@ -1449,6 +1476,21 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                         KeyCode::Esc => {}
                         _ => focus = Focus::RouteList,
                     },
+                    Focus::RoadList => match k.code { // 道路の塊の一覧(個別削除)
+                        KeyCode::Up => { road_sel = road_sel.saturating_sub(1); focus = Focus::RoadList; }
+                        KeyCode::Down => { if road_sel + 1 < road_segs.len() { road_sel += 1; } focus = Focus::RoadList; }
+                        KeyCode::Char('x') => { // 選択した道路の塊を削除
+                            if road_sel < road_segs.len() {
+                                road_segs.remove(road_sel);
+                                if road_sel >= road_segs.len() && road_sel > 0 { road_sel -= 1; }
+                                sync_roads!();
+                            }
+                            if road_segs.is_empty() { addr = "道路を全削除".into(); } // 空になったら閉じる(focusはMapのまま)
+                            else { focus = Focus::RoadList; }
+                        }
+                        KeyCode::Esc => { snd.play("back"); } // 閉じる → Map
+                        _ => focus = Focus::RoadList,
+                    },
                     // 並べ替えビュー: ↑↓で選択(地図が追従)、Spaceで掴む↔置く、掴み中は↑↓で地点を移動
                     Focus::WaypointList => match k.code {
                         KeyCode::Up | KeyCode::BackTab | KeyCode::Char('w') => {
@@ -1639,7 +1681,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             KeyCode::Char('[') => { wp_swap(&mut wps, &mut wp_sel, true); { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } }
                             KeyCode::Char(']') => { wp_swap(&mut wps, &mut wp_sel, false); { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } }
                             KeyCode::Char('m') => { mode = match mode_label(&mode) { "下道" => "highway", "高速" => "short", _ => "surface" }.to_string(); { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } }
-                            KeyCode::Char('c') => { wps.clear(); wp_sel = 0; { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } }
+                            KeyCode::Char('c') => { wps.clear(); wp_sel = 0; road_segs.clear(); spec.roads.clear(); { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } }
                             KeyCode::Char('g') => match spec.routes.last() {
                                 Some(rt) => addr = match write_gpx("termmap-route.gpx", &rt.pts) { Ok(_) => "GPX保存: termmap-route.gpx".into(), Err(e) => format!("({e})") },
                                 None => { snd.play("error"); addr = "ルート未確定".into(); }

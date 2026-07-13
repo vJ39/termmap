@@ -191,7 +191,7 @@ fn build_spec(a: &Args, center_lat: f64, center_lon: f64) -> OverlaySpec {
         let (rl, ro) = a.home.unwrap_or((center_lat, center_lon));
         rings.push(Ring { lat: rl, lon: ro, radii_km: a.range.clone(), color: [255, 90, 90], thickness: 2 });
     }
-    OverlaySpec { pois: Vec::new(), routes: Vec::new(), rings, spots: Vec::new() }
+    OverlaySpec { pois: Vec::new(), routes: Vec::new(), roads: Vec::new(), rings, spots: Vec::new() }
 }
 // --route があれば BRouter で取得して spec に追加し、要約(距離/時間)を返す。--gpx 指定時は書き出し。
 fn attach_route(spec: &mut OverlaySpec, a: &Args) -> Result<Option<String>, String> {

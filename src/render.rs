@@ -125,9 +125,11 @@ fn poi_color(c: PoiCat) -> [u8; 3] {
 pub struct Poi { pub lat: f64, pub lon: f64, pub cat: PoiCat }
 pub struct Route { pub pts: Vec<(f64, f64)>, pub color: [u8; 3], pub thickness: u32 }
 pub struct Ring { pub lat: f64, pub lon: f64, pub radii_km: Vec<f64>, pub color: [u8; 3], pub thickness: u32 }
-pub struct OverlaySpec { pub pois: Vec<Poi>, pub routes: Vec<Route>, pub rings: Vec<Ring>, pub spots: Vec<(f64, f64, [u8; 3])> }
+// roads は道路名検索(r)で追加した道路の「塊」を保持する別レイヤ。routes(BRouterルート)とは
+// 独立で、trigger_route の routes.clear() では消えない。個別追加・個別削除できる。
+pub struct OverlaySpec { pub pois: Vec<Poi>, pub routes: Vec<Route>, pub roads: Vec<Route>, pub rings: Vec<Ring>, pub spots: Vec<(f64, f64, [u8; 3])> }
 impl OverlaySpec {
-    pub fn is_empty(&self) -> bool { self.pois.is_empty() && self.routes.is_empty() && self.rings.is_empty() && self.spots.is_empty() }
+    pub fn is_empty(&self) -> bool { self.pois.is_empty() && self.routes.is_empty() && self.roads.is_empty() && self.rings.is_empty() && self.spots.is_empty() }
 }
 
 // インクマスク層。描画は最終出力寸法(resize後)で構築する。
@@ -197,9 +199,13 @@ pub fn build_overlay(spec: &OverlaySpec, cx: f64, cy: f64, z: u32, win_w: u32, w
             draw_ring(&mut ov, rx, ry, rpx, r.color, r.thickness);
         }
     }
-    for rt in &spec.routes { // 経路
+    for rt in &spec.routes { // 経路(BRouterルート)
         let pts: Vec<(i32, i32)> = rt.pts.iter().map(|&(la, lo)| to_img(la, lo)).collect();
         draw_polyline(&mut ov, &pts, rt.color, rt.thickness);
+    }
+    for rd in &spec.roads { // 道路の塊(別色レイヤ・BRouterルートの上に乗る)
+        let pts: Vec<(i32, i32)> = rd.pts.iter().map(|&(la, lo)| to_img(la, lo)).collect();
+        draw_polyline(&mut ov, &pts, rd.color, rd.thickness);
     }
     for p in &spec.pois { // マーカー(最前面)
         let (ix, iy) = to_img(p.lat, p.lon);
