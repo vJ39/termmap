@@ -324,12 +324,22 @@ fn wander_route(origin: (f64, f64), dist_km: f64, shape: &str) -> Result<Vec<(f6
     let pool = if band.len() >= 2 { band } else { cands };
     let mut rng = rng_seed();
     let k = ((dist_km / 20.0).round() as usize).clamp(2, 6);
+    // 隣接waypointがほぼ同一地点(≒100m未満)だとBRouterがルーティングできず、ルート線が
+    // 描画されないまま点だけプロットされる(#27の非同期化前から潜んでいた既存バグ)。
+    // 始点との重複/選択済み点同士の重複をここで弾く。
+    const MIN_SEP_DEG: f64 = 0.001; // 緯度経度で約111m
+    let near = |a: (f64, f64), b: (f64, f64)| (a.0 - b.0).abs() < MIN_SEP_DEG && (a.1 - b.1).abs() < MIN_SEP_DEG;
     let mut wps = vec![origin];
     if shape == "oneway" {
         let dir = (lcg(&mut rng) % 360) as f64;
-        let mut sel: Vec<(f64, f64, f64, f64)> = pool.iter().cloned().filter(|t| angdiff(t.3, dir) < 60.0).collect();
+        let mut sel: Vec<(f64, f64, f64, f64)> = pool.iter().cloned()
+            .filter(|t| angdiff(t.3, dir) < 60.0 && !near(origin, (t.0, t.1)))
+            .collect();
         sel.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
-        for t in sel.into_iter().take(k) { wps.push((t.0, t.1)); }
+        for t in sel {
+            if wps.len() > k { break; }
+            if !wps.iter().any(|&p| near(p, (t.0, t.1))) { wps.push((t.0, t.1)); }
+        }
         if wps.len() < 2 { return Err("その方角にスポットが無い".into()); }
     } else {
         let offset = (lcg(&mut rng) % 360) as f64;
@@ -337,7 +347,8 @@ fn wander_route(origin: (f64, f64), dist_km: f64, shape: &str) -> Result<Vec<(f6
         for i in 0..k {
             let center = (offset + 360.0 * i as f64 / k as f64) % 360.0;
             if let Some(t) = pool.iter().min_by(|a, b| angdiff(a.3, center).partial_cmp(&angdiff(b.3, center)).unwrap_or(std::cmp::Ordering::Equal)) {
-                if angdiff(t.3, center) < 360.0 / k as f64 && !picked.iter().any(|p| (p.0 - t.0).abs() < 1e-6 && (p.1 - t.1).abs() < 1e-6) {
+                let dup = near(origin, (t.0, t.1)) || picked.iter().any(|&(pla, plo, _)| near((pla, plo), (t.0, t.1)));
+                if angdiff(t.3, center) < 360.0 / k as f64 && !dup {
                     picked.push((t.0, t.1, t.3));
                 }
             }

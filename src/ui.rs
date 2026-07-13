@@ -910,7 +910,10 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             Focus::PoiMenu => " 目的地カテゴリ: ↑↓選択 Enter=検索(キー直打ちも可) n新規 x削除 [ ]並替 / キーワードは最終行 Esc=取消 ".to_string(),
             Focus::PoiList => format!(" [{}] ↑↓選択(追従) ←→地図 +/-拡縮 v追加 Enter移動 P登録 f再検索 Esc閉 ", poi_label),
             Focus::RouteList => " お気に入り: ↑↓選択 Enter=読込 Esc=閉 ".to_string(),
-            Focus::RoutePanel => " ルート一覧: ↑↓/ws選択 Enter実行 [ ]/ad並替 x削除 v追加 +/-拡縮 Esc/Tabで地図へ ".to_string(),
+            Focus::RoutePanel => {
+                let base = " ルート一覧: ↑↓/ws選択 Enter実行 [ ]/ad並替 x削除 v追加 +/-拡縮 Esc/Tabで地図へ ".to_string();
+                match &route_note { Some(rn) => format!("{base}| {rn} "), None => base }
+            }
             Focus::RoadList => " 道路: ↑↓選択 x削除 Esc戻る ".to_string(),
             Focus::WaypointList => " 並べ替え: ↑↓/ws選択(地図追従)  Space掴む↔置く(掴み中↑↓/wsで移動)  x削除  +/-拡縮  Esc閉 ".to_string(),
             Focus::ColorPick { .. } => " 色を選択: ←→ Enter=決定 Esc=取消 ".to_string(),
