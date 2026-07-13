@@ -900,7 +900,11 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             const RST: &str = "\x1b[0m";
             let iw = 34usize;
             let lines = [
-                "  termmap へようこそ",
+                "",
+                "   ╺┳╸┏━╸┏━┓┏┳┓┏┳┓┏━┓┏━┓",
+                "    ┃ ┣╸ ┣┳┛┃┃┃┃┃┃┣━┫┣━┛",
+                "    ╹ ┗━╸╹┗╸╹╹╹╹╹╹╹ ╹╹",
+                "   terminal touring map",
                 "",
                 "  Space   メニューを開く",
                 "  ?       ヘルプ",
