@@ -1673,10 +1673,10 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     },
                     // Space メニュー・トップ(カテゴリ選択)。文字キーは全カテゴリ横断で直接実行できる。
                     Focus::Menu(MenuLevel::Categories) => match k.code {
-                        KeyCode::Up => { menu_cat_sel = menu_cat_sel.saturating_sub(1); focus = Focus::Menu(MenuLevel::Categories); }
-                        KeyCode::Down => { if menu_cat_sel + 1 < MENU_CATEGORIES.len() { menu_cat_sel += 1; } focus = Focus::Menu(MenuLevel::Categories); }
-                        KeyCode::Enter => { menu_item_sel = 0; focus = Focus::Menu(MenuLevel::Items(menu_cat_sel)); }
-                        KeyCode::Esc => {} // メニューを閉じる → Map(音は鳴らさない)
+                        KeyCode::Up => { snd.play("blip"); menu_cat_sel = menu_cat_sel.saturating_sub(1); focus = Focus::Menu(MenuLevel::Categories); }
+                        KeyCode::Down => { snd.play("blip"); if menu_cat_sel + 1 < MENU_CATEGORIES.len() { menu_cat_sel += 1; } focus = Focus::Menu(MenuLevel::Categories); }
+                        KeyCode::Enter => { snd.play("click"); menu_item_sel = 0; focus = Focus::Menu(MenuLevel::Items(menu_cat_sel)); }
+                        KeyCode::Esc => { snd.play("back"); } // メニューを閉じる → Map
                         KeyCode::Char(c) => match menu_action_for_key(c) {
                             Some(act) => run_action!(act, lat, lon, cols, tr),
                             None => focus = Focus::Menu(MenuLevel::Categories),
@@ -1687,8 +1687,8 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     Focus::Menu(MenuLevel::Items(ci)) => {
                         let items = MENU_CATEGORIES[ci].items;
                         match k.code {
-                            KeyCode::Up => { menu_item_sel = menu_item_sel.saturating_sub(1); focus = Focus::Menu(MenuLevel::Items(ci)); }
-                            KeyCode::Down => { if menu_item_sel + 1 < items.len() { menu_item_sel += 1; } focus = Focus::Menu(MenuLevel::Items(ci)); }
+                            KeyCode::Up => { snd.play("blip"); menu_item_sel = menu_item_sel.saturating_sub(1); focus = Focus::Menu(MenuLevel::Items(ci)); }
+                            KeyCode::Down => { snd.play("blip"); if menu_item_sel + 1 < items.len() { menu_item_sel += 1; } focus = Focus::Menu(MenuLevel::Items(ci)); }
                             KeyCode::Enter => run_action!(items[menu_item_sel].action, lat, lon, cols, tr),
                             KeyCode::Esc => { snd.play("back"); focus = Focus::Menu(MenuLevel::Categories); } // 上位カテゴリへ戻る
                             KeyCode::Char(c) => match items.iter().find(|it| it.key == c) {
@@ -1766,7 +1766,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             }
                             KeyCode::Tab | KeyCode::Char('s') => { if !wps.is_empty() { wp_sel = (wp_sel + 1) % wps.len(); let (la, lo) = wps[wp_sel]; let (nx, ny) = deg_to_pixel(la, lo, z); cx = nx; cy = ny; } } // 一覧の選択を回す(選択点へ寄る)。s=次
                             KeyCode::BackTab | KeyCode::Char('w') => { if !wps.is_empty() { wp_sel = (wp_sel + wps.len() - 1) % wps.len(); let (la, lo) = wps[wp_sel]; let (nx, ny) = deg_to_pixel(la, lo, z); cx = nx; cy = ny; } } // w=前
-                            KeyCode::Char(' ') => { snd.play("blip"); menu_cat_sel = 0; focus = Focus::Menu(MenuLevel::Categories); } // Space=メニュー(カテゴリ→展開の2階層)
+                            KeyCode::Char(' ') => { snd.play("click"); menu_cat_sel = 0; focus = Focus::Menu(MenuLevel::Categories); } // Space=メニュー(カテゴリ→展開の2階層)
                             KeyCode::Char('?') => help = true,
                             KeyCode::Char('P') => { cat_sel = 0; focus = Focus::SpotCatList; } // マイスポット(カテゴリ一覧)
                             KeyCode::Char(',') => { set_sel = 0; focus = Focus::Settings; } // 設定画面
