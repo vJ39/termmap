@@ -125,7 +125,7 @@ const HELP: &[&str] = &[
     " termmap 対話モード ─ 操作マニュアル",
     "",
     " [移動]",
-    "   ←↑↓→        パン (既定で速い / Shift+矢印で微調整)",
+    "   ←↑↓→        パン (既定は細かく・押し続けで加速 / Shift+矢印で常に高速)",
     "   + / -          ズーム",
     "   /              住所・地名で検索して移動",
     "   a              中心の住所を表示",
@@ -495,6 +495,10 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     let mut prev_render_cxyz: Option<(f64, f64, u32)> = None;
     let mut moved_at: Option<std::time::Instant> = None;
     let mut emit_count: u64 = 0; // 実画像emit回数。一定間隔でscrollbackを掃除しメモリ肥大を防ぐ
+    // 地図パン: 既定は細かい1歩、同方向を短間隔で連打/押しっぱなしすると徐々に加速する。
+    let mut pan_streak: u32 = 0;
+    let mut last_pan_dir: Option<KeyCode> = None;
+    let mut last_pan_at = std::time::Instant::now();
     let _ = write!(out, "\x1b[2J");
     loop {
         spin = spin.wrapping_add(1); // 通信中スピナーのアニメ用(毎フレーム進める)
@@ -1811,9 +1815,26 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                         }
                     }
                     Focus::Map => {
-                        // 既定を速く(大きく)・Shiftで微調整(ちょびちょび)に反転
-                        let frac = if k.modifiers.contains(KeyModifiers::SHIFT) { 32.0 } else { 4.0 };
-                        let step = (oh as f64 / frac).max(1.0);
+                        // Shift=常に高速(固定)。無印=既定は細かい1歩で、同方向を短間隔(220ms以内)で
+                        // 押し続ける/連打するほど徐々に加速し、上限は高速の手前まで。方向転換や
+                        // 間隔が空くと streak がリセットされ、また細かい1歩に戻る。
+                        let is_pan = matches!(k.code, KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down);
+                        if is_pan {
+                            if last_pan_dir == Some(k.code) && last_pan_at.elapsed() < std::time::Duration::from_millis(220) {
+                                pan_streak = (pan_streak + 1).min(20);
+                            } else {
+                                pan_streak = 0;
+                            }
+                            last_pan_dir = Some(k.code);
+                            last_pan_at = std::time::Instant::now();
+                        }
+                        let fine = oh as f64 / 64.0;
+                        let fast = oh as f64 / 4.0;
+                        let step = if k.modifiers.contains(KeyModifiers::SHIFT) {
+                            fast
+                        } else {
+                            (fine * (1.0 + pan_streak as f64 * 0.35)).min(fast)
+                        }.max(1.0);
                         let mut quit = false;
                         match k.code {
                             KeyCode::Left => { cx -= step; addr.clear(); }
