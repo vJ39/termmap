@@ -490,6 +490,11 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     // など地図矩形を覆う描画の後に、残像を消すため次フレームで1度だけ強制再emitさせる。
     let mut last_map_sig: Option<u64> = None;
     let mut force_reemit = true;
+    let mut prev_map_covered = false; // map_coveredの立ち上がり/下がりエッジ検出用(被ってる間は毎フレーム強制しない)
+    // 移動検知: 直近に描画した(cx,cy,z)と比べて動いていれば低解像度・止まって一定時間(350ms)経てば設定解像度へ。
+    let mut prev_render_cxyz: Option<(f64, f64, u32)> = None;
+    let mut moved_at: Option<std::time::Instant> = None;
+    let mut emit_count: u64 = 0; // 実画像emit回数。一定間隔でscrollbackを掃除しメモリ肥大を防ぐ
     let _ = write!(out, "\x1b[2J");
     loop {
         spin = spin.wrapping_add(1); // 通信中スピナーのアニメ用(毎フレーム進める)
@@ -596,11 +601,20 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         let (lat, lon) = pixel_to_deg(cx, cy, z);
         let img_inline = cfg.image_mode && image_capable(); // 実画像モード(iTerm2系端末のみ)
 
-        // 実画像モードの描画寸法とズーム。AAと同じ地理範囲を、深いズーム段(最大+2、タイルの
-        // 上限z18まで)で取得して高精細化する。scale=2^Δ で、地図領域のセル数×(横scale/縦2*scale
-        // px)の実ピクセル解像度になる(過大にしないよう+2段=横4/縦8px per cellに制限)。
+        // 移動検知(解像度非依存): 直近に描画したフレームと(cx,cy,z)が違えば「動いた」。
+        // 動いた直後〜350ms は低解像度(delta=0)で速く描き、動きが止まって350ms経ったら
+        // 設定解像度(高/中/低)へ上げる。GPS追従/ルート再生など毎フレーム動くケースは
+        // 自然に低解像度のまま張り付く(=負荷とメモリを抑える)。
+        if prev_render_cxyz != Some((cx, cy, z)) { moved_at = Some(std::time::Instant::now()); }
+        prev_render_cxyz = Some((cx, cy, z));
+        let settling = img_inline && moved_at.map_or(false, |t| t.elapsed() < std::time::Duration::from_millis(350));
+
+        // 実画像モードの描画寸法とズーム。AAと同じ地理範囲を、深いズーム段(タイルの上限z18まで)
+        // で取得して高精細化する。scale=2^Δ で、地図領域のセル数×(横scale/縦2*scale px)の実ピクセル
+        // 解像度になる。設定(image_res)で上限を選べる: high=+2(横4/縦8px per cell) / mid=+1 / low=+0。
         // rz>z のときグローバル画素座標は 2^Δ 倍になるので中心 cx/cy も scale 倍する。
-        let delta = if img_inline { 2u32.min(18u32.saturating_sub(z)) } else { 0 };
+        let base_delta: u32 = match cfg.image_res.as_str() { "high" => 2, "low" => 0, _ => 1 };
+        let delta = if !img_inline { 0 } else if settling { 0 } else { base_delta.min(18u32.saturating_sub(z)) };
         let scale = 1u32 << delta;
         let (rw, rh, rz, rcx, rcy) = if img_inline {
             (map_cols * scale, map_rows * 2 * scale, z + delta, cx * scale as f64, cy * scale as f64)
@@ -759,6 +773,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     format!("提案AIモデル {}", model_ja),
                     format!("実写(StreetView) {}", onoff(cfg.streetview_enabled)),
                     format!("画像表示(iTerm2) {}", onoff(cfg.image_mode)),
+                    format!("画像解像度 {}", match cfg.image_res.as_str() { "high" => "高", "low" => "低", _ => "中" }),
                     format!("サウンド {}", onoff(cfg.sound_enabled)),
                     format!("オンボーディング {}", if onboarded_marker().map_or(false, |p| p.exists()) { "非表示" } else { "毎回表示" }),
                     format!("Google APIキー {}", keyset),
@@ -818,6 +833,10 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         if let Some(mi) = &map_img { // 実画像モード: 地図領域の左上セルへ移動してインライン画像を出力
             let _ = write!(out, "\x1b[1;{}H", gut + 1);
             let _ = emit_iterm2_image(&mut out, mi, map_cols, map_rows);
+            // インライン画像はscrollbackに積もりiTermのメモリを肥大させる(Cmd+Kのclear buffer相当)。
+            // 可視画面は変えず、一定枚数emitごとにscrollbackだけ捨てて自動で溜め込みを防ぐ。
+            emit_count += 1;
+            if emit_count % 40 == 0 { let _ = write!(out, "\x1b[3J"); }
         }
         if elev_h > 0 { // 標高プロファイル帯(地図の下・ステータスの上)
             let (mn, mx, _asc) = elevation::elevation_stats(&route_ele);
@@ -1078,14 +1097,15 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 let _ = write!(out, "\x1b[{};{}H{}{}{}", r0 + i as u32, c0, col, fit_cells(ln, iw), RST);
             }
         }
-        // このフレームで地図矩形を覆う中央オーバーレイ/パネルを出したら、次フレームで画像を
-        // 再emitして残像を消す(実画像モードのみ意味を持つ)。
+        // 地図矩形を覆う中央オーバーレイ/パネルが「閉じた」フレーム(エッジ)でだけ画像を再emitして
+        // 残像を消す。覆われている間(検索文字入力中など)は毎打鍵で強制再emitしない(メモリ/負荷対策)。
         let map_covered = popup.is_some() || qr_view.is_some() || onboard
             || matches!(focus,
                 Focus::SpotForm { .. } | Focus::Search(_) | Focus::SaveName(_) | Focus::NearSearch(_)
                 | Focus::NewCat(_) | Focus::RoadSearch(_) | Focus::Recommend(_)
                 | Focus::SpotRename(..) | Focus::SpotEditName(..) | Focus::ColorPick { .. });
-        if map_covered { force_reemit = true; }
+        if prev_map_covered && !map_covered { force_reemit = true; }
+        prev_map_covered = map_covered;
         out.flush()?;
 
         // バックグラウンドジョブの結果を毎フレーム取り込む(route/search/near/street/recommend)。
@@ -1187,12 +1207,14 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             }
         }
 
-        // 入力待ち。結果適用直後は即再描画(None)。ジョブ/GPS/再生いずれか進行中はポーリング。
-        let polling = route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || recommend_job.is_some() || gps_rx.is_some() || play.is_some();
+        // 入力待ち。結果適用直後は即再描画(None)。ジョブ/GPS/再生/移動settling中はポーリング。
+        // settling中は短間隔(60ms)で見に行き、動きが止まったフレームで高解像度に上げ直す。
+        let polling = route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || recommend_job.is_some() || gps_rx.is_some() || play.is_some() || settling;
         let ev: Option<Event> = if got_result {
             None
         } else if polling {
-            if event::poll(std::time::Duration::from_millis(80))? { Some(event::read()?) } else { None }
+            let ms = if settling { 60 } else { 80 };
+            if event::poll(std::time::Duration::from_millis(ms))? { Some(event::read()?) } else { None }
         } else {
             Some(event::read()?)
         };
@@ -1325,7 +1347,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     },
                     Focus::Settings => { let mut stay = true; let mut changed = false; match k.code { // 設定画面
                         KeyCode::Up => { set_sel = set_sel.saturating_sub(1); }
-                        KeyCode::Down => { if set_sel + 1 < 15 { set_sel += 1; } }
+                        KeyCode::Down => { if set_sel + 1 < 16 { set_sel += 1; } }
                         KeyCode::Left | KeyCode::Right => {
                             if set_sel == 6 { let d = if k.code == KeyCode::Left { -100.0 } else { 100.0 }; cfg.sample_interval_m = (cfg.sample_interval_m + d).clamp(100.0, 5000.0); changed = true; }
                         }
@@ -1342,8 +1364,9 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             9 => cfg.llm_model = match cfg.llm_model.as_str() { "claude-sonnet-5" => "claude-haiku-4-5", "claude-haiku-4-5" => "claude-opus-4-8", _ => "claude-sonnet-5" }.to_string(),
                             10 => cfg.streetview_enabled = !cfg.streetview_enabled,
                             11 => { cfg.image_mode = !cfg.image_mode; force_reemit = true; }
-                            12 => { cfg.sound_enabled = !cfg.sound_enabled; snd = sound::Sound::new(cfg.sound_enabled); snd.play("confirm"); }
-                            13 => { // オンボーディング: マーカーの削除=毎回表示 / 作成=次回から非表示
+                            12 => { cfg.image_res = match cfg.image_res.as_str() { "high" => "low", "low" => "mid", _ => "high" }.to_string(); force_reemit = true; }
+                            13 => { cfg.sound_enabled = !cfg.sound_enabled; snd = sound::Sound::new(cfg.sound_enabled); snd.play("confirm"); }
+                            14 => { // オンボーディング: マーカーの削除=毎回表示 / 作成=次回から非表示
                                 if let Some(p) = onboarded_marker() {
                                     if p.exists() { let _ = std::fs::remove_file(&p); addr = "オンボーディング: 毎回表示に戻した".into(); }
                                     else { let _ = crate::fsutil::write_atomic(&p, b"1", None); addr = "オンボーディング: 次回から非表示".into(); }
@@ -1924,7 +1947,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 Focus::Search(buf) | Focus::SaveName(buf) | Focus::NearSearch(buf) | Focus::NewCat(buf) | Focus::RoadSearch(buf) | Focus::Recommend(buf) => insert_str_at(buf, &mut input_cur, &s),
                 Focus::SpotForm { name, url, field } => { if *field == 0 { insert_str_at(name, &mut input_cur, &s); } else if *field == 1 { insert_str_at(url, &mut input_cur, &s); } }
                 Focus::SpotRename(buf, _) | Focus::SpotEditName(buf, _) => insert_str_at(buf, &mut input_cur, &s),
-                Focus::Settings if set_sel == 14 => { cfg.google_maps_api_key = s.trim().to_string(); let _ = config::save_config(&cfg); addr = "APIキー設定(自動保存)".into(); }
+                Focus::Settings if set_sel == 15 => { cfg.google_maps_api_key = s.trim().to_string(); let _ = config::save_config(&cfg); addr = "APIキー設定(自動保存)".into(); }
                 _ => {}
             } }
             Some(Event::Resize(..)) => { let _ = write!(out, "\x1b[2J"); force_reemit = true; } // 端末サイズ変更: 全消去して次フレームで再描画(インライン画像の残像防止)
