@@ -1,5 +1,5 @@
 // 対話UIループ。main.rs から機械的に切り出したもの(挙動は不変)。
-// show_busy / HELP / TermGuard / interactive を収める。fit_cells 等はクレートルート(main.rs)側に残す。
+// HELP / TermGuard / interactive を収める。fit_cells 等はクレートルート(main.rs)側に残す。
 
 use crate::*;
 use crate::geo::*;
@@ -72,20 +72,6 @@ fn render_with_cursor(buf: &str, cur: usize) -> String {
     let before: String = chars[..cur].iter().collect();
     let after: String = chars[cur..].iter().collect();
     format!("{before}\u{2588}{after}")
-}
-
-// 同期API待ちの間、中央に「通信中…」を出す(呼び出し直前にflushして表示)。
-// 同期処理なのでアニメーションはしないが、待ちが起きていることを示す。
-fn show_busy<W: std::io::Write>(out: &mut W, cols: u32, rows: u16, msg: &str) {
-    let text = format!("  ⏳ {}  ", msg);
-    let w = text.chars().count();
-    let c0 = ((cols as usize).saturating_sub(w) / 2).max(1);
-    let r0 = (rows / 2).max(1);
-    let pad = " ".repeat(w);
-    let _ = write!(out, "\x1b[{};{}H\x1b[7m{}\x1b[0m", r0, c0, pad);
-    let _ = write!(out, "\x1b[{};{}H\x1b[7m{}\x1b[0m", r0 + 1, c0, text);
-    let _ = write!(out, "\x1b[{};{}H\x1b[7m{}\x1b[0m", r0 + 2, c0, pad);
-    let _ = out.flush();
 }
 
 // 単一テキスト欄の中央入力パネル(底面バーでなく地図中央に重畳。SpotFormと同じ手法)。
@@ -377,6 +363,8 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     let mut near_job: Option<std::sync::mpsc::Receiver<(String, Vec<(f64, f64, String)>)>> = None; // (query, search_nearbyのosm結果)
     let mut street_job: Option<std::sync::mpsc::Receiver<(f64, f64, i32, Result<image::RgbImage, String>)>> = None; // (lat, lon, heading, 実写画像)
     let mut recommend_job: Option<std::sync::mpsc::Receiver<Result<Vec<(f64, f64, String)>, String>>> = None; // 実在確認済みスポット列
+    let mut road_job: Option<std::sync::mpsc::Receiver<(String, Result<Vec<(Vec<(f64, f64)>, bool)>, String>)>> = None; // (道路名, roadsearch::fetch結果)
+    let mut catpoi_job: Option<std::sync::mpsc::Receiver<(usize, Result<Vec<(f64, f64, String, PoiCat)>, String>)>> = None; // (POI_KINDSのindex, poi_search結果)
     let mut spin: usize = 0; // 通信中スピナーのフレーム(毎ループ+1)
     let mut spots = load_spots();          // マイスポット
     let mut spot_cats = load_spot_cats();
@@ -915,7 +903,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             Focus::Menu(MenuLevel::Items(_)) => " ↑↓選択 Enter実行 / 右端キーでも実行 Esc戻る ".to_string(),
             Focus::Map => {
                 // 通信中(いずれかのジョブがSome)はスピナー1文字＋案内を先頭に出す
-                let jobs_active = route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || recommend_job.is_some();
+                let jobs_active = route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some();
                 let spinner = if jobs_active {
                     const FR: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
                     format!("{} 通信中…(Escで中断) ", FR[spin % FR.len()])
@@ -1190,6 +1178,44 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 Err(TryRecvError::Disconnected) => { near_job = None; got_result = true; }
             }
         }
+        if road_job.is_some() {
+            match road_job.as_ref().unwrap().try_recv() {
+                Ok((name, res)) => {
+                    match res {
+                        Ok(frags) if !frags.is_empty() => {
+                            let rf: Vec<roadtrace::RoadFrag> = frags.into_iter().map(|(pts, oneway)| roadtrace::RoadFrag { pts, oneway }).collect();
+                            let poly = roadtrace::assemble_polyline(&rf);
+                            let seg = roadtrace::nearest_segment(&poly, (lat, lon), 500.0);
+                            if seg.len() >= 2 {
+                                let color = ROAD_PALETTE[road_segs.len() % ROAD_PALETTE.len()];
+                                road_segs.push(RoadSeg { name: name.clone(), color, pts: seg });
+                                sync_roads!();
+                                addr = format!("道路: {name} を塊で追加(計{}本)", road_segs.len());
+                            } else { addr = "道路: 点が足りない(拡大/移動して再検索)".into(); }
+                        }
+                        Ok(_) => addr = format!("道路が見つからない: {name}(view内に無い)"),
+                        Err(e) => addr = format!("道路: {e}"),
+                    }
+                    road_job = None; got_result = true;
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => { road_job = None; got_result = true; }
+            }
+        }
+        if catpoi_job.is_some() {
+            match catpoi_job.as_ref().unwrap().try_recv() {
+                Ok((i, res)) => {
+                    match res {
+                        Ok(items) if !items.is_empty() => { pois = items; poi_sel = 0; poi_label = POI_KINDS[i].label.to_string(); set_markers(&mut spec, &wps, &pois); focus = Focus::PoiList; }
+                        Ok(_) => { snd.play("error"); addr = format!("周辺2kmに{}無し", POI_KINDS[i].label); if matches!(focus, Focus::Map) { focus = Focus::PoiMenu; } }
+                        Err(e) => { addr = format!("({e})"); if matches!(focus, Focus::Map) { focus = Focus::PoiMenu; } }
+                    }
+                    catpoi_job = None; got_result = true;
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => { catpoi_job = None; got_result = true; }
+            }
+        }
         if street_job.is_some() {
             match street_job.as_ref().unwrap().try_recv() {
                 Ok((la, lo, hd, res)) => {
@@ -1225,7 +1251,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
 
         // 入力待ち。結果適用直後は即再描画(None)。ジョブ/GPS/再生/移動settling中はポーリング。
         // settling中は短間隔(60ms)で見に行き、動きが止まったフレームで高解像度に上げ直す。
-        let polling = route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || recommend_job.is_some() || gps_rx.is_some() || play.is_some() || settling;
+        let polling = route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some() || gps_rx.is_some() || play.is_some() || settling;
         let ev: Option<Event> = if got_result {
             None
         } else if polling {
@@ -1238,10 +1264,10 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             None => {} // 再描画のみ(計算待ち)
             Some(Event::Key(k)) if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) => {
                 // Ctrl-C: 進行中の全ジョブを中断(アプリは終了しない)
-                let any = route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || recommend_job.is_some();
+                let any = route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some();
                 if any {
                     if route_job.is_some() { route_note = Some("中断".to_string()); }
-                    route_job = None; search_job = None; near_job = None; street_job = None; recommend_job = None;
+                    route_job = None; search_job = None; near_job = None; street_job = None; recommend_job = None; road_job = None; catpoi_job = None;
                     addr = "中断".into();
                 }
             }
@@ -1269,9 +1295,9 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             }
             // Map表示中のEscは進行中ジョブの中断に使う(サブ画面のEscは各Focusの取消のまま)
             Some(Event::Key(k)) if k.code == KeyCode::Esc && matches!(focus, Focus::Map)
-                && (route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || recommend_job.is_some()) => {
+                && (route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some()) => {
                 if route_job.is_some() { route_note = Some("中断".to_string()); }
-                route_job = None; search_job = None; near_job = None; street_job = None; recommend_job = None;
+                route_job = None; search_job = None; near_job = None; street_job = None; recommend_job = None; road_job = None; catpoi_job = None;
                 addr = "中断".into();
             }
             Some(Event::Key(k)) => {
@@ -1409,24 +1435,14 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             if !name.is_empty() {
                                 let (n_lat, w_lon) = pixel_to_deg(cx - ow as f64 / 2.0, cy - oh as f64 / 2.0, z);
                                 let (s_lat, e_lon) = pixel_to_deg(cx + ow as f64 / 2.0, cy + oh as f64 / 2.0, z);
-                                show_busy(&mut out, cols, tr, "道路検索中…");
-                                match roadsearch::fetch(&name, s_lat, w_lon, n_lat, e_lon) {
-                                    Ok(frags) if !frags.is_empty() => {
-                                        let rf: Vec<roadtrace::RoadFrag> = frags.into_iter().map(|(pts, oneway)| roadtrace::RoadFrag { pts, oneway }).collect();
-                                        let poly = roadtrace::assemble_polyline(&rf);
-                                        // view中心に近い連結成分だけを塊として残す(大ジャンプで繋がった飛び地を捨てる)
-                                        let seg = roadtrace::nearest_segment(&poly, (lat, lon), 500.0);
-                                        if seg.len() >= 2 {
-                                            // BRouterでは縫わず(wpsには入れない)、別色レイヤの塊として保持する
-                                            let color = ROAD_PALETTE[road_segs.len() % ROAD_PALETTE.len()];
-                                            road_segs.push(RoadSeg { name: name.clone(), color, pts: seg });
-                                            sync_roads!();
-                                            addr = format!("道路: {name} を塊で追加(計{}本)", road_segs.len());
-                                        } else { addr = "道路: 点が足りない(拡大/移動して再検索)".into(); }
-                                    }
-                                    Ok(_) => addr = format!("道路が見つからない: {name}(view内に無い)"),
-                                    Err(e) => addr = format!("道路: {e}"),
-                                }
+                                let (tx, rx) = std::sync::mpsc::channel();
+                                let name2 = name.clone();
+                                std::thread::spawn(move || {
+                                    let r = roadsearch::fetch(&name2, s_lat, w_lon, n_lat, e_lon);
+                                    let _ = tx.send((name2, r));
+                                });
+                                road_job = Some(rx);
+                                focus = Focus::Map; // UIは生きたまま(スピナー表示・Escで中断)
                             }
                         }
                         KeyCode::Esc => { snd.play("back"); }
@@ -1616,12 +1632,13 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             match idx {
                                 Some(i) if i >= POI_KINDS.len() => { input_cur = 0; focus = Focus::NearSearch(String::new()); }
                                 Some(i) => {
-                                    show_busy(&mut out, cols, tr, "検索中…");
-                                    match poi_search(&POI_KINDS[i], cx, cy, z, ow, oh, lat, lon) {
-                                        Ok(items) if !items.is_empty() => { pois = items; poi_sel = 0; poi_label = POI_KINDS[i].label.to_string(); set_markers(&mut spec, &wps, &pois); focus = Focus::PoiList; }
-                                        Ok(_) => { snd.play("error"); addr = format!("周辺2kmに{}無し", POI_KINDS[i].label); focus = Focus::PoiMenu; }
-                                        Err(e) => { addr = format!("({e})"); focus = Focus::PoiMenu; }
-                                    }
+                                    let (tx, rx) = std::sync::mpsc::channel();
+                                    std::thread::spawn(move || {
+                                        let r = poi_search(&POI_KINDS[i], cx, cy, z, ow, oh, lat, lon);
+                                        let _ = tx.send((i, r));
+                                    });
+                                    catpoi_job = Some(rx);
+                                    focus = Focus::Map; // UIは生きたまま(スピナー表示・Escで中断)
                                 }
                                 None => focus = Focus::PoiMenu,
                             }
