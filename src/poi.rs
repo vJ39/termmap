@@ -184,7 +184,7 @@ pub fn search_nearby(q: &str, s: f64, w: f64, n: f64, e: f64) -> Vec<(f64, f64, 
 
 // ---- 目的地検索 (Overpass) ----
 pub struct PoiKind { pub key: char, pub label: &'static str, pub filter: &'static str, pub cat: PoiCat }
-pub const POI_KINDS: [PoiKind; 7] = [
+pub const POI_KINDS: [PoiKind; 8] = [
     PoiKind { key: '1', label: "ガソスタ", filter: "nwr[\"amenity\"=\"fuel\"]", cat: PoiCat::Fuel },
     PoiKind { key: '2', label: "カフェ", filter: "nwr[\"amenity\"=\"cafe\"]", cat: PoiCat::Food },
     PoiKind { key: '3', label: "コンビニ", filter: "nwr[\"shop\"=\"convenience\"]", cat: PoiCat::Shop },
@@ -192,6 +192,8 @@ pub const POI_KINDS: [PoiKind; 7] = [
     PoiKind { key: '5', label: "展望", filter: "nwr[\"tourism\"=\"viewpoint\"]", cat: PoiCat::Other },
     PoiKind { key: '6', label: "公園", filter: "nwr[\"leisure\"=\"park\"]", cat: PoiCat::Other },
     PoiKind { key: '7', label: "峠道", filter: "nwr[\"mountain_pass\"=\"yes\"]", cat: PoiCat::Danger },
+    // 二輪/バイク駐車場。OSMは名称に依らず amenity=motorcycle_parking でタグ付けされる
+    PoiKind { key: '8', label: "バイク駐車場", filter: "nwr[\"amenity\"=\"motorcycle_parking\"]", cat: PoiCat::Other },
 ];
 // Overpass out:json の要素。node は lat/lon、way/relation は center を使う。
 #[derive(Deserialize)]
