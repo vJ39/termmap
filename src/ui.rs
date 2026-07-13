@@ -1321,13 +1321,13 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                         KeyCode::Esc => { snd.play("back"); pending_spot = None; } // 登録キャンセル時も保留を消す→Mapへ
                         _ => focus = Focus::SpotCatList,
                     },
-                    Focus::Settings => { let mut stay = true; match k.code { // 設定画面
+                    Focus::Settings => { let mut stay = true; let mut changed = false; match k.code { // 設定画面
                         KeyCode::Up => { set_sel = set_sel.saturating_sub(1); }
                         KeyCode::Down => { if set_sel + 1 < 15 { set_sel += 1; } }
                         KeyCode::Left | KeyCode::Right => {
-                            if set_sel == 6 { let d = if k.code == KeyCode::Left { -100.0 } else { 100.0 }; cfg.sample_interval_m = (cfg.sample_interval_m + d).clamp(100.0, 5000.0); }
+                            if set_sel == 6 { let d = if k.code == KeyCode::Left { -100.0 } else { 100.0 }; cfg.sample_interval_m = (cfg.sample_interval_m + d).clamp(100.0, 5000.0); changed = true; }
                         }
-                        KeyCode::Enter | KeyCode::Char(' ') => match set_sel {
+                        KeyCode::Enter | KeyCode::Char(' ') => { changed = true; match set_sel {
                             0 => opts.braille = !opts.braille,
                             1 => opts.classify = !opts.classify,
                             2 => opts.edge = !opts.edge,
@@ -1347,15 +1347,17 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                     else { let _ = crate::fsutil::write_atomic(&p, b"1", None); addr = "オンボーディング: 次回から非表示".into(); }
                                 }
                             }
-                            _ => addr = "APIキー: この行で貼り付け(Cmd+V)して設定".into(),
-                        },
-                        KeyCode::Char('s') => {
-                            cfg.braille = opts.braille; cfg.classify = opts.classify; cfg.edge = opts.edge; cfg.mono = opts.mono; cfg.style = opts.style.clone();
-                            addr = match config::save_config(&cfg) { Ok(_) => "設定を保存(config.toml)".into(), Err(e) => format!("保存失敗: {e}") };
-                        }
+                            _ => addr = "APIキー: この行でCmd+V貼付で設定(自動保存)".into(),
+                        } }
+                        KeyCode::Char('s') => { changed = true; addr = "設定を保存".into(); }
                         KeyCode::Esc => { snd.play("back"); stay = false; }
                         _ => {}
-                    } if stay { focus = Focus::Settings; } },
+                    }
+                    if changed { // 変更のたびに opts→cfg を同期して即保存(sを押さなくてよい)
+                        cfg.braille = opts.braille; cfg.classify = opts.classify; cfg.edge = opts.edge; cfg.mono = opts.mono; cfg.style = opts.style.clone();
+                        let _ = config::save_config(&cfg);
+                    }
+                    if stay { focus = Focus::Settings; } },
                     Focus::RoadSearch(mut buf) => match k.code { // 道路名/ref で現在view内をルート化
                         KeyCode::Enter => {
                             let name = buf.trim().to_string();
@@ -1896,7 +1898,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 Focus::Search(buf) | Focus::SaveName(buf) | Focus::NearSearch(buf) | Focus::NewCat(buf) | Focus::RoadSearch(buf) | Focus::Recommend(buf) => insert_str_at(buf, &mut input_cur, &s),
                 Focus::SpotForm { name, url, field } => { if *field == 0 { insert_str_at(name, &mut input_cur, &s); } else if *field == 1 { insert_str_at(url, &mut input_cur, &s); } }
                 Focus::SpotRename(buf, _) | Focus::SpotEditName(buf, _) => insert_str_at(buf, &mut input_cur, &s),
-                Focus::Settings if set_sel == 13 => { cfg.google_maps_api_key = s.trim().to_string(); addr = "APIキー設定(sで保存)".into(); }
+                Focus::Settings if set_sel == 14 => { cfg.google_maps_api_key = s.trim().to_string(); let _ = config::save_config(&cfg); addr = "APIキー設定(自動保存)".into(); }
                 _ => {}
             } }
             Some(Event::Resize(..)) => { let _ = write!(out, "\x1b[2J"); force_reemit = true; } // 端末サイズ変更: 全消去して次フレームで再描画(インライン画像の残像防止)
