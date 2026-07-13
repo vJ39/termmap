@@ -464,6 +464,11 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         spec.roads = road_segs.iter().map(|r| Route { pts: r.pts.clone(), color: r.color, thickness: 2 }).collect();
     };}
 
+    // 実画像モードの再emit抑制。直近にemitした地図画像の状態シグネチャを保持し、変化が無い
+    // フレームでは PNG を吐き直さない(チラつき/負荷の回避)。force_reemit は popup/ヘルプ/実写
+    // など地図矩形を覆う描画の後に、残像を消すため次フレームで1度だけ強制再emitさせる。
+    let mut last_map_sig: Option<u64> = None;
+    let mut force_reemit = true;
     let _ = write!(out, "\x1b[2J");
     loop {
         spin = spin.wrapping_add(1); // 通信中スピナーのアニメ用(毎フレーム進める)
@@ -478,6 +483,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             let _ = write!(out, "\x1b[{};1H\x1b[7m 任意のキーで閉じる \x1b[0m\x1b[K", tr);
             let _ = out.flush();
             if let Event::Key(_) = event::read()? { help = false; }
+            force_reemit = true; // ヘルプで全画面クリアした→地図に戻ったら画像を再emit
             continue;
         }
         if street.is_some() { // 実写(Street View)全画面。←→で向き、Esc/qで戻る
@@ -521,6 +527,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     _ => {}
                 }
             }
+            force_reemit = true; // 実写で全画面を覆った→地図に戻ったら画像を再emit
             continue;
         }
         // 標高プロファイル帯を出すぶん地図の行数を減らす(E)
@@ -564,46 +571,103 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         let (lat, lon) = pixel_to_deg(cx, cy, z);
         let img_inline = cfg.image_mode && image_capable(); // 実画像モード(iTerm2系端末のみ)
 
+        // 実画像モードの描画寸法とズーム。AAと同じ地理範囲を、深いズーム段(最大+2、タイルの
+        // 上限z18まで)で取得して高精細化する。scale=2^Δ で、地図領域のセル数×(横scale/縦2*scale
+        // px)の実ピクセル解像度になる(過大にしないよう+2段=横4/縦8px per cellに制限)。
+        // rz>z のときグローバル画素座標は 2^Δ 倍になるので中心 cx/cy も scale 倍する。
+        let delta = if img_inline { 2u32.min(18u32.saturating_sub(z)) } else { 0 };
+        let scale = 1u32 << delta;
+        let (rw, rh, rz, rcx, rcy) = if img_inline {
+            (map_cols * scale, map_rows * 2 * scale, z + delta, cx * scale as f64, cy * scale as f64)
+        } else {
+            (ow, oh, z, cx, cy)
+        };
+
+        // 実画像モードの再描画判定シグネチャ。地図画像に効く状態(中心/ズーム/寸法/配置/
+        // オーバーレイ)が前回emit時と同じなら PNG を吐き直さない。
+        let map_sig: Option<u64> = if img_inline {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            rcx.to_bits().hash(&mut h); rcy.to_bits().hash(&mut h);
+            rz.hash(&mut h); rw.hash(&mut h); rh.hash(&mut h);
+            gut.hash(&mut h); map_cols.hash(&mut h); map_rows.hash(&mut h);
+            opts.style.hash(&mut h);
+            spec.routes.len().hash(&mut h);
+            spec.roads.len().hash(&mut h);
+            for rt in spec.routes.iter().chain(spec.roads.iter()) {
+                rt.color.hash(&mut h); rt.thickness.hash(&mut h);
+                for &(a2, b2) in &rt.pts { a2.to_bits().hash(&mut h); b2.to_bits().hash(&mut h); }
+            }
+            spec.pois.len().hash(&mut h);
+            for p in &spec.pois { p.lat.to_bits().hash(&mut h); p.lon.to_bits().hash(&mut h); (p.cat as u8).hash(&mut h); }
+            spec.rings.len().hash(&mut h);
+            for r in &spec.rings {
+                r.lat.to_bits().hash(&mut h); r.lon.to_bits().hash(&mut h);
+                r.color.hash(&mut h); r.thickness.hash(&mut h);
+                for k in &r.radii_km { k.to_bits().hash(&mut h); }
+            }
+            spec.spots.len().hash(&mut h);
+            for &(a2, b2, c2, s2) in &spec.spots { a2.to_bits().hash(&mut h); b2.to_bits().hash(&mut h); c2.hash(&mut h); s2.hash(&mut h); }
+            match gps_pos { Some((a2, b2)) => { 1u8.hash(&mut h); a2.to_bits().hash(&mut h); b2.to_bits().hash(&mut h); } None => 0u8.hash(&mut h) }
+            gps_trail.len().hash(&mut h);
+            for &(a2, b2) in &gps_trail { a2.to_bits().hash(&mut h); b2.to_bits().hash(&mut h); }
+            wps.len().hash(&mut h);
+            for &(a2, b2) in &wps { a2.to_bits().hash(&mut h); b2.to_bits().hash(&mut h); }
+            wp_sel.hash(&mut h);
+            Some(h.finish())
+        } else { None };
+
         let mut map_img: Option<RgbImage> = None; // 実画像モードで描く overlay 合成済み画像
-        let body = match build_window(cx, cy, z, ow, oh, &opts.style, &mut cache) {
-            Ok(img) => {
-                let mut ov = build_overlay(&spec, cx, cy, z, ow, oh, 1.0, 1.0, ow, oh);
-                let (mx, my) = (ow as i32 / 2, oh as i32 / 2); // 中心クロスヘア(黄)
-                draw_line(&mut ov, mx - 6, my, mx + 6, my, [255, 255, 0], 1);
-                draw_line(&mut ov, mx, my - 6, mx, my + 6, [255, 255, 0], 1);
-                if gps_pos.is_some() { // ライブ現在地: トレイル(薄青)+自位置(赤)
-                    for (tla, tlo) in &gps_trail {
-                        let (gx, gy) = deg_to_pixel(*tla, *tlo, z);
-                        let ix = (gx - (cx - ow as f64 / 2.0)).floor() as i32;
-                        let iy = (gy - (cy - oh as f64 / 2.0)).floor() as i32;
-                        draw_ring(&mut ov, ix, iy, 1, [80, 160, 255], 1);
+        // 実画像モードで状態が前回emitと同一なら、地図の再構築/再emitをスキップ(直近の画像を残す)。
+        let need_build = !img_inline || force_reemit || last_map_sig != map_sig;
+        let body = if !need_build {
+            String::new()
+        } else {
+            match build_window(rcx, rcy, rz, rw, rh, &opts.style, &mut cache) {
+                Ok(img) => {
+                    let mut ov = build_overlay(&spec, rcx, rcy, rz, rw, rh, 1.0, 1.0, rw, rh);
+                    let (mx, my) = (rw as i32 / 2, rh as i32 / 2); // 中心クロスヘア(黄)
+                    draw_line(&mut ov, mx - 6, my, mx + 6, my, [255, 255, 0], 1);
+                    draw_line(&mut ov, mx, my - 6, mx, my + 6, [255, 255, 0], 1);
+                    if gps_pos.is_some() { // ライブ現在地: トレイル(薄青)+自位置(赤)
+                        for (tla, tlo) in &gps_trail {
+                            let (gx, gy) = deg_to_pixel(*tla, *tlo, rz);
+                            let ix = (gx - (rcx - rw as f64 / 2.0)).floor() as i32;
+                            let iy = (gy - (rcy - rh as f64 / 2.0)).floor() as i32;
+                            draw_ring(&mut ov, ix, iy, 1, [80, 160, 255], 1);
+                        }
+                        if let Some((gla, glo)) = gps_pos {
+                            let (gx, gy) = deg_to_pixel(gla, glo, rz);
+                            let ix = (gx - (rcx - rw as f64 / 2.0)).floor() as i32;
+                            let iy = (gy - (rcy - rh as f64 / 2.0)).floor() as i32;
+                            draw_ring(&mut ov, ix, iy, 4, [255, 60, 60], 2);
+                        }
                     }
-                    if let Some((gla, glo)) = gps_pos {
-                        let (gx, gy) = deg_to_pixel(gla, glo, z);
-                        let ix = (gx - (cx - ow as f64 / 2.0)).floor() as i32;
-                        let iy = (gy - (cy - oh as f64 / 2.0)).floor() as i32;
-                        draw_ring(&mut ov, ix, iy, 4, [255, 60, 60], 2);
+                    if !wps.is_empty() { // 選択中(Tab)の waypoint を白丸で強調
+                        let s = wp_sel.min(wps.len() - 1);
+                        let (gx, gy) = deg_to_pixel(wps[s].0, wps[s].1, rz);
+                        let ix = (gx - (rcx - rw as f64 / 2.0)).floor() as i32;
+                        let iy = (gy - (rcy - rh as f64 / 2.0)).floor() as i32;
+                        draw_ring(&mut ov, ix, iy, 3, [255, 255, 255], 1);
+                    }
+                    if img_inline {
+                        // 実画像モード: 取得画像に overlay を焼き込んで保持し、AA文字列は空にする。
+                        let mut c = img;
+                        composite(&mut c, &ov);
+                        map_img = Some(c);
+                        last_map_sig = map_sig; // このsigで描いた画像がこのフレームでemitされる
+                        String::new()
+                    } else {
+                        render(&img, &opts, Some(&ov))
                     }
                 }
-                if !wps.is_empty() { // 選択中(Tab)の waypoint を白丸で強調
-                    let s = wp_sel.min(wps.len() - 1);
-                    let (gx, gy) = deg_to_pixel(wps[s].0, wps[s].1, z);
-                    let ix = (gx - (cx - ow as f64 / 2.0)).floor() as i32;
-                    let iy = (gy - (cy - oh as f64 / 2.0)).floor() as i32;
-                    draw_ring(&mut ov, ix, iy, 3, [255, 255, 255], 1);
-                }
-                if img_inline {
-                    // 実画像モード: renderに渡すのと同じ画像に overlay を焼き込んで保持。AA文字列は空。
-                    let mut c = img.clone();
-                    composite(&mut c, &ov);
-                    map_img = Some(c);
-                    String::new()
-                } else {
-                    render(&img, &opts, Some(&ov))
+                Err(e) => {
+                    if img_inline { last_map_sig = None; } // 失敗時は次フレームで再取得
+                    format!("取得失敗: {e}\r\n")
                 }
             }
-            Err(e) => format!("取得失敗: {e}\r\n"),
         };
+        if img_inline { force_reemit = false; } // 強制再emitは消費済み(被り解消は下でmap_coveredが再設定)
 
         // 左袖リスト(POI か お気に入り)の各行を組む
         let glines: Vec<String> = if gut > 0 {
@@ -947,6 +1011,14 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 let _ = write!(out, "\x1b[{};{}H{}{}{}", r0 + i as u32, c0, BG, fit_cells(ln, iw), RST);
             }
         }
+        // このフレームで地図矩形を覆う中央オーバーレイ/パネルを出したら、次フレームで画像を
+        // 再emitして残像を消す(実画像モードのみ意味を持つ)。
+        let map_covered = popup.is_some() || qr_view.is_some() || onboard
+            || matches!(focus,
+                Focus::SpotForm { .. } | Focus::Search(_) | Focus::SaveName(_) | Focus::NearSearch(_)
+                | Focus::NewCat(_) | Focus::RoadSearch(_) | Focus::Recommend(_)
+                | Focus::SpotRename(..) | Focus::SpotEditName(..) | Focus::ColorPick { .. });
+        if map_covered { force_reemit = true; }
         out.flush()?;
 
         // バックグラウンドジョブの結果を毎フレーム取り込む(route/search/near/street/recommend)。
@@ -1187,7 +1259,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             8 => cfg.llm_recommend_enabled = !cfg.llm_recommend_enabled,
                             9 => cfg.llm_model = match cfg.llm_model.as_str() { "claude-sonnet-5" => "claude-haiku-4-5", "claude-haiku-4-5" => "claude-opus-4-8", _ => "claude-sonnet-5" }.to_string(),
                             10 => cfg.streetview_enabled = !cfg.streetview_enabled,
-                            11 => cfg.image_mode = !cfg.image_mode,
+                            11 => { cfg.image_mode = !cfg.image_mode; force_reemit = true; }
                             12 => { cfg.sound_enabled = !cfg.sound_enabled; snd = sound::Sound::new(cfg.sound_enabled); snd.play("confirm"); }
                             _ => addr = "APIキー: この行で貼り付け(Cmd+V)して設定".into(),
                         },
@@ -1661,6 +1733,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             }
                             KeyCode::Char('I') => { // 実画像モード(iTerm2インライン画像)の ON/OFF
                                 cfg.image_mode = !cfg.image_mode;
+                                force_reemit = true; // 切替直後は必ず描き直す
                                 addr = if cfg.image_mode {
                                     if image_capable() { "実画像モード: ON".into() } else { "実画像モード: ON(この端末は非対応・AA継続)".into() }
                                 } else { "実画像モード: OFF".into() };
@@ -1714,6 +1787,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 Focus::Settings if set_sel == 13 => { cfg.google_maps_api_key = s.trim().to_string(); addr = "APIキー設定(sで保存)".into(); }
                 _ => {}
             } }
+            Some(Event::Resize(..)) => { let _ = write!(out, "\x1b[2J"); force_reemit = true; } // 端末サイズ変更: 全消去して次フレームで再描画(インライン画像の残像防止)
             _ => {}
         }
     }
