@@ -128,7 +128,7 @@ const HELP: &[&str] = &[
     "   r              道路名/refで道路を1本の塊として追加(例: 国道16号 / E20)。別色で表示",
     "   D              道路の塊を一覧(個別に x で削除・c で全消去)",
     "   @              おすすめ: 方向性を入力→AI(claude)が提案→実在確認して候補表示(設定でON要)",
-    "   W              走りまくり: 峠/展望を巡る周回を自動生成(連打で別案)",
+    "   W              走りまくり: 距離をゲージで選んでEnter→峠/展望を巡る周回を検索(バックグラウンド・再度Wで別案)",
     "",
     " [目的地・お気に入り]",
     "   f              カテゴリ検索(既定: ｶﾞｿ/ｶﾌｪ/ｺﾝﾋﾞﾆ/道の駅/展望/公園/峠道/ﾊﾞｲｸ駐輪場)。一覧でn新規 x削除 [ ]並替",
@@ -294,7 +294,7 @@ impl Drop for TermGuard {
 pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std::io::Result<()> {
     use crossterm::event::{self, Event, KeyCode, KeyModifiers};
     enum Focus { Map, RoutePanel, Menu(MenuLevel), Search(String), SaveName(String), NearSearch(String), PoiMenu, PoiList, RouteList, WaypointList, RoadList,
-                 NewCat(String), SpotForm { name: String, url: String, field: usize }, SpotList, SpotCatList, SpotRename(String, usize), Settings, SettingsEdit(usize, String), RoadSearch(String), SpotEditName(String, usize), Recommend(String), ColorPick { cat: usize }, ShapePick { cat: usize }, PoiKindForm { label: String, tag: String, field: usize } }
+                 NewCat(String), SpotForm { name: String, url: String, field: usize }, SpotList, SpotCatList, SpotRename(String, usize), Settings, SettingsEdit(usize, String), RoadSearch(String), SpotEditName(String, usize), Recommend(String), ColorPick { cat: usize }, ShapePick { cat: usize }, PoiKindForm { label: String, tag: String, field: usize }, WanderForm { dist_km: f64 } }
     let _guard = TermGuard::enter()?; // Drop で必ず端末復元
     let mut cache: Cache = Cache::new();
     let mut out = std::io::stdout();
@@ -365,6 +365,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     let mut street_job: Option<std::sync::mpsc::Receiver<(f64, f64, i32, Result<image::RgbImage, String>)>> = None; // (lat, lon, heading, 実写画像)
     let mut recommend_job: Option<std::sync::mpsc::Receiver<Result<Vec<(f64, f64, String)>, String>>> = None; // 実在確認済みスポット列
     let mut road_job: Option<std::sync::mpsc::Receiver<(String, Result<Vec<(Vec<(f64, f64)>, bool)>, String>)>> = None; // (道路名, roadsearch::fetch結果)
+    let mut wander_job: Option<std::sync::mpsc::Receiver<Result<Vec<(f64, f64)>, String>>> = None; // おまかせ周回(wander_route)結果
     let mut catpoi_job: Option<std::sync::mpsc::Receiver<(String, Result<Vec<(f64, f64, String, PoiCat)>, ApiError>)>> = None; // (カテゴリ名, poi_search結果)。ラベルは起動時に確定して送るので途中でpoi_kindsを編集されても安全
     let mut spin: usize = 0; // 通信中スピナーのフレーム(毎ループ+1)
     let mut poi_kinds: Vec<PoiKind> = load_poi_kinds(); // 目的地カテゴリ(並べ替え/追加/削除可・~/.config/termmap/poi-kinds.txt)
@@ -400,13 +401,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             MenuAction::RouteForm => { if wps.is_empty() { addr = "先に v で地点を置いてね".into(); } else { wp_sel = 0; grab = false; focus = Focus::WaypointList; } }
             MenuAction::AddVia => { snd.play("pop"); wp_add(&mut wps, ($lat, $lon)); let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; addr = format!("地点を追加 #{}", wps.len()); }
             MenuAction::RoadRoute => { input_cur = 0; focus = Focus::RoadSearch(String::new()); }
-            MenuAction::Wander => {
-                let dist = a.dist.unwrap_or(40.0);
-                match wander_route(($lat, $lon), dist, &a.shape) {
-                    Ok(w) => { wps = w; wp_sel = 0; let (nn, jj) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = nn; route_job = jj; }
-                    Err(e) => addr = format!("({e})"),
-                }
-            }
+            MenuAction::Wander => { focus = Focus::WanderForm { dist_km: a.dist.unwrap_or(40.0) }; } // 距離ゲージを開く(Enterで検索開始)
             MenuAction::CycleMode => { mode = match mode_label(&mode) { "下道" => "highway", "高速" => "short", _ => "surface" }.to_string(); let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; }
             MenuAction::AltRoute => {
                 if wps.len() >= 2 {
@@ -601,11 +596,14 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
 
         // 移動検知(解像度非依存): 直近に描画したフレームと(cx,cy,z)が違えば「動いた」。
         // 動いた直後〜350ms は低解像度(delta=0)で速く描き、動きが止まって350ms経ったら
-        // 設定解像度(高/中/低)へ上げる。GPS追従/ルート再生など毎フレーム動くケースは
+        // 設定解像度(高/中/低)へ上げる。GPS追従(gps_rx)のように断続的に動くケースは
         // 自然に低解像度のまま張り付く(=負荷とメモリを抑える)。
+        // ただしルート再生(play)中は毎フレーム動き続けるため、この判定に従うと恒久的に
+        // 低解像度画像が高頻度で切り替わり続けてちらついて見える。プレビューは見た目重視の
+        // 機能なので、再生中は「動いている」扱いにせず常に設定解像度を使う。
         if prev_render_cxyz != Some((cx, cy, z)) { moved_at = Some(std::time::Instant::now()); }
         prev_render_cxyz = Some((cx, cy, z));
-        let settling = img_inline && moved_at.map_or(false, |t| t.elapsed() < std::time::Duration::from_millis(350));
+        let settling = img_inline && play.is_none() && moved_at.map_or(false, |t| t.elapsed() < std::time::Duration::from_millis(350));
 
         // 実画像モードの描画寸法とズーム。AAと同じ地理範囲を、深いズーム段(タイルの上限z18まで)
         // で取得して高精細化する。scale=2^Δ で、地図領域のセル数×(横scale/縦2*scale px)の実ピクセル
@@ -867,6 +865,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             Focus::NewCat(_) => " 中央フォームに入力中 ".to_string(),
             Focus::SpotForm { .. } => " 新規スポット: ↑↓/Tab移動 入力/貼付 Enter=次/送信 Esc=取消 ".to_string(),
             Focus::PoiKindForm { .. } => " 新規カテゴリ: ↑↓/Tab移動 入力 Enter=次/追加 Esc=取消 ".to_string(),
+            Focus::WanderForm { .. } => " おまかせ周回: ←→距離調整(Shiftで粗く) Enter=検索開始 Esc=取消 ".to_string(),
             Focus::SpotList if spot_move_confirm.is_some() => {
                 let nm = spot_move_confirm.and_then(|gi| spots.get(gi)).map(|s| if s.name.is_empty() { "(無名)" } else { s.name.as_str() }).unwrap_or("");
                 format!(" 「{nm}」をこの地図中心の位置へ移動する？ y=はい / 他キー=取消 ")
@@ -903,7 +902,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             Focus::PoiMenu => " 目的地カテゴリ: ↑↓選択 Enter=検索(キー直打ちも可) n新規 x削除 [ ]並替 / キーワードは最終行 Esc=取消 ".to_string(),
             Focus::PoiList => format!(" [{}] ↑↓選択(追従) ←→地図 +/-拡縮 v追加 Enter移動 P登録 f再検索 Esc閉 ", poi_label),
             Focus::RouteList => " お気に入り: ↑↓選択 Enter=読込 Esc=閉 ".to_string(),
-            Focus::RoutePanel => " ルート一覧: ↑↓選択 Enter実行 [ ]並替 x削除 v追加 +/-拡縮 Esc/Tabで地図へ ".to_string(),
+            Focus::RoutePanel => " ルート一覧: ↑↓/ws選択 Enter実行 [ ]/ad並替 x削除 v追加 +/-拡縮 Esc/Tabで地図へ ".to_string(),
             Focus::RoadList => " 道路: ↑↓選択 x削除 Esc戻る ".to_string(),
             Focus::WaypointList => " 並べ替え: ↑↓/ws選択(地図追従)  Space掴む↔置く(掴み中↑↓/wsで移動)  x削除  +/-拡縮  Esc閉 ".to_string(),
             Focus::ColorPick { .. } => " 色を選択: ←→ Enter=決定 Esc=取消 ".to_string(),
@@ -912,7 +911,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             Focus::Menu(MenuLevel::Items(_)) => " ↑↓選択 Enter実行 / 右端キーでも実行 Esc戻る ".to_string(),
             Focus::Map => {
                 // 通信中(いずれかのジョブがSome)はスピナー1文字＋案内を先頭に出す
-                let jobs_active = route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some();
+                let jobs_active = route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some() || wander_job.is_some();
                 let spinner = if jobs_active {
                     const FR: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
                     format!("{} 通信中…(Escで中断) ", FR[spin % FR.len()])
@@ -1055,6 +1054,37 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             let _ = write!(out, "\x1b[{};{}H{}", r0 + rows.len() as u32, c0, btn);
             let _ = write!(out, "\x1b[{};{}H{}{}{}", r0 + rows.len() as u32 + 1, c0, BG, blank, RST);
         }
+        if let Focus::WanderForm { dist_km } = &focus { // おまかせ周回: 距離をゲージで選ぶ
+            const BG: &str = "\x1b[30;47m";
+            const FILL: &str = "\x1b[42;30m";  // 緑地(埋まった部分)
+            const RST: &str = "\x1b[0m";
+            let iw = (cols as usize).saturating_sub(6).clamp(24, 60);
+            let gw = iw.saturating_sub(4).max(10); // ゲージ本体の幅(セル。█/░は等幅1セルなのでfit_cells不要)
+            let (lo, hi) = (10.0, 200.0);
+            let frac = ((dist_km - lo) / (hi - lo)).clamp(0.0, 1.0);
+            let filled = ((gw as f64 * frac).round() as usize).min(gw);
+            let header = "  おまかせ周回: 距離を選択";
+            let dist_line = format!("  {:.0}km  (←→=5km Shift=20km  範囲{:.0}〜{:.0}km)", dist_km, lo, hi);
+            let blank = " ".repeat(iw);
+            let rows: [String; 6] = [
+                blank.clone(),
+                fit_cells(header, iw),
+                blank.clone(), // ゲージ本体はこの行にループ後で個別に上書き
+                fit_cells(&dist_line, iw),
+                blank.clone(),
+                fit_cells("  Enter=検索開始(バックグラウンド)  Esc=取消", iw),
+            ];
+            let r0 = ((map_rows as usize).saturating_sub(rows.len() + 1) / 2).max(1) as u32;
+            let c0 = ((cols as usize).saturating_sub(iw) / 2).max(1) as u32;
+            for (i, line) in rows.iter().enumerate() {
+                let _ = write!(out, "\x1b[{};{}H{}{}{}", r0 + i as u32, c0, BG, line, RST);
+            }
+            // ゲージ本体(行index2)を色付きで上書き。前後の余白は地の色(BG)のまま。
+            let gauge_row = r0 + 2;
+            let _ = write!(out, "\x1b[{};{}H{}  {}{}{}{}{}", gauge_row, c0, BG,
+                FILL, "█".repeat(filled), BG, "░".repeat(gw.saturating_sub(filled)), RST);
+            let _ = write!(out, "\x1b[{};{}H{}{}{}", r0 + rows.len() as u32, c0, BG, blank, RST);
+        }
         // 単一テキスト入力は地図中央のフォームで受ける(底面バーで完結させない)
         match &focus {
             Focus::Search(b) => draw_input_panel(&mut out, cols, map_rows, "地名・住所で検索", "Enter=検索  Esc=取消  (住所も入力OK)", b, input_cur),
@@ -1158,7 +1188,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             || matches!(focus,
                 Focus::SpotForm { .. } | Focus::Search(_) | Focus::SaveName(_) | Focus::NearSearch(_)
                 | Focus::NewCat(_) | Focus::RoadSearch(_) | Focus::Recommend(_)
-                | Focus::SpotRename(..) | Focus::SpotEditName(..) | Focus::ColorPick { .. } | Focus::SettingsEdit(..) | Focus::PoiKindForm { .. });
+                | Focus::SpotRename(..) | Focus::SpotEditName(..) | Focus::ColorPick { .. } | Focus::SettingsEdit(..) | Focus::PoiKindForm { .. } | Focus::WanderForm { .. });
         if prev_map_covered && !map_covered { force_reemit = true; }
         prev_map_covered = map_covered;
         out.flush()?;
@@ -1283,6 +1313,19 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 Err(TryRecvError::Disconnected) => { catpoi_job = None; got_result = true; }
             }
         }
+        if wander_job.is_some() {
+            match wander_job.as_ref().unwrap().try_recv() {
+                Ok(res) => {
+                    match res {
+                        Ok(w) => { wps = w; wp_sel = 0; route_sel = 0; let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; }
+                        Err(e) => { snd.play("error"); addr = format!("({e})"); }
+                    }
+                    wander_job = None; got_result = true;
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => { wander_job = None; got_result = true; }
+            }
+        }
         if street_job.is_some() {
             match street_job.as_ref().unwrap().try_recv() {
                 Ok((la, lo, hd, res)) => {
@@ -1318,7 +1361,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
 
         // 入力待ち。結果適用直後は即再描画(None)。ジョブ/GPS/再生/移動settling中はポーリング。
         // settling中は短間隔(60ms)で見に行き、動きが止まったフレームで高解像度に上げ直す。
-        let polling = route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some() || gps_rx.is_some() || play.is_some() || settling;
+        let polling = route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some() || wander_job.is_some() || gps_rx.is_some() || play.is_some() || settling;
         let ev: Option<Event> = if got_result {
             None
         } else if polling {
@@ -1331,10 +1374,10 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             None => {} // 再描画のみ(計算待ち)
             Some(Event::Key(k)) if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) => {
                 // Ctrl-C: 進行中の全ジョブを中断(アプリは終了しない)
-                let any = route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some();
+                let any = route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some() || wander_job.is_some();
                 if any {
                     if route_job.is_some() { route_note = Some("中断".to_string()); }
-                    route_job = None; search_job = None; near_job = None; street_job = None; recommend_job = None; road_job = None; catpoi_job = None;
+                    route_job = None; search_job = None; near_job = None; street_job = None; recommend_job = None; road_job = None; catpoi_job = None; wander_job = None;
                     addr = "中断".into();
                 }
             }
@@ -1362,9 +1405,9 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             }
             // Map表示中のEscは進行中ジョブの中断に使う(サブ画面のEscは各Focusの取消のまま)
             Some(Event::Key(k)) if k.code == KeyCode::Esc && matches!(focus, Focus::Map)
-                && (route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some()) => {
+                && (route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some() || wander_job.is_some()) => {
                 if route_job.is_some() { route_note = Some("中断".to_string()); }
-                route_job = None; search_job = None; near_job = None; street_job = None; recommend_job = None; road_job = None; catpoi_job = None;
+                route_job = None; search_job = None; near_job = None; street_job = None; recommend_job = None; road_job = None; catpoi_job = None; wander_job = None;
                 addr = "中断".into();
             }
             Some(Event::Key(k)) => {
@@ -1734,6 +1777,28 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             focus = Focus::PoiKindForm { label, tag, field };
                         }
                     },
+                    Focus::WanderForm { mut dist_km } => match k.code { // おまかせ周回: 距離ゲージ
+                        KeyCode::Left | KeyCode::Right => {
+                            let step = if k.modifiers.contains(KeyModifiers::SHIFT) { 20.0 } else { 5.0 };
+                            let d = if k.code == KeyCode::Left { -step } else { step };
+                            dist_km = (dist_km + d).clamp(10.0, 200.0);
+                            focus = Focus::WanderForm { dist_km };
+                        }
+                        KeyCode::Esc => { snd.play("back"); focus = Focus::Map; }
+                        KeyCode::Enter => {
+                            let origin = (lat, lon);
+                            let shape = a.shape.clone();
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            std::thread::spawn(move || {
+                                let r = wander_route(origin, dist_km, &shape);
+                                let _ = tx.send(r);
+                            });
+                            wander_job = Some(rx);
+                            addr = format!("走りまくり: {dist_km:.0}km圏を検索中…");
+                            focus = Focus::Map; // UIは生きたまま(スピナー表示・Escで中断)
+                        }
+                        _ => focus = Focus::WanderForm { dist_km },
+                    },
                     Focus::NearSearch(mut buf) => match k.code {
                         KeyCode::Enter => {
                             let q = buf.trim().to_string();
@@ -1916,8 +1981,8 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     },
                     // Space メニュー・トップ(カテゴリ選択)。文字キーは全カテゴリ横断で直接実行できる。
                     Focus::Menu(MenuLevel::Categories) => match k.code {
-                        KeyCode::Up => { snd.play("blip"); menu_cat_sel = menu_cat_sel.saturating_sub(1); focus = Focus::Menu(MenuLevel::Categories); }
-                        KeyCode::Down => { snd.play("blip"); if menu_cat_sel + 1 < MENU_CATEGORIES.len() { menu_cat_sel += 1; } focus = Focus::Menu(MenuLevel::Categories); }
+                        KeyCode::Up => { snd.play("click"); menu_cat_sel = menu_cat_sel.saturating_sub(1); focus = Focus::Menu(MenuLevel::Categories); }
+                        KeyCode::Down => { snd.play("click"); if menu_cat_sel + 1 < MENU_CATEGORIES.len() { menu_cat_sel += 1; } focus = Focus::Menu(MenuLevel::Categories); }
                         KeyCode::Enter => { snd.play("click"); menu_item_sel = 0; focus = Focus::Menu(MenuLevel::Items(menu_cat_sel)); }
                         KeyCode::Esc => { snd.play("back"); } // メニューを閉じる → Map
                         KeyCode::Char(c) => match menu_action_for_key(c) {
@@ -1930,8 +1995,8 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     Focus::Menu(MenuLevel::Items(ci)) => {
                         let items = MENU_CATEGORIES[ci].items;
                         match k.code {
-                            KeyCode::Up => { snd.play("blip"); menu_item_sel = menu_item_sel.saturating_sub(1); focus = Focus::Menu(MenuLevel::Items(ci)); }
-                            KeyCode::Down => { snd.play("blip"); if menu_item_sel + 1 < items.len() { menu_item_sel += 1; } focus = Focus::Menu(MenuLevel::Items(ci)); }
+                            KeyCode::Up => { snd.play("click"); menu_item_sel = menu_item_sel.saturating_sub(1); focus = Focus::Menu(MenuLevel::Items(ci)); }
+                            KeyCode::Down => { snd.play("click"); if menu_item_sel + 1 < items.len() { menu_item_sel += 1; } focus = Focus::Menu(MenuLevel::Items(ci)); }
                             KeyCode::Enter => run_action!(items[menu_item_sel].action, lat, lon, cols, tr),
                             KeyCode::Esc => { snd.play("back"); focus = Focus::Menu(MenuLevel::Categories); } // 上位カテゴリへ戻る
                             KeyCode::Char(c) => match items.iter().find(|it| it.key == c) {
@@ -1991,8 +2056,8 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                     focus = Focus::RoutePanel;
                                 }
                             }
-                            KeyCode::Char('[') => { if route_sel < wps.len() && route_sel > 0 { wps.swap(route_sel, route_sel - 1); route_sel -= 1; wp_sel = route_sel; let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } focus = Focus::RoutePanel; }
-                            KeyCode::Char(']') => { if route_sel + 1 < wps.len() { wps.swap(route_sel, route_sel + 1); route_sel += 1; wp_sel = route_sel; let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } focus = Focus::RoutePanel; }
+                            KeyCode::Char('[') | KeyCode::Char('a') => { if route_sel < wps.len() && route_sel > 0 { wps.swap(route_sel, route_sel - 1); route_sel -= 1; wp_sel = route_sel; let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } focus = Focus::RoutePanel; }
+                            KeyCode::Char(']') | KeyCode::Char('d') => { if route_sel + 1 < wps.len() { wps.swap(route_sel, route_sel + 1); route_sel += 1; wp_sel = route_sel; let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } focus = Focus::RoutePanel; }
                             KeyCode::Char('x') => {
                                 if route_sel < wps.len() { wps.remove(route_sel); if route_sel >= wps.len() && route_sel > 0 { route_sel -= 1; } wp_sel = route_sel.min(wps.len().saturating_sub(1)); let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; }
                                 if !wps.is_empty() { focus = Focus::RoutePanel; } // 空になったら地図へ
@@ -2119,13 +2184,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                     route_note = nn; route_job = jj;
                                 } else { snd.play("error"); addr = "ルート未確定".into(); }
                             }
-                            KeyCode::Char('W') => { // 走りまくり(峠/展望の周回)を生成。連打で別案
-                                let dist = a.dist.unwrap_or(40.0);
-                                match wander_route((lat, lon), dist, &a.shape) {
-                                    Ok(w) => { wps = w; wp_sel = 0; let (nn, jj) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = nn; route_job = jj; }
-                                    Err(e) => addr = format!("({e})"),
-                                }
-                            }
+                            KeyCode::Char('W') => { focus = Focus::WanderForm { dist_km: a.dist.unwrap_or(40.0) }; } // 走りまくり: 距離ゲージを開く
                             KeyCode::Char('o') => { // スマホ共有(GoogleマップQR)
                                 if wps.len() >= 2 {
                                     let (url, _) = gmaps_url(&wps);
