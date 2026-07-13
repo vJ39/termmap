@@ -1,12 +1,10 @@
-//! 操作UIの効果音。macOS の afplay に委譲して短い WAV を鳴らす。
-//! 依存追加なし。非macOS / afplay不在 / 無効時は完全に no-op。
+//! 操作UIの効果音。macOS の Core Audio(AudioServicesPlaySystemSound)で鳴らす。
+//! crate依存追加なし(build.rsでAudioToolbox/CoreFoundationフレームワークをリンクするのみ)。
 //!
-//! 再生はワーカースレッド1本に channel で sfx名(&'static str)を送るだけ。
-//! afplay の子プロセスは status() で待って reap する(＝ゾンビ化させない)。
-//! play() は送信するだけなので UI をブロックしない。
-
-use std::process::{Command, Stdio};
-use std::sync::mpsc::Sender;
+//! 起動時に各WAVを一時ファイルへ書き出し、SystemSoundIDとして事前登録しておく(＝メモリに保持)。
+//! play()は登録済みIDを渡してAudioServicesPlaySystemSoundを呼ぶだけで、都度プロセスを起動する
+//! afplay方式と違って起動オーバーヘッドが無く低レイテンシ。呼び出しは即座に返り重複再生も自然に
+//! 許容される(前の音の再生完了を待たない)。
 
 // 埋め込む効果音。名前 = play() で指定する識別子。tmp へ <name>.wav で書き出す。
 const SFX: &[(&str, &[u8])] = &[
@@ -18,65 +16,131 @@ const SFX: &[(&str, &[u8])] = &[
     ("click", include_bytes!("../assets/sfx/sfx_click.wav")),
 ];
 
+#[cfg(target_os = "macos")]
+mod coreaudio {
+    use std::os::raw::c_void;
+
+    pub type CFAllocatorRef = *const c_void;
+    pub type CFUrlRef = *const c_void;
+    pub type CfIndex = isize;
+    pub type Boolean = u8;
+    pub type OsStatus = i32;
+    pub type SystemSoundId = u32;
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        pub static kCFAllocatorDefault: CFAllocatorRef;
+        pub fn CFURLCreateFromFileSystemRepresentation(
+            allocator: CFAllocatorRef,
+            buffer: *const u8,
+            buf_len: CfIndex,
+            is_directory: Boolean,
+        ) -> CFUrlRef;
+        pub fn CFRelease(cf: *const c_void);
+    }
+
+    #[link(name = "AudioToolbox", kind = "framework")]
+    extern "C" {
+        pub fn AudioServicesCreateSystemSoundID(
+            in_file_url: CFUrlRef,
+            out_system_sound_id: *mut SystemSoundId,
+        ) -> OsStatus;
+        pub fn AudioServicesPlaySystemSound(in_system_sound_id: SystemSoundId);
+    }
+
+    /// WAVファイルをSystemSoundIDとして登録する。失敗時はNone(呼び出し側で無視する)。
+    pub fn register(path: &std::path::Path) -> Option<SystemSoundId> {
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = path.as_os_str().as_bytes();
+        unsafe {
+            let url = CFURLCreateFromFileSystemRepresentation(
+                kCFAllocatorDefault,
+                bytes.as_ptr(),
+                bytes.len() as CfIndex,
+                0,
+            );
+            if url.is_null() {
+                return None;
+            }
+            let mut id: SystemSoundId = 0;
+            let status = AudioServicesCreateSystemSoundID(url, &mut id);
+            CFRelease(url);
+            if status == 0 { Some(id) } else { None }
+        }
+    }
+}
+
 pub struct Sound {
-    tx: Option<Sender<&'static str>>,
+    #[cfg(target_os = "macos")]
+    ids: Vec<(&'static str, coreaudio::SystemSoundId)>,
+    enabled: bool,
 }
 
 impl Sound {
-    /// 効果音プレイヤーを作る。
-    /// enabled=false / 非macOS / afplay不在 のいずれかなら no-op(tx=None)を返す。
+    /// 効果音プレイヤーを作る。enabled=false / 非macOS / 登録失敗時はno-opになる。
     pub fn new(enabled: bool) -> Sound {
-        if !enabled || !cfg!(target_os = "macos") {
-            return Sound { tx: None };
-        }
-        if !afplay_available() {
-            return Sound { tx: None };
-        }
-        // 埋め込みWAVを一時ディレクトリへ起動時に一度だけ書き出す。
-        let dir = std::env::temp_dir().join("termmap-sfx");
-        if std::fs::create_dir_all(&dir).is_err() {
-            return Sound { tx: None };
-        }
-        for &(name, bytes) in SFX {
-            let _ = std::fs::write(dir.join(format!("{name}.wav")), bytes);
-        }
-        // ワーカースレッド1本: channel から sfx名を受け、afplay で鳴らす。
-        // 連打で送信済みキューが伸びると、操作をやめた後もSEが鳴り続ける("スタック")ので、
-        // recv後にキューへ溜まった分を全部先読みして捨て、常に最新の1件だけ再生する。
-        let (tx, rx) = std::sync::mpsc::channel::<&'static str>();
-        std::thread::spawn(move || {
-            // 全 Sender が drop されると recv が Err を返す → ループ終了(スレッド後始末)。
-            while let Ok(mut name) = rx.recv() {
-                while let Ok(next) = rx.try_recv() { name = next; }
-                let path = dir.join(format!("{name}.wav"));
-                // status() で子プロセスを待って回収する = ゾンビ化させない。失敗は無視。
-                let _ = Command::new("afplay")
-                    .arg(&path)
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
+        #[cfg(target_os = "macos")]
+        {
+            if !enabled {
+                return Sound { ids: Vec::new(), enabled: false };
             }
-        });
-        Sound { tx: Some(tx) }
+            let dir = std::env::temp_dir().join("termmap-sfx");
+            if std::fs::create_dir_all(&dir).is_err() {
+                return Sound { ids: Vec::new(), enabled: false };
+            }
+            let mut ids = Vec::new();
+            for &(name, bytes) in SFX {
+                let path = dir.join(format!("{name}.wav"));
+                if std::fs::write(&path, bytes).is_err() {
+                    continue;
+                }
+                if let Some(id) = coreaudio::register(&path) {
+                    ids.push((name, id));
+                }
+            }
+            let ok = !ids.is_empty();
+            return Sound { ids, enabled: ok };
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = enabled;
+            Sound { enabled: false }
+        }
     }
 
-    /// sfx名を鳴らす。無効時(tx=None)や送信失敗時は何もしない(UIをブロックしない)。
+    /// sfx名を鳴らす。無効時や未登録時は何もしない(UIをブロックしない・呼び出しは即座に返る)。
     pub fn play(&self, name: &'static str) {
-        if let Some(tx) = &self.tx {
-            let _ = tx.send(name);
+        if !self.enabled {
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(&(_, id)) = self.ids.iter().find(|(n, _)| *n == name) {
+                unsafe { coreaudio::AudioServicesPlaySystemSound(id) };
+            }
         }
     }
 }
 
-// PATH 上の afplay が起動できるか判定する。標準パスの存在を先に見て、無ければ実起動を試す。
-fn afplay_available() -> bool {
-    if std::path::Path::new("/usr/bin/afplay").exists() {
-        return true;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_registers_all_sfx_and_play_does_not_panic() {
+        let snd = Sound::new(true);
+        // CI/ヘッドレス環境でも音声デバイス有無に関わらずクラッシュしないことを確認する。
+        #[cfg(target_os = "macos")]
+        assert_eq!(snd.ids.len(), SFX.len(), "全SFXがSystemSoundIDとして登録できること");
+        for &(name, _) in SFX {
+            snd.play(name); // 音は聞こえなくてよい。panicしないことだけ確認
+        }
+        snd.play("存在しない名前"); // 未登録名はno-op
     }
-    Command::new("afplay")
-        .arg("--help")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok()
+
+    #[test]
+    fn disabled_is_noop() {
+        let snd = Sound::new(false);
+        snd.play("pop"); // no-opでpanicしない
+    }
 }
