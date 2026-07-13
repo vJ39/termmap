@@ -360,11 +360,11 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     // ルート計算と同じ非同期パターンで、検索/周辺/実写/おすすめの通信もバックグラウンド化する。
     // 新規spawn時に古いrxはdropされる=最新のみ採用(generation ID不要)。
     let mut search_job: Option<std::sync::mpsc::Receiver<(String, String, Result<Vec<(f64, f64, String)>, String>)>> = None; // (ckey, query, geocode結果)
-    let mut near_job: Option<std::sync::mpsc::Receiver<(String, Vec<(f64, f64, String)>)>> = None; // (query, search_nearbyのosm結果)
+    let mut near_job: Option<std::sync::mpsc::Receiver<(String, Result<Vec<(f64, f64, String)>, ApiError>)>> = None; // (query, search_nearbyのosm結果)
     let mut street_job: Option<std::sync::mpsc::Receiver<(f64, f64, i32, Result<image::RgbImage, String>)>> = None; // (lat, lon, heading, 実写画像)
     let mut recommend_job: Option<std::sync::mpsc::Receiver<Result<Vec<(f64, f64, String)>, String>>> = None; // 実在確認済みスポット列
     let mut road_job: Option<std::sync::mpsc::Receiver<(String, Result<Vec<(Vec<(f64, f64)>, bool)>, String>)>> = None; // (道路名, roadsearch::fetch結果)
-    let mut catpoi_job: Option<std::sync::mpsc::Receiver<(usize, Result<Vec<(f64, f64, String, PoiCat)>, String>)>> = None; // (POI_KINDSのindex, poi_search結果)
+    let mut catpoi_job: Option<std::sync::mpsc::Receiver<(usize, Result<Vec<(f64, f64, String, PoiCat)>, ApiError>)>> = None; // (POI_KINDSのindex, poi_search結果)
     let mut spin: usize = 0; // 通信中スピナーのフレーム(毎ループ+1)
     let mut spots = load_spots();          // マイスポット
     let mut spot_cats = load_spot_cats();
@@ -1159,21 +1159,37 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         }
         if near_job.is_some() {
             match near_job.as_ref().unwrap().try_recv() {
-                Ok((q, osm)) => {
-                    // ローカルの★スポット一致(距離順)を先頭、Overpass結果(距離順)を後ろにマージ
+                Ok((q, res)) => {
+                    // ローカルの★スポット一致(距離順)を先頭、Overpass結果(距離順)を後ろにマージ。
+                    // Overpassが障害の場合でも★一致だけは出す(0件=該当なしと障害を混同しない)。
                     let ql = q.to_lowercase();
                     let mut mine: Vec<(f64, f64, String, PoiCat)> = spots.iter()
                         .filter(|s| s.name.to_lowercase().contains(&ql))
                         .map(|s| (s.lat, s.lon, format!("★{}", s.name), PoiCat::Home)).collect();
                     mine.sort_by(|p, r| haversine_km((lat, lon), (p.0, p.1)).partial_cmp(&haversine_km((lat, lon), (r.0, r.1))).unwrap_or(std::cmp::Ordering::Equal));
-                    let mut got: Vec<(f64, f64, String, PoiCat)> = osm.into_iter().map(|(a, b, nm)| (a, b, nm, PoiCat::Other)).collect();
-                    got.sort_by(|p, r| haversine_km((lat, lon), (p.0, p.1)).partial_cmp(&haversine_km((lat, lon), (r.0, r.1))).unwrap_or(std::cmp::Ordering::Equal));
-                    mine.extend(got);
-                    if mine.is_empty() { snd.play("error"); addr = format!("周辺に無し: {q}"); }
-                    else {
-                        pois = mine; poi_sel = 0; poi_label = format!("周辺:{q}");
-                        set_markers(&mut spec, &wps, &pois);
-                        if matches!(focus, Focus::Map) { focus = Focus::PoiList; }
+                    match res {
+                        Ok(osm) => {
+                            let mut got: Vec<(f64, f64, String, PoiCat)> = osm.into_iter().map(|(a, b, nm)| (a, b, nm, PoiCat::Other)).collect();
+                            got.sort_by(|p, r| haversine_km((lat, lon), (p.0, p.1)).partial_cmp(&haversine_km((lat, lon), (r.0, r.1))).unwrap_or(std::cmp::Ordering::Equal));
+                            mine.extend(got);
+                            if mine.is_empty() { snd.play("error"); addr = format!("周辺に無し: {q}"); }
+                            else {
+                                pois = mine; poi_sel = 0; poi_label = format!("周辺:{q}");
+                                set_markers(&mut spec, &wps, &pois);
+                                if matches!(focus, Focus::Map) { focus = Focus::PoiList; }
+                            }
+                        }
+                        Err(e) => {
+                            snd.play("error");
+                            if mine.is_empty() {
+                                addr = format!("周辺検索: {e}"); // 障害。「該当なし」と文言を分ける
+                            } else {
+                                addr = format!("★のみ表示({e})");
+                                pois = mine; poi_sel = 0; poi_label = format!("周辺:{q}");
+                                set_markers(&mut spec, &wps, &pois);
+                                if matches!(focus, Focus::Map) { focus = Focus::PoiList; }
+                            }
+                        }
                     }
                     near_job = None; got_result = true;
                 }

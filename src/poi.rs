@@ -167,18 +167,17 @@ fn overpass_name_pattern(q: &str) -> String {
 }
 // 現在表示範囲(bbox)でキーワード周辺検索。name/brand に q を含む地物を Overpass で(部分一致・区切り許容・大小無視)。
 // Nominatim(ジオコーダ)はチェーン店の近傍列挙に弱いので Overpass の name/brand 正規表現検索を使う。
-pub fn search_nearby(q: &str, s: f64, w: f64, n: f64, e: f64) -> Vec<(f64, f64, String)> {
+// Ok(空)=該当なし / Err=通信・サーバ・解析の障害、として呼び出し側で区別できる。
+pub fn search_nearby(q: &str, s: f64, w: f64, n: f64, e: f64) -> Result<Vec<(f64, f64, String)>, ApiError> {
     let pat = overpass_name_pattern(q);
     let b = format!("{:.5},{:.5},{:.5},{:.5}", s, w, n, e);
     let query = format!(
         "[out:json][timeout:25];(nwr[\"name\"~\"{pat}\",i]({b});nwr[\"brand\"~\"{pat}\",i]({b}););out center;"
     );
     let url = format!("https://overpass-api.de/api/interpreter?data={}", urlencode(&query));
-    let body = match ureq::get(&url).set("User-Agent", "termmap/0.1 (personal experiment)").set("Accept", "application/json")
-        .timeout(std::time::Duration::from_secs(20)).call() {
-        Ok(r) => r.into_string().unwrap_or_default(),
-        Err(_) => return Vec::new(),
-    };
+    let req = ureq::get(&url).set("User-Agent", "termmap/0.1 (personal experiment)").set("Accept", "application/json")
+        .timeout(std::time::Duration::from_secs(20));
+    let body = call_text(req)?;
     parse_overpass(&body)
 }
 
@@ -211,9 +210,9 @@ struct OverElement {
 struct OverResp { #[serde(default)] elements: Vec<OverElement> }
 // Overpass out:json の elements から (lat,lon,name) を取り出す。
 // node は自身の lat/lon、way は center の lat/lon を使う(既存挙動を維持)。
-// パース不能な応答は空Vec(呼び出し側で0件として扱う)。
-fn parse_overpass(body: &str) -> Vec<(f64, f64, String)> {
-    let resp: OverResp = match serde_json::from_str(body) { Ok(r) => r, Err(_) => return Vec::new() };
+// パース不能な応答は ApiError::Decode(呼び出し側で「0件」と区別できる障害として扱う)。
+fn parse_overpass(body: &str) -> Result<Vec<(f64, f64, String)>, ApiError> {
+    let resp: OverResp = serde_json::from_str(body).map_err(|e| ApiError::Decode(e.to_string()))?;
     let mut out = Vec::new();
     for el in resp.elements {
         // node=自身の lat/lon / way=center。どちらも無ければスキップ。
@@ -224,22 +223,21 @@ fn parse_overpass(body: &str) -> Vec<(f64, f64, String)> {
         let name = el.tags.map(|t| t.name).unwrap_or_default();
         out.push((la, lo, name));
     }
-    out
+    Ok(out)
 }
-// 表示bbox(south,west,north,east)で kind を検索
-pub fn fetch_pois(kind: &PoiKind, s: f64, w: f64, n: f64, e: f64) -> Result<Vec<(f64, f64, String)>, String> {
+// 表示bbox(south,west,north,east)で kind を検索。Ok(空)=該当なし / Err=通信・サーバ・解析の障害。
+pub fn fetch_pois(kind: &PoiKind, s: f64, w: f64, n: f64, e: f64) -> Result<Vec<(f64, f64, String)>, ApiError> {
     let q = format!("[out:json][timeout:25];({}({:.5},{:.5},{:.5},{:.5}););out center;", kind.filter, s, w, n, e);
     let url = format!("https://overpass-api.de/api/interpreter?data={}", urlencode(&q));
-    let body = ureq::get(&url)
-        .set("User-Agent", "termmap/0.1 (personal experiment)")
-        .set("Accept", "application/json")
-        .timeout(std::time::Duration::from_secs(20)).call().map_err(|e| format!("overpass: {e}"))?
-        .into_string().map_err(|e| e.to_string())?;
-    Ok(parse_overpass(&body))
+    let req = ureq::get(&url).set("User-Agent", "termmap/0.1 (personal experiment)").set("Accept", "application/json")
+        .timeout(std::time::Duration::from_secs(20));
+    let body = call_text(req)?;
+    parse_overpass(&body)
 }
 
 // 中心付近(表示範囲2.5倍と半径2kmの広い方)で kind を検索し、名前重複除去・中心から近い順・最大50件で返す。
-pub fn poi_search(kind: &PoiKind, cx: f64, cy: f64, z: u32, ow: u32, oh: u32, lat: f64, lon: f64) -> Result<Vec<(f64, f64, String, PoiCat)>, String> {
+// Ok(空)=該当なし / Err=通信・サーバ・解析の障害。
+pub fn poi_search(kind: &PoiKind, cx: f64, cy: f64, z: u32, ow: u32, oh: u32, lat: f64, lon: f64) -> Result<Vec<(f64, f64, String, PoiCat)>, ApiError> {
     let (vt, vl) = crate::geo::pixel_to_deg(cx - ow as f64 * 1.25, cy - oh as f64 * 1.25, z);
     let (vb, vr) = crate::geo::pixel_to_deg(cx + ow as f64 * 1.25, cy + oh as f64 * 1.25, z);
     let rlat = 2.0 / 111.0;
@@ -263,7 +261,7 @@ mod tests {
           {"type":"node","lat":35.75,"lon":139.73,"tags":{"name":"あ店","amenity":"fuel"}},
           {"type":"way","center":{"lat":35.76,"lon":139.74},"tags":{"name":"い店"}}
         ]}"#;
-        let v = parse_overpass(body);
+        let v = parse_overpass(body).unwrap();
         assert_eq!(v.len(), 2);
         assert_eq!(v[0].2, "あ店"); // node は自身の lat/lon
         assert!((v[1].0 - 35.76).abs() < 1e-9); // wayはcenter
@@ -276,12 +274,20 @@ mod tests {
           {"type":"node","lat":35.0,"lon":139.0},
           {"type":"relation","tags":{"name":"座標なし"}}
         ]}"#;
-        let v = parse_overpass(body);
+        let v = parse_overpass(body).unwrap();
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].2, ""); // tags 無し → 空名
-        // パース不能な応答は空Vec(panicしない)
-        assert!(parse_overpass("not json").is_empty());
-        assert!(parse_overpass(r#"{"version":0.6}"#).is_empty()); // elements キー無し
+        // 「elements キー無し」は0件(該当なし)であって障害ではない
+        assert_eq!(parse_overpass(r#"{"version":0.6}"#).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn parse_overpass_malformed_json_is_decode_error_not_empty() {
+        // 壊れたJSON応答は「0件」ではなく障害(ApiError::Decode)として区別できる(panicしない)
+        match parse_overpass("not json") {
+            Err(ApiError::Decode(_)) => {}
+            other => panic!("expected Decode error, got {other:?}"),
+        }
     }
 
     #[test]
