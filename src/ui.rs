@@ -929,7 +929,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 // 一時メッセージが無い時は底面にロゴを常時表示。メッセージ発生時はそちらを優先。
                 let msg = if addr.is_empty() { "◉╌╌╌► termmap · terminal touring map   ".to_string() } else { format!("» {addr} « ") };
                 // 下部バーは細く。全操作は Space メニューから選べる
-                let route_hint = if wps.is_empty() { "v=地点を置く".to_string() } else { format!("{}点 v足す Tab=左の一覧へ(選択/操作)", wps.len()) };
+                let route_hint = if wps.is_empty() { "v=地点を置く".to_string() } else { format!("{}点 v足す w/s選択 Tab=左の一覧へ(並替/操作)", wps.len()) };
                 let base = format!(" {spinner}{msg}{live}{playing}z{z} {lat:.4},{lon:.4} ｜ {route_hint} ｜ Space:メニュー ?ヘルプ q終了");
                 match &route_note { Some(rn) => format!("{base} | {rn} "), None => base }
             }
@@ -2134,6 +2134,15 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                 snd.play("pop"); wp_add(&mut wps, (lat, lon));
                                 let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_;
                                 addr = format!("地点を追加 #{}", wps.len());
+                            }
+                            // w/s: Tabで一覧へ入らなくても、地図(パン)はそのままルート一覧の選択だけ上下できる
+                            KeyCode::Char('w') if !wps.is_empty() => {
+                                wp_sel = (wp_sel + wps.len() - 1) % wps.len(); route_sel = wp_sel;
+                                let (la, lo) = wps[wp_sel]; let (nx, ny) = deg_to_pixel(la, lo, z); cx = nx; cy = ny;
+                            }
+                            KeyCode::Char('s') if !wps.is_empty() => {
+                                wp_sel = (wp_sel + 1) % wps.len(); route_sel = wp_sel;
+                                let (la, lo) = wps[wp_sel]; let (nx, ny) = deg_to_pixel(la, lo, z); cx = nx; cy = ny;
                             }
                             KeyCode::Tab | KeyCode::BackTab => { if !wps.is_empty() { route_sel = route_sel.min(wps.len() + route_acts.len() - 1); focus = Focus::RoutePanel; } } // 左のルート一覧にフォーカス(そこで↑↓選択・Enter実行)
                             KeyCode::Char(' ') => { snd.play("click"); menu_cat_sel = 0; focus = Focus::Menu(MenuLevel::Categories); } // Space=メニュー(カテゴリ→展開の2階層)
