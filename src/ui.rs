@@ -200,6 +200,7 @@ const MENU_CATEGORIES: &[MenuCategory] = &[
     ]},
     MenuCategory { label: "ルート作成", items: &[
         MenuItem { label: "地点を置く(中心)",  key: 'v', action: MenuAction::AddVia },
+        MenuItem { label: "目的地を探して追加", key: 'f', action: MenuAction::SearchPoi }, // カテゴリ/キーワードで検索→結果一覧のvで追加
         MenuItem { label: "並べ替え・編集",    key: 'R', action: MenuAction::RouteForm },
         MenuItem { label: "道路名から追加",    key: 'r', action: MenuAction::RoadRoute },
         MenuItem { label: "道路の塊を管理",    key: 'D', action: MenuAction::ManageRoads },
