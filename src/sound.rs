@@ -40,11 +40,14 @@ impl Sound {
         for &(name, bytes) in SFX {
             let _ = std::fs::write(dir.join(format!("{name}.wav")), bytes);
         }
-        // ワーカースレッド1本: channel から sfx名を受け、afplay で直列に鳴らす(短音なので可)。
+        // ワーカースレッド1本: channel から sfx名を受け、afplay で鳴らす。
+        // 連打で送信済みキューが伸びると、操作をやめた後もSEが鳴り続ける("スタック")ので、
+        // recv後にキューへ溜まった分を全部先読みして捨て、常に最新の1件だけ再生する。
         let (tx, rx) = std::sync::mpsc::channel::<&'static str>();
         std::thread::spawn(move || {
             // 全 Sender が drop されると recv が Err を返す → ループ終了(スレッド後始末)。
-            while let Ok(name) = rx.recv() {
+            while let Ok(mut name) = rx.recv() {
+                while let Ok(next) = rx.try_recv() { name = next; }
                 let path = dir.join(format!("{name}.wav"));
                 // status() で子プロセスを待って回収する = ゾンビ化させない。失敗は無視。
                 let _ = Command::new("afplay")
