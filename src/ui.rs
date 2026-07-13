@@ -112,6 +112,14 @@ fn draw_input_panel<W: std::io::Write>(out: &mut W, cols: u32, map_rows: u32, ti
     let _ = write!(out, "\x1b[{};{}H{}{}{}", r0 + rows.len() as u32, c0, BG, blank, RST);
 }
 
+// 緑グラデのワードマーク(オンボーディング/ヘルプ共用)。(ANSI色, 文字)
+const LOGO: [(&str, &str); 4] = [
+    ("\x1b[1;38;2;130;255;150m", "   ╺┳╸┏━╸┏━┓┏┳┓┏┳┓┏━┓┏━┓"),
+    ("\x1b[1;38;2;80;220;110m",  "    ┃ ┣╸ ┣┳┛┃┃┃┃┃┃┣━┫┣━┛"),
+    ("\x1b[1;38;2;40;175;80m",   "    ╹ ┗━╸╹┗╸╹╹╹╹╹╹╹ ╹╹"),
+    ("\x1b[38;2;110;170;120m",   "   terminal touring map"),
+];
+
 // 対話モードの操作マニュアル(? で表示)
 const HELP: &[&str] = &[
     " termmap 対話モード ─ 操作マニュアル",
@@ -478,8 +486,12 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         let map_rows = (tr.max(3) - 1) as u32;
         if help { // ヘルプ全画面。任意キーで閉じる
             let _ = write!(out, "\x1b[2J\x1b[H");
-            for (i, l) in HELP.iter().enumerate().take(map_rows as usize) {
-                let _ = write!(out, "\x1b[{};1H{}\x1b[K", i + 1, l);
+            for (i, (col, ln)) in LOGO.iter().enumerate() { // 先頭に緑ワードマーク
+                let _ = write!(out, "\x1b[{};2H{}{}\x1b[0m\x1b[K", i + 1, col, ln);
+            }
+            let off = LOGO.len() + 1; // ロゴ4行 + 空行1
+            for (i, l) in HELP.iter().skip(1).enumerate().take((map_rows as usize).saturating_sub(off)) {
+                let _ = write!(out, "\x1b[{};1H{}\x1b[K", i + off + 1, l);
             }
             let _ = write!(out, "\x1b[{};1H\x1b[7m 任意のキーで閉じる \x1b[0m\x1b[K", tr);
             let _ = out.flush();
@@ -844,7 +856,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             Focus::Recommend(_) => " 中央フォームに入力中 ".to_string(),
             Focus::SpotRename(_, _) => " 中央フォームに入力中 ".to_string(),
             Focus::PoiMenu => " 目的地カテゴリ: ↑↓選択 Enter=検索 (数字1-7も可 / キーワードは最終行かEnter) Esc=取消 ".to_string(),
-            Focus::PoiList => format!(" [{}] ↑↓選択(地図追従) ←→地図 v=地点追加 Enter移動 P登録 f再検索 Esc閉 ", poi_label),
+            Focus::PoiList => format!(" [{}] ↑↓選択(追従) ←→地図 +/-拡縮 v追加 Enter移動 P登録 f再検索 Esc閉 ", poi_label),
             Focus::RouteList => " お気に入り: ↑↓選択 Enter=読込 Esc=閉 ".to_string(),
             Focus::RoadList => " 道路: ↑↓選択 x削除 Esc戻る ".to_string(),
             Focus::WaypointList => " 並べ替え: ↑↓/ws選択(地図追従)  Space掴む↔置く(掴み中↑↓/wsで移動)  x削除  +/-拡縮  Esc閉 ".to_string(),
@@ -1552,6 +1564,8 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                         KeyCode::Down => { if poi_sel + 1 < pois.len() { poi_sel += 1; } if let Some(p) = pois.get(poi_sel) { let (nx, ny) = deg_to_pixel(p.0, p.1, z); cx = nx; cy = ny; } focus = Focus::PoiList; }
                         KeyCode::Left => { cx -= (oh as f64 / 8.0).max(1.0); focus = Focus::PoiList; } // ←→で地図を微パン
                         KeyCode::Right => { cx += (oh as f64 / 8.0).max(1.0); focus = Focus::PoiList; }
+                        KeyCode::Char('+') | KeyCode::Char('=') => { if z < 19 { z += 1; cx *= 2.0; cy *= 2.0; } focus = Focus::PoiList; } // +/-でズーム
+                        KeyCode::Char('-') | KeyCode::Char('_') => { if z > 2 { z -= 1; cx /= 2.0; cy /= 2.0; } focus = Focus::PoiList; }
                         KeyCode::Enter => { // 選択地点へ移動(明示)
                             if let Some(p) = pois.get(poi_sel) { let (nx, ny) = deg_to_pixel(p.0, p.1, z); cx = nx; cy = ny; }
                             focus = Focus::PoiList;
