@@ -163,7 +163,7 @@ const HELP: &[&str] = &[
     " [設定]  , で設定画面 (braille/classify/edge/mono/style を実行中に切替・変更は自動保存)",
     "         config.toml で既定を指定可 ([display]/[streetview])",
     "",
-    "   ?  ヘルプ   q  即終了   Esc  サブモード取消(地図では終了確認 y/n)   Ctrl+C  計算の中断",
+    "   ?  ヘルプ   q  即終了   Esc  サブモード取消(地図で2連打すると終了確認 y/n)   Ctrl+C  計算の中断",
     "",
     "   (任意のキーで閉じる)",
 ];
@@ -384,7 +384,8 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     let mut shape_sel: u8 = 0; // 形状ピッカーで選択中の形状index
     let mut onboard = onboarded_marker().map_or(false, |p| !p.exists()); // 初回起動なら操作案内を出す
     let mut spot_move_confirm: Option<usize> = None; // m(中心へ移動)の確認待ち。上書きは破壊的なのでy/nを挟む
-    let mut quit_confirm = false; // Map で Esc → 終了確認(y=終了/他=取消)
+    let mut quit_confirm = false; // Map で Esc二連打 → 終了確認(y=終了/他=取消)
+    let mut last_esc_at: Option<std::time::Instant> = None; // 直前のEsc押下時刻(二連打判定用)
     apply_spots(&mut spec, &spots, &spot_cats, show_spots);
     // 操作UI効果音(macOS afplay)。設定OFF/非macOS/afplay不在なら no-op。設定トグルで作り直す。
     let mut snd = sound::Sound::new(cfg.sound_enabled);
@@ -2226,7 +2227,15 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                 None => { snd.play("error"); addr = "ルート未確定".into(); }
                             },
                             KeyCode::Char('q') => quit = true, // qは確認なしで即終了
-                            KeyCode::Esc => { quit_confirm = true; } // Escは確認を挟む(誤爆防止)
+                            KeyCode::Esc => { // Escを600ms以内に2回押すと終了確認を出す(誤爆防止)
+                                if last_esc_at.map_or(false, |t| t.elapsed() < std::time::Duration::from_millis(600)) {
+                                    quit_confirm = true;
+                                    last_esc_at = None;
+                                } else {
+                                    last_esc_at = Some(std::time::Instant::now());
+                                    addr = "もう一度Escで終了確認".into();
+                                }
+                            }
                             _ => {}
                         }
                         if quit { break; }
