@@ -20,6 +20,7 @@ mod gpslive;
 mod searchcache;
 mod roadsearch;
 mod sound;
+mod keymap;
 mod ui;
 #[allow(dead_code)]
 mod roadtrace; // point_at/sample等は使用、cut_segment等は将来用
@@ -28,6 +29,7 @@ mod roadtrace; // point_at/sample等は使用、cut_segment等は将来用
 mod config;
 #[allow(dead_code)]
 mod recommend;
+mod settings;
 
 use image::{RgbImage, imageops::FilterType};
 

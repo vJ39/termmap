@@ -13,6 +13,8 @@ OSM ラスタタイルを端末に描画する mapscii 風レンダラ。POI/ル
 
 macOS 想定。GPS連携(`--here`・ライブ現在地)は CoreLocationCLI 依存のため macOS 限定。地図描画・ルート計算・検索は他OSでも動く可能性はあるが未検証。
 
+Linux(x86_64)は `--target x86_64-unknown-linux-musl` でのクロスコンパイルと動作(`--help`・`--place`+PNG出力)を確認済み。追加の依存修正は不要だった。
+
 ## インストール
 
     cargo build --release

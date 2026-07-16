@@ -56,7 +56,8 @@ pub fn step(lat: f64, lon: f64, heading_deg: f64, dist_m: f64) -> (f64, f64) {
 }
 
 /// 実写画像を RgbImage(w x h、最大 640) で返す。被覆が無ければ Err("この地点に画像なし")。
-pub fn fetch(lat: f64, lon: f64, heading: i32, w: u32, h: u32, key: &str) -> Result<RgbImage, String> {
+/// fov(画角・度)は小さいほどズームイン。Google Street View Static APIの有効範囲(10-120)にクランプ。
+pub fn fetch(lat: f64, lon: f64, heading: i32, w: u32, h: u32, fov: f64, key: &str) -> Result<RgbImage, String> {
     if !available(key) {
         return Err("APIキー未設定".to_string());
     }
@@ -66,7 +67,8 @@ pub fn fetch(lat: f64, lon: f64, heading: i32, w: u32, h: u32, key: &str) -> Res
     }
     let (w, h) = (w.clamp(16, MAX_SIZE), h.clamp(16, MAX_SIZE));
     let hd = ((heading % 360) + 360) % 360;
-    let url = format!("{BASE}?size={w}x{h}&location={lat},{lon}&heading={hd}&pitch=0&fov=90&key={key}");
+    let fov = fov.clamp(10.0, 120.0);
+    let url = format!("{BASE}?size={w}x{h}&location={lat},{lon}&heading={hd}&pitch=0&fov={fov}&key={key}");
     let resp = ureq::get(&url)
         .timeout(std::time::Duration::from_secs(20))
         .call()
