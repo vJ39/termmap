@@ -115,6 +115,7 @@ const HELP: &[&str] = &[
     "",
     " [移動]",
     "   ←↑↓→        パン (既定は細かく・押し続けで加速 / Shift+矢印で常に高速)",
+    "   h j k l        パン常に高速 (Shift+矢印の代替。修飾キー無しの文字なので端末を選ばず効く)",
     "   + / -          ズーム",
     "   /              住所・地名で検索して移動",
     "   a              中心の住所を表示",
@@ -1374,7 +1375,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         // 入力待ち。結果適用直後は即再描画(None)。ジョブ/GPS/再生/移動settling中はポーリング。
         // settling中は短間隔(60ms)で見に行き、動きが止まったフレームで高解像度に上げ直す。
         let polling = route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some() || wander_job.is_some() || gps_rx.is_some() || play.is_some() || settling;
-        let ev: Option<Event> = if got_result {
+        let mut ev: Option<Event> = if got_result {
             None
         } else if polling {
             let ms = if settling { 60 } else { 80 };
@@ -1382,6 +1383,23 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         } else {
             Some(event::read()?)
         };
+        // 押しっぱなし/連打でパン系イベントが溜まっている間は、都度の再描画を待たずに
+        // 溜まった分を最新の1個へ間引く(SSH等で1回の再描画に往復が乗ると、律速して
+        // メニュー操作等の割り込みが後回しになるため)。別系統のキーが混ざっていたら
+        // 間引きを止めてそちらを即座に優先する。
+        if matches!(focus, Focus::Map) {
+            if let Some(Event::Key(first)) = &ev {
+                let is_pan_key = |c: KeyCode| matches!(c, KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down | KeyCode::Char('h') | KeyCode::Char('j') | KeyCode::Char('k') | KeyCode::Char('l'));
+                if is_pan_key(first.code) {
+                    while let Ok(true) = event::poll(std::time::Duration::from_millis(0)) {
+                        match event::read()? {
+                            Event::Key(next) if is_pan_key(next.code) => ev = Some(Event::Key(next)),
+                            other => { ev = Some(other); break; }
+                        }
+                    }
+                }
+            }
+        }
         match ev {
             None => {} // 再描画のみ(計算待ち)
             Some(Event::Key(k)) if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -2110,6 +2128,12 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             KeyCode::Right => { cx += step; addr.clear(); }
                             KeyCode::Up => { cy -= step; addr.clear(); }
                             KeyCode::Down => { cy += step; addr.clear(); }
+                            // h/j/k/l(vi風)は常時高速パン。Shift+矢印と違い修飾キーの拡張シーケンスに
+                            // 依存しない普通の文字なので、端末がShift+矢印の拡張CSIを送れない場合の代替
+                            KeyCode::Char('h') => { cx -= fast; addr.clear(); }
+                            KeyCode::Char('j') => { cy += fast; addr.clear(); }
+                            KeyCode::Char('k') => { cy -= fast; addr.clear(); }
+                            KeyCode::Char('l') => { cx += fast; addr.clear(); }
                             KeyCode::Char('+') | KeyCode::Char('=') => if z < 19 { z += 1; cx *= 2.0; cy *= 2.0; addr.clear(); },
                             KeyCode::Char('-') | KeyCode::Char('_') => if z > 2 { z -= 1; cx /= 2.0; cy /= 2.0; addr.clear(); },
                             KeyCode::Enter => { // 中心付近の最寄りお気に入りにスナップ＋名前表示
