@@ -35,6 +35,7 @@ pub struct Config {
     pub llm_command: String,
     pub route_profile: String,
     pub sample_interval_m: f64,
+    pub route_play_speed_kmh: f64, // ルート再生(プレビュー走行)の想定巡航速度。既定40km/h(等倍1.00xの基準)
     pub style: String,
     pub show_spots: bool,
     pub braille: bool,
@@ -58,6 +59,7 @@ impl Default for Config {
             llm_command: "claude".to_string(),
             route_profile: "car-fast".to_string(),
             sample_interval_m: 800.0,
+            route_play_speed_kmh: 40.0,
             style: "osm".to_string(),
             show_spots: true,
             braille: false,
@@ -150,6 +152,11 @@ pub fn load_config_from(path: &Path) -> Config {
                     cfg.sample_interval_m = f;
                 }
             }
+            ("route", "play_speed_kmh") => {
+                if let Some(f) = parse_number(value) {
+                    cfg.route_play_speed_kmh = f;
+                }
+            }
             ("display", "style") => {
                 if let Some(s) = parse_string(value) {
                     cfg.style = s;
@@ -221,6 +228,7 @@ pub fn save_config_to(path: &Path, c: &Config) -> Result<(), String> {
          [route]\n\
          profile = \"{}\"\n\
          sample_interval_m = {}\n\
+         play_speed_kmh = {}\n\
          \n\
          [display]\n\
          style = \"{}\"\n\
@@ -247,6 +255,7 @@ pub fn save_config_to(path: &Path, c: &Config) -> Result<(), String> {
         c.llm_command,
         c.route_profile,
         c.sample_interval_m,
+        c.route_play_speed_kmh,
         c.style,
         c.show_spots,
         c.braille,
@@ -391,6 +400,7 @@ mod tests {
             llm_command: "my-cli".to_string(),
             route_profile: "bike-scenic".to_string(),
             sample_interval_m: 12.5,
+            route_play_speed_kmh: 55.0,
             style: "satellite".to_string(),
             show_spots: false,
             braille: true,
@@ -607,6 +617,7 @@ profile = "custom-profile"
             llm_command: "c".to_string(),
             route_profile: "p".to_string(),
             sample_interval_m: 1.0,
+            route_play_speed_kmh: 30.0,
             style: "s".to_string(),
             show_spots: false,
             braille: false,

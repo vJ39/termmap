@@ -299,6 +299,14 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     let mut gps_trail: Vec<(f64, f64)> = Vec::new(); // 通過ブレッドクラム
     let mut play: Option<f64> = None; // A ルート再生(先頭からの距離m。Noneで停止)
     let mut play_speed: f64 = 1.0;    // 再生速度倍率(再生中に [ ] で 0.25〜8x)
+    let mut play_last_tick: Option<std::time::Instant> = None; // 再生の実時間ベース進行用(前回フレームの時刻)
+    // 実画像モードでのルート再生ちらつき対策: 先読みスレッドがbuild_window(重い/ネットワーク)を
+    // 事前に進めておき、メインは受け取った画像を使うだけにする(無ければ従来通り同期取得にfallback)。
+    let mut play_prefetch_rx: Option<std::sync::mpsc::Receiver<(f64, RgbImage)>> = None;
+    let mut play_prefetch_held: Option<(f64, RgbImage)> = None;
+    let mut play_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut play_speed_bits = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1.0f64.to_bits()));
+    let mut play_wants_prefetch = false; // 再生開始直後に一度だけ、rw/rh/rz確定後に先読みスレッドを起こすフラグ
     let mut scache = searchcache::load(); // 検索結果キャッシュ(キーワード+位置→結果。API節約)
     let mut popup: Option<String> = None; // 中央に出す一時ポップアップ(スポット名等・任意キーで閉じる)
     // ルート計算のバックグラウンド受信(マーカーは即時、ルート線は別スレッド)
@@ -388,8 +396,17 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             }
             MenuAction::PlayRoute => {
                 if spec.routes.last().map_or(false, |r| r.pts.len() >= 2) {
-                    if play.is_some() { play = None; addr = "再生: 停止".into(); }
-                    else { play = Some(0.0); addr = "再生: 開始(Aで停止)".into(); }
+                    if play.is_some() {
+                        play = None; play_last_tick = None;
+                        play_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                        play_prefetch_rx = None; play_prefetch_held = None;
+                        addr = "再生: 停止".into();
+                    } else {
+                        play = Some(0.0);
+                        play_last_tick = Some(std::time::Instant::now());
+                        play_wants_prefetch = true; // 実画像モードなら次フレームで先読みスレッドを起動する
+                        addr = "再生: 開始(Aで停止)".into();
+                    }
                 } else { snd.play("error"); addr = "再生: ルート未確定".into(); }
             }
             MenuAction::ToggleGps => {
@@ -557,22 +574,52 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 let (nx, ny) = deg_to_pixel(la, lo, z); cx = nx; cy = ny;
             }
         }
-        if play.is_some() { // ルート再生: 位置を進めて自動パン(全体を約20秒で走破)
+        let img_inline = cfg.image_mode && image_capable(); // 実画像モード(iTerm2系端末のみ)。play処理より先に要る
+        if play.is_some() { // ルート再生: 実時間ベースで位置を進めて自動パン(想定巡航速度×play_speed倍率)
+            // 実画像モードは先読みスレッドが返した画像をベース地図に使う。オーバーレイ(ルート線/
+            // クロスヘア)をそれと違う位置で描くと、ベースとオーバーレイがズレてルートがガタつい
+            // て見えるバグになるため、その画像が実際に描かれた位置(frame_d)を表示位置の正とする。
+            if img_inline {
+                if let Some(rx) = &play_prefetch_rx {
+                    let mut latest = None;
+                    while let Ok(f) = rx.try_recv() { latest = Some(f); }
+                    if let Some(f) = latest { play_prefetch_held = Some(f); }
+                }
+            }
+            let prefetched_d = if img_inline { play_prefetch_held.as_ref().map(|(d, _)| *d) } else { None };
             if let Some(rt) = spec.routes.last().map(|r| r.pts.clone()) {
                 if rt.len() >= 2 {
                     let total = roadtrace::polyline_len(&rt);
-                    let d = play.unwrap() + (total / 1500.0).max(0.3) * play_speed;
-                    if d >= total { play = None; addr = "再生: 終了".into(); }
-                    else {
+                    let d = if let Some(fd) = prefetched_d {
+                        fd
+                    } else {
+                        let now = std::time::Instant::now();
+                        let dt = play_last_tick.map_or(0.0, |t| now.duration_since(t).as_secs_f64());
+                        play.unwrap() + roadtrace::play_step_distance_m(cfg.route_play_speed_kmh, play_speed, dt)
+                    };
+                    play_last_tick = Some(std::time::Instant::now()); // 次回差分計算の基点(先読み経路でも維持)
+                    if d >= total {
+                        play = None; play_last_tick = None;
+                        play_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                        play_prefetch_rx = None; play_prefetch_held = None;
+                        addr = "再生: 終了".into();
+                    } else {
                         play = Some(d);
                         let (pla, plo) = roadtrace::point_at(&rt, d);
                         let (nx, ny) = deg_to_pixel(pla, plo, z); cx = nx; cy = ny;
                     }
-                } else { play = None; }
-            } else { play = None; }
+                } else {
+                    play = None; play_last_tick = None;
+                    play_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                    play_prefetch_rx = None; play_prefetch_held = None;
+                }
+            } else {
+                play = None; play_last_tick = None;
+                play_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                play_prefetch_rx = None; play_prefetch_held = None;
+            }
         }
         let (lat, lon) = pixel_to_deg(cx, cy, z);
-        let img_inline = cfg.image_mode && image_capable(); // 実画像モード(iTerm2系端末のみ)
 
         // 移動検知(解像度非依存): 直近に描画したフレームと(cx,cy,z)が違えば「動いた」。
         // 動いた直後〜350ms は低解像度(delta=0)で速く描き、動きが止まって350ms経ったら
@@ -597,6 +644,46 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         } else {
             (ow, oh, z, cx, cy)
         };
+
+        // 再生開始直後、実画像モードならrw/rh/rz確定を待って先読みスレッドを起こす(1フレーム遅延)。
+        // build_window(重い/ネットワーク)を裏で進めておき、メインは受け取った画像を使うだけにして
+        // ちらつきを抑える。ASCII描画時はネットワーク待ちが無く不要なので起こさない。
+        if play_wants_prefetch {
+            play_wants_prefetch = false;
+            if img_inline {
+                if let Some(r) = spec.routes.last().filter(|r| r.pts.len() >= 2) {
+                    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let speed_bits = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(play_speed.to_bits()));
+                    let (tx, rx) = std::sync::mpsc::sync_channel(6);
+                    let route_pts = r.pts.clone();
+                    let style = opts.style.clone();
+                    let (pw, ph, pz) = (rw, rh, rz);
+                    let speed_kmh = cfg.route_play_speed_kmh;
+                    let cancel2 = std::sync::Arc::clone(&cancel);
+                    let speed_bits2 = std::sync::Arc::clone(&speed_bits);
+                    std::thread::spawn(move || {
+                        let mut local_cache = Cache::new();
+                        let total = roadtrace::polyline_len(&route_pts);
+                        let mut d = 0.0f64;
+                        let dt = 0.08; // 80ms刻みで先読み(メインの再描画間隔に合わせる)
+                        while d < total {
+                            if cancel2.load(std::sync::atomic::Ordering::Relaxed) { break; }
+                            let (la, lo) = roadtrace::point_at(&route_pts, d);
+                            let (gx, gy) = deg_to_pixel(la, lo, pz);
+                            if let Ok(img) = build_window(gx, gy, pz, pw, ph, &style, &mut local_cache) {
+                                if tx.send((d, img)).is_err() { break; } // 受信側が止まったら終了
+                            }
+                            let speed = f64::from_bits(speed_bits2.load(std::sync::atomic::Ordering::Relaxed));
+                            d += roadtrace::play_step_distance_m(speed_kmh, speed, dt);
+                        }
+                    });
+                    play_cancel = cancel;
+                    play_speed_bits = speed_bits;
+                    play_prefetch_rx = Some(rx);
+                    play_prefetch_held = None;
+                }
+            }
+        }
 
         // 実画像モードの再描画判定シグネチャ。地図画像に効く状態(中心/ズーム/寸法/配置/
         // オーバーレイ)が前回emit時と同じなら PNG を吐き直さない。
@@ -635,10 +722,17 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         let mut map_img: Option<RgbImage> = None; // 実画像モードで描く overlay 合成済み画像
         // 実画像モードで状態が前回emitと同一なら、地図の再構築/再emitをスキップ(直近の画像を残す)。
         let need_build = !img_inline || force_reemit || last_map_sig != map_sig;
+        // 先読みの受信(最新への間引き含む)はplayブロック側で既に行っている(表示位置と
+        // ベース画像の位置を一致させるため)。ここではplay_prefetch_heldを読むだけ。
         let body = if !need_build {
             String::new()
         } else {
-            match build_window(rcx, rcy, rz, rw, rh, &opts.style, &mut cache) {
+            let prefetched = if play.is_some() && img_inline { play_prefetch_held.as_ref().map(|(_, img)| img.clone()) } else { None };
+            let built = match prefetched {
+                Some(img) => Ok(img),
+                None => build_window(rcx, rcy, rz, rw, rh, &opts.style, &mut cache),
+            };
+            match built {
                 Ok(img) => {
                     let mut ov = build_overlay(&spec, rcx, rcy, rz, rw, rh, 1.0, 1.0, rw, rh);
                     let (mx, my) = (rw as i32 / 2, rh as i32 / 2); // 中心クロスヘア(色は設定で選択可)
@@ -836,9 +930,14 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             let (mn, mx, _asc) = elevation::elevation_stats(&route_ele);
             let label = fit_cells(&format!(" 標高 ↑{route_ascend:.0}m  最高{mx:.0}m 最低{mn:.0}m  (Eで消す) "), cols as usize);
             let _ = write!(out, "\x1b[{};1H\x1b[7m{label}\x1b[0m\x1b[K", map_rows + 1);
-            let chart = elevation::elevation_chart(&route_ele, cols as usize, elev_h as usize);
+            // 左端に高さの目盛り(6桁分「1234m」+区切り1マス=7列)を出す。最上段=最高/最下段=最低/
+            // 中間段(4行以上の時)=中間値(elevation::axis_label、テスト済み)。グラフ本体はその分幅を削る。
+            const AXIS_W: usize = 7;
+            let chart_w = (cols as usize).saturating_sub(AXIS_W).max(1);
+            let chart = elevation::elevation_chart(&route_ele, chart_w, elev_h as usize);
             for (i, line) in chart.iter().enumerate() {
-                let _ = write!(out, "\x1b[{};1H{}\x1b[K", map_rows + 2 + i as u32, line);
+                let axis = elevation::axis_label(i as u32, elev_h, mn, mx).unwrap_or_else(|| "     ".to_string());
+                let _ = write!(out, "\x1b[{};1H\x1b[2m{axis}\x1b[0m {}\x1b[K", map_rows + 2 + i as u32, line);
             }
             // 地図中心が経路上のどこかを示す縦カーソル(パン/再生で動く)
             if let Some(rt) = spec.routes.last() {
@@ -848,9 +947,9 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                         let d = (p.0 - lat).powi(2) + (p.1 - lon).powi(2);
                         if d < bd { bd = d; bi = i; }
                     }
-                    let col = elevation::profile_col(rt.pts.len(), bi, cols as usize);
+                    let col = elevation::profile_col(rt.pts.len(), bi, chart_w);
                     for i in 0..elev_h as usize {
-                        let _ = write!(out, "\x1b[{};{}H\x1b[1;31m|\x1b[0m", map_rows + 2 + i as u32, col + 1);
+                        let _ = write!(out, "\x1b[{};{}H\x1b[1;31m|\x1b[0m", map_rows + 2 + i as u32, col + 1 + AXIS_W);
                     }
                 }
             }
@@ -1413,6 +1512,8 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     addr = "オンボーディング: 次回から非表示(設定で再表示)".into();
                 }
                 onboard = false;
+                force_reemit = true; // 次フレームで確実に地図を再構築・再emitし、覆っていた分の残像を消す
+                last_map_sig = None; // 実画像モードのsig一致スキップに巻き込まれず必ず再取得させる
             }
             Some(Event::Key(k)) if quit_confirm => { // 終了確認: y=終了/他=取消
                 if let KeyCode::Char('y') | KeyCode::Char('Y') = k.code { break; }
@@ -2255,12 +2356,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                 show_elev = !show_elev;
                                 if show_elev && (spec.routes.is_empty() || !route_ele.iter().any(|&z| z != 0.0)) { addr = "標高: ルート確定後に表示".into(); }
                             }
-                            KeyCode::Char('A') => { // ルート再生(プレビュー走行)の開始/停止
-                                if spec.routes.last().map_or(false, |r| r.pts.len() >= 2) {
-                                    if play.is_some() { play = None; addr = "再生: 停止".into(); }
-                                    else { play = Some(0.0); addr = "再生: 開始(Aで停止)".into(); }
-                                } else { snd.play("error"); addr = "再生: ルート未確定".into(); }
-                            }
+                            KeyCode::Char('A') => run_action!(MenuAction::PlayRoute, lat, lon, cols, tr),
                             KeyCode::Char('G') => { // ライブ現在地(ブレッドクラム)の ON/OFF
                                 if gps_rx.is_some() { gps_rx = None; addr = "ライブ現在地: OFF".into(); }
                                 else {
@@ -2310,8 +2406,8 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                 } else { snd.play("error"); addr = "ルート未確定".into(); }
                             }
                             KeyCode::Char('x') => { wp_remove(&mut wps, &mut wp_sel); route_sel = wp_sel; { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } }
-                            KeyCode::Char('[') => { if play.is_some() { play_speed = (play_speed / 1.5).max(0.1); addr = format!("再生速度 {:.2}x", play_speed); } else { wp_swap(&mut wps, &mut wp_sel, true); route_sel = wp_sel; { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } } }
-                            KeyCode::Char(']') => { if play.is_some() { play_speed = (play_speed * 1.5).min(8.0); addr = format!("再生速度 {:.2}x", play_speed); } else { wp_swap(&mut wps, &mut wp_sel, false); route_sel = wp_sel; { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } } }
+                            KeyCode::Char('[') => { if play.is_some() { play_speed = (play_speed / 1.5).max(0.1); play_speed_bits.store(play_speed.to_bits(), std::sync::atomic::Ordering::Relaxed); addr = format!("再生速度 {:.2}x", play_speed); } else { wp_swap(&mut wps, &mut wp_sel, true); route_sel = wp_sel; { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } } }
+                            KeyCode::Char(']') => { if play.is_some() { play_speed = (play_speed * 1.5).min(8.0); play_speed_bits.store(play_speed.to_bits(), std::sync::atomic::Ordering::Relaxed); addr = format!("再生速度 {:.2}x", play_speed); } else { wp_swap(&mut wps, &mut wp_sel, false); route_sel = wp_sel; { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } } }
                             KeyCode::Char('m') => { mode = match mode_label(&mode) { "下道" => "highway", "高速" => "short", _ => "surface" }.to_string(); { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } }
                             KeyCode::Char('c') => run_action!(MenuAction::ClearRoute, lat, lon, cols, tr),
                             KeyCode::Char('g') => match spec.routes.last() {

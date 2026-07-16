@@ -210,6 +210,12 @@ pub fn polyline_len(poly: &[(f64, f64)]) -> f64 {
     poly.windows(2).map(|w| haversine_m(w[0], w[1])).sum()
 }
 
+/// ルート再生(プレビュー走行)の1フレーム分の進行距離(メートル)。想定巡航速度(km/h)×再生
+/// 倍率×経過秒数。倍率は0.05未満に張り付かせて実質的な停止(0除算的な張り付き)を避ける。
+pub fn play_step_distance_m(speed_kmh: f64, multiplier: f64, dt_secs: f64) -> f64 {
+    speed_kmh * 1000.0 / 3600.0 * multiplier.max(0.05) * dt_secs
+}
+
 /// ポリライン先頭から dist_m メートル進んだ地点を線形補間で返す。範囲外は端にクランプ。
 pub fn point_at(poly: &[(f64, f64)], dist_m: f64) -> (f64, f64) {
     if poly.is_empty() {
@@ -397,6 +403,36 @@ mod tests {
         let result = sample_every(&poly, 0.0);
         assert_eq!(result.first(), Some(&poly[0]));
         assert_eq!(result.last(), Some(&poly[poly.len() - 1]));
+    }
+
+    #[test]
+    fn play_step_distance_scales_with_speed_and_time() {
+        // 40km/h = 約11.111...m/s。等倍1.0x・1秒でその分だけ進む。
+        let d = play_step_distance_m(40.0, 1.0, 1.0);
+        assert!((d - 11.111_111_111).abs() < 1e-6, "d={d}");
+    }
+
+    #[test]
+    fn play_step_distance_scales_with_multiplier() {
+        let base = play_step_distance_m(40.0, 1.0, 1.0);
+        let doubled = play_step_distance_m(40.0, 2.0, 1.0);
+        assert!((doubled - base * 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn play_step_distance_zero_dt_is_zero() {
+        assert_eq!(play_step_distance_m(40.0, 1.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn play_step_distance_clamps_multiplier_floor() {
+        // 倍率が0や負でも0.05に張り付き、進行が完全に止まらない(0除算的な停止を避ける)。
+        let d_zero = play_step_distance_m(40.0, 0.0, 1.0);
+        let d_floor = play_step_distance_m(40.0, 0.05, 1.0);
+        assert!((d_zero - d_floor).abs() < 1e-9);
+        assert!(d_zero > 0.0);
+        let d_neg = play_step_distance_m(40.0, -5.0, 1.0);
+        assert!((d_neg - d_floor).abs() < 1e-9);
     }
 
     #[test]

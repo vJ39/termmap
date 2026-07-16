@@ -104,6 +104,24 @@ pub fn profile_col(n_points: usize, index: usize, width: usize) -> usize {
     (index * (width - 1) / (n_points - 1)).min(width - 1)
 }
 
+/// 標高プロファイル左端の高さ目盛りラベル。row(0-indexed、0が最上段)がheight行中の
+/// 最上段なら最高値、最下段なら最低値、中間段(heightが4以上のときのみ、height/2行目)
+/// なら中間値を返す。それ以外はNone(その行はラベル無し)。
+pub fn axis_label(row: u32, height: u32, min: f64, max: f64) -> Option<String> {
+    if height == 0 || row >= height {
+        return None;
+    }
+    if row == 0 {
+        Some(format!("{max:>5.0}m"))
+    } else if row == height - 1 {
+        Some(format!("{min:>5.0}m"))
+    } else if height >= 4 && row == height / 2 {
+        Some(format!("{:>5.0}m", min + (max - min) / 2.0))
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,5 +225,44 @@ mod tests {
         assert_eq!(profile_col(1, 0, 10), 0); // 点1つ
         assert_eq!(profile_col(10, 5, 1), 0); // 幅1
         assert_eq!(profile_col(10, 0, 0), 0); // 幅0安全
+    }
+
+    #[test]
+    fn axis_label_top_and_bottom_rows_show_max_and_min() {
+        assert_eq!(axis_label(0, 8, -66.0, 527.0).as_deref(), Some("  527m"));
+        assert_eq!(axis_label(7, 8, -66.0, 527.0).as_deref(), Some("  -66m"));
+    }
+
+    #[test]
+    fn axis_label_mid_row_only_when_height_at_least_4() {
+        // height=8: 中間行(4行目)に (min+max)/2 = 230.5 → 230m(Rustの{:.0}は偶数丸め)
+        assert_eq!(axis_label(4, 8, -66.0, 527.0).as_deref(), Some("  230m"));
+        // height=3: 4未満なので中間ラベルは出さない(row=1が中間相当だがNone)
+        assert_eq!(axis_label(1, 3, 0.0, 100.0), None);
+    }
+
+    #[test]
+    fn axis_label_other_rows_are_none() {
+        assert_eq!(axis_label(1, 8, -66.0, 527.0), None);
+        assert_eq!(axis_label(2, 8, -66.0, 527.0), None);
+        assert_eq!(axis_label(6, 8, -66.0, 527.0), None);
+    }
+
+    #[test]
+    fn axis_label_height_one_shows_only_top_which_is_also_bottom() {
+        // height=1: row=0はtop条件に先にマッチしmaxを返す(bottom分岐には届かない)
+        assert_eq!(axis_label(0, 1, 10.0, 20.0).as_deref(), Some("   20m"));
+    }
+
+    #[test]
+    fn axis_label_zero_height_or_out_of_range_row_is_none() {
+        assert_eq!(axis_label(0, 0, 0.0, 100.0), None);
+        assert_eq!(axis_label(5, 5, 0.0, 100.0), None); // row == height(範囲外)
+    }
+
+    #[test]
+    fn axis_label_flat_elevation_min_equals_max() {
+        assert_eq!(axis_label(0, 4, 50.0, 50.0).as_deref(), Some("   50m"));
+        assert_eq!(axis_label(2, 4, 50.0, 50.0).as_deref(), Some("   50m")); // 中間値も同じ
     }
 }
