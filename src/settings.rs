@@ -22,7 +22,7 @@ pub(crate) struct SettingChoice {
 // idx は Focus::Settings 側の項目行番号と対応(4=地図種別/5=既定ルート/9=提案AIモデル/12=画像解像度)。
 // 中心十字の色(idx=16)は cfg.cross_color_idx が String でなく u8 なので、この表とは別枠(is_pickable等で16を特別扱い)。
 pub(crate) const CHOICES: &[SettingChoice] = &[
-    SettingChoice { idx: 4, values: &["osm", "voyager", "dark", "light"], labels: &["osm", "voyager", "dark", "light"] },
+    SettingChoice { idx: 4, values: &["osm", "voyager", "dark", "light", "topo"], labels: &["osm", "voyager", "dark", "light", "topo"] },
     SettingChoice { idx: 5, values: &["car-fast", "moped", "shortest"], labels: &["高速", "下道", "最短"] },
     SettingChoice { idx: 9, values: &["claude-sonnet-5", "claude-haiku-4-5", "claude-opus-4-8"], labels: &["sonnet", "haiku", "opus"] },
     SettingChoice { idx: 12, values: &["high", "mid", "low"], labels: &["高", "中", "低"] },

@@ -43,7 +43,7 @@ pub const HELP: &[&str] = &[
     "   o              スマホ共有(GoogleマップのQRをポップアップ表示)",
     "",
     " [実写]",
-    "   i              中心地点の実写(Street View)を全画面表示  ←→向き ↑↓前後移動 +/-ズーム Esc/q戻る",
+    "   i              中心地点の実写(Street View)を全画面表示  ←→向き ↑↓前後移動(地図も追従) +/-ズーム Esc/q戻る",
     "                   要 config.toml [streetview] api_key",
     "",
     " [実画像表示] (iTerm2 / WezTerm のみ)",

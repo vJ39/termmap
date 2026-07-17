@@ -38,6 +38,15 @@ pub fn bearing(from: (f64, f64), to: (f64, f64)) -> f64 {
 }
 pub fn angdiff(a: f64, b: f64) -> f64 { let d = (a - b).abs() % 360.0; d.min(360.0 - d) }
 
+/// 方位(度、北=0・時計回り)を8方向の矢印記号に変換する(実写のPegman風「方位くるくる」表示用)。
+/// 北=↑ / 北東=↗ / 東=→ / 南東=↘ / 南=↓ / 南西=↙ / 西=← / 北西=↖ の45°刻みで最も近い方向を返す。
+pub fn heading_arrow(heading_deg: f64) -> char {
+    const ARROWS: [char; 8] = ['↑', '↗', '→', '↘', '↓', '↙', '←', '↖'];
+    let h = heading_deg.rem_euclid(360.0);
+    let idx = ((h / 45.0).round() as usize) % 8;
+    ARROWS[idx]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -69,5 +78,35 @@ mod tests {
         let a = meters_per_pixel(35.0, 12);
         let b = meters_per_pixel(35.0, 13);
         assert!((a / b - 2.0).abs() < 1e-6); // ズーム+1で半分
+    }
+
+    #[test]
+    fn heading_arrow_cardinal_directions() {
+        assert_eq!(heading_arrow(0.0), '↑');
+        assert_eq!(heading_arrow(90.0), '→');
+        assert_eq!(heading_arrow(180.0), '↓');
+        assert_eq!(heading_arrow(270.0), '←');
+    }
+
+    #[test]
+    fn heading_arrow_intercardinal_directions() {
+        assert_eq!(heading_arrow(45.0), '↗');
+        assert_eq!(heading_arrow(135.0), '↘');
+        assert_eq!(heading_arrow(225.0), '↙');
+        assert_eq!(heading_arrow(315.0), '↖');
+    }
+
+    #[test]
+    fn heading_arrow_wraps_around_360() {
+        assert_eq!(heading_arrow(360.0), '↑'); // 360=0扱い
+        assert_eq!(heading_arrow(-45.0), '↖'); // 負の角度もrem_euclidで正規化
+        assert_eq!(heading_arrow(720.0 + 90.0), '→'); // 2周分足しても同じ
+    }
+
+    #[test]
+    fn heading_arrow_rounds_to_nearest_45deg_bucket() {
+        assert_eq!(heading_arrow(22.0), '↑');  // 0に近い
+        assert_eq!(heading_arrow(23.0), '↗');  // 45に近い(22.5が境界)
+        assert_eq!(heading_arrow(350.0), '↑'); // 360(=0)に近い(315との差35 vs 360との差10)
     }
 }

@@ -149,7 +149,7 @@ fn parse_args() -> Args {
             "--threshold" => a.threshold = Some(num!("--threshold")),
             "--image" => a.image = Some(val!("--image")),
             "--png" => a.png = Some(val!("--png")),
-            "-h" | "--help" => { eprintln!("usage: termmap                    引数なし=前回位置から対話起動(保存が無ければ東京中心)\n       termmap [位置] [options]\n  位置: --place \"住所\" | --lat LAT --lon LON | --here | --resume | --load-route N\n  対話が既定。-i/--interactive はその後方互換エイリアス(付けても付けなくても対話で起動)。\n  非対話(静止出力)になるのは --png OUT / --gpx OUT / --save-route N のみ。\n  options: [--zoom Z] [--style osm|voyager|dark|light] [--braille] [--classify] [--edge] [--mono] [--range KM,..] [--home LAT,LON] [--route \"LAT,LON;LAT,LON\"] [--route-mode surface|highway|short] [--routes] [--share] [--width N] | --image PNG"); std::process::exit(0); }
+            "-h" | "--help" => { eprintln!("usage: termmap                    引数なし=前回位置から対話起動(保存が無ければ東京中心)\n       termmap [位置] [options]\n  位置: --place \"住所\" | --lat LAT --lon LON | --here | --resume | --load-route N\n  対話が既定。-i/--interactive はその後方互換エイリアス(付けても付けなくても対話で起動)。\n  非対話(静止出力)になるのは --png OUT / --gpx OUT / --save-route N のみ。\n  options: [--zoom Z] [--style osm|voyager|dark|light|topo] [--braille] [--classify] [--edge] [--mono] [--range KM,..] [--home LAT,LON] [--route \"LAT,LON;LAT,LON\"] [--route-mode surface|highway|short] [--routes] [--share] [--width N] | --image PNG"); std::process::exit(0); }
             _ => arg_err(&format!("unknown arg: {k}")),
         }
     }

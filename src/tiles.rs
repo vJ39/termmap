@@ -44,11 +44,13 @@ impl Cache {
 }
 
 // タイルスタイル → URL。voyager/dark/light は CartoDB の label-free 系(端末で見やすい)。
+// topo は OpenTopoMap(地形陰影・等高線入り。最大ズームz17程度、それより深いタイルは無い)。
 fn tile_url(style: &str, z: u32, x: i64, y: i64) -> String {
     match style {
         "voyager" => format!("https://basemaps.cartocdn.com/rastertiles/voyager_nolabels/{z}/{x}/{y}.png"),
         "dark"    => format!("https://basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}.png"),
         "light"   => format!("https://basemaps.cartocdn.com/light_nolabels/{z}/{x}/{y}.png"),
+        "topo"    => format!("https://tile.opentopomap.org/{z}/{x}/{y}.png"),
         _         => format!("https://tile.openstreetmap.org/{z}/{x}/{y}.png"),
     }
 }

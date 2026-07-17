@@ -495,7 +495,8 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     }
                 }
                 let hd = ((heading % 360) + 360) % 360;
-                let st = fit_cells(&format!(" 実写 h{hd}° fov{sv_fov:.0}°  ←→向き ↑↓移動 +/-ズーム (Shiftで微調整)  Esc/q戻る  {slat:.4},{slon:.4} "), cols as usize);
+                let arrow = heading_arrow(hd as f64);
+                let st = fit_cells(&format!(" 実写 {arrow} h{hd}° fov{sv_fov:.0}°  ←→向き ↑↓移動(地図も追従) +/-ズーム (Shiftで微調整)  Esc/q戻る  {slat:.4},{slon:.4} "), cols as usize);
                 let _ = write!(out, "\x1b[{};1H\x1b[7m{st}\x1b[0m\x1b[K", tr);
                 let _ = out.flush();
             }
@@ -529,6 +530,12 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                         };
                         if let Ok(im) = streetview::fetch(nlat, nlon, nhd, 640, 480, sv_fov, &cfg.google_maps_api_key) {
                             street = Some((im, nhd, nlat, nlon)); // Err時は現状維持(行き止まり等)
+                            // 地図連動: 前後移動(↑↓)で歩いた先に地図の中心も追従させる。実写を
+                            // 閉じたとき、元の地点でなく実際に歩いた地点で地図が表示されるようにする。
+                            if matches!(k.code, KeyCode::Up | KeyCode::Down) {
+                                let (nx, ny) = deg_to_pixel(nlat, nlon, z);
+                                cx = nx; cy = ny;
+                            }
                         }
                     }
                     KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Char('-') | KeyCode::Char('_') => {
