@@ -11,206 +11,23 @@ use crate::spots::*;
 use crate::share::*;
 use std::io::Write;
 use image::{RgbImage, imageops::FilterType};
+// 単一行テキスト入力欄の共通編集ロジック(char_byte/insert_str_at/form_cur/edit_line/
+// render_with_cursor/draw_input_panel)は textedit.rs へ切り出し済み。
+use crate::textedit::{edit_line, form_cur, insert_str_at, draw_input_panel, render_with_cursor};
+// 左袖リストのスクロール追従(ensure_visible)は listview.rs へ切り出し済み。
+use crate::listview::ensure_visible;
 
-// ---- テキスト1行編集ヘルパ(全テキスト入力欄で共有) ----
-// cur は「文字単位」のカーソル位置(0..=文字数)。byte offset は char_indices で都度求めるのでマルチバイト安全。
+// PALETTE_NAMES(中心十字の色名。SPOT_PALETTEと同じ並び)・その利用箇所は settings.rs に移設。
+// 緑グラデのワードマーク(LOGO・ヘルプ画面で使用)は keymap.rs へ移設済み。
 
-// 文字位置 char_idx の byte offset を返す(末尾なら文字列長)。
-fn char_byte(s: &str, char_idx: usize) -> usize {
-    s.char_indices().nth(char_idx).map(|(b, _)| b).unwrap_or(s.len())
-}
+use crate::keymap::{HELP, LOGO};
 
-// cur 位置に文字列 s を挿入し、cur を挿入文字数ぶん進める(ペースト用)。
-fn insert_str_at(buf: &mut String, cur: &mut usize, s: &str) {
-    let at = char_byte(buf, *cur);
-    buf.insert_str(at, s);
-    *cur += s.chars().count();
-}
+// Space メニュー(MenuAction/MenuItem/MenuCategory/MENU_CATEGORIES/MenuLevel/menu_action_for_key/
+// disp_width/menu_row/ROUTE_ACTS)は menu.rs へ切り出し済み。ここでは crate::menu を参照する。
+use crate::menu::{MenuAction, MENU_CATEGORIES, MenuLevel, menu_action_for_key, menu_row, ROUTE_ACTS};
 
-// SpotForm のフィールド切替時、移動先フィールドのバッファ文字数(末尾)を返す。ボタン欄は0。
-fn form_cur(name: &str, url: &str, field: usize) -> usize {
-    match field { 0 => name.chars().count(), 1 => url.chars().count(), _ => 0 }
-}
-
-// 1行入力の編集。対象キー(←→ Home/End 文字入力 Backspace Delete)を処理したら true、非対象は false。
-fn edit_line(buf: &mut String, cur: &mut usize, code: crossterm::event::KeyCode) -> bool {
-    use crossterm::event::KeyCode;
-    let n = buf.chars().count();
-    if *cur > n { *cur = n; } // 念のため範囲に丸める
-    match code {
-        KeyCode::Left  => { *cur = cur.saturating_sub(1); true }
-        KeyCode::Right => { *cur = (*cur + 1).min(n); true }
-        KeyCode::Home  => { *cur = 0; true }
-        KeyCode::End   => { *cur = n; true }
-        KeyCode::Char(c) => { let at = char_byte(buf, *cur); buf.insert(at, c); *cur += 1; true } // cur の文字位置に挿入
-        KeyCode::Backspace => {
-            if *cur > 0 { // cur-1 の1文字を削除
-                let s = char_byte(buf, *cur - 1);
-                let e = char_byte(buf, *cur);
-                buf.replace_range(s..e, "");
-                *cur -= 1;
-            }
-            true
-        }
-        KeyCode::Delete => {
-            if *cur < n { // cur 位置の1文字を削除(cur据え置き)
-                let s = char_byte(buf, *cur);
-                let e = char_byte(buf, *cur + 1);
-                buf.replace_range(s..e, "");
-            }
-            true
-        }
-        _ => false,
-    }
-}
-
-// cur 位置にブロックカーソル █ を挟んで表示(末尾なら末尾に付く)。
-// ANSI を含めない(表示は fit_cells が幅計算するため、エスケープを入れると桁がずれる)。
-fn render_with_cursor(buf: &str, cur: usize) -> String {
-    let chars: Vec<char> = buf.chars().collect();
-    let cur = cur.min(chars.len());
-    let before: String = chars[..cur].iter().collect();
-    let after: String = chars[cur..].iter().collect();
-    format!("{before}\u{2588}{after}")
-}
-
-// 単一テキスト欄の中央入力パネル(底面バーでなく地図中央に重畳。SpotFormと同じ手法)。
-// title=見出し / hint=下部の操作説明 / buf=入力中の文字列 / cur=カーソル文字位置。
-fn draw_input_panel<W: std::io::Write>(out: &mut W, cols: u32, map_rows: u32, title: &str, hint: &str, buf: &str, cur: usize) {
-    const BG: &str = "\x1b[30;47m";  // 黒字・白地
-    const RST: &str = "\x1b[0m";
-    let iw = (cols as usize).saturating_sub(6).clamp(24, 64); // ボックス内容幅
-    let input_line = format!("  ▸ {}", render_with_cursor(buf, cur));
-    let blank = " ".repeat(iw);
-    let rows: [String; 6] = [
-        blank.clone(),
-        fit_cells(&format!("  {title}"), iw),
-        blank.clone(),
-        fit_cells(&input_line, iw),
-        blank.clone(),
-        fit_cells(&format!("  {hint}"), iw),
-    ];
-    let r0 = ((map_rows as usize).saturating_sub(rows.len() + 1) / 2).max(1) as u32;
-    let c0 = ((cols as usize).saturating_sub(iw) / 2).max(1) as u32;
-    for (i, line) in rows.iter().enumerate() {
-        let _ = write!(out, "\x1b[{};{}H{}{}{}", r0 + i as u32, c0, BG, line, RST);
-    }
-    let _ = write!(out, "\x1b[{};{}H{}{}{}", r0 + rows.len() as u32, c0, BG, blank, RST);
-}
-
-// 緑グラデのワードマーク(オンボーディング/ヘルプ共用)。(ANSI色, 文字)
-// PALETTE_NAMES(中心十字の色名。SPOT_PALETTEと同じ並び)は settings.rs に移設。
-use crate::settings::PALETTE_NAMES;
-
-const LOGO: [(&str, &str); 4] = [
-    ("\x1b[1;38;2;130;255;150m", "   ╺┳╸┏━╸┏━┓┏┳┓┏┳┓┏━┓┏━┓"),
-    ("\x1b[1;38;2;80;220;110m",  "    ┃ ┣╸ ┣┳┛┃┃┃┃┃┃┣━┫┣━┛"),
-    ("\x1b[1;38;2;40;175;80m",   "    ╹ ┗━╸╹┗╸╹╹╹╹╹╹╹ ╹╹"),
-    ("\x1b[38;2;110;170;120m",   "   terminal touring map"),
-];
-
-use crate::keymap::HELP;
-
-// 道路の塊(RoadSeg)ごとの表示色。BRouterルートの cyan [0,220,255] と被らない色を len で循環。
-const ROAD_PALETTE: &[[u8; 3]] = &[
-    [180, 80, 255],  // 紫
-    [255, 140, 0],   // 橙
-    [0, 200, 120],   // 緑
-    [255, 80, 180],  // 桃
-    [230, 200, 0],   // 黄
-];
-
-// 道路名検索(r)で追加した道路1本ぶんの塊。個別に色を持ち、一覧から個別削除できる。
-struct RoadSeg { name: String, color: [u8; 3], pts: Vec<(f64, f64)> }
-
-// Space メニュー。2階層(カテゴリ→項目)。項目は「操作として読める動詞ラベル」+ 単キー。
-// 実処理は run_action! マクロ(interactive 内)に集約し、各キーの直接操作と共通化している。
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum MenuAction {
-    SearchPlace, SearchPoi, ShowAddress, Recommend,                                    // 検索・移動
-    RouteForm, AddVia, RoadRoute, ManageRoads, Wander, CycleMode, AltRoute, ClearRoute, // ルート作成(RouteForm=並べ替えを開く / AddVia=中心に地点を置く / ManageRoads=道路の塊を管理)
-    ManageSpots, ToggleSpots,                                                          // スポット
-    ToggleElevation, StreetView, PlayRoute, ToggleGps,                                 // ナビ・表示
-    SaveRoute, LoadRoute, SaveGpx, ShareQr,                                            // 保存・共有
-    Settings, Help,                                                                    // 設定・ヘルプ
-}
-struct MenuItem { label: &'static str, key: char, action: MenuAction }
-struct MenuCategory { label: &'static str, items: &'static [MenuItem] }
-
-const MENU_CATEGORIES: &[MenuCategory] = &[
-    MenuCategory { label: "検索・移動", items: &[
-        MenuItem { label: "地名を検索",        key: '/', action: MenuAction::SearchPlace },
-        MenuItem { label: "目的地を探す",      key: 'f', action: MenuAction::SearchPoi },
-        MenuItem { label: "中心の住所を見る",  key: 'a', action: MenuAction::ShowAddress },
-        MenuItem { label: "おすすめを出す",    key: '@', action: MenuAction::Recommend },
-    ]},
-    MenuCategory { label: "ルート作成", items: &[
-        MenuItem { label: "地点を置く(中心)",  key: 'v', action: MenuAction::AddVia },
-        MenuItem { label: "目的地を探して追加", key: 'f', action: MenuAction::SearchPoi }, // カテゴリ/キーワードで検索→結果一覧のvで追加
-        MenuItem { label: "並べ替え・編集",    key: 'R', action: MenuAction::RouteForm },
-        MenuItem { label: "道路名から追加",    key: 'r', action: MenuAction::RoadRoute },
-        MenuItem { label: "道路の塊を管理",    key: 'D', action: MenuAction::ManageRoads },
-        MenuItem { label: "おまかせ周回",      key: 'W', action: MenuAction::Wander },
-        MenuItem { label: "移動モード切替",    key: 'm', action: MenuAction::CycleMode },
-        MenuItem { label: "別ルートを検索",    key: 'n', action: MenuAction::AltRoute },
-        MenuItem { label: "ルートを消去",      key: 'c', action: MenuAction::ClearRoute },
-    ]},
-    MenuCategory { label: "スポット", items: &[
-        MenuItem { label: "マイスポットを開く", key: 'P', action: MenuAction::ManageSpots },
-        MenuItem { label: "スポット表示を切替", key: 'V', action: MenuAction::ToggleSpots },
-    ]},
-    MenuCategory { label: "ナビ・表示", items: &[
-        MenuItem { label: "標高プロファイル",  key: 'E', action: MenuAction::ToggleElevation },
-        MenuItem { label: "実写を見る",        key: 'i', action: MenuAction::StreetView },
-        MenuItem { label: "ルートを再生",      key: 'A', action: MenuAction::PlayRoute },
-        MenuItem { label: "ライブ現在地",      key: 'G', action: MenuAction::ToggleGps },
-    ]},
-    MenuCategory { label: "保存・共有", items: &[
-        MenuItem { label: "ルートを保存",      key: 'S', action: MenuAction::SaveRoute },
-        MenuItem { label: "保存ルートを開く",  key: 'L', action: MenuAction::LoadRoute },
-        MenuItem { label: "GPXを書き出す",     key: 'g', action: MenuAction::SaveGpx },
-        MenuItem { label: "QRで共有",          key: 'o', action: MenuAction::ShareQr },
-    ]},
-    MenuCategory { label: "設定・ヘルプ", items: &[
-        MenuItem { label: "設定を開く",        key: ',', action: MenuAction::Settings },
-        MenuItem { label: "ヘルプ",            key: '?', action: MenuAction::Help },
-    ]},
-];
-
-// メニューの階層。Categories=トップ(カテゴリ選択) / Items(cat)=そのカテゴリの項目選択。
-#[derive(Clone, Copy)]
-enum MenuLevel { Categories, Items(usize) }
-
-// トップメニューで押された文字キーを全カテゴリ横断で対応するアクションに引く(熟練者の直打ち用)。
-fn menu_action_for_key(c: char) -> Option<MenuAction> {
-    MENU_CATEGORIES.iter().flat_map(|cat| cat.items.iter()).find(|it| it.key == c).map(|it| it.action)
-}
-
-// 表示セル幅(fit_cells と同じ規則: ASCII=1 / 非ASCII=2)。
-fn disp_width(s: &str) -> usize { unicode_width::UnicodeWidthStr::width(s) }
-
-// メニュー項目1行。ラベルは左、キーは右端に揃える(幅 w セル内。行頭カーソル prefix の1セルは呼び出し側が足す)。
-fn menu_row(label: &str, key: char, w: usize) -> String {
-    let mut ks = [0u8; 4];
-    let key_s = key.encode_utf8(&mut ks);
-    let pad = w.saturating_sub(2 + disp_width(label) + disp_width(key_s));
-    format!("  {label}{}{key_s}", " ".repeat(pad))
-}
-
-// 左袖リストの表示開始位置(offset)を、選択(sel)が viewport 内に入るよう最小移動で更新する。
-// 項目数(count)が viewport を超えたときにスクロール追従させ、選択が画面外に消えないようにする。
-fn ensure_visible(offset: &mut usize, sel: usize, count: usize, viewport: usize) {
-    if viewport == 0 {
-        *offset = 0;
-        return;
-    }
-    if sel < *offset {
-        *offset = sel; // 上へはみ出た → 選択を先頭に
-    } else if sel >= *offset + viewport {
-        *offset = sel + 1 - viewport; // 下へはみ出た → 選択を末尾に
-    }
-    *offset = (*offset).min(count.saturating_sub(viewport)); // 末尾側の空きを詰める
-}
+// 道路名検索(r)で追加した道路の塊(RoadSeg)・その表示色選択(road_color_for)は roadseg.rs へ切り出し済み。
+use crate::roadseg::{RoadSeg, road_color_for};
 
 // 初回起動オンボーディングの既読マーカー(~/.config/termmap/onboarded)。存在すれば以後は出さない。
 fn onboarded_marker() -> Option<std::path::PathBuf> {
@@ -272,16 +89,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     let mut road_sel: usize = 0;           // 道路一覧(RoadList)の選択行
     let mut grab = false;                  // 並べ替えビューで地点を「掴んで」移動中か
     let mut route_sel: usize = 0;          // Map左袖ルートパネルの選択(0..n=点 / 以降=操作行)
-    // ルートパネルの操作行。Enterで既存のMenuActionを実行(ロジック再利用)。
-    let route_acts: [(&str, MenuAction); 7] = [
-        ("▶ 保存", MenuAction::SaveRoute),
-        ("▶ GPX書き出し", MenuAction::SaveGpx),
-        ("▶ QRでスマホ共有", MenuAction::ShareQr),
-        ("▶ プレビュー走行", MenuAction::PlayRoute),
-        ("▶ 標高プロファイル", MenuAction::ToggleElevation),
-        ("▶ 代替ルート", MenuAction::AltRoute),
-        ("✕ ルート消去", MenuAction::ClearRoute),
-    ];
+    // ルートパネルの操作行(Enterで既存のMenuActionを実行・ロジック再利用)は menu.rs の ROUTE_ACTS。
     let mut mode = a.route_mode.clone();
     let mut pois: Vec<(f64, f64, String, PoiCat)> = Vec::new(); // 目的地検索結果
     let mut poi_sel: usize = 0;
@@ -811,7 +619,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     let role = if i == 0 { "始点" } else if i + 1 == n { "終点" } else { "経由" };
                     format!("#{} {} {:.3},{:.3}", i + 1, role, la, lo)
                 }).collect();
-                for (label, _) in route_acts.iter() { its.push((*label).to_string()); }
+                for (label, _) in ROUTE_ACTS.iter() { its.push((*label).to_string()); }
                 let sel = route_sel.min(its.len().saturating_sub(1));
                 let hdr = if matches!(focus, Focus::RoutePanel) { "ルート ↑↓選択".to_string() } else { "ルート(w/s上下)".to_string() };
                 (hdr, its, sel)
@@ -834,42 +642,12 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 let its = spot_cats.iter().map(|(n, _, _)| n.clone()).collect(); // 色は c、形は M で選ぶ(番号表示はやめた)
                 ("カテゴリ".to_string(), its, cat_sel)
             } else if show_settings {
-                let onoff = |b: bool| if b { "ON" } else { "OFF" };
-                let keyset = if cfg.google_maps_api_key.trim().is_empty() { "未設定" } else { "設定済" };
-                let mode_ja = match cfg.route_profile.as_str() { "car-fast" => "高速", "moped" => "下道", "shortest" => "最短", o => o };
-                let model_ja = match cfg.llm_model.as_str() { "claude-sonnet-5" => "sonnet", "claude-haiku-4-5" => "haiku", "claude-opus-4-8" => "opus", o => o };
+                // 項目一覧(its)の組み立ては settings.rs::settings_rows へ切り出し済み(opts/cfg/引数の値だけを
+                // 見る純関数)。onboarded_marker()(ファイルIO)とset_sel/set_pick_sel(ローカル選択状態)は
+                // ここで評価してから渡す。
                 let picking = if let Focus::SettingsPick(idx) = &focus { Some(*idx) } else { None };
-                let arrow = |idx: usize| if picking == Some(idx) { "▾" } else { "▸" };
-                let mut its = vec![
-                    format!("点字ドット {}", onoff(opts.braille)),
-                    format!("地物色分け {}", onoff(opts.classify)),
-                    format!("輪郭抽出 {}", onoff(opts.edge)),
-                    format!("単色 {}", onoff(opts.mono)),
-                    format!("{} 地図種別 {}", arrow(4), opts.style),
-                    format!("{} 既定ルート {}", arrow(5), mode_ja),
-                    format!("道路の点間隔 {}m", cfg.sample_interval_m as i64),
-                    format!("スポット既定表示 {}", onoff(cfg.show_spots)),
-                    format!("おすすめ {}", onoff(cfg.llm_recommend_enabled)),
-                    format!("{} 提案AIモデル {}", arrow(9), model_ja),
-                    format!("実写(StreetView) {}", onoff(cfg.streetview_enabled)),
-                    format!("画像表示(iTerm2) {}", onoff(cfg.image_mode)),
-                    format!("{} 画像解像度 {}", arrow(12), match cfg.image_res.as_str() { "high" => "高", "low" => "低", _ => "中" }),
-                    format!("移動中の低解像度化 {}", onoff(cfg.image_settle_low_res)),
-                    format!("サウンド {}", onoff(cfg.sound_enabled)),
-                    format!("オンボーディング {}", if onboarded_marker().map_or(false, |p| p.exists()) { "非表示" } else { "毎回表示" }),
-                    format!("{} 中心十字の色 {}", arrow(16), PALETTE_NAMES[cfg.cross_color_idx as usize % PALETTE_NAMES.len()]),
-                    format!("Google APIキー {}", keyset),
-                ];
-                // アコーディオン展開: 選択中の項目がpickable(3択以上)ならその直下に候補をインデント挿入し、他行を押し下げる
-                let mut sel = set_sel;
-                if let Some(idx) = picking {
-                    let labels = settings::pick_labels(idx);
-                    let sub: Vec<String> = labels.iter().map(|l| format!("    {l}")).collect();
-                    let at = idx + 1;
-                    for (i, s) in sub.into_iter().enumerate() { its.insert(at + i, s); }
-                    sel = at + set_pick_sel;
-                }
-                ("設定".to_string(), its, sel)
+                let onboarded_done = onboarded_marker().map_or(false, |p| p.exists());
+                settings::settings_rows(&opts, &cfg, picking, onboarded_done, set_sel, set_pick_sel)
             } else if show_poimenu {
                 let mut its: Vec<String> = poi_kinds.iter().map(|k| format!("{} {}", k.key, k.label)).collect();
                 its.push("キーワードで周辺検索".to_string());
@@ -983,26 +761,8 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             Focus::SpotCatList if pending_spot.is_some() => " 登録先カテゴリを選択: ↑↓ Enter=ここに登録 n新規 Esc取消 ".to_string(),
             Focus::SpotCatList => " カテゴリ: ↑↓選択 [ ]並替 Enter=中へ n新規 r改名 c色 M形 x削除(空のみ) Esc=閉 ".to_string(),
             Focus::Settings => {
-                let desc = match set_sel {
-                    0 => "braille: 点字ドットで高精細描画(色は淡め)。OFFはハーフブロック",
-                    1 => "classify: 地物を色分け(水域/緑地/道路/建物)。地形が見やすい",
-                    2 => "edge: 輪郭抽出表示(線画風)",
-                    3 => "mono: 単色描画(色を使わない)",
-                    4 => "style: タイル種別。Enterで一覧を開いて選択(osm=標準/voyager/dark=暗/light=淡)",
-                    5 => "既定mode: 起動時のルート種別。Enterで一覧を開いて選択(car-fast=高速優先 / moped=下道(高速回避) / shortest=最短距離)",
-                    6 => "道路の点間隔: rの道路名ルートで、その道を何mおきの点でなぞるか(小=忠実で点多/大=粗い)。Enterで数値入力/←→で微調整",
-                    7 => "spot既定: 起動時にお気に入りスポットを表示するか",
-                    8 => "おすすめ: claude -p でツーリングスポットを提案する機能のON/OFF(未実装)",
-                    9 => "LLM: おすすめに使うモデル。Enterで一覧を開いて選択(claude-sonnet-5/haiku/opus)",
-                    10 => "実写: iで中心地点のStreet Viewを開く機能のON/OFF(要Google APIキー)",
-                    11 => if image_capable() { "画像表示: 地図と実写をiTerm2インライン画像で実画像表示(AAでなく実画像)。Iキーでも切替" } else { "画像表示: この端末は画像非対応(iTerm2/WezTermで有効)" },
-                    12 => "画像解像度: 実画像モードの精細さ。Enterで一覧を開いて選択(高=scale4/中=scale2/低=scale1)",
-                    13 => "移動中の低解像度化: ONなら地図移動中(動いた直後〜静止350ms)は自動で低解像度にして速く描く。OFFなら常に設定解像度",
-                    14 => "サウンド: 操作音のON/OFF(macOSのafplayで再生)",
-                    15 => "オンボーディング: 毎回表示/非表示を切替(dキーでも次回から非表示にできる)",
-                    16 => "中心十字の色: 地図中心のクロスヘアの色。Enterで一覧を開いて選択(spots.rsの配色から選択)",
-                    _ => "Google APIキー: 検索(Geocoding)とStreet View共通。Enterで入力欄を開く(Cmd+V貼付も可)。環境変数TERMMAP_GOOGLE_API_KEYでも可",
-                };
+                // 各行の説明文は settings.rs::setting_description へ切り出し済み(状態を必要としない純粋部分)。
+                let desc = settings::setting_description(set_sel);
                 format!(" ▶ {desc}   [↑↓選択 Enter切替/一覧選択/編集 Esc閉(自動保存)]")
             }
             Focus::RoadSearch(_) => " 中央フォームに入力中 ".to_string(),
@@ -1399,7 +1159,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             let poly = roadtrace::assemble_polyline(&rf);
                             let seg = roadtrace::nearest_segment(&poly, (lat, lon), 500.0);
                             if seg.len() >= 2 {
-                                let color = ROAD_PALETTE[road_segs.len() % ROAD_PALETTE.len()];
+                                let color = road_color_for(road_segs.len());
                                 road_segs.push(RoadSeg { name: name.clone(), color, pts: seg });
                                 sync_roads!();
                                 addr = format!("道路: {name} を塊で追加(計{}本)", road_segs.len());
@@ -2233,7 +1993,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                 focus = Focus::RoutePanel;
                             }
                             KeyCode::Down | KeyCode::Char('s') => {
-                                let total = wps.len() + route_acts.len();
+                                let total = wps.len() + ROUTE_ACTS.len();
                                 if route_sel + 1 < total { route_sel += 1; }
                                 if route_sel < wps.len() { wp_sel = route_sel; let (la, lo) = wps[wp_sel]; let (nx, ny) = deg_to_pixel(la, lo, z); cx = nx; cy = ny; }
                                 focus = Focus::RoutePanel;
@@ -2241,7 +2001,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             KeyCode::Enter | KeyCode::Char(' ') => {
                                 if route_sel >= wps.len() { // 操作行を実行(run_action側でfocus遷移する場合あり=その時はそちら優先)
                                     let ai = route_sel - wps.len();
-                                    if ai < route_acts.len() { let act = route_acts[ai].1; run_action!(act, lat, lon, cols, tr); }
+                                    if ai < ROUTE_ACTS.len() { let act = ROUTE_ACTS[ai].1; run_action!(act, lat, lon, cols, tr); }
                                 } else { // 点を選択中: 地図を寄せてパネルに留まる
                                     let (la, lo) = wps[route_sel]; let (nx, ny) = deg_to_pixel(la, lo, z); cx = nx; cy = ny;
                                     focus = Focus::RoutePanel;
@@ -2296,10 +2056,10 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => { cy += step; addr.clear(); }
                             KeyCode::Char('+') | KeyCode::Char('=') => if z < 19 { z += 1; cx *= 2.0; cy *= 2.0; addr.clear(); },
                             KeyCode::Char('-') | KeyCode::Char('_') => if z > 2 { z -= 1; cx /= 2.0; cy /= 2.0; addr.clear(); },
-                            KeyCode::Enter if !wps.is_empty() && route_sel >= wps.len() && route_sel < wps.len() + route_acts.len() => {
+                            KeyCode::Enter if !wps.is_empty() && route_sel >= wps.len() && route_sel < wps.len() + ROUTE_ACTS.len() => {
                                 // w/sで操作行(保存/GPX等)を選択中はEnterでその操作を実行
                                 let ai = route_sel - wps.len();
-                                let act = route_acts[ai].1;
+                                let act = ROUTE_ACTS[ai].1;
                                 run_action!(act, lat, lon, cols, tr);
                             }
                             KeyCode::Enter => { // 中心付近の最寄りお気に入りにスナップ＋名前表示
@@ -2332,7 +2092,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             // w/s: Tabで一覧へ入らなくても、地図(パン)はそのまま左袖(ルート点+操作行)の
                             // 選択だけ上下できる。操作行(保存/GPX等)まで選べて、Enterでそのまま実行できる
                             KeyCode::Char('w') if !wps.is_empty() => {
-                                let total = wps.len() + route_acts.len();
+                                let total = wps.len() + ROUTE_ACTS.len();
                                 route_sel = (route_sel + total - 1) % total;
                                 if route_sel < wps.len() {
                                     wp_sel = route_sel;
@@ -2340,14 +2100,14 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                 }
                             }
                             KeyCode::Char('s') if !wps.is_empty() => {
-                                let total = wps.len() + route_acts.len();
+                                let total = wps.len() + ROUTE_ACTS.len();
                                 route_sel = (route_sel + 1) % total;
                                 if route_sel < wps.len() {
                                     wp_sel = route_sel;
                                     let (la, lo) = wps[wp_sel]; let (nx, ny) = deg_to_pixel(la, lo, z); cx = nx; cy = ny;
                                 }
                             }
-                            KeyCode::Tab | KeyCode::BackTab => { if !wps.is_empty() { route_sel = route_sel.min(wps.len() + route_acts.len() - 1); focus = Focus::RoutePanel; } } // 左のルート一覧にフォーカス(そこで↑↓選択・Enter実行)
+                            KeyCode::Tab | KeyCode::BackTab => { if !wps.is_empty() { route_sel = route_sel.min(wps.len() + ROUTE_ACTS.len() - 1); focus = Focus::RoutePanel; } } // 左のルート一覧にフォーカス(そこで↑↓選択・Enter実行)
                             KeyCode::Char(' ') => { snd.play("click"); menu_cat_sel = 0; focus = Focus::Menu(MenuLevel::Categories); } // Space=メニュー(カテゴリ→展開の2階層)
                             KeyCode::Char('?') => help = true,
                             KeyCode::Char('P') => { cat_sel = 0; focus = Focus::SpotCatList; } // マイスポット(カテゴリ一覧)
@@ -2464,163 +2224,4 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crossterm::event::KeyCode;
-
-    // 左袖リストのスクロール追従
-    #[test]
-    fn ensure_visible_follows_selection() {
-        let vh = 5; // 表示5行
-        // 収まる場合は offset=0 のまま
-        let mut o = 0;
-        ensure_visible(&mut o, 3, 4, vh);
-        assert_eq!(o, 0);
-        // 下へはみ出す: 20件・選択10 → 選択が末尾に来る位置(10+1-5=6)
-        let mut o = 0;
-        ensure_visible(&mut o, 10, 20, vh);
-        assert_eq!(o, 6);
-        assert!(10 >= o && 10 < o + vh, "選択が窓内");
-        // そこから上へ戻る: 選択2 → 先頭に
-        ensure_visible(&mut o, 2, 20, vh);
-        assert_eq!(o, 2);
-        // 末尾選択は末尾側の空きが詰まる(offset=count-vh)
-        let mut o = 0;
-        ensure_visible(&mut o, 19, 20, vh);
-        assert_eq!(o, 15);
-        // viewport=0 は安全に0
-        let mut o = 7;
-        ensure_visible(&mut o, 3, 20, 0);
-        assert_eq!(o, 0);
-    }
-
-    // 文字位置→byte offset(マルチバイト含む)
-    #[test]
-    fn char_byte_multibyte() {
-        assert_eq!(char_byte("abc", 0), 0);
-        assert_eq!(char_byte("abc", 2), 2);
-        assert_eq!(char_byte("abc", 3), 3);   // 末尾
-        assert_eq!(char_byte("あい", 0), 0);
-        assert_eq!(char_byte("あい", 1), 3);  // 'あ'=3byte
-        assert_eq!(char_byte("あい", 2), 6);  // 末尾
-        assert_eq!(char_byte("あい", 9), 6);  // 範囲外は末尾扱い
-    }
-
-    // 途中挿入(ASCII)
-    #[test]
-    fn edit_insert_middle_ascii() {
-        let mut b = "ac".to_string();
-        let mut c = 1;
-        assert!(edit_line(&mut b, &mut c, KeyCode::Char('b')));
-        assert_eq!(b, "abc");
-        assert_eq!(c, 2);
-    }
-
-    // 途中挿入(マルチバイト)。byte offset ずれで壊れないこと
-    #[test]
-    fn edit_insert_middle_multibyte() {
-        let mut b = "あう".to_string();
-        let mut c = 1; // 'あ'の後ろ
-        assert!(edit_line(&mut b, &mut c, KeyCode::Char('い')));
-        assert_eq!(b, "あいう");
-        assert_eq!(c, 2);
-    }
-
-    // 左右移動とクランプ
-    #[test]
-    fn edit_left_right_clamp() {
-        let mut b = "abc".to_string();
-        let mut c = 0;
-        assert!(edit_line(&mut b, &mut c, KeyCode::Left)); // 0で止まる
-        assert_eq!(c, 0);
-        edit_line(&mut b, &mut c, KeyCode::Right);
-        edit_line(&mut b, &mut c, KeyCode::Right);
-        edit_line(&mut b, &mut c, KeyCode::Right);
-        edit_line(&mut b, &mut c, KeyCode::Right); // 文字数3で止まる
-        assert_eq!(c, 3);
-    }
-
-    // Home/End
-    #[test]
-    fn edit_home_end() {
-        let mut b = "あいう".to_string();
-        let mut c = 1;
-        assert!(edit_line(&mut b, &mut c, KeyCode::End));
-        assert_eq!(c, 3);
-        assert!(edit_line(&mut b, &mut c, KeyCode::Home));
-        assert_eq!(c, 0);
-    }
-
-    // Backspace は cur-1 の文字を消す(マルチバイト)
-    #[test]
-    fn edit_backspace_multibyte() {
-        let mut b = "あいう".to_string();
-        let mut c = 2; // 'い'の後ろ
-        assert!(edit_line(&mut b, &mut c, KeyCode::Backspace));
-        assert_eq!(b, "あう");
-        assert_eq!(c, 1);
-        // cur=0 では何もしない
-        let mut c0 = 0;
-        let mut b0 = "x".to_string();
-        edit_line(&mut b0, &mut c0, KeyCode::Backspace);
-        assert_eq!(b0, "x");
-        assert_eq!(c0, 0);
-    }
-
-    // Delete は cur 位置の文字を消す(cur据え置き)
-    #[test]
-    fn edit_delete_multibyte() {
-        let mut b = "あいう".to_string();
-        let mut c = 1; // 'い'を消す
-        assert!(edit_line(&mut b, &mut c, KeyCode::Delete));
-        assert_eq!(b, "あう");
-        assert_eq!(c, 1);
-        // 末尾では何もしない
-        let mut cend = 2;
-        edit_line(&mut b, &mut cend, KeyCode::Delete);
-        assert_eq!(b, "あう");
-    }
-
-    // 非対象キーは false
-    #[test]
-    fn edit_ignores_other_keys() {
-        let mut b = "ab".to_string();
-        let mut c = 1;
-        assert!(!edit_line(&mut b, &mut c, KeyCode::Enter));
-        assert!(!edit_line(&mut b, &mut c, KeyCode::Tab));
-        assert!(!edit_line(&mut b, &mut c, KeyCode::Up));
-        assert_eq!(b, "ab"); // 変化なし
-        assert_eq!(c, 1);
-    }
-
-    // ペースト挿入
-    #[test]
-    fn insert_str_at_middle() {
-        let mut b = "あZ".to_string();
-        let mut c = 1;
-        insert_str_at(&mut b, &mut c, "XY");
-        assert_eq!(b, "あXYZ");
-        assert_eq!(c, 3);
-    }
-
-    // 表示: cur 位置にブロック █
-    #[test]
-    fn render_cursor_positions() {
-        assert_eq!(render_with_cursor("abc", 0), "\u{2588}abc");
-        assert_eq!(render_with_cursor("abc", 1), "a\u{2588}bc");
-        assert_eq!(render_with_cursor("abc", 3), "abc\u{2588}"); // 末尾
-        assert_eq!(render_with_cursor("あい", 1), "あ\u{2588}い");
-        assert_eq!(render_with_cursor("ab", 9), "ab\u{2588}"); // 範囲外は末尾
-    }
-
-    // SpotForm フィールド切替時のカーソル位置
-    #[test]
-    fn form_cur_by_field() {
-        assert_eq!(form_cur("あい", "http://x", 0), 2); // 名称の文字数
-        assert_eq!(form_cur("あい", "http://x", 1), 8); // URLの文字数
-        assert_eq!(form_cur("あい", "http://x", 2), 0); // ボタン欄
-        assert_eq!(form_cur("あい", "http://x", 3), 0);
-    }
-}
 

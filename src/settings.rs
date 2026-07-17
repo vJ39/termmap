@@ -7,6 +7,8 @@
 // 強く依存しているためここには移せない。ここに切り出したのは、その状態を必要としない純粋な部分のみ。
 
 use crate::config::Config;
+use crate::render::image_capable;
+use crate::Args;
 
 // 色ピッカー(ColorPick)と同じ並びの色名。中心十字の色選択・設定画面の表示に使う。
 pub(crate) const PALETTE_NAMES: [&str; 10] = ["赤", "橙", "金", "黄緑", "水色", "紫", "桃", "緑青", "茶", "灰"];
@@ -70,6 +72,77 @@ pub(crate) fn apply_pick(idx: usize, sel: usize, cfg: &mut Config, style: &mut S
         _ => {}
     }
     eff
+}
+
+// Focus::Settings のステータス行(画面下部)に出す、選択中の行(set_sel)ごとの説明文。
+// set_sel だけを引数に取る純関数(cfg/opts等の外部状態には触れない)。
+pub(crate) fn setting_description(idx: usize) -> &'static str {
+    match idx {
+        0 => "braille: 点字ドットで高精細描画(色は淡め)。OFFはハーフブロック",
+        1 => "classify: 地物を色分け(水域/緑地/道路/建物)。地形が見やすい",
+        2 => "edge: 輪郭抽出表示(線画風)",
+        3 => "mono: 単色描画(色を使わない)",
+        4 => "style: タイル種別。Enterで一覧を開いて選択(osm=標準/voyager/dark=暗/light=淡)",
+        5 => "既定mode: 起動時のルート種別。Enterで一覧を開いて選択(car-fast=高速優先 / moped=下道(高速回避) / shortest=最短距離)",
+        6 => "道路の点間隔: rの道路名ルートで、その道を何mおきの点でなぞるか(小=忠実で点多/大=粗い)。Enterで数値入力/←→で微調整",
+        7 => "spot既定: 起動時にお気に入りスポットを表示するか",
+        8 => "おすすめ: claude -p でツーリングスポットを提案する機能のON/OFF(未実装)",
+        9 => "LLM: おすすめに使うモデル。Enterで一覧を開いて選択(claude-sonnet-5/haiku/opus)",
+        10 => "実写: iで中心地点のStreet Viewを開く機能のON/OFF(要Google APIキー)",
+        11 => if image_capable() { "画像表示: 地図と実写をiTerm2インライン画像で実画像表示(AAでなく実画像)。Iキーでも切替" } else { "画像表示: この端末は画像非対応(iTerm2/WezTermで有効)" },
+        12 => "画像解像度: 実画像モードの精細さ。Enterで一覧を開いて選択(高=scale4/中=scale2/低=scale1)",
+        13 => "移動中の低解像度化: ONなら地図移動中(動いた直後〜静止350ms)は自動で低解像度にして速く描く。OFFなら常に設定解像度",
+        14 => "サウンド: 操作音のON/OFF(macOSのafplayで再生)",
+        15 => "オンボーディング: 毎回表示/非表示を切替(dキーでも次回から非表示にできる)",
+        16 => "中心十字の色: 地図中心のクロスヘアの色。Enterで一覧を開いて選択(spots.rsの配色から選択)",
+        _ => "Google APIキー: 検索(Geocoding)とStreet View共通。Enterで入力欄を開く(Cmd+V貼付も可)。環境変数TERMMAP_GOOGLE_API_KEYでも可",
+    }
+}
+
+// Focus::Settings描画時の左袖項目一覧(its)の組み立て。ui.rs側のonboarded_marker()(ファイルIO)や
+// set_sel/set_pick_sel(interactive()のローカル選択状態)は呼び出し側で評価/取得し、値(bool/usize)として
+// 渡す(この関数自体はopts/cfg/引数の値だけを見る純関数)。戻り値は(見出し, 項目一覧, 選択位置)で、
+// ui.rs側の他フォーカスの分岐が返す形と同じ。
+// - picking: Focus::SettingsPick(idx)ならSome(idx)(サイド一覧を展開表示中の項目)
+// - onboarded: オンボーディング済み(marker存在)ならtrue
+// - set_sel: 設定画面での選択中の行番号
+// - set_pick_sel: SettingsPick(一覧選択)展開中の候補選択位置
+pub(crate) fn settings_rows(opts: &Args, cfg: &Config, picking: Option<usize>, onboarded: bool, set_sel: usize, set_pick_sel: usize) -> (String, Vec<String>, usize) {
+    let onoff = |b: bool| if b { "ON" } else { "OFF" };
+    let keyset = if cfg.google_maps_api_key.trim().is_empty() { "未設定" } else { "設定済" };
+    let mode_ja = match cfg.route_profile.as_str() { "car-fast" => "高速", "moped" => "下道", "shortest" => "最短", o => o };
+    let model_ja = match cfg.llm_model.as_str() { "claude-sonnet-5" => "sonnet", "claude-haiku-4-5" => "haiku", "claude-opus-4-8" => "opus", o => o };
+    let arrow = |idx: usize| if picking == Some(idx) { "▾" } else { "▸" };
+    let mut its = vec![
+        format!("点字ドット {}", onoff(opts.braille)),
+        format!("地物色分け {}", onoff(opts.classify)),
+        format!("輪郭抽出 {}", onoff(opts.edge)),
+        format!("単色 {}", onoff(opts.mono)),
+        format!("{} 地図種別 {}", arrow(4), opts.style),
+        format!("{} 既定ルート {}", arrow(5), mode_ja),
+        format!("道路の点間隔 {}m", cfg.sample_interval_m as i64),
+        format!("スポット既定表示 {}", onoff(cfg.show_spots)),
+        format!("おすすめ {}", onoff(cfg.llm_recommend_enabled)),
+        format!("{} 提案AIモデル {}", arrow(9), model_ja),
+        format!("実写(StreetView) {}", onoff(cfg.streetview_enabled)),
+        format!("画像表示(iTerm2) {}", onoff(cfg.image_mode)),
+        format!("{} 画像解像度 {}", arrow(12), match cfg.image_res.as_str() { "high" => "高", "low" => "低", _ => "中" }),
+        format!("移動中の低解像度化 {}", onoff(cfg.image_settle_low_res)),
+        format!("サウンド {}", onoff(cfg.sound_enabled)),
+        format!("オンボーディング {}", if onboarded { "非表示" } else { "毎回表示" }),
+        format!("{} 中心十字の色 {}", arrow(16), PALETTE_NAMES[cfg.cross_color_idx as usize % PALETTE_NAMES.len()]),
+        format!("Google APIキー {}", keyset),
+    ];
+    // アコーディオン展開: 選択中の項目がpickable(3択以上)ならその直下に候補をインデント挿入し、他行を押し下げる
+    let mut sel = set_sel;
+    if let Some(idx) = picking {
+        let labels = pick_labels(idx);
+        let sub: Vec<String> = labels.iter().map(|l| format!("    {l}")).collect();
+        let at = idx + 1;
+        for (i, s) in sub.into_iter().enumerate() { its.insert(at + i, s); }
+        sel = at + set_pick_sel;
+    }
+    ("設定".to_string(), its, sel)
 }
 
 #[cfg(test)]
@@ -149,5 +222,26 @@ mod tests {
             assert_eq!(pick_labels(idx).len(), c.values.len());
         }
         assert_eq!(pick_labels(16).len(), PALETTE_NAMES.len());
+    }
+
+    #[test]
+    fn setting_description_covers_every_known_row_distinctly() {
+        // 0〜16 は個別の説明文を持つ(idx=11は端末対応有無で文言が変わるが、いずれにせよ空でない)。
+        let mut seen = Vec::new();
+        for idx in 0usize..=16 {
+            let d = setting_description(idx);
+            assert!(!d.is_empty(), "idx {idx} should have a description");
+            if idx != 11 { seen.push(d); } // 11は環境依存で文言が2通りあるため一意性判定から除外
+        }
+        let mut uniq = seen.clone();
+        uniq.sort();
+        uniq.dedup();
+        assert_eq!(seen.len(), uniq.len(), "each settings row should have a distinct description");
+    }
+
+    #[test]
+    fn setting_description_out_of_range_falls_back_to_google_api_key() {
+        assert_eq!(setting_description(17), setting_description(999));
+        assert!(setting_description(17).contains("Google APIキー"));
     }
 }
