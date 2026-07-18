@@ -49,6 +49,7 @@ pub struct Config {
     pub google_maps_api_key: String, // Google Maps系(Geocoding検索/Street View)共通キー。旧streetview_api_keyから改名
     pub streetview_enabled: bool,     // 実写(i)を使うか
     pub sound_enabled: bool,          // 操作UI効果音(macOS afplay)を鳴らすか
+    pub qr_style: String,             // スマホ共有QRの描画方式: "dense"(標準/1x2)/"quadrant"(2x2ブロック・縦長歪みあり)/"braille"(2x4ドット・正方形維持で最小)。既定dense
 }
 
 impl Default for Config {
@@ -73,6 +74,7 @@ impl Default for Config {
             google_maps_api_key: String::new(),
             streetview_enabled: true,
             sound_enabled: true,
+            qr_style: "dense".to_string(),
         }
     }
 }
@@ -179,6 +181,11 @@ pub fn load_config_from(path: &Path) -> Config {
             }
             ("display", "image_settle_low_res") => { if let Some(b) = parse_bool(value) { cfg.image_settle_low_res = b; } }
             ("display", "cross_color_idx") => { if let Some(n) = parse_number(value) { cfg.cross_color_idx = (n as u8).min(9); } }
+            ("display", "qr_style") => {
+                if let Some(s) = parse_string(value) {
+                    if matches!(s.as_str(), "dense" | "quadrant" | "braille") { cfg.qr_style = s; }
+                }
+            }
             ("google", "maps_api_key") => {
                 if let Some(s) = parse_string(value) {
                     cfg.google_maps_api_key = s;
@@ -241,6 +248,7 @@ pub fn save_config_to(path: &Path, c: &Config) -> Result<(), String> {
          image_res = \"{}\"\n\
          image_settle_low_res = {}\n\
          cross_color_idx = {}\n\
+         qr_style = \"{}\"\n\
          \n\
          [google]\n\
          maps_api_key = \"{}\"\n\
@@ -266,6 +274,7 @@ pub fn save_config_to(path: &Path, c: &Config) -> Result<(), String> {
         c.image_res,
         c.image_settle_low_res,
         c.cross_color_idx,
+        c.qr_style,
         c.google_maps_api_key,
         c.streetview_enabled,
         c.sound_enabled,
@@ -413,6 +422,7 @@ mod tests {
             cross_color_idx: 5,
             google_maps_api_key: "AIzaTESTKEY_example_123".to_string(), streetview_enabled: true,
             sound_enabled: false,
+            qr_style: "braille".to_string(),
         };
         save_config_to(&path, &original).expect("save should succeed");
         let loaded = load_config_from(&path);
@@ -499,6 +509,21 @@ show_spots = maybe
         assert_eq!(cfg.google_maps_api_key, "NEWKEY");
         assert!(!cfg.streetview_enabled);
         cleanup(&path);
+    }
+
+    #[test]
+    fn qr_style_only_accepts_known_values() {
+        let path = unique_temp_path("qr_style_known");
+        std::fs::write(&path, "[display]\nqr_style = \"braille\"\n").unwrap();
+        let cfg = load_config_from(&path);
+        assert_eq!(cfg.qr_style, "braille");
+        cleanup(&path);
+
+        let path2 = unique_temp_path("qr_style_unknown");
+        std::fs::write(&path2, "[display]\nqr_style = \"bogus\"\n").unwrap();
+        let cfg2 = load_config_from(&path2);
+        assert_eq!(cfg2.qr_style, Config::default().qr_style);
+        cleanup(&path2);
     }
 
     #[test]
@@ -630,6 +655,7 @@ profile = "custom-profile"
             cross_color_idx: 0,
             google_maps_api_key: "k".to_string(), streetview_enabled: true,
             sound_enabled: true,
+            qr_style: "quadrant".to_string(),
         };
         save_config_to(&path, &cfg).unwrap();
         let loaded = load_config_from(&path);

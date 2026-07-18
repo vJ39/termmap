@@ -34,6 +34,18 @@ fn onboarded_marker() -> Option<std::path::PathBuf> {
     std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".config/termmap/onboarded"))
 }
 
+// スマホ共有QRを cfg.qr_style に応じた密度で描画する(dense=既定のDense1x2/quadrant・braille=render.rs参照)。
+fn render_qr_view(c: &qrcode::QrCode, style: &str) -> String {
+    match style {
+        "quadrant" | "braille" => {
+            let w = c.width();
+            let dark: Vec<bool> = c.to_colors().iter().map(|col| *col == qrcode::Color::Dark).collect();
+            if style == "quadrant" { render_qr_quadrant(&dark, w) } else { render_qr_braille(&dark, w) }
+        }
+        _ => c.render::<qrcode::render::unicode::Dense1x2>().quiet_zone(false).build(),
+    }
+}
+
 
 // ---- 対話モード (crossterm) ----
 // 端末状態を RAII で復元する。パニック/早期return でも Drop で raw mode と代替スクリーンを必ず戻す。
@@ -252,7 +264,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 if wps.len() >= 2 {
                     let (url, _) = gmaps_url(&wps);
                     match qrcode::QrCode::with_error_correction_level(url.as_bytes(), qrcode::EcLevel::L) {
-                        Ok(c) => qr_view = Some(c.render::<qrcode::render::unicode::Dense1x2>().quiet_zone(false).build()),
+                        Ok(c) => qr_view = Some(render_qr_view(&c, &cfg.qr_style)),
                         Err(_) => addr = "QR生成失敗".into(),
                     }
                 } else { snd.play("error"); addr = "ルート未確定".into(); }
@@ -1361,8 +1373,8 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 if let KeyCode::Char('y') | KeyCode::Char('Y') = k.code { break; }
                 quit_confirm = false;
             }
-            Some(Event::Key(_)) if qr_view.is_some() => qr_view = None, // ポップアップを閉じる
-            Some(Event::Key(_)) if popup.is_some() => popup = None, // 名前ポップアップを閉じる
+            Some(Event::Key(_)) if qr_view.is_some() => { qr_view = None; force_reemit = true; } // ポップアップを閉じる(即座に再emitして残像を消す)
+            Some(Event::Key(_)) if popup.is_some() => { popup = None; force_reemit = true; } // 名前ポップアップを閉じる(同上)
             Some(Event::Key(k)) if spot_move_confirm.is_some() => { // 「中心へ移動」の確認(y=実行/他=取消)
                 let gi = spot_move_confirm.take().unwrap();
                 if let KeyCode::Char('y') = k.code {
@@ -1488,7 +1500,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     },
                     Focus::Settings => { let mut stay = true; let mut changed = false; match k.code { // 設定画面
                         KeyCode::Up | KeyCode::Char('w') => { snd.play("click"); set_sel = set_sel.saturating_sub(1); }
-                        KeyCode::Down | KeyCode::Char('s') => { snd.play("click"); if set_sel + 1 < 18 { set_sel += 1; } }
+                        KeyCode::Down | KeyCode::Char('s') => { snd.play("click"); if set_sel + 1 < 19 { set_sel += 1; } }
                         KeyCode::Left | KeyCode::Right => {
                             if set_sel == 6 { let d = if k.code == KeyCode::Left { -100.0 } else { 100.0 }; cfg.sample_interval_m = (cfg.sample_interval_m + d).clamp(100.0, 5000.0); changed = true; }
                         }
@@ -2248,7 +2260,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                 if wps.len() >= 2 {
                                     let (url, _) = gmaps_url(&wps);
                                     match qrcode::QrCode::with_error_correction_level(url.as_bytes(), qrcode::EcLevel::L) {
-                                        Ok(c) => qr_view = Some(c.render::<qrcode::render::unicode::Dense1x2>().quiet_zone(false).build()),
+                                        Ok(c) => qr_view = Some(render_qr_view(&c, &cfg.qr_style)),
                                         Err(_) => addr = "QR生成失敗".into(),
                                     }
                                 } else { snd.play("error"); addr = "ルート未確定".into(); }

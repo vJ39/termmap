@@ -111,6 +111,56 @@ pub fn render_braille(img: &RgbImage, mono: bool, classify_on: bool, threshold: 
     out
 }
 
+// ---- QRコード高密度描画 ----
+// いずれも dark[y*width+x] (true=QRの黒モジュール) の正方格子を受け取る、qrcodeクレートに依存しない純関数。
+
+// 2x2モジュールを1文字(Block Elements の quadrant字形)へ詰める。ソリッド矩形を維持できるが、
+// 端末の文字セル比率(概ね横1:縦2)により全体が縦長に歪む(横方向だけ2倍密度になるため)。
+pub fn render_qr_quadrant(dark: &[bool], width: usize) -> String {
+    if width == 0 { return String::new(); }
+    const GLYPH: [char; 16] = [' ', '▘', '▝', '▀', '▖', '▌', '▞', '▛', '▗', '▚', '▐', '▜', '▄', '▙', '▟', '█'];
+    let at = |x: usize, y: usize| -> bool { x < width && y < width && dark.get(y * width + x).copied().unwrap_or(false) };
+    let cells = (width + 1) / 2;
+    let mut out = String::with_capacity(cells * (cells + 1));
+    for cy in 0..cells {
+        for cx in 0..cells {
+            let (bx, by) = (cx * 2, cy * 2);
+            let mut bits = 0usize;
+            if at(bx, by) { bits |= 1; }
+            if at(bx + 1, by) { bits |= 2; }
+            if at(bx, by + 1) { bits |= 4; }
+            if at(bx + 1, by + 1) { bits |= 8; }
+            out.push(GLYPH[bits]);
+        }
+        out.push('\n');
+    }
+    out
+}
+
+// 2x4モジュールを1文字(braille)へ詰める。端末の文字セル比率と噛み合い正方形比率を保ったまま
+// quadrant比でさらに縦2倍密度(Dense1x2比で縦横とも半分・面積1/4)にできるが、各モジュールが丸ドットになる。
+pub fn render_qr_braille(dark: &[bool], width: usize) -> String {
+    if width == 0 { return String::new(); }
+    const BITS: [[u8; 4]; 2] = [[0x01, 0x02, 0x04, 0x40], [0x08, 0x10, 0x20, 0x80]];
+    let at = |x: usize, y: usize| -> bool { x < width && y < width && dark.get(y * width + x).copied().unwrap_or(false) };
+    let cols = (width + 1) / 2;
+    let rows = (width + 3) / 4;
+    let mut out = String::with_capacity(cols * (rows + 1));
+    for cy in 0..rows {
+        for cx in 0..cols {
+            let mut bits = 0u8;
+            for dx in 0..2usize {
+                for dy in 0..4usize {
+                    if at(cx * 2 + dx, cy * 4 + dy) { bits |= BITS[dx][dy]; }
+                }
+            }
+            out.push(char::from_u32(0x2800 + bits as u32).unwrap());
+        }
+        out.push('\n');
+    }
+    out
+}
+
 // ---- オーバーレイ (POIマーカー / 経路 / 航続リング) ----
 #[derive(Clone, Copy)]
 #[allow(dead_code)] // POI 実装(次増分)で全variant使用
@@ -353,6 +403,76 @@ mod tests {
         let a = rgb_to_ansi256(100, 150, 200);
         let b = rgb_to_ansi256(102, 148, 198);
         assert!(a.abs_diff(b) <= 1, "a={a} b={b} should be identical or adjacent");
+    }
+
+    // quadrant: 2x2全explicitly false(空)は空白1文字になる。
+    #[test]
+    fn render_qr_quadrant_all_light_is_blank() {
+        let dark = vec![false; 4]; // 2x2
+        assert_eq!(render_qr_quadrant(&dark, 2), " \n");
+    }
+
+    // quadrant: 2x2全trueはフルブロック1文字になる。
+    #[test]
+    fn render_qr_quadrant_all_dark_is_full_block() {
+        let dark = vec![true; 4]; // 2x2
+        assert_eq!(render_qr_quadrant(&dark, 2), "█\n");
+    }
+
+    // quadrant: 左上のみdarkは左上quadrant字形(▘)になる。
+    #[test]
+    fn render_qr_quadrant_top_left_only() {
+        let dark = vec![true, false, false, false]; // (0,0)=dark
+        assert_eq!(render_qr_quadrant(&dark, 2), "▘\n");
+    }
+
+    // quadrant: 奇数幅(width=3)でも panic せず、はみ出す側は光(false)扱いで詰められる。
+    #[test]
+    fn render_qr_quadrant_odd_width_does_not_panic() {
+        let dark = vec![true; 9]; // 3x3 全dark
+        let out = render_qr_quadrant(&dark, 3);
+        assert_eq!(out.lines().count(), 2); // ceil(3/2)=2行
+        assert_eq!(out.lines().next().unwrap().chars().count(), 2); // ceil(3/2)=2桁
+    }
+
+    // width=0 は空文字列を返す(0除算等でpanicしない)。
+    #[test]
+    fn render_qr_quadrant_zero_width_is_empty() {
+        assert_eq!(render_qr_quadrant(&[], 0), "");
+    }
+
+    // braille: 2x4全false は空パターン(U+2800)になる。
+    #[test]
+    fn render_qr_braille_all_light_is_blank_pattern() {
+        let dark = vec![false; 8]; // 2x4
+        assert_eq!(render_qr_braille(&dark, 2), "\u{2800}\n");
+    }
+
+    // braille: 全trueの正方格子(QRは常に正方形)は全ドット(U+28FF)になる。
+    // width=4を使うのは、1文字が2x4モジュールを読むため縦4行分ないと本来の8ドット判定を検証できないため
+    // (width=2だと縦のy=2,3がグリッド外でfalse扱いになり、全ドットにならない)。
+    #[test]
+    fn render_qr_braille_all_dark_is_full_pattern() {
+        let dark = vec![true; 16]; // 4x4
+        assert_eq!(render_qr_braille(&dark, 4), "\u{28FF}\u{28FF}\n");
+    }
+
+    // braille: Dense1x2比で縦横とも約半分になる(密度2倍x2倍=面積4倍相当)。
+    #[test]
+    fn render_qr_braille_is_quarter_area_of_quadrant() {
+        let dark = vec![true; 16 * 16];
+        let q = render_qr_quadrant(&dark, 16);
+        let b = render_qr_braille(&dark, 16);
+        let q_rows = q.lines().count();
+        let b_rows = b.lines().count();
+        assert_eq!(q_rows, 8); // 16/2
+        assert_eq!(b_rows, 4); // 16/4
+        assert_eq!(q.lines().next().unwrap().chars().count(), b.lines().next().unwrap().chars().count()); // 横の詰め方は同じ(2列/文字)
+    }
+
+    #[test]
+    fn render_qr_braille_zero_width_is_empty() {
+        assert_eq!(render_qr_braille(&[], 0), "");
     }
 
     #[test]

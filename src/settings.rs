@@ -21,13 +21,14 @@ pub(crate) struct SettingChoice {
     pub labels: &'static [&'static str],
 }
 
-// idx は Focus::Settings 側の項目行番号と対応(4=地図種別/5=既定ルート/9=提案AIモデル/12=画像解像度)。
+// idx は Focus::Settings 側の項目行番号と対応(4=地図種別/5=既定ルート/9=提案AIモデル/12=画像解像度/18=QR表示方式)。
 // 中心十字の色(idx=16)は cfg.cross_color_idx が String でなく u8 なので、この表とは別枠(is_pickable等で16を特別扱い)。
 pub(crate) const CHOICES: &[SettingChoice] = &[
     SettingChoice { idx: 4, values: &["osm", "voyager", "dark", "light", "topo"], labels: &["osm", "voyager", "dark", "light", "topo"] },
     SettingChoice { idx: 5, values: &["car-fast", "moped", "shortest"], labels: &["高速", "下道", "最短"] },
     SettingChoice { idx: 9, values: &["claude-sonnet-5", "claude-haiku-4-5", "claude-opus-4-8"], labels: &["sonnet", "haiku", "opus"] },
     SettingChoice { idx: 12, values: &["high", "mid", "low"], labels: &["高", "中", "低"] },
+    SettingChoice { idx: 18, values: &["dense", "quadrant", "braille"], labels: &["標準", "小型A", "極小B"] },
 ];
 
 fn choice_for(idx: usize) -> Option<&'static SettingChoice> { CHOICES.iter().find(|c| c.idx == idx) }
@@ -49,6 +50,7 @@ pub(crate) fn pick_current(idx: usize, cfg: &Config, style: &str) -> usize {
         9 => choice_for(9).and_then(|c| c.values.iter().position(|v| *v == cfg.llm_model)).unwrap_or(0),
         12 => choice_for(12).and_then(|c| c.values.iter().position(|v| *v == cfg.image_res)).unwrap_or(0),
         16 => cfg.cross_color_idx as usize % PALETTE_NAMES.len(),
+        18 => choice_for(18).and_then(|c| c.values.iter().position(|v| *v == cfg.qr_style)).unwrap_or(0),
         _ => 0,
     }
 }
@@ -69,6 +71,7 @@ pub(crate) fn apply_pick(idx: usize, sel: usize, cfg: &mut Config, style: &mut S
         9 => if let Some(v) = choice_for(9).and_then(|c| c.values.get(sel)) { cfg.llm_model = v.to_string(); }
         12 => if let Some(v) = choice_for(12).and_then(|c| c.values.get(sel)) { cfg.image_res = v.to_string(); eff.force_reemit = true; }
         16 => { cfg.cross_color_idx = (sel % PALETTE_NAMES.len()) as u8; eff.force_reemit = true; }
+        18 => if let Some(v) = choice_for(18).and_then(|c| c.values.get(sel)) { cfg.qr_style = v.to_string(); }
         _ => {}
     }
     eff
@@ -95,6 +98,7 @@ pub(crate) fn setting_description(idx: usize) -> &'static str {
         14 => "サウンド: 操作音のON/OFF(macOSのafplayで再生)",
         15 => "オンボーディング: 毎回表示/非表示を切替(dキーでも次回から非表示にできる)",
         16 => "中心十字の色: 地図中心のクロスヘアの色。Enterで一覧を開いて選択(spots.rsの配色から選択)",
+        18 => "QR表示方式: スマホ共有QRの描画密度。Enterで一覧を開いて選択(標準=読み取り安定・現状のサイズ / 小型A=ブロックのまま小型化するが縦長に歪む / 極小B=正方形を保ったまま最小化するが丸ドットになる。A/Bは実機でスキャン確認推奨)",
         _ => "Google APIキー: 検索(Geocoding)とStreet View共通。Enterで入力欄を開く(Cmd+V貼付も可)。環境変数TERMMAP_GOOGLE_API_KEYでも可",
     }
 }
@@ -132,6 +136,7 @@ pub(crate) fn settings_rows(opts: &Args, cfg: &Config, picking: Option<usize>, o
         format!("オンボーディング {}", if onboarded { "非表示" } else { "毎回表示" }),
         format!("{} 中心十字の色 {}", arrow(16), PALETTE_NAMES[cfg.cross_color_idx as usize % PALETTE_NAMES.len()]),
         format!("Google APIキー {}", keyset),
+        format!("{} QR表示方式 {}", arrow(18), match cfg.qr_style.as_str() { "quadrant" => "小型A", "braille" => "極小B", _ => "標準" }),
     ];
     // アコーディオン展開: 選択中の項目がpickable(3択以上)ならその直下に候補をインデント挿入し、他行を押し下げる
     let mut sel = set_sel;
@@ -152,7 +157,7 @@ mod tests {
 
     #[test]
     fn pickable_covers_the_four_multi_choice_items_and_cross_color() {
-        for idx in [4usize, 5, 9, 12, 16] {
+        for idx in [4usize, 5, 9, 12, 16, 18] {
             assert!(is_pickable(idx), "idx {idx} should be pickable");
         }
         for idx in [0usize, 1, 2, 3, 6, 7, 8, 10, 11, 13, 14, 15, 17] {
@@ -217,7 +222,7 @@ mod tests {
 
     #[test]
     fn pick_labels_len_matches_choice_values_len() {
-        for idx in [4usize, 5, 9, 12] {
+        for idx in [4usize, 5, 9, 12, 18] {
             let c = choice_for(idx).unwrap();
             assert_eq!(pick_labels(idx).len(), c.values.len());
         }
@@ -225,10 +230,23 @@ mod tests {
     }
 
     #[test]
+    fn pick_current_and_apply_pick_roundtrip_qr_style() {
+        let mut cfg = Config::default();
+        let mut style = "osm".to_string();
+        assert_eq!(pick_current(18, &cfg, &style), 0); // dense は values[0]
+        let eff = apply_pick(18, 2, &mut cfg, &mut style); // 2 => "braille"
+        assert_eq!(cfg.qr_style, "braille");
+        assert!(!eff.cache_clear);
+        assert!(!eff.force_reemit);
+        assert_eq!(pick_current(18, &cfg, &style), 2);
+    }
+
+    #[test]
     fn setting_description_covers_every_known_row_distinctly() {
-        // 0〜16 は個別の説明文を持つ(idx=11は端末対応有無で文言が変わるが、いずれにせよ空でない)。
+        // 0〜16,18 は個別の説明文を持つ(idx=11は端末対応有無で文言が変わるが、いずれにせよ空でない。
+        // 17=Google APIキーはフォールバック経由で別テストで確認するためここでは含めない)。
         let mut seen = Vec::new();
-        for idx in 0usize..=16 {
+        for idx in (0usize..=16).chain(std::iter::once(18)) {
             let d = setting_description(idx);
             assert!(!d.is_empty(), "idx {idx} should have a description");
             if idx != 11 { seen.push(d); } // 11は環境依存で文言が2通りあるため一意性判定から除外
