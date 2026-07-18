@@ -27,7 +27,6 @@ impl Default for Cache { fn default() -> Self { Self::new() } }
 
 impl Cache {
     pub fn new() -> Self { Cache { map: HashMap::new(), tick: 0, cap: 256 } }
-    pub fn clear(&mut self) { self.map.clear(); self.tick = 0; }
     fn contains(&self, k: &TileKey) -> bool { self.map.contains_key(k) }
     fn get(&mut self, k: &TileKey) -> Option<&RgbImage> {
         self.tick += 1;
@@ -57,13 +56,27 @@ fn tile_url(style: &str, z: u32, x: i64, y: i64) -> String {
         _         => format!("https://tile.openstreetmap.org/{z}/{x}/{y}.png"),
     }
 }
+// ディスクキャッシュの有効期限。タイル自体は滅多に変わらないが、無期限だと地図更新(新道路等)が
+// 反映されないため30日で区切る。期限切れは「無かった」扱いにしてネットワークから取り直す。
+const TILE_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 60 * 60);
+
+// mtimeからの経過時間がTTL未満か(ネットワーク/ファイルI/Oを伴わない純粋関数)。
+fn is_tile_fresh(age: std::time::Duration) -> bool { age < TILE_TTL }
+
 pub fn fetch_tile(style: &str, z: u32, x: i64, y: i64) -> Result<RgbImage, String> {
-    // 1) ディスクキャッシュを先に見る(在ればネット無しで読む)
+    // 1) ディスクキャッシュを先に見る(在って、かつ30日以内ならネット無しで読む)
     let cache_path = tile_cache_path(style, z, x, y);
     if let Some(p) = &cache_path {
-        if let Ok(buf) = std::fs::read(p) {
-            if let Ok(img) = image::load_from_memory(&buf) { return Ok(img.to_rgb8()); }
-            // 壊れたキャッシュは無視して取り直す
+        let fresh = std::fs::metadata(p).ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|m| m.elapsed().ok())
+            .map(is_tile_fresh)
+            .unwrap_or(false); // mtime取得失敗時は期限切れ扱い(安全側)にして取り直す
+        if fresh {
+            if let Ok(buf) = std::fs::read(p) {
+                if let Ok(img) = image::load_from_memory(&buf) { return Ok(img.to_rgb8()); }
+                // 壊れたキャッシュは無視して取り直す
+            }
         }
     }
     // 2) ネットワーク取得
@@ -303,6 +316,70 @@ fn worker_loop(shared: Arc<Mutex<Cache>>, view: Arc<Mutex<ViewState>>, pending: 
     }
 }
 
+// 仮表示フォールバックで試すスタイル一覧(現styleを除いてこの順に探す)。settings.rs のスタイル定義と揃える。
+const FALLBACK_STYLES: [&str; 5] = ["osm", "voyager", "dark", "light", "topo"];
+
+// 未取得タイル(現styleではメモリキャッシュに無い)について、他styleの同一z/x/yがキャッシュにあれば
+// それを仮表示として流用する。Cache::get は &mut self かつ返り値の借用が cache を可変借用し続けるため、
+// 見つかった画像は即 clone して所有権付きで返し、呼び出し側の借用スコープを単純に保つ(256x256のcloneは安価)。
+fn find_fallback_tile(cache: &mut Cache, current_style: &str, z: u32, x: i64, y: i64) -> Option<RgbImage> {
+    for &s in FALLBACK_STYLES.iter() {
+        if s == current_style { continue; }
+        let key = TileKey { style: s.to_string(), z, x, y };
+        if let Some(img) = cache.get(&key) { return Some(img.clone()); }
+    }
+    None
+}
+
+// "LOADING" 透かし用の 5x7 ドットマトリクスフォント。1=点灯、上位ビットが左端の列。
+fn glyph_bits(c: char) -> [u8; 7] {
+    match c {
+        'L' => [0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111],
+        'O' => [0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
+        'A' => [0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
+        'D' => [0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110],
+        'I' => [0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b11111],
+        'N' => [0b10001, 0b11001, 0b10101, 0b10101, 0b10011, 0b10001, 0b10001],
+        'G' => [0b01110, 0b10001, 0b10000, 0b10111, 0b10001, 0b10001, 0b01111],
+        _ => [0; 7],
+    }
+}
+
+// フォント寸法と描画拡大率。1ドット=SCALE×SCALE実ピクセル。
+const GLYPH_W: u32 = 5;
+const GLYPH_H: u32 = 7;
+const GLYPH_SCALE: u32 = 4;
+
+// 未取得タイル(グレー or 他style代用)の中央に "LOADING" を1回描く薄い透かし。
+// ox,oy=このタイルのキャンバス上左上オフセット。ink=文字色(背景より少し暗いグレーで控えめに)。
+// 総幅 = 7文字 × (GLYPH_W+1)×SCALE = 168px、高さ = GLYPH_H×SCALE = 28px を 256px 角の中央へ置く。
+fn draw_loading_watermark(canvas: &mut RgbImage, ox: u32, oy: u32, ink: image::Rgb<u8>) {
+    let word = "LOADING";
+    let char_w = (GLYPH_W + 1) * GLYPH_SCALE; // 字幅 + 1列ぶんの字間
+    let word_w = word.chars().count() as u32 * char_w;
+    let word_h = GLYPH_H * GLYPH_SCALE;
+    let start_x = ox + (TILE - word_w) / 2;
+    let start_y = oy + (TILE - word_h) / 2;
+    for (ci, ch) in word.chars().enumerate() {
+        let bits = glyph_bits(ch);
+        let cx0 = start_x + ci as u32 * char_w;
+        for (row, rowbits) in bits.iter().enumerate() {
+            for col in 0..GLYPH_W {
+                // 上位ビットが左端の列: col=0 は bit(GLYPH_W-1)。
+                if (rowbits >> (GLYPH_W - 1 - col)) & 1 == 1 {
+                    let px0 = cx0 + col * GLYPH_SCALE;
+                    let py0 = start_y + row as u32 * GLYPH_SCALE;
+                    for dy in 0..GLYPH_SCALE {
+                        for dx in 0..GLYPH_SCALE {
+                            canvas.put_pixel(px0 + dx, py0 + dy, ink);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 // build_window の非ブロッキング版。未取得タイルはネットワークを待たずグレーのプレースホルダーで埋め、
 // ローダーへ取得依頼だけ出して即座に返す。届いたタイルは次フレームで cache から拾われ自動的に地図へ反映される。
 pub fn build_window_nowait(cx: f64, cy: f64, z: u32, win_w: u32, win_h: u32, style: &str, loader: &TileLoader) -> Result<RgbImage, String> {
@@ -324,6 +401,8 @@ pub fn build_window_nowait(cx: f64, cy: f64, z: u32, win_w: u32, win_h: u32, sty
     // 世界の端(範囲外タイル)は bg、範囲内で未取得のタイルは placeholder。bg(221 or 26)と見分けが付くグレー。
     let bg = if style == "dark" { image::Rgb([26, 26, 26]) } else { image::Rgb([221, 221, 221]) };
     let placeholder = image::Rgb([200u8, 200, 200]);
+    // 透かしのink色は背景(グレー200 or 他style代用タイル)より少し暗いグレーにして薄く目立たせない。
+    let watermark_ink = image::Rgb([150u8, 150, 150]);
     let mut canvas = RgbImage::from_pixel(cols * TILE, rows * TILE, bg);
 
     // cacheロックは1回だけ取り、範囲内タイルの描画/欠落判定をまとめて行いすぐ離す(1タイルごとの取り直しをしない)。
@@ -340,7 +419,14 @@ pub fn build_window_nowait(cx: f64, cy: f64, z: u32, win_w: u32, win_h: u32, sty
                 if let Some(t) = cache.get(&key) {
                     for (px, py, p) in t.enumerate_pixels() { canvas.put_pixel(ox + px, oy + py, *p); }
                 } else {
-                    for py in 0..TILE { for px in 0..TILE { canvas.put_pixel(ox + px, oy + py, placeholder); } }
+                    // 未取得: 他styleの同一タイルがキャッシュにあれば仮表示に流用、無ければ薄いグレー。
+                    // いずれの場合も本来のスタイルが未達であることが分かるよう LOADING 透かしを必ず重ねる。
+                    if let Some(fb) = find_fallback_tile(&mut cache, style, z, wx, ty) {
+                        for (px, py, p) in fb.enumerate_pixels() { canvas.put_pixel(ox + px, oy + py, *p); }
+                    } else {
+                        for py in 0..TILE { for px in 0..TILE { canvas.put_pixel(ox + px, oy + py, placeholder); } }
+                    }
+                    draw_loading_watermark(&mut canvas, ox, oy, watermark_ink);
                     missing.push(key);
                 }
             }
@@ -357,6 +443,15 @@ pub fn build_window_nowait(cx: f64, cy: f64, z: u32, win_w: u32, win_h: u32, sty
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // 30日未満は新鮮、30日以上は期限切れ。
+    #[test]
+    fn is_tile_fresh_boundary() {
+        assert!(is_tile_fresh(std::time::Duration::from_secs(29 * 24 * 60 * 60)));
+        assert!(!is_tile_fresh(std::time::Duration::from_secs(30 * 24 * 60 * 60)));
+        assert!(!is_tile_fresh(std::time::Duration::from_secs(31 * 24 * 60 * 60)));
+        assert!(is_tile_fresh(std::time::Duration::from_secs(0)));
+    }
 
     // 各種 win_w/win_h/shift の組み合わせで、拡大後(scaled_w/h)が要求サイズ(win_w/h)以上に
     // なること(=crop_immがパニックしない前提条件)を確認する。
@@ -450,5 +545,45 @@ mod tests {
         let (tx_min, tx_max, ty_min, ty_max, ..) = window_tile_range(256.0, 256.0, 200, 200);
         assert!(tx_max > tx_min);
         assert!(ty_max > ty_min);
+    }
+
+    // "LOADING" を構成する7文字は全て何らかのドットが点灯している(空グリフだと透かしが出ない)。
+    #[test]
+    fn glyph_bits_non_empty_for_word_letters() {
+        for c in ['L', 'O', 'A', 'D', 'I', 'N', 'G'] {
+            let bits = glyph_bits(c);
+            assert!(bits.iter().any(|&b| b != 0), "glyph {c} has no lit dots");
+        }
+    }
+
+    // find_fallback_tile: (a)同一styleは候補にしない (b)他styleがあれば返す (c)どこにも無ければNone。
+    #[test]
+    fn find_fallback_tile_behaviors() {
+        let z = 10u32;
+        let (x, y) = (100i64, 200i64);
+
+        // (a) キャッシュには "dark" だけ。current_style も "dark" なら自分自身は候補外 → None。
+        let mut cache = Cache::new();
+        cache.insert(TileKey { style: "dark".to_string(), z, x, y }, RgbImage::from_pixel(TILE, TILE, image::Rgb([1, 2, 3])));
+        assert!(find_fallback_tile(&mut cache, "dark", z, x, y).is_none());
+
+        // (b) current_style="osm" なら他style "dark" のタイルがそのまま返る(色も維持)。
+        let got = find_fallback_tile(&mut cache, "osm", z, x, y);
+        assert!(got.is_some());
+        assert_eq!(*got.unwrap().get_pixel(0, 0), image::Rgb([1, 2, 3]));
+
+        // (c) 空キャッシュならどのstyleにも無く None。
+        let mut empty = Cache::new();
+        assert!(find_fallback_tile(&mut empty, "osm", z, x, y).is_none());
+    }
+
+    // draw_loading_watermark: 描画後、ink色のピクセルが1つ以上存在する(=実際に何か描かれている)。
+    #[test]
+    fn draw_loading_watermark_marks_pixels() {
+        let ink = image::Rgb([150u8, 150, 150]);
+        let mut canvas = RgbImage::from_pixel(TILE, TILE, image::Rgb([200u8, 200, 200]));
+        draw_loading_watermark(&mut canvas, 0, 0, ink);
+        let count = canvas.pixels().filter(|p| **p == ink).count();
+        assert!(count > 0, "no ink pixels were drawn");
     }
 }

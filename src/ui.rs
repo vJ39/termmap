@@ -100,6 +100,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     let mut route_names: Vec<String> = Vec::new(); // お気に入り一覧(L)
     let mut rn_sel: usize = 0;
     let mut help = false; // ? でヘルプ表示
+    let mut help_page: usize = 0; // ヘルプが画面高に収まらない時のページ送り(0始まり)
     let mut qr_view: Option<String> = None; // o でGoogleマップQRをポップアップ表示
     let mut route_alt: u32 = 0; // n で BRouter の代替ルート(0..=3)を巡回
     let mut route_ele: Vec<f64> = Vec::new(); // 直近ルートの標高列(pts と同数)
@@ -257,7 +258,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 } else { snd.play("error"); addr = "ルート未確定".into(); }
             }
             MenuAction::Settings => { set_sel = 0; focus = Focus::Settings; }
-            MenuAction::Help => { help = true; }
+            MenuAction::Help => { help = true; help_page = 0; }
         }
     }};}
 
@@ -286,18 +287,31 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         let (tc, tr) = crossterm::terminal::size().unwrap_or((100, 40));
         let cols = tc.max(20) as u32;
         let map_rows = (tr.max(3) - 1) as u32;
-        if help { // ヘルプ全画面。任意キーで閉じる
+        if help { // ヘルプ全画面。画面高に収まらなければページ送り(最終ページで任意キー→閉じる)
             let _ = write!(out, "\x1b[2J\x1b[H");
-            for (i, (col, ln)) in LOGO.iter().enumerate() { // 先頭に緑ワードマーク
+            for (i, (bold, (r, g, b), ln)) in LOGO.iter().enumerate() { // 先頭に緑ワードマーク
+                let bold_code = if *bold { "\x1b[1m" } else { "" };
+                let col = format!("{bold_code}{}", sgr_fg(*r, *g, *b, truecolor_safe()));
                 let _ = write!(out, "\x1b[{};2H{}{}\x1b[0m\x1b[K", i + 1, col, ln);
             }
             let off = LOGO.len() + 1; // ロゴ4行 + 空行1
-            for (i, l) in HELP.iter().skip(1).enumerate().take((map_rows as usize).saturating_sub(off)) {
+            let per_page = (map_rows as usize).saturating_sub(off).max(1);
+            let content_len = HELP.len().saturating_sub(1); // 先頭行(見出し)はLOGOと重複するため除く
+            let total_pages = content_len.div_ceil(per_page).max(1);
+            help_page = help_page.min(total_pages - 1);
+            for (i, l) in HELP.iter().skip(1 + help_page * per_page).enumerate().take(per_page) {
                 let _ = write!(out, "\x1b[{};1H{}\x1b[K", i + off + 1, l);
             }
-            let _ = write!(out, "\x1b[{};1H\x1b[7m 任意のキーで閉じる \x1b[0m\x1b[K", tr);
+            let has_more = help_page + 1 < total_pages;
+            let hint = if total_pages > 1 {
+                if has_more { format!(" {}/{} ページ (任意のキーで次へ) ", help_page + 1, total_pages) }
+                else { format!(" {}/{} ページ (任意のキーで閉じる) ", help_page + 1, total_pages) }
+            } else { " 任意のキーで閉じる ".to_string() };
+            let _ = write!(out, "\x1b[{};1H\x1b[7m{hint}\x1b[0m\x1b[K", tr);
             let _ = out.flush();
-            if let Event::Key(_) = event::read()? { help = false; }
+            if let Event::Key(_) = event::read()? {
+                if has_more { help_page += 1; } else { help = false; help_page = 0; }
+            }
             force_reemit = true; // ヘルプで全画面クリアした→地図に戻ったら画像を再emit
             continue;
         }
@@ -310,7 +324,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     let _ = emit_iterm2_image(&mut out, img, cols, map_rows);
                 } else {
                     let rs = image::imageops::resize(img, cols.max(10), map_rows * 2, FilterType::Triangle);
-                    let art = render_halfblock(&rs);
+                    let art = render_halfblock(&rs, truecolor_safe());
                     let sv_lines: Vec<&str> = art.split("\r\n").collect();
                     let _ = write!(out, "\x1b[H");
                     for i in 0..map_rows as usize {
@@ -374,6 +388,12 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                         }
                     }
                     KeyCode::Esc | KeyCode::Char('q') => street = None,
+                    KeyCode::Char('I') => { // 実写表示中も画像モードON/OFFを切替できるように(Map focusと同じキー)
+                        cfg.image_mode = !cfg.image_mode;
+                        addr = if cfg.image_mode {
+                            if image_capable() { "実画像モード: ON".into() } else { "実画像モード: ON(この端末は非対応・AA継続)".into() }
+                        } else { "実画像モード: OFF".into() };
+                    }
                     _ => {}
                 }
             }
@@ -519,9 +539,11 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             }
         }
 
-        // 実画像モードの再描画判定シグネチャ。地図画像に効く状態(中心/ズーム/寸法/配置/
-        // オーバーレイ)が前回emit時と同じなら PNG を吐き直さない。
-        let map_sig: Option<u64> = if img_inline {
+        // 再描画判定シグネチャ。地図に効く状態(中心/ズーム/寸法/配置/オーバーレイ)が前回emit時と
+        // 同じなら描き直さない。以前は実画像モード限定だったが、AAモードも同じ判定に乗せることで
+        // タイル非同期ロード中(#35)にloader.generation()だけが変わり続けて毎ポーリング(80ms毎)
+        // 無条件に全画面書き込みが発生する問題を解消する(macOS標準Terminal.appでの描画崩れの原因)。
+        let map_sig: Option<u64> = {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
             rcx.to_bits().hash(&mut h); rcy.to_bits().hash(&mut h);
@@ -554,11 +576,13 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             for &(a2, b2) in &wps { a2.to_bits().hash(&mut h); b2.to_bits().hash(&mut h); }
             wp_sel.hash(&mut h);
             Some(h.finish())
-        } else { None };
+        };
 
         let mut map_img: Option<RgbImage> = None; // 実画像モードで描く overlay 合成済み画像
-        // 実画像モードで状態が前回emitと同一なら、地図の再構築/再emitをスキップ(直近の画像を残す)。
-        let need_build = !img_inline || force_reemit || last_map_sig != map_sig;
+        // 状態が前回emitと同一なら、地図の再構築/再emit・AA再描画をスキップ(直近の描画を残す)。
+        // 空文字を書いても既存セルは上書きされない(何も描かれない)ため、スキップ時は前フレームの
+        // 内容がそのまま画面に残る(iTerm2の画像もAAの文字も同じ理屈で安全にスキップできる)。
+        let need_build = force_reemit || last_map_sig != map_sig;
         // 先読みの受信(最新への間引き含む)はplayブロック側で既に行っている(表示位置と
         // ベース画像の位置を一致させるため)。ここではplay_prefetch_heldを読むだけ。
         let body = if !need_build {
@@ -598,24 +622,24 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                         let iy = (gy - (rcy - rh as f64 / 2.0)).floor() as i32;
                         draw_ring(&mut ov, ix, iy, 3, [255, 255, 255], 1);
                     }
+                    last_map_sig = map_sig; // このsigで描いた内容がこのフレームでemitされる
                     if img_inline {
                         // 実画像モード: 取得画像に overlay を焼き込んで保持し、AA文字列は空にする。
                         let mut c = img;
                         composite(&mut c, &ov);
                         map_img = Some(c);
-                        last_map_sig = map_sig; // このsigで描いた画像がこのフレームでemitされる
                         String::new()
                     } else {
                         render(&img, &opts, Some(&ov))
                     }
                 }
                 Err(e) => {
-                    if img_inline { last_map_sig = None; } // 失敗時は次フレームで再取得
+                    last_map_sig = None; // 失敗時は次フレームで再取得
                     format!("取得失敗: {e}\r\n")
                 }
             }
         };
-        if img_inline { force_reemit = false; } // 強制再emitは消費済み(被り解消は下でmap_coveredが再設定)
+        force_reemit = false; // 強制再emitは消費済み(image_inlineの被り解消は下でmap_coveredが再設定)
 
         // 左袖リスト(POI か お気に入り)の各行を組む
         let glines: Vec<String> = if gut > 0 {
@@ -742,12 +766,23 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             // 中間段(4行以上の時)=中間値(elevation::axis_label、テスト済み)。グラフ本体はその分幅を削る。
             const AXIS_W: usize = 7;
             let chart_w = (cols as usize).saturating_sub(AXIS_W).max(1);
-            let chart = elevation::elevation_chart(&route_ele, chart_w, elev_h as usize);
+            // ルート点は間隔が不均一(直線区間は疎・複雑な区間は密)なため、単純に点のインデックスで
+            // ビン化すると横軸が実距離とズレる(グラフの形も現在地カーソルも)。累積距離で一度
+            // chart_w点に均等リサンプルしてからelevation_chartへ渡すことで、その後の単純な
+            // インデックスビン化(bin_values)が距離一様として正しく機能するようにする。
+            let cum_dist = spec.routes.last().map(|rt| elevation::cumulative_distances(&rt.pts));
+            let route_ele_by_dist = match &cum_dist {
+                Some(cd) if cd.len() == route_ele.len() && !route_ele.is_empty() =>
+                    elevation::resample_by_distance(&route_ele, cd, chart_w),
+                _ => route_ele.clone(),
+            };
+            let chart = elevation::elevation_chart(&route_ele_by_dist, chart_w, elev_h as usize);
             for (i, line) in chart.iter().enumerate() {
                 let axis = elevation::axis_label(i as u32, elev_h, mn, mx).unwrap_or_else(|| "     ".to_string());
                 let _ = write!(out, "\x1b[{};1H\x1b[2m{axis}\x1b[0m {}\x1b[K", map_rows + 2 + i as u32, line);
             }
-            // 地図中心が経路上のどこかを示す縦カーソル(パン/再生で動く)
+            // 地図中心が経路上のどこかを示す縦カーソル(パン/再生で動く)。実距離基準で位置を出す
+            // (点のインデックス基準だとグラフ側と同じ理由でズレる)。
             if let Some(rt) = spec.routes.last() {
                 if rt.pts.len() >= 2 {
                     let (mut bi, mut bd) = (0usize, f64::MAX);
@@ -755,7 +790,13 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                         let d = (p.0 - lat).powi(2) + (p.1 - lon).powi(2);
                         if d < bd { bd = d; bi = i; }
                     }
-                    let col = elevation::profile_col(rt.pts.len(), bi, chart_w);
+                    let col = match &cum_dist {
+                        Some(cd) if cd.len() == rt.pts.len() => {
+                            let total = *cd.last().unwrap_or(&0.0);
+                            elevation::profile_col_by_distance(cd[bi], total, chart_w)
+                        }
+                        _ => elevation::profile_col(rt.pts.len(), bi, chart_w),
+                    };
                     for i in 0..elev_h as usize {
                         let _ = write!(out, "\x1b[{};{}H\x1b[1;31m|\x1b[0m", map_rows + 2 + i as u32, col + 1 + AXIS_W);
                     }
@@ -1060,23 +1101,29 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         if onboard {
             const RST: &str = "\x1b[0m";
             let iw = 40usize;
-            // 緑グラデのワードマーク(端末=Term を意識)。背景は塗らない。(ANSI色, 文字)
-            let rows: [(&str, &str); 11] = [
-                ("", ""),
-                ("\x1b[1;38;2;130;255;150m", "   ╺┳╸┏━╸┏━┓┏┳┓┏┳┓┏━┓┏━┓"),
-                ("\x1b[1;38;2;80;220;110m",  "    ┃ ┣╸ ┣┳┛┃┃┃┃┃┃┣━┫┣━┛"),
-                ("\x1b[1;38;2;40;175;80m",   "    ╹ ┗━╸╹┗╸╹╹╹╹╹╹╹ ╹╹"),
-                ("\x1b[38;2;110;170;120m",   "   terminal touring map"),
-                ("", ""),
-                ("\x1b[38;2;190;235;200m",   "  Space  メニュー   ?  ヘルプ   q  終了"),
-                ("", ""),
-                ("\x1b[38;2;150;205;160m",   "  何かキーを押して開始"),
-                ("\x1b[38;2;110;150;120m",   "  d = 次回から表示しない (設定で再表示)"),
-                ("", ""),
+            // 緑グラデのワードマーク(端末=Term を意識)。背景は塗らない。(太字か, RGB, 文字)
+            // SGRはtruecolor_safe()を見て組み立てる(truecolor不安定端末では256色にフォールバック)。
+            let rows: [(Option<(bool, (u8, u8, u8))>, &str); 11] = [
+                (None, ""),
+                (Some((true, (130, 255, 150))), "   ╺┳╸┏━╸┏━┓┏┳┓┏┳┓┏━┓┏━┓"),
+                (Some((true, (80, 220, 110))),  "    ┃ ┣╸ ┣┳┛┃┃┃┃┃┃┣━┫┣━┛"),
+                (Some((true, (40, 175, 80))),   "    ╹ ┗━╸╹┗╸╹╹╹╹╹╹╹ ╹╹"),
+                (Some((false, (110, 170, 120))), "   terminal touring map"),
+                (None, ""),
+                (Some((false, (190, 235, 200))), "  Space  メニュー   ?  ヘルプ   q  終了"),
+                (None, ""),
+                (Some((false, (150, 205, 160))), "  何かキーを押して開始"),
+                (Some((false, (110, 150, 120))), "  d = 次回から表示しない (設定で再表示)"),
+                (None, ""),
             ];
             let r0 = ((map_rows as usize).saturating_sub(rows.len()) / 2).max(1) as u32;
             let c0 = ((cols as usize).saturating_sub(iw) / 2).max(1) as u32;
-            for (i, (col, ln)) in rows.iter().enumerate() {
+            let tc_ok = truecolor_safe();
+            for (i, (spec, ln)) in rows.iter().enumerate() {
+                let col = match spec {
+                    Some((bold, (r, g, b))) => format!("{}{}", if *bold { "\x1b[1m" } else { "" }, sgr_fg(*r, *g, *b, tc_ok)),
+                    None => String::new(),
+                };
                 let _ = write!(out, "\x1b[{};{}H{}{}{}", r0 + i as u32, c0, col, fit_cells(ln, iw), RST);
             }
         }
@@ -1460,10 +1507,12 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             } else {
                                 changed = true;
                                 match set_sel {
-                                    0 => opts.braille = !opts.braille,
-                                    1 => opts.classify = !opts.classify,
-                                    2 => opts.edge = !opts.edge,
-                                    3 => opts.mono = !opts.mono,
+                                    // 表示に効くAAスタイル(braille/classify/edge/mono)は、map_sigに含まれない
+                                    // opts側の状態なので、切替時はforce_reemitで確実に次フレーム反映させる。
+                                    0 => { opts.braille = !opts.braille; force_reemit = true; }
+                                    1 => { opts.classify = !opts.classify; force_reemit = true; }
+                                    2 => { opts.edge = !opts.edge; force_reemit = true; }
+                                    3 => { opts.mono = !opts.mono; force_reemit = true; }
                                     7 => { cfg.show_spots = !cfg.show_spots; show_spots = cfg.show_spots; apply_spots(&mut spec, &spots, &spot_cats, show_spots); }
                                     8 => cfg.llm_recommend_enabled = !cfg.llm_recommend_enabled,
                                     10 => cfg.streetview_enabled = !cfg.streetview_enabled,
@@ -2000,9 +2049,11 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             KeyCode::Down | KeyCode::Char('s') => { set_pick_sel = (set_pick_sel + 1) % n; focus = Focus::SettingsPick(idx); }
                             KeyCode::Enter => {
                                 let eff = settings::apply_pick(idx, set_pick_sel, &mut cfg, &mut opts.style);
-                                // スタイル変更等でキャッシュを空にするとき、ローダーの未着手依頼も一緒に捨てる
-                                // (旧スタイルの取得依頼が溜まり続けないように)。
-                                if eff.cache_clear { cache.lock().unwrap().clear(); loader.clear_pending(); }
+                                // スタイル変更時、キャッシュ自体はもう消さない(TileKeyがstyleを含むため
+                                // 別styleと混ざる心配は無く、むしろ残しておくことで切替直後に旧styleを
+                                // フォールバック仮表示できる)。ローダーの未着手依頼だけ捨てる(旧styleの
+                                // 取得依頼が溜まり続けないように)。
+                                if eff.cache_clear { loader.clear_pending(); }
                                 if eff.force_reemit { force_reemit = true; }
                                 let _ = config::save_config(&cfg);
                                 focus = Focus::Settings;
@@ -2136,7 +2187,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             }
                             KeyCode::Tab | KeyCode::BackTab => { if !wps.is_empty() { route_sel = route_sel.min(wps.len() + ROUTE_ACTS.len() - 1); focus = Focus::RoutePanel; } } // 左のルート一覧にフォーカス(そこで↑↓選択・Enter実行)
                             KeyCode::Char(' ') => { snd.play("click"); menu_cat_sel = 0; focus = Focus::Menu(MenuLevel::Categories); } // Space=メニュー(カテゴリ→展開の2階層)
-                            KeyCode::Char('?') => help = true,
+                            KeyCode::Char('?') => { help = true; help_page = 0; }
                             KeyCode::Char('P') => { cat_sel = 0; focus = Focus::SpotCatList; } // マイスポット(カテゴリ一覧)
                             KeyCode::Char(',') => { set_sel = 0; focus = Focus::Settings; } // 設定画面
                             KeyCode::Char('r') => { input_cur = 0; focus = Focus::RoadSearch(String::new()); } // 道路名でルート(現在view内)
@@ -2201,7 +2252,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             }
                             KeyCode::Char('x') => { wp_remove(&mut wps, &mut wp_sel); route_sel = wp_sel; { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } }
                             KeyCode::Char('[') => { if play.is_some() { play_speed = (play_speed / 1.5).max(0.1); play_speed_bits.store(play_speed.to_bits(), std::sync::atomic::Ordering::Relaxed); addr = format!("再生速度 {:.2}x", play_speed); } else { wp_swap(&mut wps, &mut wp_sel, true); route_sel = wp_sel; { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } } }
-                            KeyCode::Char(']') => { if play.is_some() { play_speed = (play_speed * 1.5).min(8.0); play_speed_bits.store(play_speed.to_bits(), std::sync::atomic::Ordering::Relaxed); addr = format!("再生速度 {:.2}x", play_speed); } else { wp_swap(&mut wps, &mut wp_sel, false); route_sel = wp_sel; { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } } }
+                            KeyCode::Char(']') => { if play.is_some() { play_speed = (play_speed * 1.5).min(32.0); play_speed_bits.store(play_speed.to_bits(), std::sync::atomic::Ordering::Relaxed); addr = format!("再生速度 {:.2}x", play_speed); } else { wp_swap(&mut wps, &mut wp_sel, false); route_sel = wp_sel; { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } } }
                             KeyCode::Char('m') => { mode = match mode_label(&mode) { "下道" => "highway", "高速" => "short", _ => "surface" }.to_string(); { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; } }
                             KeyCode::Char('c') => run_action!(MenuAction::ClearRoute, lat, lon, cols, tr),
                             KeyCode::Char('g') => match spec.routes.last() {

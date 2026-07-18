@@ -92,8 +92,76 @@ pub fn elevation_stats(ele: &[f64]) -> (f64, f64, f64) {
     (min, max, ascent)
 }
 
+// 緯度経度2点間の概算距離(m、球面近似)。roadtrace.rsに同種のhaversine_mがあるが、
+// elevation.rsはcrate::参照なしの単体コンパイル方針(ファイル冒頭コメント)のため独立実装する。
+fn haversine_m(a: (f64, f64), b: (f64, f64)) -> f64 {
+    let r = 6371000.0;
+    let (la1, la2) = (a.0.to_radians(), b.0.to_radians());
+    let (dlat, dlon) = ((b.0 - a.0).to_radians(), (b.1 - a.1).to_radians());
+    let h = (dlat / 2.0).sin().powi(2) + la1.cos() * la2.cos() * (dlon / 2.0).sin().powi(2);
+    2.0 * r * h.sqrt().asin()
+}
+
+/// pts(緯度経度列)の各点までの累積距離(m)。先頭は常に0.0、長さはptsと同じ。
+/// ptsが空ならNoneを返す(呼び出し側で「距離不明」を区別できるように)。
+pub fn cumulative_distances(pts: &[(f64, f64)]) -> Vec<f64> {
+    if pts.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(pts.len());
+    let mut acc = 0.0;
+    out.push(0.0);
+    for w in pts.windows(2) {
+        acc += haversine_m(w[0], w[1]);
+        out.push(acc);
+    }
+    out
+}
+
+/// ele(各点の標高。cum_distと同数を想定)を、距離基準で均等な n_samples 点へ線形補間で
+/// 再サンプルする。ルート点はBRouterの都合で間隔が不均一(直線区間は疎・複雑な区間は密)なため、
+/// 単純にインデックスでビン化すると横軸が実距離とズレる(プロファイルの形も現在地カーソルも)。
+/// 一度これで距離一様な配列に直してからelevation_chartへ渡せば、その後の単純なインデックス
+/// ビン化(bin_values)がそのまま距離一様として正しく機能する。
+pub fn resample_by_distance(ele: &[f64], cum_dist: &[f64], n_samples: usize) -> Vec<f64> {
+    if ele.is_empty() || cum_dist.is_empty() || n_samples == 0 {
+        return Vec::new();
+    }
+    let total = *cum_dist.last().unwrap();
+    if total <= 0.0 {
+        return vec![ele[0]; n_samples];
+    }
+    let mut out = Vec::with_capacity(n_samples);
+    for i in 0..n_samples {
+        let target = if n_samples == 1 { 0.0 } else { total * i as f64 / (n_samples - 1) as f64 };
+        let mut j = 1;
+        while j < cum_dist.len() && cum_dist[j] < target {
+            j += 1;
+        }
+        if j >= cum_dist.len() {
+            out.push(*ele.last().unwrap());
+            continue;
+        }
+        let (d0, d1) = (cum_dist[j - 1], cum_dist[j]);
+        let t = if d1 > d0 { (target - d0) / (d1 - d0) } else { 0.0 };
+        out.push(ele[j - 1] + (ele[j] - ele[j - 1]) * t);
+    }
+    out
+}
+
+/// 距離dist_m(0..=total_m)が、幅widthのプロファイル上で占める列(0..width-1)。
+/// profile_colの距離版。現在地カーソルを実距離に基づいて置くための変換(純粋・テスト対象)。
+pub fn profile_col_by_distance(dist_m: f64, total_m: f64, width: usize) -> usize {
+    if width == 0 || total_m <= 0.0 {
+        return 0;
+    }
+    let frac = (dist_m / total_m).clamp(0.0, 1.0);
+    ((frac * (width - 1) as f64).round() as usize).min(width - 1)
+}
+
 /// n_points 個の経路点のうち index 番目が、幅 width のプロファイル上で占める列(0..width-1)。
 /// 標高帯に「現在地カーソル」を出すための位置変換(純粋・テスト対象)。
+/// 距離不明(cum_distが無い)場合のフォールバック用。通常はprofile_col_by_distanceを使う。
 pub fn profile_col(n_points: usize, index: usize, width: usize) -> usize {
     if width == 0 {
         return 0;
@@ -149,6 +217,50 @@ mod tests {
     fn stats_empty_is_safe() {
         let ele: [f64; 0] = [];
         assert_eq!(elevation_stats(&ele), (0.0, 0.0, 0.0));
+    }
+
+    // 東京駅(35.681236,139.767125)から新宿駅(35.690921,139.700258)まで約6km。
+    #[test]
+    fn cumulative_distances_starts_at_zero_and_increases() {
+        let pts = [(35.681236, 139.767125), (35.690921, 139.700258)];
+        let d = cumulative_distances(&pts);
+        assert_eq!(d.len(), 2);
+        assert_eq!(d[0], 0.0);
+        assert!(d[1] > 5000.0 && d[1] < 7000.0, "d[1]={}", d[1]);
+    }
+
+    #[test]
+    fn cumulative_distances_empty_is_safe() {
+        assert!(cumulative_distances(&[]).is_empty());
+    }
+
+    // 点間隔が不均一(前半は密・後半は疎)でも、距離基準で均等にリサンプルされること。
+    #[test]
+    fn resample_by_distance_uses_distance_not_index() {
+        // 距離0,10,20,100(m)の4点、標高は0,10,20,100(距離と同じ=距離基準なら値も距離に比例するはず)
+        let cum = [0.0, 10.0, 20.0, 100.0];
+        let ele = [0.0, 10.0, 20.0, 100.0];
+        let out = resample_by_distance(&ele, &cum, 5);
+        assert_eq!(out.len(), 5);
+        assert!((out[0] - 0.0).abs() < 1e-6);
+        assert!((out[4] - 100.0).abs() < 1e-6);
+        // 中間(距離50m)は区間20-100mの中なので線形補間で 20 + (100-20)*(50-20)/(100-20) = 50
+        assert!((out[2] - 50.0).abs() < 1e-6, "out[2]={}", out[2]);
+    }
+
+    #[test]
+    fn resample_by_distance_empty_is_safe() {
+        assert!(resample_by_distance(&[], &[], 5).is_empty());
+        assert!(resample_by_distance(&[1.0], &[0.0], 0).is_empty());
+    }
+
+    #[test]
+    fn profile_col_by_distance_maps_endpoints_and_midpoint() {
+        assert_eq!(profile_col_by_distance(0.0, 100.0, 11), 0);
+        assert_eq!(profile_col_by_distance(100.0, 100.0, 11), 10);
+        assert_eq!(profile_col_by_distance(50.0, 100.0, 11), 5);
+        assert_eq!(profile_col_by_distance(10.0, 0.0, 11), 0); // total=0は安全側で先頭
+        assert_eq!(profile_col_by_distance(10.0, 100.0, 0), 0); // width=0は安全側で0
     }
 
     #[test]

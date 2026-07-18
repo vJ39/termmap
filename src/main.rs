@@ -209,18 +209,19 @@ fn attach_route(spec: &mut OverlaySpec, a: &Args) -> Result<Option<String>, Stri
 
 fn render(img: &RgbImage, a: &Args, ov: Option<&OverlayLayer>) -> String {
     let th = a.threshold.unwrap_or(if a.edge { 45 } else { 195 });
-    if a.edge { render_braille(img, a.mono, false, th, true, ov) }
-    else if a.braille { render_braille(img, a.mono, a.classify, th, false, ov) }
+    let truecolor = truecolor_safe();
+    if a.edge { render_braille(img, a.mono, false, th, true, ov, truecolor) }
+    else if a.braille { render_braille(img, a.mono, a.classify, th, false, ov, truecolor) }
     else if a.classify {
         let mut rc = recolor(img);
         if let Some(o) = ov { composite(&mut rc, o); }
-        render_halfblock(&rc)
+        render_halfblock(&rc, truecolor)
     } else if let Some(o) = ov {
         let mut c = img.clone();
         composite(&mut c, o);
-        render_halfblock(&c)
+        render_halfblock(&c, truecolor)
     } else {
-        render_halfblock(img)
+        render_halfblock(img, truecolor)
     }
 }
 

@@ -35,7 +35,7 @@ pub fn recolor(img: &RgbImage) -> RgbImage {
     out
 }
 
-pub fn render_halfblock(img: &RgbImage) -> String {
+pub fn render_halfblock(img: &RgbImage, truecolor: bool) -> String {
     let (w, h) = img.dimensions();
     let mut out = String::with_capacity(w as usize * h as usize * 20);
     let mut y = 0;
@@ -43,14 +43,16 @@ pub fn render_halfblock(img: &RgbImage) -> String {
         for x in 0..w {
             let t = img.get_pixel(x, y);
             let b = img.get_pixel(x, y + 1);
-            out.push_str(&format!("\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m\u{2580}", t[0], t[1], t[2], b[0], b[1], b[2]));
+            out.push_str(&sgr_fg(t[0], t[1], t[2], truecolor));
+            out.push_str(&sgr_bg(b[0], b[1], b[2], truecolor));
+            out.push('\u{2580}');
         }
         out.push_str("\x1b[0m\r\n");
         y += 2;
     }
     out
 }
-pub fn render_braille(img: &RgbImage, mono: bool, classify_on: bool, threshold: u8, edge: bool, ov: Option<&OverlayLayer>) -> String {
+pub fn render_braille(img: &RgbImage, mono: bool, classify_on: bool, threshold: u8, edge: bool, ov: Option<&OverlayLayer>, truecolor: bool) -> String {
     const BITS: [[u8; 4]; 2] = [[0x01, 0x02, 0x04, 0x40], [0x08, 0x10, 0x20, 0x80]];
     let (w, h) = img.dimensions();
     let (cols, rows) = (w / 2, h / 4);
@@ -92,15 +94,15 @@ pub fn render_braille(img: &RgbImage, mono: bool, classify_on: bool, threshold: 
             let ch = char::from_u32(0x2800 + bits as u32).unwrap();
             if bits == 0 { out.push(' '); }
             else if mono { out.push(ch); }
-            else if ovn > 0 { out.push_str(&format!("\x1b[38;2;{};{};{}m{ch}", ovr / ovn, ovg / ovn, ovb / ovn)); }
+            else if ovn > 0 { out.push_str(&sgr_fg((ovr / ovn) as u8, (ovg / ovn) as u8, (ovb / ovn) as u8, truecolor)); out.push(ch); }
             else if classify_on {
                 let bi = (0..6).max_by_key(|&i| cc[i]).unwrap();
                 let (r, g, b) = cat_color([Cat::Water, Cat::Park, Cat::RoadMajor, Cat::Rail, Cat::Building, Cat::Other][bi]);
-                out.push_str(&format!("\x1b[38;2;{r};{g};{b}m{ch}"));
+                out.push_str(&sgr_fg(r, g, b, truecolor)); out.push(ch);
             } else {
                 // braille はインク=暗い画素の平均色になりがちで沈むので輝度を持ち上げる
                 let br = |s: u32| ((s as f64 / n as f64) * 1.6).min(255.0) as u8;
-                out.push_str(&format!("\x1b[38;2;{};{};{}m{ch}", br(sr), br(sg), br(sb)));
+                out.push_str(&sgr_fg(br(sr), br(sg), br(sb), truecolor)); out.push(ch);
             }
         }
         if !mono { out.push_str("\x1b[0m"); }
@@ -254,6 +256,43 @@ pub fn image_capable() -> bool {
     std::env::var_os("ITERM_SESSION_ID").is_some()
 }
 
+// halfblock/braille描画(1文字ごとにtruecolorのSGRを2〜3個発行する高密度な出力)を、24bit色の
+// まま出しても安定して描画できるか。macOS標準Terminal.app(TERM_PROGRAM=Apple_Terminal)は
+// COLORTERM=truecolorを名乗るが、実際にはこの密度のtruecolorシーケンスを捌ききれず、色の
+// 状態を見失って帯状に色がにじむ表示崩れを起こすことを確認済み(termmap/aquaterm両方で再現)。
+// 個別に除外し、それ以外はCOLORTERM=truecolor/24bitの申告を信用する(不明な端末は256色側)。
+pub fn truecolor_safe() -> bool {
+    if std::env::var("TERM_PROGRAM").ok().as_deref() == Some("Apple_Terminal") { return false; }
+    matches!(std::env::var("COLORTERM").ok().as_deref(), Some("truecolor") | Some("24bit"))
+}
+
+// RGBをxterm 256色パレット(16〜231=6x6x6キューブ, 232〜255=24階調グレー)の最近傍indexへ。
+// truecolor不安定な端末向けのフォールバック用(近似でよく、正確なCIE距離等は不要)。
+pub fn rgb_to_ansi256(r: u8, g: u8, b: u8) -> u8 {
+    if r.abs_diff(g) < 10 && g.abs_diff(b) < 10 && r.abs_diff(b) < 10 {
+        let avg = (r as u32 + g as u32 + b as u32) / 3;
+        if avg < 8 { return 16; }
+        if avg > 248 { return 231; }
+        return (232 + (avg - 8) * 24 / 247) as u8;
+    }
+    const LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+    let level = |c: u8| -> u8 {
+        LEVELS.iter().enumerate()
+            .min_by_key(|(_, &lv)| (c as i32 - lv as i32).abs())
+            .map(|(i, _)| i as u8).unwrap()
+    };
+    16 + 36 * level(r) + 6 * level(g) + level(b)
+}
+
+// 前景色のSGRを1つ発行する(truecolor不安定端末では256色に量子化)。ui.rs側のロゴ描画等でも使う。
+pub(crate) fn sgr_fg(r: u8, g: u8, b: u8, truecolor: bool) -> String {
+    if truecolor { format!("\x1b[38;2;{r};{g};{b}m") } else { format!("\x1b[38;5;{}m", rgb_to_ansi256(r, g, b)) }
+}
+// 背景色のSGRを1つ発行する(同上)。
+fn sgr_bg(r: u8, g: u8, b: u8, truecolor: bool) -> String {
+    if truecolor { format!("\x1b[48;2;{r};{g};{b}m") } else { format!("\x1b[48;5;{}m", rgb_to_ansi256(r, g, b)) }
+}
+
 // 標準base64符号化(依存追加なしのため自前実装)。パディングは '=' で埋める。
 fn base64_encode(data: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -290,6 +329,31 @@ pub fn emit_iterm2_image<W: std::io::Write>(out: &mut W, rgb: &RgbImage, cell_w:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // xterm256の既知の代表色(黒/白/純色RGB)が期待indexへ変換されること。
+    #[test]
+    fn rgb_to_ansi256_known_colors() {
+        assert_eq!(rgb_to_ansi256(0, 0, 0), 16);       // 黒(グレースケール下限)
+        assert_eq!(rgb_to_ansi256(255, 255, 255), 231); // 白(カラーキューブ上限)
+        assert_eq!(rgb_to_ansi256(255, 0, 0), 196);     // 純赤
+        assert_eq!(rgb_to_ansi256(0, 255, 0), 46);      // 純緑
+        assert_eq!(rgb_to_ansi256(0, 0, 255), 21);      // 純青
+    }
+
+    // グレースケール(R≈G≈B)は24階調グレー領域(232〜255)に落ちる。
+    #[test]
+    fn rgb_to_ansi256_grayscale_uses_gray_ramp() {
+        let idx = rgb_to_ansi256(128, 128, 128);
+        assert!((232..=255).contains(&idx), "mid-gray should map into the gray ramp, got {idx}");
+    }
+
+    // 近い色は同じか隣接indexになる(量子化が単調であることの簡易確認)。
+    #[test]
+    fn rgb_to_ansi256_nearby_colors_map_close() {
+        let a = rgb_to_ansi256(100, 150, 200);
+        let b = rgb_to_ansi256(102, 148, 198);
+        assert!(a.abs_diff(b) <= 1, "a={a} b={b} should be identical or adjacent");
+    }
 
     #[test]
     fn base64_matches_known_vectors() {
