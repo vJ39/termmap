@@ -10,6 +10,23 @@ pub fn deg_to_pixel(lat: f64, lon: f64, z: u32) -> (f64, f64) {
     let y = (1.0 - (latr.tan() + 1.0 / latr.cos()).ln() / std::f64::consts::PI) / 2.0 * n;
     (x, y)
 }
+// pts(緯度経度列)の各点が、zoom z でどのタイル(x,y)に属するかを重複排除して列挙する。
+// ルート確定時、その経路が通るタイルをバックグラウンドローダーへ先読み依頼する用途。
+// 点と点の間の線分が通過する中間タイルまでは網羅しない(サンプル点そのものが乗るタイルのみ。
+// 見た目のカクつき軽減が目的の先読みなのでこれで十分と判断)。
+pub fn route_tile_coords(pts: &[(f64, f64)], z: u32) -> Vec<(i64, i64)> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for &(lat, lon) in pts {
+        let (px, py) = deg_to_pixel(lat, lon, z);
+        let tx = (px / TILE as f64).floor() as i64;
+        let ty = (py / TILE as f64).floor() as i64;
+        if seen.insert((tx, ty)) {
+            out.push((tx, ty));
+        }
+    }
+    out
+}
 pub fn pixel_to_deg(px: f64, py: f64, z: u32) -> (f64, f64) {
     let n = (TILE as f64) * 2f64.powi(z as i32);
     let lon = px / n * 360.0 - 180.0;
@@ -108,5 +125,54 @@ mod tests {
         assert_eq!(heading_arrow(22.0), '↑');  // 0に近い
         assert_eq!(heading_arrow(23.0), '↗');  // 45に近い(22.5が境界)
         assert_eq!(heading_arrow(350.0), '↑'); // 360(=0)に近い(315との差35 vs 360との差10)
+    }
+
+    #[test]
+    fn route_tile_coords_dedups_nearby_points() {
+        // 同一タイル内に収まるごく近接した3点 → 1タイルに畳まれる
+        let pts = [(35.681, 139.767), (35.6811, 139.7671), (35.6812, 139.7669)];
+        let out = route_tile_coords(&pts, 14);
+        assert_eq!(out.len(), 1, "近接点は重複排除で1タイル: {out:?}");
+        // deg_to_pixel と整合しているか検算
+        let (px, py) = deg_to_pixel(35.681, 139.767, 14);
+        let expect = ((px / TILE as f64).floor() as i64, (py / TILE as f64).floor() as i64);
+        assert_eq!(out[0], expect);
+    }
+
+    #[test]
+    fn route_tile_coords_lists_distant_points_separately() {
+        // 東京と大阪(遠く離れた2点) → 別タイルとして2つ列挙される
+        let pts = [(35.681, 139.767), (34.702, 135.495)];
+        let out = route_tile_coords(&pts, 14);
+        assert_eq!(out.len(), 2, "離れた点は別タイル: {out:?}");
+        assert_ne!(out[0], out[1]);
+    }
+
+    #[test]
+    fn route_tile_coords_empty_input_returns_empty() {
+        let out = route_tile_coords(&[], 14);
+        assert!(out.is_empty()); // 空配列でパニックしない
+    }
+
+    #[test]
+    fn route_tile_coords_matches_deg_to_pixel() {
+        // 複数の既知座標/ズームで deg_to_pixel の計算と一致することを検算
+        for &(lat, lon, z) in &[(35.68, 139.76, 14u32), (0.0, 0.0, 5), (34.702, 135.495, 12)] {
+            let out = route_tile_coords(&[(lat, lon)], z);
+            let (px, py) = deg_to_pixel(lat, lon, z);
+            let expect = ((px / TILE as f64).floor() as i64, (py / TILE as f64).floor() as i64);
+            assert_eq!(out, vec![expect], "lat={lat} lon={lon} z={z}");
+        }
+    }
+
+    #[test]
+    fn route_tile_coords_preserves_first_seen_order() {
+        // A(タイル1) → B(タイル2) → A近傍(タイル1に戻る) の順で、初出順を保ち重複は落とす
+        let a = (35.681, 139.767);
+        let b = (34.702, 135.495);
+        let out = route_tile_coords(&[a, b, (35.6811, 139.7671)], 14);
+        let ta = route_tile_coords(&[a], 14)[0];
+        let tb = route_tile_coords(&[b], 14)[0];
+        assert_eq!(out, vec![ta, tb]); // 3点目はaと同タイルなので落ちる
     }
 }

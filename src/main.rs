@@ -200,7 +200,7 @@ fn build_spec(a: &Args, center_lat: f64, center_lon: f64) -> OverlaySpec {
 // --route があれば BRouter で取得して spec に追加し、要約(距離/時間)を返す。--gpx 指定時は書き出し。
 fn attach_route(spec: &mut OverlaySpec, a: &Args) -> Result<Option<String>, String> {
     let wps = match &a.route { Some(w) => w, None => return Ok(None) };
-    let r = fetch_route(wps, &a.route_mode, 0)?;
+    let r = fetch_route(wps, &a.route_mode, 0, "")?; // CLI一発描画はBRouterのみ(Googleキー未提供=フォールバックしない)
     if let Some(g) = &a.gpx { write_gpx(g, &r.pts)?; }
     let summary = format!("ルート {} {}点", route_summary(&a.route_mode, &r), r.pts.len());
     spec.routes.push(Route { pts: r.pts, color: [0, 220, 255], thickness: 2 });

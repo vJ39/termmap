@@ -3,7 +3,7 @@ use crate::render::{OverlaySpec, Poi, PoiCat};
 use serde::Deserialize;
 
 #[derive(serde::Serialize, serde::Deserialize)]
-pub struct RouteResult { pub pts: Vec<(f64, f64)>, pub ele: Vec<f64>, pub dist_m: f64, pub time_s: f64, pub hw_m: f64, pub ascend_m: f64 }
+pub struct RouteResult { pub pts: Vec<(f64, f64)>, pub ele: Vec<f64>, pub dist_m: f64, pub time_s: f64, pub hw_m: f64, pub ascend_m: f64, #[serde(default)] pub via_google: bool }
 
 // BRouter geojson の応答。features[0] の geometry.coordinates([[lon,lat,ele?],...]) と
 // properties(track-length/total-time/filtered ascend は全て文字列, messages は文字列表)を読む。
@@ -51,6 +51,9 @@ pub fn route_summary(mode: &str, r: &RouteResult) -> String {
     if r.hw_m > 50.0 {
         let km = r.hw_m / 1000.0;
         s.push_str(&format!(" 高速{km:.1}km ¥{}概算", (km * 30.0).round() as i64));
+    }
+    if r.via_google {
+        s.push_str(" (Google経由)");
     }
     s
 }
@@ -119,7 +122,8 @@ fn route_cache_path(wps: &[(f64, f64)], mode: &str, alt: u32) -> Option<std::pat
 }
 
 // mode: "short"=最短(shortest) / それ以外=裏道(safety)。wps は (lat,lon) 列。
-pub fn fetch_route(wps: &[(f64, f64)], mode: &str, alt: u32) -> Result<RouteResult, String> {
+// key: Google Maps APIキー。BRouterが最終的に失敗した時だけ Google Directions へフォールバックする(空なら試さない)。
+pub fn fetch_route(wps: &[(f64, f64)], mode: &str, alt: u32, key: &str) -> Result<RouteResult, String> {
     if wps.len() < 2 { return Err("--route は始点と終点(2点以上)が必要".into()); }
     let alt = alt.min(3); // BRouter の代替ルートは 0..=3
     // ディスクキャッシュ: 同じプロット(wps,profile,alt)なら BRouter を叩かず再利用(再起動後も)
@@ -131,6 +135,7 @@ pub fn fetch_route(wps: &[(f64, f64)], mode: &str, alt: u32) -> Result<RouteResu
     }
     let primary = route_profile(mode);
     // まず希望プロファイルで。target island(その道路網に点が繋がらない)なら car-fast で必ず線を出す。
+    // BRouter が(ISLAND救済含め)最終的に失敗した場合のみ、key があれば Google へフォールバックする。
     let result = match fetch_route_once(wps, primary, alt) {
         Ok(r) => r,
         Err(e) if e == "ISLAND" => {
@@ -140,10 +145,16 @@ pub fn fetch_route(wps: &[(f64, f64)], mode: &str, alt: u32) -> Result<RouteResu
             match fetch_route_once(wps, "car-fast", alt) {
                 Ok(r) => r, // 下道で繋がらないので車道優先で表示
                 Err(e2) if e2 == "ISLAND" => return Err("この点は道路網に繋がらない(点を道路上へ動かして)".to_string()),
-                Err(e2) => return Err(e2),
+                Err(e2) => match fetch_google_route(wps, mode, key) {
+                    Ok(r) => r,
+                    Err(_) => return Err(e2), // Googleも失敗→元のBRouterエラーを返す
+                },
             }
         }
-        Err(e) => return Err(e),
+        Err(e) => match fetch_google_route(wps, mode, key) {
+            Ok(r) => r,
+            Err(_) => return Err(e), // Googleも失敗→元のBRouterエラーを返す
+        },
     };
     // 成功時のみ保存(ベストエフォート)
     if let Some(p) = &cpath {
@@ -172,7 +183,77 @@ fn fetch_route_once(wps: &[(f64, f64)], profile: &str, alt: u32) -> Result<Route
     let ele = parse_geojson_ele(&body);
     let (dist_m, time_s, ascend_m) = parse_geojson_props(&body);
     let hw_m = expressway_meters(&body);
-    Ok(RouteResult { pts, ele, dist_m, time_s, hw_m, ascend_m })
+    Ok(RouteResult { pts, ele, dist_m, time_s, hw_m, ascend_m, via_google: false })
+}
+
+// Google Directions API(旧・レガシー版、Routes APIではない)でのフォールバック取得。
+// BRouterが失敗した時だけ最終手段として呼ばれる。標高データは提供されないため ele は空Vec、
+// 高速区間の判定手段が無いため hw_m は 0.0(料金概算は出ない=呼び出し側で自然にスキップされる)。
+fn fetch_google_route(wps: &[(f64, f64)], mode: &str, key: &str) -> Result<RouteResult, String> {
+    if key.trim().is_empty() { return Err("Google APIキー未設定".to_string()); }
+    let origin = format!("{},{}", wps[0].0, wps[0].1);
+    let destination = format!("{},{}", wps[wps.len() - 1].0, wps[wps.len() - 1].1);
+    let mut url = format!("https://maps.googleapis.com/maps/api/directions/json?origin={origin}&destination={destination}&key={key}");
+    if wps.len() > 2 {
+        let via: Vec<String> = wps[1..wps.len() - 1].iter().map(|(la, lo)| format!("{la},{lo}")).collect();
+        url.push_str(&format!("&waypoints={}", via.join("|")));
+    }
+    // route_profile(mode) が "moped"(下道=高速回避)ならavoid=highwaysを付ける。
+    // "shortest"はGoogle側に直接の等価オプションが無いため素のまま(車での既定経路)。
+    if route_profile(mode) == "moped" {
+        url.push_str("&avoid=highways");
+    }
+    let body = ureq::get(&url)
+        .timeout(std::time::Duration::from_secs(20)).call()
+        .map_err(|e| format!("Google route: {e}"))?
+        .into_string().map_err(|e| e.to_string())?;
+    let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| format!("Google route parse: {e}"))?;
+    let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("");
+    if status != "OK" {
+        let msg = v.get("error_message").and_then(|m| m.as_str()).unwrap_or(status);
+        return Err(format!("Google route: {msg}"));
+    }
+    let route = v.get("routes").and_then(|r| r.get(0)).ok_or("Google route: routes無し")?;
+    let encoded = route.get("overview_polyline").and_then(|p| p.get("points")).and_then(|p| p.as_str())
+        .ok_or("Google route: polyline無し")?;
+    let pts = decode_google_polyline(encoded);
+    if pts.is_empty() { return Err("Google route: 空のポリライン".to_string()); }
+    let legs = route.get("legs").and_then(|l| l.as_array()).cloned().unwrap_or_default();
+    let mut dist_m = 0.0;
+    let mut time_s = 0.0;
+    for leg in &legs {
+        dist_m += leg.get("distance").and_then(|d| d.get("value")).and_then(|v| v.as_f64()).unwrap_or(0.0);
+        time_s += leg.get("duration").and_then(|d| d.get("value")).and_then(|v| v.as_f64()).unwrap_or(0.0);
+    }
+    Ok(RouteResult { pts, ele: Vec::new(), dist_m, time_s, hw_m: 0.0, ascend_m: 0.0, via_google: true })
+}
+
+// Googleのポリラインエンコーディング(https://developers.google.com/maps/documentation/utilities/polylinealgorithm)
+// をデコードして (lat,lon) 列にする(ネットワーク非依存の純粋関数)。
+fn decode_google_polyline(encoded: &str) -> Vec<(f64, f64)> {
+    let mut points = Vec::new();
+    let bytes = encoded.as_bytes();
+    let mut idx = 0usize;
+    let (mut lat, mut lon) = (0i64, 0i64);
+    // 1つの符号化数値を取り出す(可変長・zigzag)。idx を進める。
+    fn decode_value(bytes: &[u8], idx: &mut usize) -> i64 {
+        let mut result: i64 = 0;
+        let mut shift = 0u32;
+        loop {
+            let b = bytes[*idx] as i64 - 63;
+            *idx += 1;
+            result |= (b & 0x1f) << shift;
+            shift += 5;
+            if b < 0x20 { break; }
+        }
+        if result & 1 != 0 { !(result >> 1) } else { result >> 1 }
+    }
+    while idx < bytes.len() {
+        lat += decode_value(bytes, &mut idx);
+        lon += decode_value(bytes, &mut idx);
+        points.push((lat as f64 / 1e5, lon as f64 / 1e5));
+    }
+    points
 }
 pub fn write_gpx(path: &str, pts: &[(f64, f64)]) -> Result<(), String> {
     let mut s = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<gpx version=\"1.1\" creator=\"termmap\" xmlns=\"http://www.topografix.com/GPX/1/1\">\n<trk><name>termmap route</name><trkseg>\n");
@@ -194,13 +275,13 @@ pub fn set_markers(spec: &mut OverlaySpec, wps: &[(f64, f64)], pois: &[(f64, f64
 pub type RouteRx = std::sync::mpsc::Receiver<Result<RouteResult, String>>;
 // マーカーは即反映し、ルートはバックグラウンドスレッドで計算する(受信チャネルを返す)。
 // Ctrl+C で受信側を捨てれば計算を中断できる(スレッドはtimeoutまで走るが結果は無視)。
-pub fn trigger_route(spec: &mut OverlaySpec, wps: &[(f64, f64)], pois: &[(f64, f64, String, PoiCat)], mode: &str, alt: u32) -> (Option<String>, Option<RouteRx>) {
+pub fn trigger_route(spec: &mut OverlaySpec, wps: &[(f64, f64)], pois: &[(f64, f64, String, PoiCat)], mode: &str, alt: u32, key: &str) -> (Option<String>, Option<RouteRx>) {
     set_markers(spec, wps, pois);
     spec.routes.clear();
     if wps.len() >= 2 {
         let (tx, rx) = std::sync::mpsc::channel();
-        let (w, m) = (wps.to_vec(), mode.to_string());
-        std::thread::spawn(move || { let _ = tx.send(fetch_route(&w, &m, alt)); });
+        let (w, m, k) = (wps.to_vec(), mode.to_string(), key.to_string());
+        std::thread::spawn(move || { let _ = tx.send(fetch_route(&w, &m, alt, &k)); });
         (Some("計算中… (Ctrl+Cで中断)".to_string()), Some(rx))
     } else {
         (None, None)
@@ -314,5 +395,33 @@ mod tests {
           ["1","2","3","50","0","0","0","0","0","highway=residential","","0","0"]
         ]}}]}"#;
         assert!((expressway_meters(body) - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn decode_google_polyline_known_vector() {
+        // Google公式ドキュメントの標準テストベクタ(polylinealgorithm)
+        let pts = decode_google_polyline("_p~iF~ps|U_ulLnnqC_mqNvxq`@");
+        let want = [(38.5, -120.2), (40.7, -120.95), (43.252, -126.453)];
+        assert_eq!(pts.len(), want.len());
+        for (got, exp) in pts.iter().zip(want.iter()) {
+            assert!((got.0 - exp.0).abs() < 1e-4, "lat {got:?} != {exp:?}");
+            assert!((got.1 - exp.1).abs() < 1e-4, "lon {got:?} != {exp:?}");
+        }
+    }
+
+    #[test]
+    fn route_summary_marks_google_source() {
+        let g = RouteResult { pts: vec![], ele: vec![], dist_m: 261865.0, time_s: 11232.0, hw_m: 0.0, ascend_m: 0.0, via_google: true };
+        assert!(route_summary("highway", &g).contains("(Google経由)"));
+        let b = RouteResult { pts: vec![], ele: vec![], dist_m: 1000.0, time_s: 60.0, hw_m: 0.0, ascend_m: 0.0, via_google: false };
+        assert!(!route_summary("highway", &b).contains("(Google経由)"));
+    }
+
+    #[test]
+    fn route_result_serde_back_compat() {
+        // via_google が無い旧キャッシュJSONも #[serde(default)] で false として読める
+        let old = r#"{"pts":[],"ele":[],"dist_m":0.0,"time_s":0.0,"hw_m":0.0,"ascend_m":0.0}"#;
+        let r: RouteResult = serde_json::from_str(old).expect("旧JSONが読めること");
+        assert!(!r.via_google);
     }
 }

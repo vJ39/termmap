@@ -251,6 +251,15 @@ impl TileLoader {
         }
     }
 
+    // ルート確定時、その経路が通るタイルを先読み依頼として登録する(#34)。既存のrequest_tilesを
+    // そのまま使う=画面表示中のタイルの方が常にview距離で優先されるため、専用の優先度階層は不要。
+    pub fn request_route_tiles(&self, style: &str, z: u32, tile_coords: &[(i64, i64)]) {
+        let keys = tile_coords.iter()
+            .map(|&(x, y)| TileKey { style: style.to_string(), z, x, y })
+            .collect();
+        self.request_tiles(keys);
+    }
+
     // 1タイルでも取得が進むと増える世代。ui側が map_sig に混ぜて次フレームの再描画を誘発する。
     pub fn generation(&self) -> u64 { self.generation.load(Ordering::Relaxed) }
 
