@@ -60,7 +60,10 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                  NewCat(String), SpotForm { name: String, url: String, field: usize }, SpotList, SpotCatList, SpotRename(String, usize), Settings, SettingsEdit(usize, String), SettingsPick(usize), RoadSearch(String), SpotEditName(String, usize), Recommend(String), ColorPick { cat: usize }, ShapePick { cat: usize }, PoiKindForm { label: String, tag: String, field: usize }, WanderForm { dist_km: f64 },
                  RouteFavMenu { sel: usize } } // お気に入りルート: 保存/呼び出しの小メニュー(Sキーで開く)
     let _guard = TermGuard::enter()?; // Drop で必ず端末復元
-    let mut cache: Cache = Cache::new();
+    // タイルキャッシュは常駐ローダーとメイン描画で共有する(Arc<Mutex>)。未取得タイルはメインが
+    // グレーで即描画し、ローダーが現在viewに近い順で裏取得→cacheへ→次フレームで自動反映される。
+    let cache = std::sync::Arc::new(std::sync::Mutex::new(Cache::new()));
+    let loader = TileLoader::start(std::sync::Arc::clone(&cache));
     let mut out = std::io::stdout();
     let mut addr = String::new();          // 'a' 住所 / 一時メッセージ
     let mut focus = Focus::Map;
@@ -154,6 +157,19 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     apply_spots(&mut spec, &spots, &spot_cats, show_spots);
     // 操作UI効果音(macOS afplay)。設定OFF/非macOS/afplay不在なら no-op。設定トグルで作り直す。
     let mut snd = sound::Sound::new(cfg.sound_enabled);
+
+    // ズーム変更(+/-)直後に呼ぶ。再生(play)中は先読みスレッドが再生開始時のズームを
+    // 捕まえたまま動き続けるため、そのままだと「古いズームの先読み画像」と「新ズーム基準の
+    // オーバーレイ(クロスヘア/ルート線)」でスケールが食い違い表示が壊れる。再生中にズームが
+    // 変わったら先読みを取消し、次フレームで新ズームを使って再起動する(再生距離playは維持)。
+    macro_rules! restart_prefetch_on_zoom { () => {
+        if play.is_some() {
+            play_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            play_prefetch_rx = None;
+            play_prefetch_held = None;
+            play_wants_prefetch = true;
+        }
+    }; }
 
     // メニュー項目/直接キー どちらからでも同じ処理を走らせる。
     // lat/lon/cols/tr は各ループで再計算されるフレーム値。マクロ衛生性のため引数で受け取る。
@@ -459,6 +475,9 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         } else {
             (ow, oh, z, cx, cy)
         };
+        // ローダーへ今の表示位置(実描画のズーム/中心)を毎フレーム渡す。need_buildがfalseで再構築を
+        // 省くフレームでも、裏取得の近傍優先が最新の現在地を使えるよう常に更新しておく。
+        loader.set_view(rcx, rcy, rz, &opts.style);
 
         // 再生開始直後、実画像モードならrw/rh/rz確定を待って先読みスレッドを起こす(1フレーム遅延)。
         // build_window(重い/ネットワーク)を裏で進めておき、メインは受け取った画像を使うだけにして
@@ -509,6 +528,9 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             rz.hash(&mut h); rw.hash(&mut h); rh.hash(&mut h);
             gut.hash(&mut h); map_cols.hash(&mut h); map_rows.hash(&mut h);
             opts.style.hash(&mut h);
+            // 裏取得でタイルが1枚届くたびに世代が変わる→sigが変わり次フレームで再構築され、
+            // グレーのプレースホルダーが実タイルへ順次置き換わる。
+            loader.generation().hash(&mut h);
             spec.routes.len().hash(&mut h);
             spec.roads.len().hash(&mut h);
             for rt in spec.routes.iter().chain(spec.roads.iter()) {
@@ -545,7 +567,8 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             let prefetched = if play.is_some() && img_inline { play_prefetch_held.as_ref().map(|(_, img)| img.clone()) } else { None };
             let built = match prefetched {
                 Some(img) => Ok(img),
-                None => build_window(rcx, rcy, rz, rw, rh, &opts.style, &mut cache),
+                // 非ブロッキング版: 未取得タイルはグレーで即返し、取得はローダーが裏で進める。
+                None => build_window_nowait(rcx, rcy, rz, rw, rh, &opts.style, &loader),
             };
             match built {
                 Ok(img) => {
@@ -1236,7 +1259,9 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
 
         // 入力待ち。結果適用直後は即再描画(None)。ジョブ/GPS/再生/移動settling中はポーリング。
         // settling中は短間隔(60ms)で見に行き、動きが止まったフレームで高解像度に上げ直す。
-        let polling = route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some() || wander_job.is_some() || gps_rx.is_some() || play.is_some() || settling;
+        // ローダーがまだ未取得タイルを抱えている間もポーリング側に倒す(read()でブロックすると
+        // 無入力時に届いたタイルが画面へ反映されないため)。
+        let polling = route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some() || wander_job.is_some() || gps_rx.is_some() || play.is_some() || settling || loader.is_busy();
         let mut ev: Option<Event> = if got_result {
             None
         } else if polling {
@@ -1786,8 +1811,8 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                         KeyCode::Char('l') => { cx += (oh as f64 / 8.0).max(1.0); focus = Focus::PoiList; }
                         KeyCode::Char('k') => { cy -= (oh as f64 / 8.0).max(1.0); focus = Focus::PoiList; }
                         KeyCode::Char('j') => { cy += (oh as f64 / 8.0).max(1.0); focus = Focus::PoiList; }
-                        KeyCode::Char('+') | KeyCode::Char('=') => { if z < 19 { z += 1; cx *= 2.0; cy *= 2.0; } focus = Focus::PoiList; } // +/-でズーム
-                        KeyCode::Char('-') | KeyCode::Char('_') => { if z > 2 { z -= 1; cx /= 2.0; cy /= 2.0; } focus = Focus::PoiList; }
+                        KeyCode::Char('+') | KeyCode::Char('=') => { if z < 19 { z += 1; cx *= 2.0; cy *= 2.0; restart_prefetch_on_zoom!(); } focus = Focus::PoiList; } // +/-でズーム
+                        KeyCode::Char('-') | KeyCode::Char('_') => { if z > 2 { z -= 1; cx /= 2.0; cy /= 2.0; restart_prefetch_on_zoom!(); } focus = Focus::PoiList; }
                         KeyCode::Enter => { // 選択地点へ移動(明示)
                             if let Some(p) = pois.get(poi_sel) { let (nx, ny) = deg_to_pixel(p.0, p.1, z); cx = nx; cy = ny; }
                             focus = Focus::PoiList;
@@ -1892,8 +1917,8 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             focus = Focus::WaypointList;
                         }
                         KeyCode::Char(' ') => { if !wps.is_empty() { grab = !grab; snd.play(if grab { "blip" } else { "pop" }); } focus = Focus::WaypointList; }
-                        KeyCode::Char('+') | KeyCode::Char('=') => { if z < 19 { z += 1; cx *= 2.0; cy *= 2.0; } focus = Focus::WaypointList; }
-                        KeyCode::Char('-') | KeyCode::Char('_') => { if z > 2 { z -= 1; cx /= 2.0; cy /= 2.0; } focus = Focus::WaypointList; }
+                        KeyCode::Char('+') | KeyCode::Char('=') => { if z < 19 { z += 1; cx *= 2.0; cy *= 2.0; restart_prefetch_on_zoom!(); } focus = Focus::WaypointList; }
+                        KeyCode::Char('-') | KeyCode::Char('_') => { if z > 2 { z -= 1; cx /= 2.0; cy /= 2.0; restart_prefetch_on_zoom!(); } focus = Focus::WaypointList; }
                         KeyCode::Char('[') => { if wp_sel > 0 && wp_sel < wps.len() { wps.swap(wp_sel, wp_sel - 1); wp_sel -= 1; let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; if let Some(&(la, lo)) = wps.get(wp_sel) { let (nx, ny) = deg_to_pixel(la, lo, z); cx = nx; cy = ny; } } focus = Focus::WaypointList; }
                         KeyCode::Char(']') => { if wp_sel + 1 < wps.len() { wps.swap(wp_sel, wp_sel + 1); wp_sel += 1; let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; if let Some(&(la, lo)) = wps.get(wp_sel) { let (nx, ny) = deg_to_pixel(la, lo, z); cx = nx; cy = ny; } } focus = Focus::WaypointList; }
                         KeyCode::Char('x') => {
@@ -1975,7 +2000,9 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             KeyCode::Down | KeyCode::Char('s') => { set_pick_sel = (set_pick_sel + 1) % n; focus = Focus::SettingsPick(idx); }
                             KeyCode::Enter => {
                                 let eff = settings::apply_pick(idx, set_pick_sel, &mut cfg, &mut opts.style);
-                                if eff.cache_clear { cache.clear(); }
+                                // スタイル変更等でキャッシュを空にするとき、ローダーの未着手依頼も一緒に捨てる
+                                // (旧スタイルの取得依頼が溜まり続けないように)。
+                                if eff.cache_clear { cache.lock().unwrap().clear(); loader.clear_pending(); }
                                 if eff.force_reemit { force_reemit = true; }
                                 let _ = config::save_config(&cfg);
                                 focus = Focus::Settings;
@@ -2014,8 +2041,8 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                 if !wps.is_empty() { focus = Focus::RoutePanel; } // 空になったら地図へ
                             }
                             KeyCode::Char('v') => { snd.play("pop"); wp_add(&mut wps, (lat, lon)); let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0); route_note = n_; route_job = j_; addr = format!("地点を追加 #{}", wps.len()); focus = Focus::RoutePanel; }
-                            KeyCode::Char('+') | KeyCode::Char('=') => { if z < 19 { z += 1; cx *= 2.0; cy *= 2.0; } focus = Focus::RoutePanel; }
-                            KeyCode::Char('-') | KeyCode::Char('_') => { if z > 2 { z -= 1; cx /= 2.0; cy /= 2.0; } focus = Focus::RoutePanel; }
+                            KeyCode::Char('+') | KeyCode::Char('=') => { if z < 19 { z += 1; cx *= 2.0; cy *= 2.0; restart_prefetch_on_zoom!(); } focus = Focus::RoutePanel; }
+                            KeyCode::Char('-') | KeyCode::Char('_') => { if z > 2 { z -= 1; cx /= 2.0; cy /= 2.0; restart_prefetch_on_zoom!(); } focus = Focus::RoutePanel; }
                             KeyCode::Esc | KeyCode::Tab => { snd.play("back"); } // 地図へ戻る(既定=Map)
                             _ => { focus = Focus::RoutePanel; }
                         }
@@ -2054,8 +2081,8 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('L') => { cx += step; addr.clear(); }
                             KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => { cy -= step; addr.clear(); }
                             KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => { cy += step; addr.clear(); }
-                            KeyCode::Char('+') | KeyCode::Char('=') => if z < 19 { z += 1; cx *= 2.0; cy *= 2.0; addr.clear(); },
-                            KeyCode::Char('-') | KeyCode::Char('_') => if z > 2 { z -= 1; cx /= 2.0; cy /= 2.0; addr.clear(); },
+                            KeyCode::Char('+') | KeyCode::Char('=') => if z < 19 { z += 1; cx *= 2.0; cy *= 2.0; addr.clear(); restart_prefetch_on_zoom!(); },
+                            KeyCode::Char('-') | KeyCode::Char('_') => if z > 2 { z -= 1; cx /= 2.0; cy /= 2.0; addr.clear(); restart_prefetch_on_zoom!(); },
                             KeyCode::Enter if !wps.is_empty() && route_sel >= wps.len() && route_sel < wps.len() + ROUTE_ACTS.len() => {
                                 // w/sで操作行(保存/GPX等)を選択中はEnterでその操作を実行
                                 let ai = route_sel - wps.len();
