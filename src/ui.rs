@@ -34,15 +34,18 @@ fn onboarded_marker() -> Option<std::path::PathBuf> {
     std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".config/termmap/onboarded"))
 }
 
-// スマホ共有QRを cfg.qr_style に応じた密度で描画する(dense=既定のDense1x2/quadrant・braille=render.rs参照)。
-fn render_qr_view(c: &qrcode::QrCode, style: &str) -> String {
-    match style {
-        "quadrant" | "braille" => {
-            let w = c.width();
-            let dark: Vec<bool> = c.to_colors().iter().map(|col| *col == qrcode::Color::Dark).collect();
-            if style == "quadrant" { render_qr_quadrant(&dark, w) } else { render_qr_braille(&dark, w) }
-        }
-        _ => c.render::<qrcode::render::unicode::Dense1x2>().quiet_zone(false).build(),
+// スマホ共有QRの表示内容。Text=既定のDense1x2文字描画(全端末で動作)/Image=iTerm2インライン画像
+// (見た目のセルサイズをモジュール数と切り離して小さくできるが、image_capable()な端末限定)。
+enum QrView { Text(String), Image(RgbImage) }
+
+// cfg.qr_style に応じてQrViewを組み立てる。"image"指定でも非対応端末ならTextへ自動フォールバックする。
+fn build_qr_view(c: &qrcode::QrCode, style: &str) -> QrView {
+    if style == "image" && image_capable() {
+        let w = c.width();
+        let dark: Vec<bool> = c.to_colors().iter().map(|col| *col == qrcode::Color::Dark).collect();
+        QrView::Image(render_qr_image(&dark, w, 8, 4))
+    } else {
+        QrView::Text(c.render::<qrcode::render::unicode::Dense1x2>().quiet_zone(false).build())
     }
 }
 
@@ -113,7 +116,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     let mut rn_sel: usize = 0;
     let mut help = false; // ? でヘルプ表示
     let mut help_page: usize = 0; // ヘルプが画面高に収まらない時のページ送り(0始まり)
-    let mut qr_view: Option<String> = None; // o でGoogleマップQRをポップアップ表示
+    let mut qr_view: Option<QrView> = None; // o でGoogleマップQRをポップアップ表示
     let mut route_alt: u32 = 0; // n で BRouter の代替ルート(0..=3)を巡回
     let mut route_ele: Vec<f64> = Vec::new(); // 直近ルートの標高列(pts と同数)
     let mut route_ascend: f64 = 0.0;          // 直近ルートの累積登り(m)
@@ -264,7 +267,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 if wps.len() >= 2 {
                     let (url, _) = gmaps_url(&wps);
                     match qrcode::QrCode::with_error_correction_level(url.as_bytes(), qrcode::EcLevel::L) {
-                        Ok(c) => qr_view = Some(render_qr_view(&c, &cfg.qr_style)),
+                        Ok(c) => qr_view = Some(build_qr_view(&c, &cfg.qr_style)),
                         Err(_) => addr = "QR生成失敗".into(),
                     }
                 } else { snd.play("error"); addr = "ルート未確定".into(); }
@@ -556,6 +559,14 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         // 同じなら描き直さない。以前は実画像モード限定だったが、AAモードも同じ判定に乗せることで
         // タイル非同期ロード中(#35)にloader.generation()だけが変わり続けて毎ポーリング(80ms毎)
         // 無条件に全画面書き込みが発生する問題を解消する(macOS標準Terminal.appでの描画崩れの原因)。
+        // このフレームの再描画判定に使うgeneration値をここで固定する。ローダーのワーカーは
+        // 「cacheへinsert→generation加算→pending.inflightから除去」の順で動くため、この直後に
+        // is_busy()を見る時点までの間に最後の1枚がちょうど着地すると、is_busy()はfalse(もう待たない)
+        // だが今フレームの再構築には間に合っていない、という取りこぼしが起き得る(#53)。
+        // その場合pollingがfalseになりevent::read()でブロックしてしまい、実際は届いているのに
+        // 次のキー入力までLOADING表示が残り続ける。スナップショットして後段で比較し、その間に
+        // 進んでいたら強制的にポーリング継続させることでこの1フレーム分の取りこぼしを防ぐ。
+        let loader_gen_snapshot = loader.generation();
         let map_sig: Option<u64> = {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -565,7 +576,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             opts.style.hash(&mut h);
             // 裏取得でタイルが1枚届くたびに世代が変わる→sigが変わり次フレームで再構築され、
             // グレーのプレースホルダーが実タイルへ順次置き換わる。
-            loader.generation().hash(&mut h);
+            loader_gen_snapshot.hash(&mut h);
             spec.routes.len().hash(&mut h);
             spec.roads.len().hash(&mut h);
             for rt in spec.routes.iter().chain(spec.roads.iter()) {
@@ -902,29 +913,36 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             let _ = write!(out, "\x1b[{};{}H\x1b[30;47m{}\x1b[0m", r0 + 2, c0, pad);
         }
 
-        // QR共有ポップアップ(地図の上に白地で重ねる。白地×黒でどのテーマでもスキャン可)
-        if let Some(q) = &qr_view {
+        // QR共有ポップアップ(地図の上に白地で重ねる。白地×黒でどのテーマでもスキャン可。
+        // QRだけで用途は自明なため案内ラベルは出さない)。
+        if let Some(QrView::Text(q)) = &qr_view {
             let lines: Vec<&str> = q.lines().collect();
             let qw = lines.iter().map(|l| l.chars().count()).max().unwrap_or(21);
             let padx = 2usize; // 左右の白余白(quiet zone)
             let bw = qw + padx * 2;
             let c0 = ((cols as usize).saturating_sub(bw) / 2).max(1) as u32;
-            // 行構成: ラベル / 上白余白×2 / QR / 下白余白×2
-            let total = lines.len() + 5;
+            // 行構成: 上白余白×2 / QR / 下白余白×2
+            let total = lines.len() + 4;
             let r0 = ((map_rows as usize).saturating_sub(total) / 2).max(1) as u32;
             let hpad = " ".repeat(bw);
             let side = " ".repeat(padx);
-            // ラベルを箱幅で中央寄せ
-            let label = "スマホでスキャン → Googleマップ";
-            let lw: usize = label.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum();
-            let lc = c0 + (bw.saturating_sub(lw) / 2) as u32;
-            let _ = write!(out, "\x1b[{r0};{lc}H\x1b[1m{label}\x1b[0m");
             // 純白の箱(bright white 107 + black 30)。上下2行の白余白でquiet zone確保
-            for k in 0..2 { let _ = write!(out, "\x1b[{};{c0}H\x1b[30;107m{hpad}\x1b[0m", r0 + 1 + k); }
+            for k in 0..2 { let _ = write!(out, "\x1b[{};{c0}H\x1b[30;107m{hpad}\x1b[0m", r0 + k); }
             for (i, l) in lines.iter().enumerate() {
-                let _ = write!(out, "\x1b[{};{c0}H\x1b[30;107m{side}{l:<qw$}{side}\x1b[0m", r0 + 3 + i as u32, qw = qw);
+                let _ = write!(out, "\x1b[{};{c0}H\x1b[30;107m{side}{l:<qw$}{side}\x1b[0m", r0 + 2 + i as u32, qw = qw);
             }
-            for k in 0..2 { let _ = write!(out, "\x1b[{};{c0}H\x1b[30;107m{hpad}\x1b[0m", r0 + 3 + lines.len() as u32 + k); }
+            for k in 0..2 { let _ = write!(out, "\x1b[{};{c0}H\x1b[30;107m{hpad}\x1b[0m", r0 + 2 + lines.len() as u32 + k); }
+            let _ = write!(out, "\x1b[{};1H\x1b[7m 任意のキーで閉じる \x1b[0m\x1b[K", tr);
+        }
+        // QR共有ポップアップ(画像モード): インライン画像は文字セル密度の制約を受けないため、
+        // モジュール数(=QRの複雑さ)に関係なく常に一定の小さいセル数で表示できる。
+        if let Some(QrView::Image(img)) = &qr_view {
+            let cell_w: u32 = 20; // 端末フォントの縦横比(概ね横1:縦2)を踏まえ、正方形に見えるよう縦の2倍を確保
+            let cell_h: u32 = 10;
+            let c0 = ((cols as usize).saturating_sub(cell_w as usize) / 2).max(1) as u32;
+            let r0 = ((map_rows as usize).saturating_sub(cell_h as usize) / 2).max(1) as u32;
+            let _ = write!(out, "\x1b[{};{c0}H", r0);
+            let _ = emit_iterm2_image(&mut out, img, cell_w, cell_h);
             let _ = write!(out, "\x1b[{};1H\x1b[7m 任意のキーで閉じる \x1b[0m\x1b[K", tr);
         }
 
@@ -1323,7 +1341,10 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         // settling中は短間隔(60ms)で見に行き、動きが止まったフレームで高解像度に上げ直す。
         // ローダーがまだ未取得タイルを抱えている間もポーリング側に倒す(read()でブロックすると
         // 無入力時に届いたタイルが画面へ反映されないため)。
-        let polling = route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some() || wander_job.is_some() || gps_rx.is_some() || play.is_some() || settling || loader.is_busy();
+        // is_busy()に加えgenerationのスナップショット比較も見る(#53): このフレームの再構築後、
+        // is_busy()を読むまでの間に最後の1枚がちょうど着地しinflightが空になっていた場合、
+        // is_busy()だけではその1枚の反映漏れを検知できずread()でブロックしてしまうため。
+        let polling = route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some() || wander_job.is_some() || gps_rx.is_some() || play.is_some() || settling || loader.is_busy() || loader.generation() != loader_gen_snapshot;
         let mut ev: Option<Event> = if got_result {
             None
         } else if polling {
@@ -2260,7 +2281,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                 if wps.len() >= 2 {
                                     let (url, _) = gmaps_url(&wps);
                                     match qrcode::QrCode::with_error_correction_level(url.as_bytes(), qrcode::EcLevel::L) {
-                                        Ok(c) => qr_view = Some(render_qr_view(&c, &cfg.qr_style)),
+                                        Ok(c) => qr_view = Some(build_qr_view(&c, &cfg.qr_style)),
                                         Err(_) => addr = "QR生成失敗".into(),
                                     }
                                 } else { snd.play("error"); addr = "ルート未確定".into(); }

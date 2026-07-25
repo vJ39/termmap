@@ -28,7 +28,7 @@ pub(crate) const CHOICES: &[SettingChoice] = &[
     SettingChoice { idx: 5, values: &["car-fast", "moped", "shortest"], labels: &["高速", "下道", "最短"] },
     SettingChoice { idx: 9, values: &["claude-sonnet-5", "claude-haiku-4-5", "claude-opus-4-8"], labels: &["sonnet", "haiku", "opus"] },
     SettingChoice { idx: 12, values: &["high", "mid", "low"], labels: &["高", "中", "低"] },
-    SettingChoice { idx: 18, values: &["dense", "quadrant", "braille"], labels: &["標準", "小型A", "極小B"] },
+    SettingChoice { idx: 18, values: &["dense", "image"], labels: &["標準", "画像(小型)"] },
 ];
 
 fn choice_for(idx: usize) -> Option<&'static SettingChoice> { CHOICES.iter().find(|c| c.idx == idx) }
@@ -98,7 +98,7 @@ pub(crate) fn setting_description(idx: usize) -> &'static str {
         14 => "サウンド: 操作音のON/OFF(macOSのafplayで再生)",
         15 => "オンボーディング: 毎回表示/非表示を切替(dキーでも次回から非表示にできる)",
         16 => "中心十字の色: 地図中心のクロスヘアの色。Enterで一覧を開いて選択(spots.rsの配色から選択)",
-        18 => "QR表示方式: スマホ共有QRの描画密度。Enterで一覧を開いて選択(標準=読み取り安定・現状のサイズ / 小型A=ブロックのまま小型化するが縦長に歪む / 極小B=正方形を保ったまま最小化するが丸ドットになる。A/Bは実機でスキャン確認推奨)",
+        18 => "QR表示方式: スマホ共有QRの表示方法。Enterで一覧を開いて選択(標準=文字描画・全端末対応 / 画像(小型)=iTerm2等のインライン画像でモジュール数に関係なく小さく表示。画像非対応端末では自動的に標準へフォールバック)",
         _ => "Google APIキー: 検索(Geocoding)とStreet View共通。Enterで入力欄を開く(Cmd+V貼付も可)。環境変数TERMMAP_GOOGLE_API_KEYでも可",
     }
 }
@@ -136,7 +136,7 @@ pub(crate) fn settings_rows(opts: &Args, cfg: &Config, picking: Option<usize>, o
         format!("オンボーディング {}", if onboarded { "非表示" } else { "毎回表示" }),
         format!("{} 中心十字の色 {}", arrow(16), PALETTE_NAMES[cfg.cross_color_idx as usize % PALETTE_NAMES.len()]),
         format!("Google APIキー {}", keyset),
-        format!("{} QR表示方式 {}", arrow(18), match cfg.qr_style.as_str() { "quadrant" => "小型A", "braille" => "極小B", _ => "標準" }),
+        format!("{} QR表示方式 {}", arrow(18), match cfg.qr_style.as_str() { "image" => "画像(小型)", _ => "標準" }),
     ];
     // アコーディオン展開: 選択中の項目がpickable(3択以上)ならその直下に候補をインデント挿入し、他行を押し下げる
     let mut sel = set_sel;
@@ -234,11 +234,11 @@ mod tests {
         let mut cfg = Config::default();
         let mut style = "osm".to_string();
         assert_eq!(pick_current(18, &cfg, &style), 0); // dense は values[0]
-        let eff = apply_pick(18, 2, &mut cfg, &mut style); // 2 => "braille"
-        assert_eq!(cfg.qr_style, "braille");
+        let eff = apply_pick(18, 1, &mut cfg, &mut style); // 1 => "image"
+        assert_eq!(cfg.qr_style, "image");
         assert!(!eff.cache_clear);
         assert!(!eff.force_reemit);
-        assert_eq!(pick_current(18, &cfg, &style), 2);
+        assert_eq!(pick_current(18, &cfg, &style), 1);
     }
 
     #[test]

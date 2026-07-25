@@ -49,7 +49,7 @@ pub struct Config {
     pub google_maps_api_key: String, // Google Maps系(Geocoding検索/Street View)共通キー。旧streetview_api_keyから改名
     pub streetview_enabled: bool,     // 実写(i)を使うか
     pub sound_enabled: bool,          // 操作UI効果音(macOS afplay)を鳴らすか
-    pub qr_style: String,             // スマホ共有QRの描画方式: "dense"(標準/1x2)/"quadrant"(2x2ブロック・縦長歪みあり)/"braille"(2x4ドット・正方形維持で最小)。既定dense
+    pub qr_style: String,             // スマホ共有QRの描画方式: "dense"(標準/文字描画・全端末対応)/"image"(iTerm2インライン画像・セル数を固定小型にできるが画像非対応端末はdenseへ自動フォールバック)。既定dense
 }
 
 impl Default for Config {
@@ -183,7 +183,7 @@ pub fn load_config_from(path: &Path) -> Config {
             ("display", "cross_color_idx") => { if let Some(n) = parse_number(value) { cfg.cross_color_idx = (n as u8).min(9); } }
             ("display", "qr_style") => {
                 if let Some(s) = parse_string(value) {
-                    if matches!(s.as_str(), "dense" | "quadrant" | "braille") { cfg.qr_style = s; }
+                    if matches!(s.as_str(), "dense" | "image") { cfg.qr_style = s; }
                 }
             }
             ("google", "maps_api_key") => {
@@ -422,7 +422,7 @@ mod tests {
             cross_color_idx: 5,
             google_maps_api_key: "AIzaTESTKEY_example_123".to_string(), streetview_enabled: true,
             sound_enabled: false,
-            qr_style: "braille".to_string(),
+            qr_style: "image".to_string(),
         };
         save_config_to(&path, &original).expect("save should succeed");
         let loaded = load_config_from(&path);
@@ -514,9 +514,9 @@ show_spots = maybe
     #[test]
     fn qr_style_only_accepts_known_values() {
         let path = unique_temp_path("qr_style_known");
-        std::fs::write(&path, "[display]\nqr_style = \"braille\"\n").unwrap();
+        std::fs::write(&path, "[display]\nqr_style = \"image\"\n").unwrap();
         let cfg = load_config_from(&path);
-        assert_eq!(cfg.qr_style, "braille");
+        assert_eq!(cfg.qr_style, "image");
         cleanup(&path);
 
         let path2 = unique_temp_path("qr_style_unknown");
@@ -655,7 +655,7 @@ profile = "custom-profile"
             cross_color_idx: 0,
             google_maps_api_key: "k".to_string(), streetview_enabled: true,
             sound_enabled: true,
-            qr_style: "quadrant".to_string(),
+            qr_style: "dense".to_string(),
         };
         save_config_to(&path, &cfg).unwrap();
         let loaded = load_config_from(&path);
