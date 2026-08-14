@@ -2155,7 +2155,10 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                         KeyCode::Up | KeyCode::Char('w') => { snd.play("click"); menu_cat_sel = menu_cat_sel.saturating_sub(1); focus = Focus::Menu(MenuLevel::Categories); }
                         KeyCode::Down | KeyCode::Char('s') => { snd.play("click"); if menu_cat_sel + 1 < MENU_CATEGORIES.len() { menu_cat_sel += 1; } focus = Focus::Menu(MenuLevel::Categories); }
                         KeyCode::Enter => { snd.play("click"); menu_item_sel = 0; focus = Focus::Menu(MenuLevel::Items(menu_cat_sel)); }
-                        KeyCode::Esc => { snd.play("back"); } // メニューを閉じる → Map
+                        // メニューを閉じる → Map。左袖(カテゴリ一覧)はマップとは別の列に描かれており、
+                        // 通常のマップ再描画では上書きされない列が残ることがあるため、全消去してから
+                        // 次フレームで確実に再構築させる(Resize時の扱いと同じ)。
+                        KeyCode::Esc => { snd.play("back"); focus = Focus::Map; let _ = write!(out, "\x1b[2J"); force_reemit = true; }
                         KeyCode::Char(c) => match menu_action_for_key(c) {
                             Some(act) => run_action!(act, lat, lon, cols, tr),
                             None => focus = Focus::Menu(MenuLevel::Categories),
