@@ -50,6 +50,13 @@ fn build_qr_view(c: &qrcode::QrCode, style: &str) -> QrView {
 }
 
 
+// 雨雲レーダーの不透明度(0.0..=1.0)。1.0にしないのは地図が消えたら地図アプリとして機能しないため。
+// 設定項目(薄い/標準/濃い)は次フェーズで追加予定。そこで cfg.radar_opacity へ差し替える。
+const RADAR_OPACITY: f64 = 0.55;
+// targetTimes(フレーム時刻一覧)の再取得間隔(秒)。ナウキャスト自体が5分更新なので、
+// これより短くしても新しい情報は無い。
+const RADAR_REFRESH_SECS: u64 = 300;
+
 // ---- 対話モード (crossterm) ----
 // 端末状態を RAII で復元する。パニック/早期return でも Drop で raw mode と代替スクリーンを必ず戻す。
 struct TermGuard;
@@ -124,6 +131,13 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     let mut gps_rx: Option<gpslive::GpsPoller> = None; // G ライブ現在地(drop で停止)
     let mut gps_pos: Option<(f64, f64)> = None; // 最新の自位置
     let mut gps_trail: Vec<(f64, f64)> = Vec::new(); // 通過ブレッドクラム
+    // 雨雲レーダー(気象庁ナウキャスト・C で ON/OFF、< > で表示時刻を前後)。
+    // 起動時は常にOFF(設定からの復元は次フェーズ)。ONにした人だけが外部サービスへ問い合わせる。
+    let mut radar_on = false;
+    let mut radar_tl = radar::Timeline::default();  // フレーム時刻の一覧(RadarClock が5分ごとに更新)
+    let mut radar_idx: usize = 0;                   // 表示中のコマ
+    let mut radar_follow = true;                    // 最新の実況に追従するか(< > でスクラブすると外れる)
+    let mut radar_clock: Option<radar::RadarClock> = None; // 時刻一覧の背景ポーラー(drop で停止)
     let mut play: Option<f64> = None; // A ルート再生(先頭からの距離m。Noneで停止)
     let mut play_speed: f64 = 1.0;    // 再生速度倍率(再生中に [ ] で 0.25〜8x)
     let mut play_last_tick: Option<std::time::Instant> = None; // 再生の実時間ベース進行用(前回フレームの時刻)
@@ -185,6 +199,16 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             play_prefetch_held = None;
             play_wants_prefetch = true;
         }
+    }; }
+
+    // 雨雲レーダーをONにする(C と > の共通処理)。時刻一覧の背景ポーラーがまだ無ければ起こし、
+    // 表示は必ず最新の実況(now_idx)から始める。一覧が未着なら idx=0 のまま「時刻取得中…」になる。
+    macro_rules! radar_turn_on { () => {
+        radar_on = true;
+        if radar_clock.is_none() { radar_clock = Some(radar::start_clock(RADAR_REFRESH_SECS)); }
+        radar_idx = radar_tl.now_idx.min(radar_tl.frames.len().saturating_sub(1));
+        radar_follow = true;
+        addr = "雨雲レーダー: ON (出典: 気象庁ナウキャスト)".into();
     }; }
 
     // メニュー項目/直接キー どちらからでも同じ処理を走らせる。
@@ -442,6 +466,10 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             }
         }
         let img_inline = cfg.image_mode && image_capable(); // 実画像モード(iTerm2系端末のみ)。play処理より先に要る
+        // 雨雲を地図へ重ねられる描画モードか。braille/edge は「面」を混ぜても降水として読めない/
+        // 線画が壊れるため、classify は量子化で淡い青の降水が湖に化けるため、今回は合成しない
+        // (インク化での対応は次フェーズ)。実画像モードはAA設定に関係なく合成できる。
+        let radar_blend_ok = img_inline || !(opts.braille || opts.edge || opts.classify || opts.mono);
         if play.is_some() { // ルート再生: 実時間ベースで位置を進めて自動パン(想定巡航速度×play_speed倍率)
             // 実画像モードは先読みスレッドが返した画像をベース地図に使う。オーバーレイ(ルート線/
             // クロスヘア)をそれと違う位置で描くと、ベースとオーバーレイがズレてルートがガタつい
@@ -599,6 +627,13 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             wps.len().hash(&mut h);
             for &(a2, b2) in &wps { a2.to_bits().hash(&mut h); b2.to_bits().hash(&mut h); }
             wp_sel.hash(&mut h);
+            // 雨雲レーダー: ON/OFF と表示中コマ(basetime+validtime)が変われば描き直す。
+            // < > でコマを送ったとき、また targetTimes 更新で表示時刻が変わったときに効く。
+            radar_on.hash(&mut h);
+            if radar_on {
+                if let Some(f) = radar_tl.get(radar_idx) { f.basetime.hash(&mut h); f.validtime.hash(&mut h); }
+            }
+            RADAR_OPACITY.to_bits().hash(&mut h); // 設定項目化したら値が変わる=描き直す
             Some(h.finish())
         };
 
@@ -619,7 +654,18 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 None => build_window_nowait(rcx, rcy, rz, rw, rh, &opts.style, &loader),
             };
             match built {
-                Ok(img) => {
+                Ok(mut img) => {
+                    // 雨雲レーダー: 地図の上に半透明合成する。経路/POI/中心十字(ov)はこの後に
+                    // 焼くので常に雨雲より前面に残る。
+                    if radar_on && radar_blend_ok {
+                        if let Some(f) = radar_tl.get(radar_idx) {
+                            // 未取得タイルは透明のまま返る(グレー箱もLOADING透かしも出さない)。
+                            // 視野が日本国外なら None = 何も重ねない。
+                            if let Some(layer) = build_radar_window_nowait(rcx, rcy, rz, rw, rh, f, &loader) {
+                                blend_rgba_over(&mut img, &layer, RADAR_OPACITY);
+                            }
+                        }
+                    }
                     let mut ov = build_overlay(&spec, rcx, rcy, rz, rw, rh, 1.0, 1.0, rw, rh);
                     let (mx, my) = (rw as i32 / 2, rh as i32 / 2); // 中心クロスヘア(色は設定で選択可)
                     let cross = SPOT_PALETTE[cfg.cross_color_idx as usize % SPOT_PALETTE.len()];
@@ -881,11 +927,36 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 } else { String::new() };
                 let live = if gps_rx.is_some() { "●LIVE(Gで解除) " } else { "" };
                 let playing = if play.is_some() { format!("▶再生{play_speed:.2}x([ ]変速/A停止) ") } else { String::new() };
+                // 雨雲レーダー: 表示中の時刻・種別と、タイルの読込状況。ONのときだけ出す。
+                // 出典表記は幅を食うので毎フレームは出さず、ONにした直後のメッセージ(addr)で1回出す。
+                let radar_txt = if !radar_on {
+                    String::new()
+                } else {
+                    match radar_tl.get(radar_idx) {
+                        // targetTimes がまだ届いていない(ONにした直後・取得失敗中)
+                        None => "☂時刻取得中… ".to_string(),
+                        // 合成しない描画モードでは1枚も取りに行かないので、読込枚数でなく理由を出す
+                        // (「読込0/1」のまま止まって見えるのを避ける)。
+                        Some(_) if !radar_blend_ok =>
+                            format!("☂{} このモードでは非表示 ", radar::frame_label(&radar_tl, radar_idx)),
+                        Some(f) => {
+                            let (got, need) = radar_progress(&loader, rcx, rcy, rz, rw, rh, f);
+                            if need == 0 {
+                                "☂範囲外 ".to_string() // 日本国外を表示中=1枚も取りに行っていない
+                            } else if got < need {
+                                format!("☂{} 読込{got}/{need} ", radar::frame_label(&radar_tl, radar_idx))
+                            } else {
+                                let follow = if radar_follow { "(追従)" } else { "" };
+                                format!("☂{}{follow} ", radar::frame_label(&radar_tl, radar_idx))
+                            }
+                        }
+                    }
+                };
                 // 一時メッセージが無い時は底面にロゴを常時表示。メッセージ発生時はそちらを優先。
                 let msg = if addr.is_empty() { "◉╌╌╌► termmap · terminal touring map   ".to_string() } else { format!("» {addr} « ") };
                 // 下部バーは細く。全操作は Space メニューから選べる
                 let route_hint = if wps.is_empty() { "v=地点を置く".to_string() } else { format!("{}点 v足す w/s選択(操作行までEnterで実行) Tab=左の一覧へ(並替/操作)", wps.len()) };
-                let base = format!(" {spinner}{msg}{live}{playing}z{z} {lat:.4},{lon:.4} ｜ {route_hint} ｜ Space:メニュー ?ヘルプ q終了");
+                let base = format!(" {spinner}{msg}{live}{playing}{radar_txt}z{z} {lat:.4},{lon:.4} ｜ {route_hint} ｜ Space:メニュー ?ヘルプ q終了");
                 match &route_note { Some(rn) => format!("{base} | {rn} "), None => base }
             }
         };
@@ -1317,6 +1388,24 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 Err(TryRecvError::Disconnected) => { street_job = None; got_result = true; }
             }
         }
+        // 雨雲レーダーの時刻一覧(5分ごと)。届いていれば最新の1件だけを採用する。
+        // targetTimes は更新のたびに basetime が動き、古いコマは JMA 側から消えるため、
+        // 表示位置は index でなく直前に見ていた validtime を基準に取り直す(reanchor)。
+        if let Some(rc) = &radar_clock {
+            let mut latest: Option<radar::Timeline> = None;
+            while let Ok(tl) = rc.rx.try_recv() { latest = Some(tl); }
+            if let Some(tl) = latest {
+                let prev_vt = radar_tl.get(radar_idx).map(|f| f.validtime.clone());
+                let (idx, follow, msg) = tl.reanchor(prev_vt.as_deref(), radar_follow);
+                radar_tl = tl;
+                radar_idx = idx;
+                radar_follow = follow;
+                if let Some(m) = msg { addr = format!("雨雲: {m}"); }
+                // 一覧から消えたコマのタイルはもう取得できない。キャッシュと取得キューから捨てる。
+                loader.drop_radar_frames_except(&radar_tl.frames);
+                got_result = true;
+            }
+        }
         if recommend_job.is_some() {
             match recommend_job.as_ref().unwrap().try_recv() {
                 Ok(res) => {
@@ -1344,7 +1433,8 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         // is_busy()に加えgenerationのスナップショット比較も見る(#53): このフレームの再構築後、
         // is_busy()を読むまでの間に最後の1枚がちょうど着地しinflightが空になっていた場合、
         // is_busy()だけではその1枚の反映漏れを検知できずread()でブロックしてしまうため。
-        let polling = route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some() || wander_job.is_some() || gps_rx.is_some() || play.is_some() || settling || loader.is_busy() || loader.generation() != loader_gen_snapshot;
+        let polling = route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some() || wander_job.is_some() || gps_rx.is_some() || play.is_some() || settling || loader.is_busy() || loader.generation() != loader_gen_snapshot
+            || radar_clock.is_some(); // 雨雲: 背景ポーラーからの時刻一覧を取りこぼさない
         let mut ev: Option<Event> = if got_result {
             None
         } else if polling {
@@ -2237,6 +2327,37 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                 show_elev = !show_elev;
                                 if show_elev && (spec.routes.is_empty() || !route_ele.iter().any(|&z| z != 0.0)) { addr = "標高: ルート確定後に表示".into(); }
                             }
+                            KeyCode::Char('C') => { // 雨雲レーダー(気象庁ナウキャスト)の表示/非表示
+                                if radar_on {
+                                    radar_on = false;
+                                    // 背景ポーラーを止める(取得済みタイルはキャッシュに残す=すぐ再表示できる)。
+                                    // RadarClock の drop はスレッドを join するため、取得中(HTTPは最大20秒)に
+                                    // ここで drop すると入力が固まる。停止フラグは drop 側で即座に立つので、
+                                    // join だけを別スレッドへ逃がしてUIを待たせない。
+                                    if let Some(rc) = radar_clock.take() { std::thread::spawn(move || drop(rc)); }
+                                    addr = "雨雲レーダー: OFF".into();
+                                } else {
+                                    radar_turn_on!();
+                                }
+                            }
+                            KeyCode::Char('>') => { // 表示時刻を未来へ1コマ(OFFなら発見しやすさのためONにする)
+                                if !radar_on {
+                                    radar_turn_on!();
+                                } else if !radar_tl.is_empty() {
+                                    radar_idx = (radar_idx + 1).min(radar_tl.frames.len() - 1); // 折り返さない
+                                    // 「現在」ちょうどに戻ったら追従モードへ復帰、それより未来なら外れる。
+                                    if radar_idx == radar_tl.now_idx { radar_follow = true; }
+                                    else if radar_idx > radar_tl.now_idx { radar_follow = false; }
+                                    addr = format!("雨雲 {}", radar::frame_label(&radar_tl, radar_idx));
+                                }
+                            }
+                            KeyCode::Char('<') => { // 表示時刻を過去へ1コマ(OFFのときは何もしない=誤爆で勝手にONにしない)
+                                if radar_on && !radar_tl.is_empty() {
+                                    radar_idx = radar_idx.saturating_sub(1);
+                                    radar_follow = false;
+                                    addr = format!("雨雲 {}", radar::frame_label(&radar_tl, radar_idx));
+                                }
+                            }
                             KeyCode::Char('A') => run_action!(MenuAction::PlayRoute, lat, lon, cols, tr),
                             KeyCode::Char('G') => { // ライブ現在地(ブレッドクラム)の ON/OFF
                                 if gps_rx.is_some() { gps_rx = None; addr = "ライブ現在地: OFF".into(); }
@@ -2333,6 +2454,9 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             _ => {}
         }
     }
+    // 雨雲の背景ポーラーは drop でスレッドを join する。終了時にちょうど取得中だと、その分
+    // (HTTPは最大20秒)終了が固まって見えるので join を別スレッドへ逃がす(プロセス終了で消える)。
+    if let Some(rc) = radar_clock.take() { std::thread::spawn(move || drop(rc)); }
     let (lat, lon) = pixel_to_deg(cx, cy, z);
     save_state(lat, lon, z, &opts.style, &wps, &mode); // 終了時の位置とルートを --resume 用に保存
     Ok(())

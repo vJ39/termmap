@@ -16,53 +16,115 @@ fn tile_cache_path(style: &str, z: u32, x: i64, y: i64) -> Option<PathBuf> {
 }
 
 // タイルの取得元。従来 TileKey.style: String が持っていた「どのタイル群か」の軸を型にする。
-// 今は地図タイル(Base)だけだが、将来ここに Radar { basetime, validtime }(気象庁ナウキャスト)を
-// 足す前提。地図スタイルと雨雲フレームは直交する軸なので String 1本には押し込めない。
+// 地図スタイル(Base)と雨雲フレーム(Radar)は直交する軸なので String 1本には押し込めない。
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum TileSource {
     // 通常の地図タイル。値は "osm" / "voyager" / "dark" / "light" / "topo"。
     Base(String),
+    // 気象庁ナウキャスト(降水)の1コマ。basetime=発表時刻 / validtime=対象時刻(いずれもUTCの14桁)。
+    // 文字列は radar.rs が JMA の応答から取り出したものをそのまま持つ(URLのパス要素に直接使う)。
+    Radar { basetime: String, validtime: String },
 }
 
 impl TileSource {
     // 取得元のタイルURL。
     fn url(&self, z: u32, x: i64, y: i64) -> String {
-        match self { TileSource::Base(style) => tile_url(style, z, x, y) }
+        match self {
+            TileSource::Base(style) => tile_url(style, z, x, y),
+            TileSource::Radar { basetime, validtime } => radar_tile_url(basetime, validtime, z, x, y),
+        }
     }
     // ディスクキャッシュ先のパス(保存しない取得元では None)。
     fn cache_path(&self, z: u32, x: i64, y: i64) -> Option<PathBuf> {
-        match self { TileSource::Base(style) => tile_cache_path(style, z, x, y) }
+        match self {
+            TileSource::Base(style) => tile_cache_path(style, z, x, y),
+            // 雨雲タイルはディスクに保存しない。パスに basetime/validtime が入るためヒット率が
+            // ほぼゼロで書き捨てのファイルが無限に積み上がるうえ、30日TTLで期限内と判断された
+            // 古い降水がそのまま地図に描かれる危険がある(ツーリング用途では実害)。
+            TileSource::Radar { .. } => None,
+        }
     }
+    // 雨雲タイルか(キャッシュ予算の分離判定に使う)。
+    fn is_radar(&self) -> bool { matches!(self, TileSource::Radar { .. }) }
 }
 
 // キャッシュキーは取得元(src)を含む(style違いのタイルが混ざらない。以前は clear() 頼みで危うかった)。
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct TileKey { src: TileSource, z: u32, x: i64, y: i64 }
 
-// タイルキャッシュ。上限(cap)超過時は最終アクセスが最古のものから捨てる簡易LRU。
+// 地図タイルのメモリ上限(枚)。従来の cap と同じ値(挙動を変えない)。
+const BASE_CACHE_CAP: usize = 256;
+// 雨雲タイルのメモリ上限(枚)。RGBA 256x256 = 256KB/枚 → 約48MB。1画面は概ね4〜9枚なので、
+// タイムラインを端から端までスクラブしても大半のコマがメモリに残る。
+const RADAR_CACHE_CAP: usize = 192;
+
+// タイルキャッシュ。上限超過時は最終アクセスが最古のものから捨てる簡易LRU。
 // 長時間パンし続けてもメモリが訪問範囲に比例して無制限に増えないようにする。
-// 値は RGBA で持つ(将来の半透明タイル用。地図タイルは alpha=255 の不透明画像として入る)。
-pub struct Cache { map: HashMap<TileKey, (RgbaImage, u64)>, tick: u64, cap: usize }
+// 値は RGBA で持つ(雨雲タイルの透過を落とさないため。地図タイルは alpha=255 で入る)。
+//
+// 予算(LRU)は取得元の種別ごとに分ける。1つのHashMapに混ぜると、雨雲のタイムラインを端から端まで
+// スクラブした瞬間に雨雲タイルが地図タイルを全部追い出し、地図が LOADING だらけになる。
+pub struct Cache {
+    base: HashMap<TileKey, (RgbaImage, u64)>,
+    radar: HashMap<TileKey, (RgbaImage, u64)>,
+    tick: u64,
+    base_cap: usize,
+    radar_cap: usize,
+}
 
 impl Default for Cache { fn default() -> Self { Self::new() } }
 
 impl Cache {
-    pub fn new() -> Self { Cache { map: HashMap::new(), tick: 0, cap: 256 } }
-    fn contains(&self, k: &TileKey) -> bool { self.map.contains_key(k) }
+    pub fn new() -> Self {
+        Cache { base: HashMap::new(), radar: HashMap::new(), tick: 0, base_cap: BASE_CACHE_CAP, radar_cap: RADAR_CACHE_CAP }
+    }
+    // このキーが属する側のマップ(読み取り)。
+    fn bucket(&self, k: &TileKey) -> &HashMap<TileKey, (RgbaImage, u64)> {
+        if k.src.is_radar() { &self.radar } else { &self.base }
+    }
+    // このキーが属する側のマップ(書き込み)と、その予算。
+    fn bucket_mut(&mut self, k: &TileKey) -> (&mut HashMap<TileKey, (RgbaImage, u64)>, usize) {
+        if k.src.is_radar() {
+            let cap = self.radar_cap;
+            (&mut self.radar, cap)
+        } else {
+            let cap = self.base_cap;
+            (&mut self.base, cap)
+        }
+    }
+    fn contains(&self, k: &TileKey) -> bool { self.bucket(k).contains_key(k) }
     fn get(&mut self, k: &TileKey) -> Option<&RgbaImage> {
         self.tick += 1;
         let t = self.tick;
-        match self.map.get_mut(k) { Some(e) => { e.1 = t; Some(&e.0) } None => None }
+        let (m, _) = self.bucket_mut(k);
+        match m.get_mut(k) { Some(e) => { e.1 = t; Some(&e.0) } None => None }
     }
     fn insert(&mut self, k: TileKey, img: RgbaImage) {
-        if self.map.len() >= self.cap && !self.map.contains_key(&k) {
-            if let Some(old) = self.map.iter().min_by_key(|(_, (_, t))| *t).map(|(kk, _)| kk.clone()) {
-                self.map.remove(&old); // 最古を1つ退避
-            }
-        }
         self.tick += 1;
         let t = self.tick;
-        self.map.insert(k, (img, t));
+        let (m, cap) = self.bucket_mut(&k);
+        if m.len() >= cap && !m.contains_key(&k) {
+            if let Some(old) = m.iter().min_by_key(|(_, (_, t))| *t).map(|(kk, _)| kk.clone()) {
+                m.remove(&old); // 最古を1つ退避
+            }
+        }
+        m.insert(k, (img, t));
+    }
+    // keep に含まれないフレームの雨雲タイルを捨てる。targetTimes が更新されると古い basetime の
+    // タイルは JMA 側から消えて二度と使えないため、放置するとLRUが「もう絶対に使わないタイル」で
+    // 埋まる。地図タイル側には触れない。
+    fn retain_radar_frames(&mut self, keep: &[crate::radar::Frame]) {
+        self.radar.retain(|k, _| radar_key_is_kept(k, keep));
+    }
+}
+
+// keep(新しいフレーム一覧)に残すべきキーか。コマの同一性は basetime と validtime の両方で決まる。
+// 雨雲以外(地図タイル)は判定対象外なので常に残す。ネットワークにも状態にも触れない純粋関数。
+fn radar_key_is_kept(k: &TileKey, keep: &[crate::radar::Frame]) -> bool {
+    match &k.src {
+        TileSource::Radar { basetime, validtime } =>
+            keep.iter().any(|f| &f.basetime == basetime && &f.validtime == validtime),
+        _ => true,
     }
 }
 
@@ -77,6 +139,16 @@ fn tile_url(style: &str, z: u32, x: i64, y: i64) -> String {
         _         => format!("https://tile.openstreetmap.org/{z}/{x}/{y}.png"),
     }
 }
+// 気象庁ナウキャスト(降水)のタイルURL。背景透過PNGで、降水なしの領域は透明で返る。
+// 非公式エンドポイント(開発者向けAPIとして文書化されていない)なので、URL構築はここと
+// radar.rs の targetTimes 定数の2箇所だけに閉じる(壊れたら1箇所直せば済む)。
+// basetime/validtime は radar.rs 側で「ASCII数字のみ」の検証を通ったものだけが渡る。
+// どのz/x/yでもHTTP 200が返る(404は無い)。中身が入っているズームは限られるので、
+// 要求するズームの決定は radar_source_zoom が行う。
+fn radar_tile_url(basetime: &str, validtime: &str, z: u32, x: i64, y: i64) -> String {
+    format!("https://www.jma.go.jp/bosai/jmatile/data/nowc/{basetime}/none/{validtime}/surf/hrpns/{z}/{x}/{y}.png")
+}
+
 // ディスクキャッシュの有効期限。タイル自体は滅多に変わらないが、無期限だと地図更新(新道路等)が
 // 反映されないため30日で区切る。期限切れは「無かった」扱いにしてネットワークから取り直す。
 const TILE_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 60 * 60);
@@ -319,6 +391,17 @@ impl TileLoader {
         let mut p = self.pending.lock().unwrap();
         p.queued.clear();
     }
+
+    // targetTimes 更新時に呼ぶ。新しいフレーム一覧(keep)に含まれない雨雲タイルを、メモリキャッシュ
+    // からも未着手の取得依頼からも捨てる。古い basetime のタイルは JMA 側から消えており二度と
+    // 使えないため、残すとLRUと取得キューが「もう絶対に使わないタイル」で埋まる。
+    // inflight は取得完了で自然に外れるのでそのまま流す(結果はキャッシュに入るが次回の掃除で落ちる)。
+    pub fn drop_radar_frames_except(&self, keep: &[crate::radar::Frame]) {
+        self.shared.lock().unwrap().retain_radar_frames(keep);
+        let mut p = self.pending.lock().unwrap();
+        p.queued.retain(|k| radar_key_is_kept(k, keep));
+        p.failed.retain(|k, _| radar_key_is_kept(k, keep));
+    }
 }
 
 impl Drop for TileLoader {
@@ -497,6 +580,143 @@ pub fn build_window_nowait(cx: f64, cy: f64, z: u32, win_w: u32, win_h: u32, sty
     let crop_x = (left - tx_min as f64 * tf).max(0.0) as u32;
     let crop_y = (top - ty_min as f64 * tf).max(0.0) as u32;
     Ok(image::imageops::crop_imm(&canvas, crop_x, crop_y, win_w, win_h).to_image())
+}
+
+// ---- 雨雲レーダー(気象庁ナウキャスト)レイヤ ----
+
+// 降水ナウキャストのタイルは「偶数ズームの z4〜z10」にしか中身が無い。
+// 奇数ズーム(z5/z7/z9…)と z11 以上は HTTP 200 で返るが全透明の空PNG(334バイト)で、
+// これは実際に降っている場所でも同じ(2026/08/14 実測: 埼玉・ときがわ 8.0mm/10min の地点で
+// z6/z8/z10 は 2〜4KB、z5/z7/z9/z11/z12 はいずれも 334バイト。他2地点でも同じ並び)。
+// したがって要求ズームをそのまま投げると、ツーリングで常用する z11 以上では雨雲が一切出ない。
+// データのあるズームで取得し、表示ズームへ最近傍で拡大して重ねる(元が250mメッシュの粗い面
+// データなので、拡大でぼやけても情報は失われない)。
+const RADAR_DATA_MIN_Z: u32 = 4;
+const RADAR_DATA_MAX_Z: u32 = 10;
+
+// 表示ズーム z に対して、実際にタイルを取りに行くズーム。
+// z4未満(日本全体が画面に収まらない広域)は None = 雨雲を出さない。ここで z4 のタイルへ
+// 引き上げてしまうと、世界全体の窓に対して z4 のタイルを何百枚も要求することになるため。
+fn radar_source_zoom(z: u32) -> Option<u32> {
+    if z < RADAR_DATA_MIN_Z { return None; }
+    let sz = z.min(RADAR_DATA_MAX_Z);
+    Some(sz - (sz % 2)) // 偶数へ切り下げ
+}
+
+// 雨雲レイヤ1枚ぶんのタイル配置。build_radar_window_nowait と radar_progress で
+// タイル列挙のジオメトリを二重管理しない(ズレ防止)ため純粋関数に切り出す。
+// tiles = (取得するタイルのキー, 折り返し前のタイルx, タイルy)。x は経度方向の折り返し前の値を
+// 保持する(キーは折り返し後・表示位置の計算は折り返し前を使うため)。
+struct RadarLayout {
+    tiles: Vec<(TileKey, i64, i64)>,
+    scale: f64,      // 表示px / ソースpx = 2^(z - source_z)
+    left: f64, top: f64, // 表示ズームでの窓左上のグローバルpx
+}
+
+impl RadarLayout {
+    // ソースタイル(tx,ty)が覆う表示座標の矩形 [x0,x1) × [y0,y1)(窓内にクリップ済み)。
+    // 表示画素 d の中心は「表示グローバルpx = left + d + 0.5」、その位置のソースpx は /scale。
+    fn dest_rect(&self, tx: i64, ty: i64, win_w: u32, win_h: u32) -> (u32, u32, u32, u32) {
+        let tf = TILE as f64;
+        let span = |t: i64, origin: f64, limit: u32| -> (u32, u32) {
+            let a = ((t as f64 * tf) * self.scale - origin - 0.5).ceil();
+            let b = (((t + 1) as f64 * tf) * self.scale - origin - 0.5).ceil();
+            let a = a.max(0.0).min(limit as f64) as u32;
+            let b = b.max(0.0).min(limit as f64) as u32;
+            (a, b)
+        };
+        let (x0, x1) = span(tx, self.left, win_w);
+        let (y0, y1) = span(ty, self.top, win_h);
+        (x0, x1, y0, y1)
+    }
+}
+
+// 窓(中心cx,cy グローバルpx / win_w×win_h・表示ズームz)に対して、どのタイルをどう貼るかを決める。
+// 視野がナウキャストの提供範囲(日本)に全くかからない場合、および広域すぎる場合は None を返す
+// = 1枚もリクエストしない(公共サービスへの無駄打ちを避ける)。
+fn radar_layout(cx: f64, cy: f64, z: u32, win_w: u32, win_h: u32, frame: &crate::radar::Frame) -> Option<RadarLayout> {
+    let sz = radar_source_zoom(z)?;
+    let tf = TILE as f64;
+    let left = cx - win_w as f64 / 2.0;
+    let top = cy - win_h as f64 / 2.0;
+    // 窓の対角2隅の緯度経度で圏域判定する(海外を表示しているときに無駄打ちしない)。
+    let (lat_top, lon_left) = pixel_to_deg(left, top, z);
+    let (lat_bottom, lon_right) = pixel_to_deg(left + win_w as f64, top + win_h as f64, z);
+    if !crate::radar::covers_japan(lat_bottom, lon_left, lat_top, lon_right) { return None; }
+
+    let scale = 2f64.powi(z as i32 - sz as i32);
+    // ソースズームでの窓範囲 → タイル範囲
+    let (s_left, s_top) = (left / scale, top / scale);
+    let (s_right, s_bottom) = ((left + win_w as f64) / scale, (top + win_h as f64) / scale);
+    let tx_min = (s_left / tf).floor() as i64;
+    let tx_max = ((s_right - 1e-9) / tf).floor() as i64;
+    let ty_min = (s_top / tf).floor() as i64;
+    let ty_max = ((s_bottom - 1e-9) / tf).floor() as i64;
+    let max_t = 2i64.pow(sz);
+    let src = TileSource::Radar { basetime: frame.basetime.clone(), validtime: frame.validtime.clone() };
+    let mut tiles = Vec::new();
+    for ty in ty_min..=ty_max {
+        if ty < 0 || ty >= max_t { continue; } // 世界の上下端の外はタイルが存在しない
+        for tx in tx_min..=tx_max {
+            let wx = ((tx % max_t) + max_t) % max_t; // 経度方向は一周ぶんで折り返す
+            tiles.push((TileKey { src: src.clone(), z: sz, x: wx, y: ty }, tx, ty));
+        }
+    }
+    Some(RadarLayout { tiles, scale, left, top })
+}
+
+// 雨雲レイヤの窓を組む(非ブロッキング)。取得済みタイルだけを貼り、未取得タイルの領域は
+// 「全透明」のまま返す。グレーのプレースホルダーも LOADING 透かしも描かない: このレイヤの下には
+// 既に地図が描かれており、そこにグレーの箱や文字を重ねると地図が読めなくなるため。
+// 読込中であることはステータス行(radar_progress の枚数)で伝える。
+// 視野が日本国外/広域すぎる場合は None(1枚もリクエストしない)。
+//
+// データのあるズーム(偶数z4〜z10)で取得したタイルを、表示ズームへ最近傍で拡大しながら
+// 表示画素へ直接書く。中間の巨大キャンバスを作らないので、拡大率が大きくても
+// 確保するのは出力サイズぶんだけで済み、位置ズレも生じない。
+pub fn build_radar_window_nowait(
+    cx: f64, cy: f64, z: u32, win_w: u32, win_h: u32,
+    frame: &crate::radar::Frame, loader: &TileLoader,
+) -> Option<RgbaImage> {
+    let layout = radar_layout(cx, cy, z, win_w, win_h, frame)?;
+    let tf = TILE as f64;
+    let mut canvas = RgbaImage::from_pixel(win_w, win_h, image::Rgba([0, 0, 0, 0]));
+    // cacheロックは1回だけ取り、描画/欠落判定をまとめて行いすぐ離す。
+    let mut missing: Vec<TileKey> = Vec::new();
+    {
+        let mut cache = loader.shared.lock().unwrap();
+        for (key, tx, ty) in &layout.tiles {
+            let (x0, x1, y0, y1) = layout.dest_rect(*tx, *ty, win_w, win_h);
+            let Some(t) = cache.get(key) else { missing.push(key.clone()); continue };
+            let (iw, ih) = t.dimensions();
+            if iw == 0 || ih == 0 { continue; }
+            // タイル左上のソースpx。ここからの相対位置で元画素を引く。
+            let (tsx, tsy) = (*tx as f64 * tf, *ty as f64 * tf);
+            for dy in y0..y1 {
+                let sy = ((layout.top + dy as f64 + 0.5) / layout.scale - tsy).floor();
+                let py = (sy.max(0.0) as u32).min(ih - 1);
+                for dx in x0..x1 {
+                    let sx = ((layout.left + dx as f64 + 0.5) / layout.scale - tsx).floor();
+                    let px = (sx.max(0.0) as u32).min(iw - 1);
+                    canvas.put_pixel(dx, dy, *t.get_pixel(px, py));
+                }
+            }
+        }
+    }
+    // 取得依頼はcacheロック解放後にまとめて登録(二重登録・失敗クールダウンはローダー側で弾く)。
+    if !missing.is_empty() { loader.request_tiles(missing); }
+    Some(canvas)
+}
+
+// 表示中フレームの読込進捗(ステータス行用)。(取得済み枚数, 必要枚数)。
+// 視野が日本国外/広域すぎる場合は (0, 0) を返す = 呼び出し側はこれを「範囲外」の表示に使う
+// (圏内なら窓は必ず1枚以上のタイルを覆うので、必要枚数0にはならない)。
+pub fn radar_progress(loader: &TileLoader, cx: f64, cy: f64, z: u32,
+                      win_w: u32, win_h: u32, frame: &crate::radar::Frame) -> (usize, usize) {
+    let Some(layout) = radar_layout(cx, cy, z, win_w, win_h, frame) else { return (0, 0) };
+    let cache = loader.shared.lock().unwrap();
+    let got = layout.tiles.iter().filter(|(k, _, _)| cache.contains(k)).count();
+    (got, layout.tiles.len())
 }
 
 #[cfg(test)]
@@ -679,13 +899,345 @@ mod tests {
     #[test]
     fn cache_evicts_oldest_over_cap() {
         let mut cache = Cache::new();
-        let cap = cache.cap;
+        let cap = cache.base_cap;
         let key = |i: i64| TileKey { src: TileSource::Base("osm".to_string()), z: 5, x: i, y: 0 };
         for i in 0..cap as i64 { cache.insert(key(i), RgbaImage::from_pixel(1, 1, image::Rgba([0, 0, 0, 255]))); }
         assert!(cache.contains(&key(0)));
         cache.insert(key(cap as i64), RgbaImage::from_pixel(1, 1, image::Rgba([0, 0, 0, 255])));
         assert!(!cache.contains(&key(0)), "最古のエントリが退避されていない");
         assert!(cache.contains(&key(cap as i64)));
+    }
+
+    // ---- 雨雲レーダー ----
+
+    fn radar_frame(basetime: &str, validtime: &str) -> crate::radar::Frame {
+        crate::radar::Frame {
+            basetime: basetime.to_string(),
+            validtime: validtime.to_string(),
+            kind: crate::radar::FrameKind::Observed,
+        }
+    }
+    fn radar_key(basetime: &str, validtime: &str, x: i64) -> TileKey {
+        TileKey { src: TileSource::Radar { basetime: basetime.to_string(), validtime: validtime.to_string() }, z: 10, x, y: 0 }
+    }
+    fn px(v: u8) -> RgbaImage { RgbaImage::from_pixel(1, 1, image::Rgba([v, v, v, 255])) }
+    // 東京(35.68,139.76)を中心にした窓のグローバルpx。
+    fn tokyo_center(z: u32) -> (f64, f64) { deg_to_pixel(35.68, 139.76, z) }
+
+    // 雨雲タイルのURLは JMA ナウキャストの形式で、basetime/validtime が正しい位置に入る。
+    #[test]
+    fn radar_tile_url_has_basetime_and_validtime_in_place() {
+        let src = TileSource::Radar { basetime: "20260814125500".into(), validtime: "20260814131000".into() };
+        assert_eq!(
+            src.url(10, 909, 403),
+            "https://www.jma.go.jp/bosai/jmatile/data/nowc/20260814125500/none/20260814131000/surf/hrpns/10/909/403.png"
+        );
+    }
+
+    // 雨雲タイルはディスクキャッシュに乗せない(basetime入りでヒットせず、TTLで古い雨を出す危険)。
+    #[test]
+    fn radar_tiles_are_not_disk_cached() {
+        let src = TileSource::Radar { basetime: "20260814125500".into(), validtime: "20260814125500".into() };
+        assert!(src.cache_path(10, 1, 2).is_none());
+        assert!(src.is_radar());
+        assert!(!TileSource::Base("osm".to_string()).is_radar());
+    }
+
+    // basetime/validtime が違えば別エントリ(コマを跨いでタイルが混ざらない)。
+    #[test]
+    fn cache_key_separates_radar_frames() {
+        let mut cache = Cache::new();
+        let a = radar_key("20260814125500", "20260814125500", 1);
+        let b = radar_key("20260814125500", "20260814130000", 1); // validtime違い
+        let c = radar_key("20260814125000", "20260814125500", 1); // basetime違い
+        cache.insert(a.clone(), px(1));
+        assert!(cache.contains(&a));
+        assert!(!cache.contains(&b));
+        assert!(!cache.contains(&c));
+    }
+
+    // 種別ごとにLRU予算が独立している: 雨雲を上限いっぱい投入しても地図タイルは落ちない。
+    #[test]
+    fn cache_budgets_are_independent_per_source() {
+        let mut cache = Cache::new();
+        let base = TileKey { src: TileSource::Base("osm".to_string()), z: 5, x: 0, y: 0 };
+        cache.insert(base.clone(), px(9));
+        for i in 0..(cache.radar_cap as i64 * 2) {
+            cache.insert(radar_key("20260814125500", "20260814125500", i), px(1));
+        }
+        assert!(cache.contains(&base), "雨雲の大量投入で地図タイルが追い出された");
+        // 雨雲側は自分の予算内に収まっている。
+        assert!(cache.radar.len() <= cache.radar_cap);
+    }
+
+    // retain_radar_frames: 新しい一覧に無いコマだけ捨て、残るコマと地図タイルには触れない。
+    #[test]
+    fn retain_radar_frames_drops_only_stale_frames() {
+        let mut cache = Cache::new();
+        let base = TileKey { src: TileSource::Base("osm".to_string()), z: 5, x: 0, y: 0 };
+        let keep = radar_key("20260814130000", "20260814130000", 1);
+        let stale = radar_key("20260814125500", "20260814125500", 1);
+        cache.insert(base.clone(), px(9));
+        cache.insert(keep.clone(), px(1));
+        cache.insert(stale.clone(), px(2));
+        cache.retain_radar_frames(&[radar_frame("20260814130000", "20260814130000")]);
+        assert!(cache.contains(&keep));
+        assert!(!cache.contains(&stale));
+        assert!(cache.contains(&base), "地図タイルを巻き込んで捨てている");
+    }
+
+    // 空の keep(異常系)でも雨雲だけが全消しになり、地図タイルは残る。
+    #[test]
+    fn retain_radar_frames_with_empty_keep_clears_radar_only() {
+        let mut cache = Cache::new();
+        let base = TileKey { src: TileSource::Base("osm".to_string()), z: 5, x: 0, y: 0 };
+        let r = radar_key("20260814125500", "20260814125500", 1);
+        cache.insert(base.clone(), px(9));
+        cache.insert(r.clone(), px(1));
+        cache.retain_radar_frames(&[]);
+        assert!(!cache.contains(&r));
+        assert!(cache.contains(&base));
+    }
+
+    // 日本国外(ハワイ)の視野では1枚も要求しない = レイアウトが None。
+    #[test]
+    fn radar_layout_is_none_outside_japan() {
+        let z = 10u32;
+        let (cx, cy) = deg_to_pixel(21.3, -157.8, z); // ホノルル
+        assert!(radar_layout(cx, cy, z, 256, 256, &radar_frame("20260814125500", "20260814125500")).is_none());
+    }
+
+    // 取得ズームの決定: データがあるのは偶数ズームの z4〜z10 だけ。奇数/z11以上は切り下げ、
+    // z4未満は None(広域では雨雲を出さない = z4タイルを何百枚も要求しない)。
+    #[test]
+    fn radar_source_zoom_snaps_to_even_zoom_up_to_ten() {
+        assert_eq!(radar_source_zoom(0), None);
+        assert_eq!(radar_source_zoom(3), None);
+        assert_eq!(radar_source_zoom(4), Some(4));
+        assert_eq!(radar_source_zoom(5), Some(4));
+        assert_eq!(radar_source_zoom(6), Some(6));
+        assert_eq!(radar_source_zoom(9), Some(8));
+        assert_eq!(radar_source_zoom(10), Some(10));
+        assert_eq!(radar_source_zoom(11), Some(10));
+        assert_eq!(radar_source_zoom(16), Some(10));
+        assert_eq!(radar_source_zoom(19), Some(10));
+    }
+
+    // 広域(z4未満)では日本が視野に入っていても1枚も要求しない。
+    #[test]
+    fn radar_layout_is_none_on_very_wide_view() {
+        let (cx, cy) = tokyo_center(3);
+        assert!(radar_layout(cx, cy, 3, 300, 200, &radar_frame("20260814125500", "20260814125500")).is_none());
+    }
+
+    // 日本国内なら窓を覆うタイルが列挙され、キーのズームは取得ズーム(偶数z4〜z10)になる。
+    #[test]
+    fn radar_layout_covers_window_inside_japan() {
+        let z = 10u32;
+        let (cx, cy) = tokyo_center(z);
+        let lay = radar_layout(cx, cy, z, 300, 200, &radar_frame("20260814125500", "20260814125500")).unwrap();
+        assert!(!lay.tiles.is_empty());
+        assert!(lay.tiles.iter().all(|(k, _, _)| matches!(k.src, TileSource::Radar { .. })));
+        assert!(lay.tiles.iter().all(|(k, _, _)| k.z == 10));
+        assert_eq!(lay.scale, 1.0);
+        // 深いズームでは取得ズームがz10に張り付き、必要タイル数はむしろ減る(拡大表示するため)。
+        let (dcx, dcy) = tokyo_center(16);
+        let deep = radar_layout(dcx, dcy, 16, 300, 200, &radar_frame("20260814125500", "20260814125500")).unwrap();
+        assert!(deep.tiles.iter().all(|(k, _, _)| k.z == 10));
+        assert_eq!(deep.scale, 64.0);
+        assert!(deep.tiles.len() <= lay.tiles.len(), "拡大表示なのにタイル数が増えている");
+    }
+
+    // 表示ズーム=取得ズームのとき、貼られる画素は同じ位置のタイル画素と1:1で一致する。
+    #[test]
+    fn build_radar_window_nowait_maps_pixels_one_to_one_at_source_zoom() {
+        let z = 10u32; // 取得ズームと同じ = 等倍
+        let frame = radar_frame("20260814125500", "20260814125500");
+        let (cx, cy) = tokyo_center(z);
+        let (tx, ty) = ((cx / TILE as f64).floor() as i64, (cy / TILE as f64).floor() as i64);
+        // 画素ごとに違う値を持つタイル(位置の対応が崩れたら検出できる)
+        let mut tile = RgbaImage::new(TILE, TILE);
+        for (x, y, p) in tile.enumerate_pixels_mut() { *p = image::Rgba([x as u8, y as u8, 0, 255]); }
+        let cache = Arc::new(Mutex::new(Cache::new()));
+        cache.lock().unwrap().insert(
+            TileKey { src: TileSource::Radar { basetime: frame.basetime.clone(), validtime: frame.validtime.clone() }, z, x: tx, y: ty },
+            tile,
+        );
+        let loader = TileLoader::start(Arc::clone(&cache));
+        // タイル左上から16px内側に窓の左上が来るように中心を置く
+        let ccx = tx as f64 * TILE as f64 + 16.0 + 8.0;
+        let ccy = ty as f64 * TILE as f64 + 32.0 + 8.0;
+        let img = build_radar_window_nowait(ccx, ccy, z, 16, 16, &frame, &loader).unwrap();
+        assert_eq!(img.dimensions(), (16, 16));
+        assert_eq!(*img.get_pixel(0, 0), image::Rgba([16, 32, 0, 255]));
+        assert_eq!(*img.get_pixel(1, 0), image::Rgba([17, 32, 0, 255]));
+        assert_eq!(*img.get_pixel(0, 1), image::Rgba([16, 33, 0, 255]));
+        assert_eq!(*img.get_pixel(15, 15), image::Rgba([31, 47, 0, 255]));
+    }
+
+    // 表示ズームが取得ズームより深いときは、最近傍で拡大される(1ソース画素が scale×scale の塊になる)。
+    #[test]
+    fn build_radar_window_nowait_magnifies_when_zoomed_in() {
+        let z = 12u32; // 取得はz10 → scale=4
+        let frame = radar_frame("20260814125500", "20260814125500");
+        let (cx, cy) = tokyo_center(z);
+        let (stx, sty) = ((cx / 4.0 / TILE as f64).floor() as i64, (cy / 4.0 / TILE as f64).floor() as i64);
+        let mut tile = RgbaImage::new(TILE, TILE);
+        for (x, y, p) in tile.enumerate_pixels_mut() { *p = image::Rgba([x as u8, y as u8, 0, 255]); }
+        let cache = Arc::new(Mutex::new(Cache::new()));
+        cache.lock().unwrap().insert(
+            TileKey { src: TileSource::Radar { basetime: frame.basetime.clone(), validtime: frame.validtime.clone() }, z: 10, x: stx, y: sty },
+            tile,
+        );
+        let loader = TileLoader::start(Arc::clone(&cache));
+        // 表示ズームでの窓左上が、ソースタイル内の (10, 20) px ちょうどに来るように中心を置く。
+        let ccx = (stx as f64 * TILE as f64 + 10.0) * 4.0 + 8.0;
+        let ccy = (sty as f64 * TILE as f64 + 20.0) * 4.0 + 8.0;
+        let img = build_radar_window_nowait(ccx, ccy, z, 16, 16, &frame, &loader).unwrap();
+        // 左上4x4は全てソース(10,20)、その右隣4x4は(11,20)。
+        for dy in 0..4 { for dx in 0..4 {
+            assert_eq!(*img.get_pixel(dx, dy), image::Rgba([10, 20, 0, 255]), "({dx},{dy})");
+        }}
+        assert_eq!(*img.get_pixel(4, 0), image::Rgba([11, 20, 0, 255]));
+        assert_eq!(*img.get_pixel(0, 4), image::Rgba([10, 21, 0, 255]));
+        assert_eq!(*img.get_pixel(15, 15), image::Rgba([13, 23, 0, 255]));
+    }
+
+    // 未取得タイルの領域は「全透明」で返る(グレーの箱もLOADING透かしも描かない)。
+    // 必要タイルを事前に failed(クールダウン中)へ入れておき、テストが実際にJMAを叩かないようにする。
+    #[test]
+    fn build_radar_window_nowait_fills_missing_with_transparent() {
+        let z = 10u32;
+        let (cx, cy) = tokyo_center(z);
+        let cache = Arc::new(Mutex::new(Cache::new()));
+        let loader = TileLoader::start(Arc::clone(&cache));
+        let frame = radar_frame("20260814125500", "20260814125500");
+        {
+            let lay = radar_layout(cx, cy, z, 64, 64, &frame).unwrap();
+            let mut p = loader.pending.lock().unwrap();
+            for (k, _, _) in &lay.tiles { p.failed.insert(k.clone(), std::time::Instant::now()); }
+        }
+        let img = build_radar_window_nowait(cx, cy, z, 64, 64, &frame, &loader).unwrap();
+        assert_eq!(img.dimensions(), (64, 64));
+        assert!(img.pixels().all(|p| p[3] == 0), "未取得の領域が透明になっていない");
+        assert!(loader.pending.lock().unwrap().queued.is_empty(), "クールダウン中のタイルを再登録している");
+    }
+
+    // キャッシュ済みの雨雲タイルはアルファを保ったまま窓へ貼られる。
+    #[test]
+    fn build_radar_window_nowait_copies_cached_alpha() {
+        let z = 10u32;
+        let (cx, cy) = tokyo_center(z);
+        let (tx, ty) = ((cx / TILE as f64).floor() as i64, (cy / TILE as f64).floor() as i64);
+        let frame = radar_frame("20260814125500", "20260814125500");
+        let cache = Arc::new(Mutex::new(Cache::new()));
+        cache.lock().unwrap().insert(
+            TileKey { src: TileSource::Radar { basetime: frame.basetime.clone(), validtime: frame.validtime.clone() }, z, x: tx, y: ty },
+            RgbaImage::from_pixel(TILE, TILE, image::Rgba([10, 20, 30, 128])),
+        );
+        let loader = TileLoader::start(Arc::clone(&cache));
+        // タイル中心に窓を置き、1タイルの内側に収める(未取得タイルが混ざらない)。
+        let ccx = (tx as f64 + 0.5) * TILE as f64;
+        let ccy = (ty as f64 + 0.5) * TILE as f64;
+        let img = build_radar_window_nowait(ccx, ccy, z, 32, 32, &frame, &loader).unwrap();
+        assert!(img.pixels().all(|p| *p == image::Rgba([10, 20, 30, 128])));
+    }
+
+    // 同じ地点を別ズームで見たとき、窓の中心には同じ地理点(=同じソース画素)が来る。
+    // 拡大時に位置がずれていないこと(オフセットの取り違え)の回帰テスト。
+    #[test]
+    fn build_radar_window_nowait_center_is_same_place_across_zooms() {
+        let frame = radar_frame("20260814125500", "20260814125500");
+        let (lat, lon) = (35.99, 139.2067);
+        let (bx, by) = deg_to_pixel(lat, lon, 10);
+        let (stx, sty) = ((bx / TILE as f64).floor() as i64, (by / TILE as f64).floor() as i64);
+        let mut tile = RgbaImage::new(TILE, TILE);
+        for (x, y, p) in tile.enumerate_pixels_mut() { *p = image::Rgba([x as u8, y as u8, 0, 255]); }
+        let cache = Arc::new(Mutex::new(Cache::new()));
+        cache.lock().unwrap().insert(
+            TileKey { src: TileSource::Radar { basetime: frame.basetime.clone(), validtime: frame.validtime.clone() }, z: 10, x: stx, y: sty },
+            tile,
+        );
+        let loader = TileLoader::start(Arc::clone(&cache));
+        let center_px = |z: u32| -> image::Rgba<u8> {
+            let (cx, cy) = deg_to_pixel(lat, lon, z);
+            let img = build_radar_window_nowait(cx, cy, z, 16, 16, &frame, &loader).unwrap();
+            *img.get_pixel(8, 8)
+        };
+        let at10 = center_px(10);
+        assert_eq!(at10[3], 255, "z10でソース画素が引けていない");
+        // 等倍(z10)・4倍(z12)・64倍(z16)のいずれでも中心は同じ地理点を指す。
+        assert_eq!(center_px(12), at10);
+        assert_eq!(center_px(16), at10);
+        // 奇数ズーム(取得はz10へ切り下げ)でも同じ。
+        assert_eq!(center_px(13), at10);
+    }
+
+    // radar_progress: 圏外は(0,0)、圏内は必要枚数を返し、キャッシュに入るほど取得済みが増える。
+    #[test]
+    fn radar_progress_counts_cached_tiles() {
+        let z = 10u32;
+        let (cx, cy) = tokyo_center(z);
+        let frame = radar_frame("20260814125500", "20260814125500");
+        let cache = Arc::new(Mutex::new(Cache::new()));
+        let loader = TileLoader::start(Arc::clone(&cache));
+        let (got, need) = radar_progress(&loader, cx, cy, z, 300, 200, &frame);
+        assert_eq!(got, 0);
+        assert!(need >= 1);
+        // レイアウトが列挙するキーを1枚だけ入れると取得済みが1になる。
+        let lay = radar_layout(cx, cy, z, 300, 200, &frame).unwrap();
+        cache.lock().unwrap().insert(lay.tiles[0].0.clone(), RgbaImage::from_pixel(TILE, TILE, image::Rgba([0, 0, 0, 0])));
+        let (got2, need2) = radar_progress(&loader, cx, cy, z, 300, 200, &frame);
+        assert_eq!(got2, 1);
+        assert_eq!(need2, need);
+        // 圏外は (0,0)。
+        let (hcx, hcy) = deg_to_pixel(21.3, -157.8, z);
+        assert_eq!(radar_progress(&loader, hcx, hcy, z, 300, 200, &frame), (0, 0));
+    }
+
+    // 掃除対象の判定(純粋関数): 一覧に無い雨雲コマだけが false、残すコマと地図タイルは true。
+    #[test]
+    fn radar_key_is_kept_only_for_listed_frames() {
+        let keep = [radar_frame("20260814130000", "20260814130000")];
+        assert!(radar_key_is_kept(&radar_key("20260814130000", "20260814130000", 1), &keep));
+        assert!(!radar_key_is_kept(&radar_key("20260814125500", "20260814125500", 1), &keep));
+        // basetime だけ / validtime だけ一致でも残さない(コマの同一性は両方で決まる)。
+        assert!(!radar_key_is_kept(&radar_key("20260814130000", "20260814131000", 1), &keep));
+        assert!(!radar_key_is_kept(&radar_key("20260814125500", "20260814130000", 1), &keep));
+        // 地図タイルは keep が空でも常に残す。
+        let base = TileKey { src: TileSource::Base("osm".to_string()), z: 5, x: 0, y: 0 };
+        assert!(radar_key_is_kept(&base, &keep));
+        assert!(radar_key_is_kept(&base, &[]));
+    }
+
+    // TileLoader 経由の掃除: キャッシュと未着手キュー・失敗記録の全部から古いコマが消える。
+    // ワーカーが queued の中身を実際に取りに行かないよう、inflight を上限まで埋めてから積む
+    // (テストがJMAを叩かないようにするため。ダミーの inflight エントリは誰も fetch しない)。
+    #[test]
+    fn loader_drop_radar_frames_except_cleans_cache_and_pending() {
+        let cache = Arc::new(Mutex::new(Cache::new()));
+        let loader = TileLoader::start(Arc::clone(&cache));
+        let keep = radar_key("20260814130000", "20260814130000", 1);
+        let stale = radar_key("20260814125500", "20260814125500", 1);
+        cache.lock().unwrap().insert(keep.clone(), px(1));
+        cache.lock().unwrap().insert(stale.clone(), px(2));
+        {
+            let mut p = loader.pending.lock().unwrap();
+            for i in 0..LOADER_WORKERS as i64 {
+                p.inflight.insert(TileKey { src: TileSource::Base("osm".to_string()), z: 5, x: i, y: 99 });
+            }
+            p.queued.insert(stale.clone());
+            p.failed.insert(stale.clone(), std::time::Instant::now());
+        }
+        loader.drop_radar_frames_except(&[radar_frame("20260814130000", "20260814130000")]);
+        {
+            let c = cache.lock().unwrap();
+            assert!(c.contains(&keep));
+            assert!(!c.contains(&stale));
+        }
+        let p = loader.pending.lock().unwrap();
+        assert!(!p.queued.contains(&stale));
+        assert!(!p.failed.contains_key(&stale));
     }
 
     // build_window_nowait: キャッシュ済みタイル(RGBA)の画素が、そのままのRGB値で窓へ貼られる。

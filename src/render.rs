@@ -1,5 +1,5 @@
 // 端末描画 (halfblock/braille/edge/classify) と オーバーレイ(POI/経路/リング)の構築・合成
-use image::RgbImage;
+use image::{RgbImage, RgbaImage};
 use crate::geo::{deg_to_pixel, meters_per_pixel};
 
 fn lum(p: &image::Rgb<u8>) -> f64 { 0.299 * p[0] as f64 + 0.587 * p[1] as f64 + 0.114 * p[2] as f64 }
@@ -268,6 +268,27 @@ pub fn composite(img: &mut RgbImage, ov: &OverlayLayer) {
     }}
 }
 
+// 半透明レイヤ(雨雲など)を base の上に source-over 合成する。
+// a' = (src.a / 255) * opacity として out = base*(1-a') + src*a'。opacity は 0.0..=1.0 にクランプ。
+// 寸法が違う場合は重なる範囲だけ処理する(パニックしない)。
+// OverlayLayer(不透明1色インク)と違い、地図が下に透けて見えるのが要点。
+pub fn blend_rgba_over(base: &mut RgbImage, layer: &RgbaImage, opacity: f64) {
+    let op = opacity.clamp(0.0, 1.0);
+    if op <= 0.0 { return; }
+    let (bw, bh) = base.dimensions();
+    let (lw, lh) = layer.dimensions();
+    for y in 0..bh.min(lh) {
+        for x in 0..bw.min(lw) {
+            let s = layer.get_pixel(x, y);
+            let a = (s[3] as f64 / 255.0) * op;
+            if a <= 0.0 { continue; } // 降水なし(透明)の画素は地図をそのまま残す
+            let d = base.get_pixel(x, y);
+            let mix = |dv: u8, sv: u8| ((dv as f64) * (1.0 - a) + (sv as f64) * a).round().clamp(0.0, 255.0) as u8;
+            base.put_pixel(x, y, image::Rgb([mix(d[0], s[0]), mix(d[1], s[1]), mix(d[2], s[2])]));
+        }
+    }
+}
+
 // ---- インライン画像出力 (iTerm2 OSC 1337) ----
 // AA(ハーフブロック/braille)ではなく、端末のインライン画像プロトコルで実画像を表示する。
 
@@ -354,6 +375,84 @@ pub fn emit_iterm2_image<W: std::io::Write>(out: &mut W, rgb: &RgbImage, cell_w:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- blend_rgba_over(雨雲などの半透明レイヤ合成) ----
+
+    fn base_img(v: u8) -> RgbImage { RgbImage::from_pixel(4, 3, image::Rgb([v, v, v])) }
+
+    // alpha=0(降水なし)は地図をそのまま残す。
+    #[test]
+    fn blend_transparent_layer_leaves_base_unchanged() {
+        let mut b = base_img(100);
+        let l = RgbaImage::from_pixel(4, 3, image::Rgba([255, 0, 0, 0]));
+        blend_rgba_over(&mut b, &l, 1.0);
+        assert!(b.pixels().all(|p| *p == image::Rgb([100, 100, 100])));
+    }
+
+    // alpha=255 かつ opacity=1.0 は完全置換。
+    #[test]
+    fn blend_opaque_layer_at_full_opacity_replaces() {
+        let mut b = base_img(100);
+        let l = RgbaImage::from_pixel(4, 3, image::Rgba([10, 20, 30, 255]));
+        blend_rgba_over(&mut b, &l, 1.0);
+        assert!(b.pixels().all(|p| *p == image::Rgb([10, 20, 30])));
+    }
+
+    // opacity=0.5 は中間値(200 と 100 の中間=150)。
+    #[test]
+    fn blend_half_opacity_is_midpoint() {
+        let mut b = base_img(200);
+        let l = RgbaImage::from_pixel(4, 3, image::Rgba([100, 100, 100, 255]));
+        blend_rgba_over(&mut b, &l, 0.5);
+        assert!(b.pixels().all(|p| *p == image::Rgb([150, 150, 150])));
+    }
+
+    // レイヤのalphaとopacityは掛け合わされる(a'=0.5*0.5=0.25 → 200 と 0 で 150)。
+    #[test]
+    fn blend_multiplies_layer_alpha_and_opacity() {
+        let mut b = base_img(200);
+        let l = RgbaImage::from_pixel(1, 1, image::Rgba([0, 0, 0, 128]));
+        blend_rgba_over(&mut b, &l, 0.5);
+        // a' = (128/255)*0.5 ≒ 0.251 → 200*(1-0.251) ≒ 149.8 → 150
+        assert_eq!(*b.get_pixel(0, 0), image::Rgb([150, 150, 150]));
+        // レイヤ範囲外(1x1なので(1,0)以降)は変化しない。
+        assert_eq!(*b.get_pixel(1, 0), image::Rgb([200, 200, 200]));
+    }
+
+    // opacity=0 は何もしない。範囲外(負/1超)はクランプされる。
+    #[test]
+    fn blend_opacity_bounds() {
+        let l = RgbaImage::from_pixel(4, 3, image::Rgba([0, 0, 0, 255]));
+        let mut b = base_img(200);
+        blend_rgba_over(&mut b, &l, 0.0);
+        assert!(b.pixels().all(|p| *p == image::Rgb([200, 200, 200])));
+        blend_rgba_over(&mut b, &l, -5.0);
+        assert!(b.pixels().all(|p| *p == image::Rgb([200, 200, 200])));
+        blend_rgba_over(&mut b, &l, 9.0); // 1.0 として扱う=完全置換
+        assert!(b.pixels().all(|p| *p == image::Rgb([0, 0, 0])));
+    }
+
+    // 寸法が違ってもパニックせず、重なる範囲だけ処理する(レイヤが大きい/小さい両方)。
+    #[test]
+    fn blend_mismatched_dimensions_do_not_panic() {
+        let mut b = base_img(200); // 4x3
+        let big = RgbaImage::from_pixel(10, 10, image::Rgba([0, 0, 0, 255]));
+        blend_rgba_over(&mut b, &big, 1.0);
+        assert!(b.pixels().all(|p| *p == image::Rgb([0, 0, 0])));
+
+        let mut b2 = base_img(200);
+        let small = RgbaImage::from_pixel(2, 1, image::Rgba([0, 0, 0, 255]));
+        blend_rgba_over(&mut b2, &small, 1.0);
+        assert_eq!(*b2.get_pixel(0, 0), image::Rgb([0, 0, 0]));
+        assert_eq!(*b2.get_pixel(1, 0), image::Rgb([0, 0, 0]));
+        assert_eq!(*b2.get_pixel(2, 0), image::Rgb([200, 200, 200]));
+        assert_eq!(*b2.get_pixel(0, 1), image::Rgb([200, 200, 200]));
+
+        // 空レイヤでも安全。
+        let mut b3 = base_img(200);
+        blend_rgba_over(&mut b3, &RgbaImage::new(0, 0), 1.0);
+        assert!(b3.pixels().all(|p| *p == image::Rgb([200, 200, 200])));
+    }
 
     // xterm256の既知の代表色(黒/白/純色RGB)が期待indexへ変換されること。
     #[test]
