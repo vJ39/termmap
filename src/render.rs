@@ -224,9 +224,13 @@ pub fn draw_ring(ov: &mut OverlayLayer, cx: i32, cy: i32, radius: i32, color: [u
     }
 }
 // spec(緯度経度) を 表示画像座標へ射影して焼く。win_w/h=元画像寸法, scale=resize比, out_w/h=最終寸法。
+// radar は braille/edge 経路の雨雲インク(None なら従来と同じ)。最背面に最初に焼く。
 pub fn build_overlay(spec: &OverlaySpec, cx: f64, cy: f64, z: u32, win_w: u32, win_h: u32,
-                 scale_x: f64, scale_y: f64, out_w: u32, out_h: u32) -> OverlayLayer {
+                 scale_x: f64, scale_y: f64, out_w: u32, out_h: u32,
+                 radar: Option<RadarInk>) -> OverlayLayer {
     let mut ov = OverlayLayer::new(out_w, out_h);
+    // 雨雲(最背面)。リング/経路/道路/POI/スポットはこの後に描かれるので、常に雨雲より前面になる。
+    if let Some(r) = radar { ink_radar_into_overlay(&mut ov, r.layer, RADAR_INK_MIN_ALPHA, r.density); }
     let left = cx - win_w as f64 / 2.0;
     let top = cy - win_h as f64 / 2.0;
     let to_img = |lat: f64, lon: f64| -> (i32, i32) {
@@ -285,6 +289,43 @@ pub fn blend_rgba_over(base: &mut RgbImage, layer: &RgbaImage, opacity: f64) {
             let d = base.get_pixel(x, y);
             let mix = |dv: u8, sv: u8| ((dv as f64) * (1.0 - a) + (sv as f64) * a).round().clamp(0.0, 255.0) as u8;
             base.put_pixel(x, y, image::Rgb([mix(d[0], s[0]), mix(d[1], s[1]), mix(d[2], s[2])]));
+        }
+    }
+}
+
+// braille/edge 経路で雨雲を焼くときの指定。build_overlay へ渡す。
+// layer は build_radar_window_nowait が返す降水レイヤ(降水なし=透明)、density はディザの密度。
+pub struct RadarInk<'a> { pub layer: &'a RgbaImage, pub density: f64 }
+
+// インクを置く「降水あり」のアルファ下限。気象庁ナウキャストのタイルは降水域=不透明/降水なし=
+// 完全透明の2値(実測: 4bitパレット+tRNS。透明indexのalphaが0、降水色は全て255)なので、
+// タイル拡大時の補間等で生じうる中途半端なアルファだけを弾く控えめな値にしてある。
+const RADAR_INK_MIN_ALPHA: u8 = 32;
+
+// 4x4 Bayer(ディザ)閾値マトリクス。値(0..15)が density*16 未満の画素だけインクを置く。
+// density=0.5 でちょうど (x+y)%2==0 の市松、0.75 で4画素に3つ、0.35 前後で3画素に1つ、
+// 1.0 で全塗りになる(設計 §7.3 の 薄い/標準/濃い をそのまま密度で表現できる)。
+const BAYER4: [[u8; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
+
+// braille/edge 用。降水域を OverlayLayer の「インク」として置く。
+// これらのモードは「ドットが立つか立たないか」しかなく背景色の概念が無いため、アルファ合成では
+// 降水として読めない(braille)/降水の境界が全部輪郭になって線画が壊れる(edge)。
+// alpha が min_alpha 以上の画素のみ対象。さらに density(0.0..=1.0)でディザ間引きして
+// スクリーンドア状に下の地図を透かす(全画素塗ると不透明インクなので地図が完全に隠れる)。
+// インクの色は降水強度の色(気象庁の配色)をそのまま使うので、braille でも強弱が色で読める。
+pub fn ink_radar_into_overlay(ov: &mut OverlayLayer, layer: &RgbaImage, min_alpha: u8, density: f64) {
+    let d = density.clamp(0.0, 1.0);
+    if d <= 0.0 { return; }
+    let th = d * 16.0;
+    let (lw, lh) = layer.dimensions();
+    // min_alpha=0 でも完全透明(降水なし)の画素は置かない。全面がインクで埋まる事故を型で防げない分ここで止める。
+    let floor = min_alpha.max(1);
+    for y in 0..ov.h.min(lh) {
+        for x in 0..ov.w.min(lw) {
+            let p = layer.get_pixel(x, y);
+            if p[3] < floor { continue; }                                      // 降水なし
+            if (BAYER4[(y % 4) as usize][(x % 4) as usize] as f64) >= th { continue; } // ディザ間引き
+            ov.put(x as i32, y as i32, [p[0], p[1], p[2]]);
         }
     }
 }
@@ -452,6 +493,153 @@ mod tests {
         let mut b3 = base_img(200);
         blend_rgba_over(&mut b3, &RgbaImage::new(0, 0), 1.0);
         assert!(b3.pixels().all(|p| *p == image::Rgb([200, 200, 200])));
+    }
+
+    // ---- ink_radar_into_overlay(braille/edge 用の雨雲インク) ----
+
+    // 全画素が降水(不透明)のレイヤ。
+    fn rain_layer(w: u32, h: u32) -> RgbaImage { RgbaImage::from_pixel(w, h, image::Rgba([0, 65, 255, 255])) }
+    // ov に置かれたインクの数。
+    fn ink_count(ov: &OverlayLayer) -> usize { ov.ink.iter().filter(|c| c.is_some()).count() }
+
+    // alpha が min_alpha 未満(降水なし/ごく薄い縁)の画素にはインクを置かない。
+    #[test]
+    fn ink_skips_pixels_below_min_alpha() {
+        let mut ov = OverlayLayer::new(4, 4);
+        let layer = RgbaImage::from_pixel(4, 4, image::Rgba([0, 65, 255, 31]));
+        ink_radar_into_overlay(&mut ov, &layer, 32, 1.0);
+        assert_eq!(ink_count(&ov), 0);
+        // 閾値ちょうどは対象(「min_alpha 以上」)。
+        let mut ov2 = OverlayLayer::new(4, 4);
+        let layer2 = RgbaImage::from_pixel(4, 4, image::Rgba([0, 65, 255, 32]));
+        ink_radar_into_overlay(&mut ov2, &layer2, 32, 1.0);
+        assert_eq!(ink_count(&ov2), 16);
+    }
+
+    // min_alpha=0 を渡されても、完全透明(降水なし)は置かない(全面インクで地図が消える事故を防ぐ)。
+    #[test]
+    fn ink_min_alpha_zero_still_skips_fully_transparent() {
+        let mut ov = OverlayLayer::new(4, 4);
+        let layer = RgbaImage::from_pixel(4, 4, image::Rgba([0, 65, 255, 0]));
+        ink_radar_into_overlay(&mut ov, &layer, 0, 1.0);
+        assert_eq!(ink_count(&ov), 0);
+    }
+
+    // density=1.0 は間引きなし(全塗り)。density=0.0 は1つも置かない。
+    #[test]
+    fn ink_density_bounds() {
+        let layer = rain_layer(4, 4);
+        let mut full = OverlayLayer::new(4, 4);
+        ink_radar_into_overlay(&mut full, &layer, 32, 1.0);
+        assert_eq!(ink_count(&full), 16);
+
+        let mut none = OverlayLayer::new(4, 4);
+        ink_radar_into_overlay(&mut none, &layer, 32, 0.0);
+        assert_eq!(ink_count(&none), 0);
+
+        // 範囲外はクランプ(負=何もしない / 1超=全塗り)。
+        let mut neg = OverlayLayer::new(4, 4);
+        ink_radar_into_overlay(&mut neg, &layer, 32, -1.0);
+        assert_eq!(ink_count(&neg), 0);
+        let mut over = OverlayLayer::new(4, 4);
+        ink_radar_into_overlay(&mut over, &layer, 32, 5.0);
+        assert_eq!(ink_count(&over), 16);
+    }
+
+    // density=0.5 はちょうど市松((x+y)%2==0 の画素だけ)。下の地図が半分透ける。
+    #[test]
+    fn ink_density_half_is_checkerboard() {
+        let mut ov = OverlayLayer::new(8, 8);
+        ink_radar_into_overlay(&mut ov, &rain_layer(8, 8), 32, 0.5);
+        assert_eq!(ink_count(&ov), 32);
+        for y in 0..8u32 {
+            for x in 0..8u32 {
+                let on = ov.get(x, y).is_some();
+                assert_eq!(on, (x + y) % 2 == 0, "({x},{y}) の市松が期待と違う");
+            }
+        }
+    }
+
+    // 設計 §7.3 の密度換算: 薄い(0.35)≒3画素に1つ / 標準(0.55)≒半分 / 濃い(0.75)=4画素に3つ。
+    #[test]
+    fn ink_density_matches_designed_coverage() {
+        let cases = [(0.35, 6usize), (0.55, 9), (0.75, 12)]; // 4x4=16画素あたりの点数
+        for (d, want) in cases {
+            let mut ov = OverlayLayer::new(4, 4);
+            ink_radar_into_overlay(&mut ov, &rain_layer(4, 4), 32, d);
+            assert_eq!(ink_count(&ov), want, "density={d}");
+        }
+        // 間引き模様は4x4周期。8x8では4x4ブロックと同じ密度がタイル状に繰り返される。
+        let mut ov = OverlayLayer::new(8, 8);
+        ink_radar_into_overlay(&mut ov, &rain_layer(8, 8), 32, 0.75);
+        assert_eq!(ink_count(&ov), 12 * 4);
+    }
+
+    // インクの色は降水強度の色(気象庁の配色)をそのまま使う。braille でも強弱が色で読める。
+    #[test]
+    fn ink_uses_precipitation_color() {
+        let mut ov = OverlayLayer::new(2, 2);
+        let mut layer = RgbaImage::from_pixel(2, 2, image::Rgba([0, 0, 0, 0]));
+        layer.put_pixel(0, 0, image::Rgba([255, 40, 0, 255]));   // 強い雨(赤)
+        layer.put_pixel(1, 1, image::Rgba([160, 210, 255, 255])); // 弱い雨(淡い青)
+        ink_radar_into_overlay(&mut ov, &layer, 32, 1.0);
+        assert_eq!(ov.get(0, 0), Some([255, 40, 0]));
+        assert_eq!(ov.get(1, 1), Some([160, 210, 255]));
+        assert_eq!(ov.get(1, 0), None); // 降水なしはインクを置かない
+    }
+
+    // 寸法が違ってもパニックせず、重なる範囲だけ処理する。
+    #[test]
+    fn ink_mismatched_dimensions_do_not_panic() {
+        let mut ov = OverlayLayer::new(4, 4);
+        ink_radar_into_overlay(&mut ov, &rain_layer(10, 10), 32, 1.0); // レイヤが大きい
+        assert_eq!(ink_count(&ov), 16);
+
+        let mut ov2 = OverlayLayer::new(4, 4);
+        ink_radar_into_overlay(&mut ov2, &rain_layer(2, 1), 32, 1.0); // レイヤが小さい
+        assert_eq!(ink_count(&ov2), 2);
+        assert!(ov2.get(0, 0).is_some());
+        assert!(ov2.get(0, 1).is_none());
+
+        let mut ov3 = OverlayLayer::new(4, 4);
+        ink_radar_into_overlay(&mut ov3, &RgbaImage::new(0, 0), 32, 1.0); // 空レイヤ
+        assert_eq!(ink_count(&ov3), 0);
+    }
+
+    // build_overlay に雨雲を渡すと最背面に入る = 経路/マーカーは必ず雨雲より前面に残る。
+    #[test]
+    fn build_overlay_puts_radar_behind_markers() {
+        let (lat, lon, z) = (35.0, 139.0, 10u32);
+        let (cx, cy) = deg_to_pixel(lat, lon, z);
+        let spec = OverlaySpec { pois: Vec::new(), routes: Vec::new(), roads: Vec::new(),
+                                 rings: Vec::new(), spots: vec![(lat, lon, [1, 2, 3], 0)] };
+        let layer = RgbaImage::from_pixel(8, 8, image::Rgba([200, 0, 0, 255]));
+        let ink = RadarInk { layer: &layer, density: 1.0 };
+        let ov = build_overlay(&spec, cx, cy, z, 8, 8, 1.0, 1.0, 8, 8, Some(ink));
+        assert_eq!(ov.get(4, 4), Some([1, 2, 3]));    // 窓中心のマーカーが雨雲を上書きしている
+        assert_eq!(ov.get(0, 0), Some([200, 0, 0]));  // マーカーの無い所は雨雲のインク
+
+        // radar=None なら従来どおり(マーカー以外は何も置かれない)。
+        let ov2 = build_overlay(&spec, cx, cy, z, 8, 8, 1.0, 1.0, 8, 8, None);
+        assert_eq!(ov2.get(4, 4), Some([1, 2, 3]));
+        assert_eq!(ov2.get(0, 0), None);
+    }
+
+    // classify(量子化)と雨雲合成の順序。recolor の「後」に混ぜないと、淡い青の降水が
+    // classify() の水域条件に合致して湖(Cat::Water)の色に化ける(設計 §8.4)。
+    #[test]
+    fn classify_must_blend_radar_after_recolor() {
+        let base = RgbImage::from_pixel(2, 2, image::Rgb([245, 245, 245])); // 何にも分類されない下地
+        let rain = RgbaImage::from_pixel(2, 2, image::Rgba([160, 210, 255, 255])); // 弱い雨(淡い青)
+
+        let mut correct = recolor(&base); // 量子化 → 合成(正しい順序)
+        blend_rgba_over(&mut correct, &rain, 1.0);
+        assert_eq!(*correct.get_pixel(0, 0), image::Rgb([160, 210, 255]), "降水の色がそのまま残るはず");
+
+        let mut mixed = base.clone(); // 合成 → 量子化(誤った順序)
+        blend_rgba_over(&mut mixed, &rain, 1.0);
+        let wrong = recolor(&mixed);
+        assert_eq!(*wrong.get_pixel(0, 0), image::Rgb(cat_color(Cat::Water).into()), "誤順序では湖に化ける");
     }
 
     // xterm256の既知の代表色(黒/白/純色RGB)が期待indexへ変換されること。

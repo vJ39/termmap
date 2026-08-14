@@ -21,15 +21,21 @@ pub(crate) struct SettingChoice {
     pub labels: &'static [&'static str],
 }
 
-// idx は Focus::Settings 側の項目行番号と対応(4=地図種別/5=既定ルート/9=提案AIモデル/12=画像解像度/18=QR表示方式)。
+// idx は Focus::Settings 側の項目行番号と対応(4=地図種別/5=既定ルート/9=提案AIモデル/12=画像解像度/18=QR表示方式/20=雨雲の濃さ)。
 // 中心十字の色(idx=16)は cfg.cross_color_idx が String でなく u8 なので、この表とは別枠(is_pickable等で16を特別扱い)。
+// 項目を増やすときは必ず末尾に足す(既存 idx を動かすと ui.rs の set_sel == 6 / 17 等の生の数値比較と食い違う)。
 pub(crate) const CHOICES: &[SettingChoice] = &[
     SettingChoice { idx: 4, values: &["osm", "voyager", "dark", "light", "topo"], labels: &["osm", "voyager", "dark", "light", "topo"] },
     SettingChoice { idx: 5, values: &["car-fast", "moped", "shortest"], labels: &["高速", "下道", "最短"] },
     SettingChoice { idx: 9, values: &["claude-sonnet-5", "claude-haiku-4-5", "claude-opus-4-8"], labels: &["sonnet", "haiku", "opus"] },
     SettingChoice { idx: 12, values: &["high", "mid", "low"], labels: &["高", "中", "低"] },
     SettingChoice { idx: 18, values: &["dense", "image"], labels: &["標準", "画像(小型)"] },
+    SettingChoice { idx: 20, values: &["light", "mid", "strong"], labels: &["薄い", "標準", "濃い"] },
 ];
+
+// 設定画面の項目行数(アコーディオン未展開時)。ui.rs のカーソル下移動の上限がこれを参照する。
+// settings_rows() が返す行数と必ず一致すること(下の回帰テスト settings_row_count_matches_rows で固定)。
+pub(crate) const SETTINGS_ROW_COUNT: usize = 21;
 
 fn choice_for(idx: usize) -> Option<&'static SettingChoice> { CHOICES.iter().find(|c| c.idx == idx) }
 
@@ -51,6 +57,7 @@ pub(crate) fn pick_current(idx: usize, cfg: &Config, style: &str) -> usize {
         12 => choice_for(12).and_then(|c| c.values.iter().position(|v| *v == cfg.image_res)).unwrap_or(0),
         16 => cfg.cross_color_idx as usize % PALETTE_NAMES.len(),
         18 => choice_for(18).and_then(|c| c.values.iter().position(|v| *v == cfg.qr_style)).unwrap_or(0),
+        20 => choice_for(20).and_then(|c| c.values.iter().position(|v| *v == cfg.radar_opacity)).unwrap_or(0),
         _ => 0,
     }
 }
@@ -72,6 +79,8 @@ pub(crate) fn apply_pick(idx: usize, sel: usize, cfg: &mut Config, style: &mut S
         12 => if let Some(v) = choice_for(12).and_then(|c| c.values.get(sel)) { cfg.image_res = v.to_string(); eff.force_reemit = true; }
         16 => { cfg.cross_color_idx = (sel % PALETTE_NAMES.len()) as u8; eff.force_reemit = true; }
         18 => if let Some(v) = choice_for(18).and_then(|c| c.values.get(sel)) { cfg.qr_style = v.to_string(); }
+        // 雨雲の濃さは今表示している地図の見た目が変わるので、確定した時点で描き直す。
+        20 => if let Some(v) = choice_for(20).and_then(|c| c.values.get(sel)) { cfg.radar_opacity = v.to_string(); eff.force_reemit = true; }
         _ => {}
     }
     eff
@@ -99,6 +108,8 @@ pub(crate) fn setting_description(idx: usize) -> &'static str {
         15 => "オンボーディング: 毎回表示/非表示を切替(dキーでも次回から非表示にできる)",
         16 => "中心十字の色: 地図中心のクロスヘアの色。Enterで一覧を開いて選択(spots.rsの配色から選択)",
         18 => "QR表示方式: スマホ共有QRの表示方法。Enterで一覧を開いて選択(標準=文字描画・全端末対応 / 画像(小型)=iTerm2等のインライン画像でモジュール数に関係なく小さく表示。画像非対応端末では自動的に標準へフォールバック)",
+        19 => "雨雲レーダー: 気象庁ナウキャストの降水を地図に重ねる。ここでのON/OFFは起動時の既定にもなる(Cキーでも切替・< > で表示時刻を過去〜+60分に移動)",
+        20 => "雨雲の濃さ: 重ねる強さ。Enterで一覧を開いて選択(薄い=地図優先 / 標準 / 濃い=雨優先)",
         _ => "Google APIキー: 検索(Geocoding)とStreet View共通。Enterで入力欄を開く(Cmd+V貼付も可)。環境変数TERMMAP_GOOGLE_API_KEYでも可",
     }
 }
@@ -137,7 +148,10 @@ pub(crate) fn settings_rows(opts: &Args, cfg: &Config, picking: Option<usize>, o
         format!("{} 中心十字の色 {}", arrow(16), PALETTE_NAMES[cfg.cross_color_idx as usize % PALETTE_NAMES.len()]),
         format!("Google APIキー {}", keyset),
         format!("{} QR表示方式 {}", arrow(18), match cfg.qr_style.as_str() { "image" => "画像(小型)", _ => "標準" }),
+        format!("雨雲レーダー {}", onoff(cfg.radar_enabled)),
+        format!("{} 雨雲の濃さ {}", arrow(20), match cfg.radar_opacity.as_str() { "light" => "薄い", "strong" => "濃い", _ => "標準" }),
     ];
+    debug_assert_eq!(its.len(), SETTINGS_ROW_COUNT, "SETTINGS_ROW_COUNT と行数がずれている");
     // アコーディオン展開: 選択中の項目がpickable(3択以上)ならその直下に候補をインデント挿入し、他行を押し下げる
     let mut sel = set_sel;
     if let Some(idx) = picking {
@@ -156,11 +170,11 @@ mod tests {
     use crate::config::Config;
 
     #[test]
-    fn pickable_covers_the_four_multi_choice_items_and_cross_color() {
-        for idx in [4usize, 5, 9, 12, 16, 18] {
+    fn pickable_covers_the_multi_choice_items_and_cross_color() {
+        for idx in [4usize, 5, 9, 12, 16, 18, 20] {
             assert!(is_pickable(idx), "idx {idx} should be pickable");
         }
-        for idx in [0usize, 1, 2, 3, 6, 7, 8, 10, 11, 13, 14, 15, 17] {
+        for idx in [0usize, 1, 2, 3, 6, 7, 8, 10, 11, 13, 14, 15, 17, 19] {
             assert!(!is_pickable(idx), "idx {idx} should not be pickable");
         }
     }
@@ -222,7 +236,7 @@ mod tests {
 
     #[test]
     fn pick_labels_len_matches_choice_values_len() {
-        for idx in [4usize, 5, 9, 12, 18] {
+        for idx in [4usize, 5, 9, 12, 18, 20] {
             let c = choice_for(idx).unwrap();
             assert_eq!(pick_labels(idx).len(), c.values.len());
         }
@@ -243,10 +257,10 @@ mod tests {
 
     #[test]
     fn setting_description_covers_every_known_row_distinctly() {
-        // 0〜16,18 は個別の説明文を持つ(idx=11は端末対応有無で文言が変わるが、いずれにせよ空でない。
+        // 0〜16,18〜20 は個別の説明文を持つ(idx=11は端末対応有無で文言が変わるが、いずれにせよ空でない。
         // 17=Google APIキーはフォールバック経由で別テストで確認するためここでは含めない)。
         let mut seen = Vec::new();
-        for idx in (0usize..=16).chain(std::iter::once(18)) {
+        for idx in (0usize..=16).chain(18..=20) {
             let d = setting_description(idx);
             assert!(!d.is_empty(), "idx {idx} should have a description");
             if idx != 11 { seen.push(d); } // 11は環境依存で文言が2通りあるため一意性判定から除外
@@ -261,5 +275,83 @@ mod tests {
     fn setting_description_out_of_range_falls_back_to_google_api_key() {
         assert_eq!(setting_description(17), setting_description(999));
         assert!(setting_description(17).contains("Google APIキー"));
+    }
+
+    #[test]
+    fn pick_current_and_apply_pick_roundtrip_radar_opacity() {
+        let mut cfg = Config::default();
+        let mut style = "osm".to_string();
+        assert_eq!(pick_current(20, &cfg, &style), 1); // 既定 "mid" は values[1]
+        let eff = apply_pick(20, 2, &mut cfg, &mut style); // 2 => "strong"
+        assert_eq!(cfg.radar_opacity, "strong");
+        assert!(eff.force_reemit); // 濃さを変えたら即描き直す
+        assert!(!eff.cache_clear);
+        assert_eq!(pick_current(20, &cfg, &style), 2);
+
+        let eff2 = apply_pick(20, 0, &mut cfg, &mut style); // 0 => "light"
+        assert_eq!(cfg.radar_opacity, "light");
+        assert!(eff2.force_reemit);
+    }
+
+    #[test]
+    fn apply_pick_radar_opacity_out_of_range_sel_is_ignored() {
+        let mut cfg = Config::default();
+        let mut style = "osm".to_string();
+        let eff = apply_pick(20, 99, &mut cfg, &mut style); // 候補は3個しかない
+        assert_eq!(cfg.radar_opacity, Config::default().radar_opacity);
+        assert!(!eff.force_reemit);
+    }
+
+    #[test]
+    fn pick_current_unknown_radar_opacity_defaults_to_zero() {
+        let mut cfg = Config::default();
+        cfg.radar_opacity = "bogus".to_string(); // configを手書きで壊された場合
+        assert_eq!(pick_current(20, &cfg, "osm"), 0);
+    }
+
+    // settings_rows() を呼ぶテスト用の Args(既定値。parse_args() の初期値と同じ)。
+    fn test_args() -> Args {
+        Args { lat: None, lon: None, place: None, zoom: 14, width: None, win_px: 640,
+               style: "osm".to_string(), braille: false, mono: false, classify: false,
+               edge: false, here: false, threshold: None,
+               range: Vec::new(), home: None, route: None, route_mode: "surface".to_string(),
+               gpx: None, load_route: None, save_route: None, list_routes: false, share: false,
+               wander: false, dist: None, shape: "loop".to_string(), image: None, png: None }
+    }
+
+    // ui.rs のカーソル移動上限が参照する SETTINGS_ROW_COUNT が、実際の行数とずれていないこと。
+    // ここがずれると「設定画面の最終行まで下がれない/存在しない行を選べる」壊れ方をする。
+    #[test]
+    fn settings_row_count_matches_rows() {
+        let cfg = Config::default();
+        let (_, its, _) = settings_rows(&test_args(), &cfg, None, false, 0, 0);
+        assert_eq!(its.len(), SETTINGS_ROW_COUNT);
+    }
+
+    #[test]
+    fn settings_rows_end_with_the_two_radar_rows() {
+        let mut cfg = Config::default();
+        cfg.radar_enabled = true;
+        cfg.radar_opacity = "strong".to_string();
+        let (_, its, _) = settings_rows(&test_args(), &cfg, None, false, 19, 0);
+        assert_eq!(its[19], "雨雲レーダー ON");
+        assert_eq!(its[20], "▸ 雨雲の濃さ 濃い");
+        // 既存項目(0〜18)の並びが動いていないことの回帰確認
+        assert!(its[0].starts_with("点字ドット"));
+        assert!(its[17].starts_with("Google APIキー"));
+        assert!(its[18].contains("QR表示方式"));
+    }
+
+    #[test]
+    fn settings_rows_expands_radar_opacity_accordion_below_its_row() {
+        let cfg = Config::default();
+        // idx=20 を展開: 20行目の直下に候補3件がインデントで挿入され、選択位置はその中を指す
+        let (_, its, sel) = settings_rows(&test_args(), &cfg, Some(20), false, 20, 1);
+        assert_eq!(its.len(), SETTINGS_ROW_COUNT + 3);
+        assert_eq!(its[20], "▾ 雨雲の濃さ 標準"); // 展開中は矢印が▾になる
+        assert_eq!(its[21], "    薄い");
+        assert_eq!(its[22], "    標準");
+        assert_eq!(its[23], "    濃い");
+        assert_eq!(sel, 22); // 21(先頭候補) + set_pick_sel(1)
     }
 }

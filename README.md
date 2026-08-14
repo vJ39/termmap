@@ -48,6 +48,7 @@ Linux(x86_64)は `--target x86_64-unknown-linux-musl` でのクロスコンパ�
 - **マイスポット**: カテゴリ階層(登録・改名・並べ替え・色分け)で任意の地点を保存。GoogleマップURLを貼るだけで座標+店名を抽出登録できる
 - **標高プロファイル・ルート再生・ライブ現在地**: 確定ルートの高低差表示、プレビュー走行アニメ、CoreLocationCLI経由の現在地トラッキング
 - **実写(Street View)**: 中心地点の実写を全画面表示(要 Google APIキー)
+- **雨雲レーダー**: 気象庁ナウキャストの降水を地図に半透明で重ねる(`C`)。`<` `>` で表示時刻を過去〜60分先まで5分刻みで動かせるので、走る前に雨雲の抜けるタイミングを見られる
 - **QR共有**: ルートをGoogleマップ経路URL化し、端末にQRコードを表示してスマホで開ける
 - **2階層Spaceメニュー**: 全操作をキー無しでも選べる(カテゴリ→項目)。熟練者は各項目のキーを直打ちしてもよい
 - **設定画面**: 描画スタイル・ルート既定・APIキー等を実行中に切り替え、`config.toml` へ保存できる
@@ -79,9 +80,17 @@ maps_api_key = ""
 
 [streetview]
 enabled = true
+
+[radar]
+enabled = false
+opacity = "mid"
+refresh_sec = 300
 ```
 
 - `[google] maps_api_key`: 地名検索(Geocoding)と実写(Street View)で共通に使うキー。環境変数 `TERMMAP_GOOGLE_API_KEY` があればこちらを優先(configにキーを書かず運用できる)
+- `[radar] enabled`: 起動時に雨雲レーダーをONにするか。既定 `false`(`C` を押した人だけが気象庁へ問い合わせる)
+- `[radar] opacity`: 雨雲の濃さ `light`(0.35) / `mid`(0.55) / `strong`(0.75)
+- `[radar] refresh_sec`: フレーム時刻一覧(targetTimes)の再取得間隔(秒)。既定300(ナウキャスト自体が5分更新なのでこれより短くしても新しい情報は無い)。設定画面には出さない。下限60秒
 - 旧スキーマ `[streetview] api_key` は後方互換で読める(`[google] maps_api_key` が空のときのみ採用)
 - 未設定でも動く。地名検索は Nominatim のみに、実写は「APIキー未設定」表示になる
 
@@ -153,6 +162,7 @@ termmap 本体はそのままで、[ttyd](https://github.com/tsl0922/ttyd) の�
 - ルーティング: BRouter(公開API)
 - 目的地・周辺検索: Overpass API
 - 実写: Google Street View Static API(任意・要APIキー)
+- 雨雲レーダー: 気象庁 降水ナウキャスト(キー不要。開発者向けAPIとして公開されたものではない非公式エンドポイントの個人利用であり、予告なく停止しうる)
 - GPS/現在地: CoreLocationCLI (`brew install corelocationcli`。macOSのみ、初回は位置情報の許可が必要)
 - おすすめ機能: `claude` CLI (Claude Code。config.toml `[llm] command` で変更可)
 
@@ -206,6 +216,7 @@ termmap 本体はそのままで、[ttyd](https://github.com/tsl0922/ttyd) の�
     目的地 f カテゴリ検索(1-7)→左袖リスト(↑↓/ws選択 / v 追加 / Enter移動 / f 再検索 / Esc 閉)
     お気に入り  S 保存/呼び出しの小メニュー / P マイスポット
     表示・ナビ  E 標高プロファイル(高さ目盛り付き) / A ルート再生(実速度・[ ]で速度調整) / G ライブ現在地 / i 実写(+/-でズーム) / V スポット表示切替 / o QR共有
+    雨雲   C 雨雲レーダー表示切替 / < > 表示時刻を過去・未来へ5分ずつ(最大+60分)
     設定   , 設定画面(braille/classify/edge/mono/style等。3択以上の項目はEnterでその場にアコーディオン展開。変更は自動保存)
     終了   ?  ヘルプ   q  終了   Esc  サブモード取消   Ctrl+C  通信中の処理を中断(終了はq)
 
@@ -238,6 +249,7 @@ termmap 本体はそのままで、[ttyd](https://github.com/tsl0922/ttyd) の�
 - タイル: `tile.openstreetmap.org` (© OpenStreetMap contributors, ODbL)、CARTO(voyager/dark/light)、OpenTopoMap(topo。© OpenTopoMap (CC-BY-SA))
 - ジオコーディング/逆ジオコーディング/語検索: Nominatim。優先で Google Geocoding
 - ルーティング: BRouter (公開API)。目的地・周辺検索: Overpass API
+- 雨雲レーダー: 出典 気象庁ナウキャスト
 - 料金は概算(高速区間 × ¥30/km, 普通車, 割引なし)。実額とは異なる
 - お気に入りルート: `~/.config/termmap/routes/<名前>.txt`
 - マイスポット: `~/.config/termmap/spots.txt` / カテゴリ: `~/.config/termmap/spot-categories.txt`

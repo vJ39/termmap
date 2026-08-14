@@ -10,7 +10,7 @@ use crate::poi::*;
 use crate::spots::*;
 use crate::share::*;
 use std::io::Write;
-use image::{RgbImage, imageops::FilterType};
+use image::{RgbImage, RgbaImage, imageops::FilterType};
 // 単一行テキスト入力欄の共通編集ロジック(char_byte/insert_str_at/form_cur/edit_line/
 // render_with_cursor/draw_input_panel)は textedit.rs へ切り出し済み。
 use crate::textedit::{edit_line, form_cur, insert_str_at, draw_input_panel, render_with_cursor};
@@ -51,11 +51,20 @@ fn build_qr_view(c: &qrcode::QrCode, style: &str) -> QrView {
 
 
 // 雨雲レーダーの不透明度(0.0..=1.0)。1.0にしないのは地図が消えたら地図アプリとして機能しないため。
-// 設定項目(薄い/標準/濃い)は次フェーズで追加予定。そこで cfg.radar_opacity へ差し替える。
-const RADAR_OPACITY: f64 = 0.55;
-// targetTimes(フレーム時刻一覧)の再取得間隔(秒)。ナウキャスト自体が5分更新なので、
-// これより短くしても新しい情報は無い。
+// 設定 [radar] opacity の3択を実際の値へ読み替える(薄い=地図優先 / 標準 / 濃い=雨優先)。
+// 未知の値(configを手書きで壊した場合)は標準扱いにして必ず描ける値を返す。
+fn radar_opacity_value(cfg: &config::Config) -> f64 {
+    match cfg.radar_opacity.as_str() { "light" => 0.35, "strong" => 0.75, _ => 0.55 }
+}
+// targetTimes(フレーム時刻一覧)の再取得間隔(秒)の既定。ナウキャスト自体が5分更新なので、
+// これより短くしても新しい情報は無い。設定 [radar] refresh_sec で変えられる。
 const RADAR_REFRESH_SECS: u64 = 300;
+
+// 設定の再取得間隔(秒・f64)を RadarClock に渡す u64 へ。壊れた値なら既定値へ落として必ず動かす。
+fn radar_refresh_secs(cfg: &config::Config) -> u64 {
+    let s = cfg.radar_refresh_sec;
+    if s.is_finite() && s >= 1.0 { s as u64 } else { RADAR_REFRESH_SECS }
+}
 
 // ---- 対話モード (crossterm) ----
 // 端末状態を RAII で復元する。パニック/早期return でも Drop で raw mode と代替スクリーンを必ず戻す。
@@ -132,12 +141,14 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     let mut gps_pos: Option<(f64, f64)> = None; // 最新の自位置
     let mut gps_trail: Vec<(f64, f64)> = Vec::new(); // 通過ブレッドクラム
     // 雨雲レーダー(気象庁ナウキャスト・C で ON/OFF、< > で表示時刻を前後)。
-    // 起動時は常にOFF(設定からの復元は次フェーズ)。ONにした人だけが外部サービスへ問い合わせる。
-    let mut radar_on = false;
+    // 起動時の状態は設定 [radar] enabled(既定OFF)に従う。ONにした人だけが外部サービスへ問い合わせる。
+    let mut radar_on = cfg.radar_enabled;
     let mut radar_tl = radar::Timeline::default();  // フレーム時刻の一覧(RadarClock が5分ごとに更新)
     let mut radar_idx: usize = 0;                   // 表示中のコマ
     let mut radar_follow = true;                    // 最新の実況に追従するか(< > でスクラブすると外れる)
-    let mut radar_clock: Option<radar::RadarClock> = None; // 時刻一覧の背景ポーラー(drop で停止)
+    // 時刻一覧の背景ポーラー(drop で停止)。起動時ONなら最初から立てておく(一覧が届くまでは「時刻取得中…」)。
+    let mut radar_clock: Option<radar::RadarClock> =
+        radar_on.then(|| radar::start_clock(radar_refresh_secs(&cfg)));
     let mut play: Option<f64> = None; // A ルート再生(先頭からの距離m。Noneで停止)
     let mut play_speed: f64 = 1.0;    // 再生速度倍率(再生中に [ ] で 0.25〜8x)
     let mut play_last_tick: Option<std::time::Instant> = None; // 再生の実時間ベース進行用(前回フレームの時刻)
@@ -205,10 +216,24 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     // 表示は必ず最新の実況(now_idx)から始める。一覧が未着なら idx=0 のまま「時刻取得中…」になる。
     macro_rules! radar_turn_on { () => {
         radar_on = true;
-        if radar_clock.is_none() { radar_clock = Some(radar::start_clock(RADAR_REFRESH_SECS)); }
+        if radar_clock.is_none() { radar_clock = Some(radar::start_clock(radar_refresh_secs(&cfg))); }
         radar_idx = radar_tl.now_idx.min(radar_tl.frames.len().saturating_sub(1));
         radar_follow = true;
         addr = "雨雲レーダー: ON (出典: 気象庁ナウキャスト)".into();
+    }; }
+
+    // 雨雲レーダーの ON/OFF を反転する(Spaceメニューの「雨雲レーダー」と設定画面の行から使う。
+    // 地図での C キーも同じ処理)。OFFにするとき背景ポーラーの drop はスレッドを join するため、
+    // 取得中(HTTPは最大20秒)にここで待つと入力が固まる。停止フラグは drop 側で即座に立つので、
+    // join だけを別スレッドへ逃がしてUIを待たせない。
+    macro_rules! radar_toggle { () => {
+        if radar_on {
+            radar_on = false;
+            if let Some(rc) = radar_clock.take() { std::thread::spawn(move || drop(rc)); }
+            addr = "雨雲レーダー: OFF".into();
+        } else {
+            radar_turn_on!();
+        }
     }; }
 
     // メニュー項目/直接キー どちらからでも同じ処理を走らせる。
@@ -281,6 +306,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     else { addr = "ライブ: CoreLocationCLI無し(brew install corelocationcli)".into(); }
                 }
             }
+            MenuAction::ToggleRadar => { radar_toggle!(); } // 雨雲レーダー(地図の C キーと同じ)
             MenuAction::SaveRoute => { input_cur = route_name_hint.chars().count(); focus = Focus::SaveName(route_name_hint.clone()); }
             MenuAction::LoadRoute => { route_names = list_named_routes(); rn_sel = 0; if route_names.is_empty() { addr = "お気に入り無し".into(); } else { focus = Focus::RouteList; } }
             MenuAction::SaveGpx => match spec.routes.last() {
@@ -466,10 +492,13 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             }
         }
         let img_inline = cfg.image_mode && image_capable(); // 実画像モード(iTerm2系端末のみ)。play処理より先に要る
-        // 雨雲を地図へ重ねられる描画モードか。braille/edge は「面」を混ぜても降水として読めない/
-        // 線画が壊れるため、classify は量子化で淡い青の降水が湖に化けるため、今回は合成しない
-        // (インク化での対応は次フェーズ)。実画像モードはAA設定に関係なく合成できる。
-        let radar_blend_ok = img_inline || !(opts.braille || opts.edge || opts.classify || opts.mono);
+        // 雨雲の合成方式は描画モードで2系統に分かれる(設計 §2.1)。どのモードでも表示はできる。
+        //   実画像 / halfblock … 地図へ直接アルファ合成(下の地図が透ける)
+        //   classify         … recolor()で6色へ量子化した「後」に合成(先に混ぜると淡い青の降水が湖に化ける)
+        //   braille / edge   … 背景色の概念が無いので OverlayLayer へディザ間引きしたインクとして焼く
+        // mono は単体では描画経路を変えない(render_braille の色を落とすだけ)ので、braille/edge が
+        // 立っていなければ halfblock と同じアルファ合成になる。
+        let radar_ink = !img_inline && (opts.braille || opts.edge);
         if play.is_some() { // ルート再生: 実時間ベースで位置を進めて自動パン(想定巡航速度×play_speed倍率)
             // 実画像モードは先読みスレッドが返した画像をベース地図に使う。オーバーレイ(ルート線/
             // クロスヘア)をそれと違う位置で描くと、ベースとオーバーレイがズレてルートがガタつい
@@ -633,7 +662,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             if radar_on {
                 if let Some(f) = radar_tl.get(radar_idx) { f.basetime.hash(&mut h); f.validtime.hash(&mut h); }
             }
-            RADAR_OPACITY.to_bits().hash(&mut h); // 設定項目化したら値が変わる=描き直す
+            radar_opacity_value(&cfg).to_bits().hash(&mut h); // 濃さ(設定)を変えたら描き直す
             Some(h.finish())
         };
 
@@ -655,18 +684,22 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             };
             match built {
                 Ok(mut img) => {
-                    // 雨雲レーダー: 地図の上に半透明合成する。経路/POI/中心十字(ov)はこの後に
-                    // 焼くので常に雨雲より前面に残る。
-                    if radar_on && radar_blend_ok {
-                        if let Some(f) = radar_tl.get(radar_idx) {
-                            // 未取得タイルは透明のまま返る(グレー箱もLOADING透かしも出さない)。
-                            // 視野が日本国外なら None = 何も重ねない。
-                            if let Some(layer) = build_radar_window_nowait(rcx, rcy, rz, rw, rh, f, &loader) {
-                                blend_rgba_over(&mut img, &layer, RADAR_OPACITY);
-                            }
-                        }
+                    // 雨雲レーダーの降水レイヤ。未取得タイルは透明のまま返る(グレー箱もLOADING
+                    // 透かしも出さない)。視野が日本国外/広域すぎる場合は None = 何も重ねない。
+                    let radar_layer: Option<RgbaImage> = if radar_on {
+                        radar_tl.get(radar_idx)
+                            .and_then(|f| build_radar_window_nowait(rcx, rcy, rz, rw, rh, f, &loader))
+                    } else { None };
+                    // 実画像モードはここで地図へ直接アルファ合成する(オーバーレイはこの後に焼くので
+                    // 経路/POI/中心十字は常に雨雲より前面に残る)。
+                    if img_inline {
+                        if let Some(l) = &radar_layer { blend_rgba_over(&mut img, l, radar_opacity_value(&cfg)); }
                     }
-                    let mut ov = build_overlay(&spec, rcx, rcy, rz, rw, rh, 1.0, 1.0, rw, rh);
+                    // braille/edge は OverlayLayer へインクとして焼く(build_overlay の先頭で最背面に入る)。
+                    let ink = if radar_ink {
+                        radar_layer.as_ref().map(|l| RadarInk { layer: l, density: radar_opacity_value(&cfg) })
+                    } else { None };
+                    let mut ov = build_overlay(&spec, rcx, rcy, rz, rw, rh, 1.0, 1.0, rw, rh, ink);
                     let (mx, my) = (rw as i32 / 2, rh as i32 / 2); // 中心クロスヘア(色は設定で選択可)
                     let cross = SPOT_PALETTE[cfg.cross_color_idx as usize % SPOT_PALETTE.len()];
                     draw_line(&mut ov, mx - 6, my, mx + 6, my, cross, 1);
@@ -700,7 +733,10 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                         map_img = Some(c);
                         String::new()
                     } else {
-                        render(&img, &opts, Some(&ov))
+                        // インク経路(braille/edge)は ov に入れ済みなので render 側では合成しない。
+                        // halfblock/classify はここで渡し、classify は recolor 後に混ざる。
+                        let rd = if radar_ink { None } else { radar_layer.as_ref().map(|l| (l, radar_opacity_value(&cfg))) };
+                        render(&img, &opts, Some(&ov), rd)
                     }
                 }
                 Err(e) => {
@@ -935,10 +971,6 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     match radar_tl.get(radar_idx) {
                         // targetTimes がまだ届いていない(ONにした直後・取得失敗中)
                         None => "☂時刻取得中… ".to_string(),
-                        // 合成しない描画モードでは1枚も取りに行かないので、読込枚数でなく理由を出す
-                        // (「読込0/1」のまま止まって見えるのを避ける)。
-                        Some(_) if !radar_blend_ok =>
-                            format!("☂{} このモードでは非表示 ", radar::frame_label(&radar_tl, radar_idx)),
                         Some(f) => {
                             let (got, need) = radar_progress(&loader, rcx, rcy, rz, rw, rh, f);
                             if need == 0 {
@@ -1611,7 +1643,8 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     },
                     Focus::Settings => { let mut stay = true; let mut changed = false; match k.code { // 設定画面
                         KeyCode::Up | KeyCode::Char('w') => { snd.play("click"); set_sel = set_sel.saturating_sub(1); }
-                        KeyCode::Down | KeyCode::Char('s') => { snd.play("click"); if set_sel + 1 < 19 { set_sel += 1; } }
+                        // 下端は settings.rs の行数定義から取る(生の数値で持つと項目追加のたびに手で同期する羽目になる)
+                        KeyCode::Down | KeyCode::Char('s') => { snd.play("click"); if set_sel + 1 < settings::SETTINGS_ROW_COUNT { set_sel += 1; } }
                         KeyCode::Left | KeyCode::Right => {
                             if set_sel == 6 { let d = if k.code == KeyCode::Left { -100.0 } else { 100.0 }; cfg.sample_interval_m = (cfg.sample_interval_m + d).clamp(100.0, 5000.0); changed = true; }
                         }
@@ -1650,6 +1683,10 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                             if p.exists() { let _ = std::fs::remove_file(&p); addr = "オンボーディング: 毎回表示に戻した".into(); }
                                             else { let _ = crate::fsutil::write_atomic(&p, b"1", None); addr = "オンボーディング: 次回から非表示".into(); }
                                         }
+                                    }
+                                    19 => { // 雨雲レーダー: 起動時の既定を切り替え、いま表示中の地図にも即反映する
+                                        cfg.radar_enabled = !cfg.radar_enabled;
+                                        if cfg.radar_enabled != radar_on { radar_toggle!(); }
                                     }
                                     _ => {}
                                 }
@@ -2327,19 +2364,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                 show_elev = !show_elev;
                                 if show_elev && (spec.routes.is_empty() || !route_ele.iter().any(|&z| z != 0.0)) { addr = "標高: ルート確定後に表示".into(); }
                             }
-                            KeyCode::Char('C') => { // 雨雲レーダー(気象庁ナウキャスト)の表示/非表示
-                                if radar_on {
-                                    radar_on = false;
-                                    // 背景ポーラーを止める(取得済みタイルはキャッシュに残す=すぐ再表示できる)。
-                                    // RadarClock の drop はスレッドを join するため、取得中(HTTPは最大20秒)に
-                                    // ここで drop すると入力が固まる。停止フラグは drop 側で即座に立つので、
-                                    // join だけを別スレッドへ逃がしてUIを待たせない。
-                                    if let Some(rc) = radar_clock.take() { std::thread::spawn(move || drop(rc)); }
-                                    addr = "雨雲レーダー: OFF".into();
-                                } else {
-                                    radar_turn_on!();
-                                }
-                            }
+                            KeyCode::Char('C') => { radar_toggle!(); } // 雨雲レーダー(気象庁ナウキャスト)の表示/非表示。Spaceメニュー・設定画面と共通処理
                             KeyCode::Char('>') => { // 表示時刻を未来へ1コマ(OFFなら発見しやすさのためONにする)
                                 if !radar_on {
                                     radar_turn_on!();

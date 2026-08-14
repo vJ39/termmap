@@ -8,7 +8,7 @@ pub(crate) enum MenuAction {
     SearchPlace, SearchPoi, ShowAddress, Recommend,                                    // 検索・移動
     RouteForm, AddVia, RoadRoute, ManageRoads, Wander, CycleMode, AltRoute, ClearRoute, // ルート作成(RouteForm=並べ替えを開く / AddVia=中心に地点を置く / ManageRoads=道路の塊を管理)
     ManageSpots, ToggleSpots,                                                          // スポット
-    ToggleElevation, StreetView, PlayRoute, ToggleGps,                                 // ナビ・表示
+    ToggleElevation, StreetView, PlayRoute, ToggleGps, ToggleRadar,                    // ナビ・表示(ToggleRadar=雨雲レーダー)
     SaveRoute, LoadRoute, SaveGpx, ShareQr,                                            // 保存・共有
     Settings, Help,                                                                    // 設定・ヘルプ
 }
@@ -42,6 +42,7 @@ pub(crate) const MENU_CATEGORIES: &[MenuCategory] = &[
         MenuItem { label: "実写を見る",        key: 'i', action: MenuAction::StreetView },
         MenuItem { label: "ルートを再生",      key: 'A', action: MenuAction::PlayRoute },
         MenuItem { label: "ライブ現在地",      key: 'G', action: MenuAction::ToggleGps },
+        MenuItem { label: "雨雲レーダー",      key: 'C', action: MenuAction::ToggleRadar },
     ]},
     MenuCategory { label: "保存・共有", items: &[
         MenuItem { label: "ルートを保存",      key: 'S', action: MenuAction::SaveRoute },
@@ -100,6 +101,18 @@ mod tests {
                 assert!(matches!(resolved, Some(a) if a == it.action), "key {:?} should resolve", it.key);
             }
         }
+    }
+
+    // 雨雲レーダーは「ナビ・表示」カテゴリに C で載っている(地図の C キーと同じアクション)。
+    #[test]
+    fn toggle_radar_is_registered_under_navigation_with_key_c() {
+        let nav = MENU_CATEGORIES.iter().find(|c| c.label == "ナビ・表示").expect("ナビ・表示 カテゴリ");
+        let it = nav.items.iter().find(|i| i.action == MenuAction::ToggleRadar).expect("雨雲レーダーの項目");
+        assert_eq!(it.key, 'C');
+        assert_eq!(it.label, "雨雲レーダー");
+        assert!(matches!(menu_action_for_key('C'), Some(MenuAction::ToggleRadar)));
+        // 小文字 c(ルート消去)とは別物であること
+        assert!(matches!(menu_action_for_key('c'), Some(MenuAction::ClearRoute)));
     }
 
     #[test]

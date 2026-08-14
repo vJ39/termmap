@@ -39,7 +39,7 @@ mod settings;
 #[allow(dead_code)]
 mod radar;
 
-use image::{RgbImage, imageops::FilterType};
+use image::{RgbImage, RgbaImage, imageops::FilterType};
 
 use geo::*;
 use tiles::*;
@@ -211,18 +211,23 @@ fn attach_route(spec: &mut OverlaySpec, a: &Args) -> Result<Option<String>, Stri
     Ok(Some(summary))
 }
 
-fn render(img: &RgbImage, a: &Args, ov: Option<&OverlayLayer>) -> String {
+// radar は雨雲レイヤ(降水なし=透明)と不透明度。braille/edge では使わない(呼び出し側が
+// OverlayLayer へインクとして焼いている)。classify では recolor() の「後」に合成する:
+// 先に混ぜると classify() が淡い青の降水を Cat::Water(湖)と誤判定して雨が湖に化ける。
+fn render(img: &RgbImage, a: &Args, ov: Option<&OverlayLayer>, radar: Option<(&RgbaImage, f64)>) -> String {
     let th = a.threshold.unwrap_or(if a.edge { 45 } else { 195 });
     let truecolor = truecolor_safe();
     if a.edge { render_braille(img, a.mono, false, th, true, ov, truecolor) }
     else if a.braille { render_braille(img, a.mono, a.classify, th, false, ov, truecolor) }
     else if a.classify {
         let mut rc = recolor(img);
+        if let Some((l, op)) = radar { blend_rgba_over(&mut rc, l, op); }
         if let Some(o) = ov { composite(&mut rc, o); }
         render_halfblock(&rc, truecolor)
-    } else if let Some(o) = ov {
+    } else if ov.is_some() || radar.is_some() {
         let mut c = img.clone();
-        composite(&mut c, o);
+        if let Some((l, op)) = radar { blend_rgba_over(&mut c, l, op); }
+        if let Some(o) = ov { composite(&mut c, o); }
         render_halfblock(&c, truecolor)
     } else {
         render_halfblock(img, truecolor)
@@ -389,7 +394,7 @@ fn oneshot(src: RgbImage, a: &Args, ctx: Option<(f64, f64, u32, &OverlaySpec)>) 
         if let Some((cx, cy, z, spec)) = ctx {
             if !spec.is_empty() {
                 let (w, h) = rc.dimensions();
-                let ov = build_overlay(spec, cx, cy, z, w, h, 1.0, 1.0, w, h);
+                let ov = build_overlay(spec, cx, cy, z, w, h, 1.0, 1.0, w, h, None);
                 composite(&mut rc, &ov);
             }
         }
@@ -405,9 +410,10 @@ fn oneshot(src: RgbImage, a: &Args, ctx: Option<(f64, f64, u32, &OverlaySpec)>) 
     let resized = image::imageops::resize(&src, out_w, out_h, FilterType::Triangle);
     let ov = ctx.and_then(|(cx, cy, z, spec)| {
         if spec.is_empty() { None }
-        else { Some(build_overlay(spec, cx, cy, z, sw, sh, out_w as f64 / sw as f64, out_h as f64 / sh as f64, out_w, out_h)) }
+        else { Some(build_overlay(spec, cx, cy, z, sw, sh, out_w as f64 / sw as f64, out_h as f64 / sh as f64, out_w, out_h, None)) }
     });
-    print!("{}", render(&resized, a, ov.as_ref()).replace("\r\n", "\n"));
+    // CLI一発描画は雨雲レーダー非対応(対話モード限定・設計 §5.4)。
+    print!("{}", render(&resized, a, ov.as_ref(), None).replace("\r\n", "\n"));
 }
 
 fn main() {
@@ -527,6 +533,58 @@ mod tests {
         assert_eq!(sanitize_name("a/b:c"), "a_b_c");
         assert_eq!(fit_cells("ab", 5), "ab   ");
         assert!(fit_cells("あ", 4).starts_with("あ"));
+    }
+
+    // 描画モードだけを変えた Args(他は parse_args の既定値と同じ)。
+    fn args_for(braille: bool, classify: bool, edge: bool) -> Args {
+        Args { lat: None, lon: None, place: None, zoom: 14, width: None, win_px: 640,
+               style: "osm".to_string(), braille, mono: false, classify, edge, here: false,
+               threshold: None, range: Vec::new(), home: None, route: None,
+               route_mode: "surface".to_string(), gpx: None, load_route: None, save_route: None,
+               list_routes: false, share: false, wander: false, dist: None,
+               shape: "loop".to_string(), image: None, png: None }
+    }
+
+    // classify は recolor(6色へ量子化)の「後」に雨雲を合成する。先に混ぜると淡い青の降水が
+    // Cat::Water(湖)と誤判定される(設計 §8.4)。render() がその順序で組んでいることを確認する。
+    #[test]
+    fn render_classify_blends_radar_after_recolor() {
+        let img = RgbImage::from_pixel(4, 4, image::Rgb([245, 245, 245]));
+        let rain = RgbaImage::from_pixel(4, 4, image::Rgba([160, 210, 255, 255]));
+        let got = render(&img, &args_for(false, true, false), None, Some((&rain, 1.0)));
+
+        let mut want = recolor(&img);
+        blend_rgba_over(&mut want, &rain, 1.0);
+        assert_eq!(got, render_halfblock(&want, truecolor_safe()));
+
+        let mut wrong = img.clone(); // 誤順序(合成→量子化)の出力とは一致しないこと
+        blend_rgba_over(&mut wrong, &rain, 1.0);
+        assert_ne!(got, render_halfblock(&recolor(&wrong), truecolor_safe()));
+    }
+
+    // halfblock(既定)は地図へ直接アルファ合成する。
+    #[test]
+    fn render_halfblock_blends_radar_over_map() {
+        let img = RgbImage::from_pixel(4, 4, image::Rgb([200, 200, 200]));
+        let rain = RgbaImage::from_pixel(4, 4, image::Rgba([0, 65, 255, 255]));
+        let got = render(&img, &args_for(false, false, false), None, Some((&rain, 0.5)));
+
+        let mut want = img.clone();
+        blend_rgba_over(&mut want, &rain, 0.5);
+        assert_eq!(got, render_halfblock(&want, truecolor_safe()));
+        // 雨雲なしの出力とは変わっている(合成が効いている)。
+        assert_ne!(got, render(&img, &args_for(false, false, false), None, None));
+    }
+
+    // braille/edge では雨雲は OverlayLayer のインクとして入るので、render() 側では合成しない
+    // (ここで混ぜると輝度が動くだけ/降水の境界が全部輪郭になって線画が壊れる)。
+    #[test]
+    fn render_braille_and_edge_ignore_radar_layer() {
+        let img = RgbImage::from_pixel(4, 4, image::Rgb([200, 200, 200]));
+        let rain = RgbaImage::from_pixel(4, 4, image::Rgba([0, 65, 255, 255]));
+        for a in [args_for(true, false, false), args_for(false, false, true)] {
+            assert_eq!(render(&img, &a, None, Some((&rain, 1.0))), render(&img, &a, None, None));
+        }
     }
 
     #[test]

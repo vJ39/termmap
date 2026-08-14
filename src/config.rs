@@ -50,6 +50,9 @@ pub struct Config {
     pub streetview_enabled: bool,     // 実写(i)を使うか
     pub sound_enabled: bool,          // 操作UI効果音(macOS afplay)を鳴らすか
     pub qr_style: String,             // スマホ共有QRの描画方式: "dense"(標準/文字描画・全端末対応)/"image"(iTerm2インライン画像・セル数を固定小型にできるが画像非対応端末はdenseへ自動フォールバック)。既定dense
+    pub radar_enabled: bool,          // 起動時に雨雲レーダー(気象庁ナウキャスト)をONにするか。既定false(ONにした人だけが外部サービスへ問い合わせる)
+    pub radar_opacity: String,        // 雨雲の重ね方: "light"(0.35)/"mid"(0.55)/"strong"(0.75)。既定mid
+    pub radar_refresh_sec: f64,       // フレーム時刻一覧(targetTimes)の再取得間隔(秒)。既定300。ナウキャスト自体が5分更新なのでこれより短くしても新しい情報は無い(設定画面には出さない)
 }
 
 impl Default for Config {
@@ -75,6 +78,9 @@ impl Default for Config {
             streetview_enabled: true,
             sound_enabled: true,
             qr_style: "dense".to_string(),
+            radar_enabled: false,
+            radar_opacity: "mid".to_string(),
+            radar_refresh_sec: 300.0,
         }
     }
 }
@@ -201,6 +207,22 @@ pub fn load_config_from(path: &Path) -> Config {
                     cfg.sound_enabled = b;
                 }
             }
+            ("radar", "enabled") => {
+                if let Some(b) = parse_bool(value) {
+                    cfg.radar_enabled = b;
+                }
+            }
+            ("radar", "opacity") => {
+                if let Some(s) = parse_string(value) {
+                    if matches!(s.as_str(), "light" | "mid" | "strong") { cfg.radar_opacity = s; }
+                }
+            }
+            ("radar", "refresh_sec") => {
+                // 短すぎる間隔で公共サービスを叩かないよう下限60秒でクランプする(上限は無し)。
+                if let Some(f) = parse_number(value) {
+                    if f.is_finite() { cfg.radar_refresh_sec = f.max(60.0); }
+                }
+            }
             // 旧スキーマ後方互換: [streetview] api_key を google_maps_api_key に取り込む(未設定時のみ)
             ("streetview", "api_key") => {
                 if cfg.google_maps_api_key.is_empty() {
@@ -257,7 +279,12 @@ pub fn save_config_to(path: &Path, c: &Config) -> Result<(), String> {
          enabled = {}\n\
          \n\
          [sound]\n\
-         enabled = {}\n",
+         enabled = {}\n\
+         \n\
+         [radar]\n\
+         enabled = {}\n\
+         opacity = \"{}\"\n\
+         refresh_sec = {}\n",
         c.llm_recommend_enabled,
         c.llm_model,
         c.llm_command,
@@ -278,6 +305,9 @@ pub fn save_config_to(path: &Path, c: &Config) -> Result<(), String> {
         c.google_maps_api_key,
         c.streetview_enabled,
         c.sound_enabled,
+        c.radar_enabled,
+        c.radar_opacity,
+        c.radar_refresh_sec,
     );
 
     // APIキーを含むので unix では 0600。書込中クラッシュで壊さないよう atomic。
@@ -423,6 +453,9 @@ mod tests {
             google_maps_api_key: "AIzaTESTKEY_example_123".to_string(), streetview_enabled: true,
             sound_enabled: false,
             qr_style: "image".to_string(),
+            radar_enabled: true,
+            radar_opacity: "strong".to_string(),
+            radar_refresh_sec: 600.0,
         };
         save_config_to(&path, &original).expect("save should succeed");
         let loaded = load_config_from(&path);
@@ -523,6 +556,54 @@ show_spots = maybe
         std::fs::write(&path2, "[display]\nqr_style = \"bogus\"\n").unwrap();
         let cfg2 = load_config_from(&path2);
         assert_eq!(cfg2.qr_style, Config::default().qr_style);
+        cleanup(&path2);
+    }
+
+    #[test]
+    fn radar_defaults_are_off_mid_and_300s() {
+        let c = Config::default();
+        assert_eq!(c.radar_enabled, false);
+        assert_eq!(c.radar_opacity, "mid");
+        assert_eq!(c.radar_refresh_sec, 300.0);
+    }
+
+    #[test]
+    fn radar_section_is_read() {
+        let path = unique_temp_path("radar_section");
+        std::fs::write(&path, "[radar]\nenabled = true\nopacity = \"strong\"\nrefresh_sec = 900\n").unwrap();
+        let cfg = load_config_from(&path);
+        assert_eq!(cfg.radar_enabled, true);
+        assert_eq!(cfg.radar_opacity, "strong");
+        assert_eq!(cfg.radar_refresh_sec, 900.0);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn radar_opacity_only_accepts_known_values() {
+        let path = unique_temp_path("radar_opacity_unknown");
+        std::fs::write(&path, "[radar]\nopacity = \"bogus\"\n").unwrap();
+        let cfg = load_config_from(&path);
+        assert_eq!(cfg.radar_opacity, Config::default().radar_opacity);
+        cleanup(&path);
+
+        let path2 = unique_temp_path("radar_opacity_light");
+        std::fs::write(&path2, "[radar]\nopacity = \"light\"\n").unwrap();
+        let cfg2 = load_config_from(&path2);
+        assert_eq!(cfg2.radar_opacity, "light");
+        cleanup(&path2);
+    }
+
+    #[test]
+    fn radar_refresh_sec_is_clamped_to_60_seconds_minimum() {
+        // 公共サービス(気象庁)を短間隔で叩かないための下限。0や負値でも60秒に丸まる。
+        let path = unique_temp_path("radar_refresh_floor");
+        std::fs::write(&path, "[radar]\nrefresh_sec = 5\n").unwrap();
+        assert_eq!(load_config_from(&path).radar_refresh_sec, 60.0);
+        cleanup(&path);
+
+        let path2 = unique_temp_path("radar_refresh_negative");
+        std::fs::write(&path2, "[radar]\nrefresh_sec = -1\n").unwrap();
+        assert_eq!(load_config_from(&path2).radar_refresh_sec, 60.0);
         cleanup(&path2);
     }
 
@@ -656,6 +737,9 @@ profile = "custom-profile"
             google_maps_api_key: "k".to_string(), streetview_enabled: true,
             sound_enabled: true,
             qr_style: "dense".to_string(),
+            radar_enabled: false,
+            radar_opacity: "light".to_string(),
+            radar_refresh_sec: 300.0,
         };
         save_config_to(&path, &cfg).unwrap();
         let loaded = load_config_from(&path);
