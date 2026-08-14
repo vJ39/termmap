@@ -60,11 +60,15 @@
   // ── 調整パラメータ ───────────────────────────────────────────────
   var TAP_SLOP_PX      = 12;   // 移動量がこれ以下ならタップ(Enter)扱い
   var TAP_MAX_MS       = 400;  // 接触時間がこれより長いものはタップにしない
-  var PX_PER_STEP      = 40;   // スワイプ何 px ごとに矢印キー1回送るか
-  var MAX_STEPS        = 15;   // 1スワイプで送る矢印キーの上限
-  var STEP_INTERVAL_MS = 16;   // 連続発火の間隔。termmap 側は同方向 220ms 以内の
-                               // 連続入力で pan_streak が伸びて加速する(Rust側の既存実装)
-  var SWIPE_MIN_PX     = 24;   // これ未満の移動はスワイプとして扱わない(タップにも当たらなければ無視)
+  var PX_PER_STEP      = 40;   // パン: 何 px ごとに矢印キー1回か(X/Yそれぞれ独立に判定=斜め対応)
+  var PINCH_PX_PER_STEP = 55;  // ピンチ: 指の間隔が何 px 変わるごとにズーム1段か(誤爆軽減でパンより粗め)
+  var MAX_STEPS_PER_TICK = 6;  // touchmove/慣性の1tickで送るキーの上限(暴走防止の保険)
+  var STEP_INTERVAL_MS = 16;   // sendKeyBurst(ピンチの多段ジャンプ用)の連続発火間隔。termmap 側は
+                               // 同方向220ms以内の連続入力でpan_streakが伸びて加速する(Rust側既存実装)
+  var GLIDE_TICK_MS   = 60;    // 指を離した後の慣性スクロールの1tick間隔
+  var GLIDE_DECAY     = 0.85;  // 1tickごとにこの倍率で速度を減衰させる
+  var GLIDE_MIN_SPEED = 0.05;  // px/ms。これ未満まで減衰したら慣性を止める
+  var GLIDE_MAX_TICKS = 25;    // 保険の上限(だいたい1.5秒で必ず止まる)
 
   // スワイプの向き。true = 地図を指でつかんで動かす向き(Googleマップ等と同じ)。
   //   指を右へ払う → 地図が右へ動く → 見えるのは西側 → ArrowLeft を送る
@@ -189,39 +193,107 @@
     return !!node.closest(TERMINAL_SELECTOR);
   }
 
-  // スワイプの主方向(縦横のうち移動量が大きい方)を矢印キー名へ変換する
-  function directionKey(dx, dy) {
-    var horizontal = Math.abs(dx) >= Math.abs(dy);
-    if (horizontal) {
-      if (DRAG_MAP) { return dx > 0 ? 'ArrowLeft' : 'ArrowRight'; }
-      return dx > 0 ? 'ArrowRight' : 'ArrowLeft';
+  // X軸/Y軸それぞれ独立に「押すべき矢印キー」を決める(斜めスワイプでは両方使う)。
+  function xKey(dx) { return DRAG_MAP ? (dx > 0 ? 'ArrowLeft' : 'ArrowRight') : (dx > 0 ? 'ArrowRight' : 'ArrowLeft'); }
+  function yKey(dy) { return DRAG_MAP ? (dy > 0 ? 'ArrowUp' : 'ArrowDown') : (dy > 0 ? 'ArrowDown' : 'ArrowUp'); }
+
+  // dx/dy ぶんの移動をX軸・Y軸それぞれ独立に矢印キーへ変換して送る(=斜め移動に対応)。
+  // 1回で送るのは MAX_STEPS_PER_TICK まで(暴走防止)。端数(PX_PER_STEP未満)を捨てずに
+  // 済むよう、実際に消費した距離(送った分)を返す。呼び出し側はこれを引いた残りを次回へ繰り越す。
+  function sendPanDelta(dx, dy) {
+    var usedX = 0, usedY = 0;
+    var stepsX = Math.trunc(dx / PX_PER_STEP);
+    if (stepsX !== 0) {
+      var nx = Math.min(Math.abs(stepsX), MAX_STEPS_PER_TICK);
+      var kx = xKey(dx);
+      for (var i = 0; i < nx; i++) { sendKey(kx); }
+      usedX = (stepsX > 0 ? nx : -nx) * PX_PER_STEP;
     }
-    if (DRAG_MAP) { return dy > 0 ? 'ArrowUp' : 'ArrowDown'; }
-    return dy > 0 ? 'ArrowDown' : 'ArrowUp';
+    var stepsY = Math.trunc(dy / PX_PER_STEP);
+    if (stepsY !== 0) {
+      var ny = Math.min(Math.abs(stepsY), MAX_STEPS_PER_TICK);
+      var ky = yKey(dy);
+      for (var j = 0; j < ny; j++) { sendKey(ky); }
+      usedY = (stepsY > 0 ? ny : -ny) * PX_PER_STEP;
+    }
+    return { usedX: usedX, usedY: usedY };
   }
 
-  // 1ジェスチャーの終了時に呼ぶ。タップなら Enter、スワイプなら矢印キーの連打。
-  function resolveGesture(dx, dy, dt) {
+  // タップ判定・慣性の初速推定に使う、直近(150ms以内)の指の軌跡。
+  var velTrack = [];
+  function trackVelocity(x, y) {
+    var now = Date.now();
+    velTrack.push({ x: x, y: y, t: now });
+    while (velTrack.length > 5) { velTrack.shift(); }
+    while (velTrack.length > 1 && now - velTrack[0].t > 150) { velTrack.shift(); }
+  }
+  function estimateVelocity() {
+    if (velTrack.length < 2) { return null; }
+    var a = velTrack[0], b = velTrack[velTrack.length - 1];
+    var dt = b.t - a.t;
+    if (dt <= 0) { return null; }
+    return { vx: (b.x - a.x) / dt, vy: (b.y - a.y) / dt };
+  }
+
+  var glideTimer = null;
+  function stopGlide() {
+    if (glideTimer) { clearTimeout(glideTimer); glideTimer = null; }
+  }
+  // 指を離した瞬間の速度をもとに、減衰させながら動かし続ける慣性スクロール
+  // (「しゅーっ」と流れて自然に止まる感じを出す)。新しい操作が始まったら即打ち切る。
+  function startGlide(v) {
+    stopGlide();
+    if (!v) { return; }
+    var vx = v.vx, vy = v.vy;
+    if (Math.sqrt(vx * vx + vy * vy) < GLIDE_MIN_SPEED * 2) { return; } // 離す直前がほぼ静止=弾かない
+    var carryX = 0, carryY = 0, ticks = 0;
+    (function tick() {
+      ticks++;
+      var dx = vx * GLIDE_TICK_MS + carryX;
+      var dy = vy * GLIDE_TICK_MS + carryY;
+      var used = sendPanDelta(dx, dy);
+      carryX = dx - used.usedX;
+      carryY = dy - used.usedY;
+      vx *= GLIDE_DECAY; vy *= GLIDE_DECAY;
+      if (Math.sqrt(vx * vx + vy * vy) < GLIDE_MIN_SPEED || ticks >= GLIDE_MAX_TICKS) { glideTimer = null; return; }
+      glideTimer = setTimeout(tick, GLIDE_TICK_MS);
+    })();
+  }
+
+  // 2本指ピンチ(拡大/縮小)。指の間隔の変化量をズームキーの回数に変換する。
+  function touchDist(a, b) {
+    var dx = a.clientX - b.clientX, dy = a.clientY - b.clientY;
+    return Math.sqrt(dx * dx + dy * dy);
+  }
+  function consumePinch(touches) {
+    var dist = touchDist(touches[0], touches[1]);
+    if (!pinch) { pinch = { baseDist: dist, sentSteps: 0 }; return; }
+    var want = Math.trunc((dist - pinch.baseDist) / PINCH_PX_PER_STEP);
+    var diff = want - pinch.sentSteps;
+    if (diff === 0) { return; }
+    var n = Math.min(Math.abs(diff), MAX_STEPS_PER_TICK);
+    sendKeyBurst(diff > 0 ? '+' : '-', n); // 指を開く=+(ズームイン) / つまむ=-(ズームアウト)
+    pinch.sentSteps += (diff > 0 ? n : -n);
+  }
+
+  // 1本指ジェスチャーの終了時に呼ぶ。タップなら Enter、それ以外は離した瞬間の速度で慣性へ。
+  function onGestureEnd(startX, startY, startT, endX, endY) {
+    var dx = endX - startX, dy = endY - startY;
     var dist = Math.sqrt(dx * dx + dy * dy);
-
-    if (dist <= TAP_SLOP_PX && dt <= TAP_MAX_MS) {
+    if (dist <= TAP_SLOP_PX && Date.now() - startT <= TAP_MAX_MS) {
       sendKey('Enter');
-      return 'tap';
+      return;
     }
-    if (dist < SWIPE_MIN_PX) { return 'none'; }
-
-    var steps = Math.round(dist / PX_PER_STEP);
-    if (steps < 1) { steps = 1; }
-    if (steps > MAX_STEPS) { steps = MAX_STEPS; }
-    sendKeyBurst(directionKey(dx, dy), steps);
-    return 'swipe';
+    startGlide(estimateVelocity());
   }
 
-  var gesture = null;   // { x, y, t } 追跡中のジェスチャー
+  var gesture = null;   // { x, y, t } タップ判定用(1本指ジェスチャーの開始点)
+  var panLast = null;   // { x, y } ここまで消費した位置(ライブパン用)
+  var pinch = null;     // { baseDist, sentSteps } 2本指ピンチ
   var sawTouch = false; // タッチ端末ではマウス側の代替処理を止める
 
   function bindGestures() {
-    // タッチ(本番: iPhone等)
+    // タッチ(本番: iPhone等)。1本指=ドラッグでその場から地図が追従、2本指=ピンチでズーム。
     document.addEventListener('touchstart', function (e) {
       if (!inTerminal(e.target)) { return; }
       // ブラウザ既定のスクロール/ダブルタップ拡大/フォーカス移動を止める「だけ」では不十分:
@@ -232,40 +304,73 @@
       e.preventDefault();
       e.stopPropagation();
       sawTouch = true;
-      if (e.touches.length !== 1) { gesture = null; return; } // ピンチ等は無視
+      stopGlide(); // 新しい操作が始まったら前の慣性は打ち切る
+      if (e.touches.length === 2) {
+        gesture = null; panLast = null;
+        pinch = { baseDist: touchDist(e.touches[0], e.touches[1]), sentSteps: 0 };
+        return;
+      }
+      if (e.touches.length !== 1) { gesture = null; panLast = null; pinch = null; return; }
+      pinch = null;
       var t = e.touches[0];
       gesture = { x: t.clientX, y: t.clientY, t: Date.now() };
+      panLast = { x: t.clientX, y: t.clientY };
+      velTrack = [{ x: t.clientX, y: t.clientY, t: Date.now() }];
     }, { capture: true, passive: false });
 
     document.addEventListener('touchmove', function (e) {
       if (!inTerminal(e.target)) { return; }
       e.preventDefault();                       // 慣性スクロール/ピンチ拡大の暴発を抑える
       e.stopPropagation();                       // 理由は touchstart 側のコメント参照
-      if (e.touches.length !== 1) { gesture = null; }
+      if (e.touches.length === 2) {
+        gesture = null; panLast = null;
+        consumePinch(e.touches);
+        return;
+      }
+      if (e.touches.length !== 1 || !panLast) { gesture = null; panLast = null; return; }
+      var t = e.touches[0];
+      trackVelocity(t.clientX, t.clientY);
+      var dx = t.clientX - panLast.x, dy = t.clientY - panLast.y;
+      var used = sendPanDelta(dx, dy);
+      panLast.x += used.usedX; panLast.y += used.usedY;
     }, { capture: true, passive: false });
 
     document.addEventListener('touchend', function (e) {
       if (!inTerminal(e.target)) { return; }
       e.preventDefault();
       e.stopPropagation();                       // 理由は touchstart 側のコメント参照
+      pinch = null;
       if (!gesture) { return; }
       var t = e.changedTouches && e.changedTouches[0];
-      if (t) { resolveGesture(t.clientX - gesture.x, t.clientY - gesture.y, Date.now() - gesture.t); }
-      gesture = null;
+      if (t) { onGestureEnd(gesture.x, gesture.y, gesture.t, t.clientX, t.clientY); }
+      gesture = null; panLast = null;
     }, { capture: true, passive: false });
 
-    document.addEventListener('touchcancel', function () { gesture = null; }, { capture: true });
+    document.addEventListener('touchcancel', function () {
+      gesture = null; panLast = null; pinch = null; stopGlide();
+    }, { capture: true });
 
     // マウス(PCブラウザでの動作確認用。タッチが一度でも来たら無効化する)
     document.addEventListener('mousedown', function (e) {
       if (sawTouch || !inTerminal(e.target)) { return; }
+      stopGlide();
       gesture = { x: e.clientX, y: e.clientY, t: Date.now() };
+      panLast = { x: e.clientX, y: e.clientY };
+      velTrack = [{ x: e.clientX, y: e.clientY, t: Date.now() }];
+    }, true);
+
+    document.addEventListener('mousemove', function (e) {
+      if (sawTouch || !gesture || !panLast) { return; }
+      trackVelocity(e.clientX, e.clientY);
+      var dx = e.clientX - panLast.x, dy = e.clientY - panLast.y;
+      var used = sendPanDelta(dx, dy);
+      panLast.x += used.usedX; panLast.y += used.usedY;
     }, true);
 
     document.addEventListener('mouseup', function (e) {
       if (sawTouch || !gesture || !inTerminal(e.target)) { return; }
-      resolveGesture(e.clientX - gesture.x, e.clientY - gesture.y, Date.now() - gesture.t);
-      gesture = null;
+      onGestureEnd(gesture.x, gesture.y, gesture.t, e.clientX, e.clientY);
+      gesture = null; panLast = null;
     }, true);
   }
 
@@ -422,7 +527,9 @@
     version: OVERLAY_VERSION,
     sendKey: sendKey,
     sendKeyBurst: sendKeyBurst,
-    resolveGesture: resolveGesture,
+    sendPanDelta: sendPanDelta,
+    onGestureEnd: onGestureEnd,
+    consumePinch: consumePinch,
     keys: KEYS,
     findTextarea: findTextarea
   };
