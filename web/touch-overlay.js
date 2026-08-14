@@ -138,6 +138,43 @@
     });
   }
 
+  // ── ライブ現在地(ブラウザのGeolocation APIをtermmapへ送る) ──────────────────────
+  // termmap側の G キーは Mac 本体の CoreLocationCLI しか読めず、Web からアクセスしている
+  // スマホの位置は取れない。window.term.paste() で SOH()区切りの専用マーカーを
+  // 「貼り付け」として送り、termmap 側の Event::Paste ハンドラで検出・解釈させる
+  // (bracketed paste モードなので任意の制御文字を含んでいても1つのテキストとして届く。
+  // 通常のペースト内容とは衝突しない制御文字を区切りに選んでいる)。GキーのCoreLocationCLI
+  // 経路とは完全に独立しており、送るだけならこちらの操作でMac側のGPSは一切起動しない。
+  var GPS_WATCH_ID = null;
+  var GPS_MIN_INTERVAL_MS = 3000; // 送信間隔の下限(pty/描画を圧迫しないよう間引く)
+  var gpsLastSentAt = 0;
+
+  function sendGpsPaste(text) {
+    var t = window.term;
+    if (!t || typeof t.paste !== 'function') { return; }
+    t.paste('' + text);
+  }
+
+  function toggleWebGps() {
+    if (GPS_WATCH_ID !== null) {
+      navigator.geolocation.clearWatch(GPS_WATCH_ID);
+      GPS_WATCH_ID = null;
+      sendGpsPaste('GPS_STOP');
+      return;
+    }
+    if (!navigator.geolocation) { return; } // 非対応環境は何もしない
+    GPS_WATCH_ID = navigator.geolocation.watchPosition(
+      function (pos) {
+        var now = Date.now();
+        if (now - gpsLastSentAt < GPS_MIN_INTERVAL_MS) { return; } // 間引き
+        gpsLastSentAt = now;
+        sendGpsPaste('GPS' + pos.coords.latitude + '' + pos.coords.longitude);
+      },
+      function () { GPS_WATCH_ID = null; }, // 権限拒否/取得失敗: 状態を戻すだけ
+      { enableHighAccuracy: true, maximumAge: 5000, timeout: 15000 }
+    );
+  }
+
   // ── キーイベント合成 ────────────────────────────────────────────
   function defineIfNeeded(ev, name, value) {
     if (ev[name] === value) { return; }
@@ -433,6 +470,13 @@
   // 離脱はブラウザのタブを閉じる操作に任せる。
   // ▲▼はメニュー(Space)を開いている時のカーソル移動(項目選択)に主に使う。
   // 地図がフォーカスの時は普通にパン(1段)になる。
+  // ボタン定義のaction指定を実行する(action無しなら通常どおりキー送信)。
+  function runButtonAction(def) {
+    if (def.action === 'keyboard') { toggleKeyboard(); }
+    else if (def.action === 'gps') { toggleWebGps(); }
+    else { sendKey(def.key); }
+  }
+
   var BUTTONS = [
     { label: 'Menu', key: ' ',        title: 'メニュー (Space)' },
     { label: '▲',    key: 'ArrowUp',   title: '上(メニューでは項目選択)' },
@@ -447,7 +491,10 @@
     { label: '?',    key: '?',        title: 'ヘルプ' },
     // key ではなく action:'keyboard' 指定。住所検索(`/`)やスポット名入力など、文字入力が
     // したい時だけ本物のソフトキーボードを呼び出す(他のボタンは意図的にキーボードを出さない)。
-    { label: '⌨',    action: 'keyboard', title: 'ソフトキーボードを開く(住所検索・名前入力用)' }
+    { label: '⌨',    action: 'keyboard', title: 'ソフトキーボードを開く(住所検索・名前入力用)' },
+    // action:'gps'。スマホのGeolocation APIでライブ現在地(トグル)。Gキー(Mac本体の
+    // CoreLocationCLI)とは別経路で、こちらはスマホ自身の位置を送る。
+    { label: '📍',   action: 'gps',      title: 'スマホのGPSでライブ現在地(トグル)' }
   ];
 
   // レイアウトの考え方:
@@ -535,7 +582,7 @@
         e.stopPropagation();
         sawTouch = true;
         flash(btn);
-        if (def.action === 'keyboard') { toggleKeyboard(); } else { sendKey(def.key); }
+        runButtonAction(def);
       }, { passive: false });
 
       btn.addEventListener('click', function (e) {
@@ -543,7 +590,7 @@
         e.stopPropagation();
         if (sawTouch) { return; }
         flash(btn);
-        if (def.action === 'keyboard') { toggleKeyboard(); } else { sendKey(def.key); }
+        runButtonAction(def);
       });
 
       bar.appendChild(btn);
@@ -595,6 +642,7 @@
     onGestureEnd: onGestureEnd,
     consumePinch: consumePinch,
     toggleKeyboard: toggleKeyboard,
+    toggleWebGps: toggleWebGps,
     keys: KEYS,
     findTextarea: findTextarea
   };

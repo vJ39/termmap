@@ -140,6 +140,9 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     let mut gps_rx: Option<gpslive::GpsPoller> = None; // G ライブ現在地(drop で停止)
     let mut gps_pos: Option<(f64, f64)> = None; // 最新の自位置
     let mut gps_trail: Vec<(f64, f64)> = Vec::new(); // 通過ブレッドクラム
+    // web/touch-overlay.js からブラウザのGeolocation APIで送られてくるライブ現在地。
+    // gps_rx(CoreLocationCLI・Mac本体の位置)とは別経路だが、描画(gps_pos/gps_trail)は共有する。
+    let mut web_gps_active = false;
     // 雨雲レーダー(気象庁ナウキャスト・C で ON/OFF、< > で表示時刻を前後)。
     // 起動時の状態は設定 [radar] enabled(既定OFF)に従う。ONにした人だけが外部サービスへ問い合わせる。
     let mut radar_on = cfg.radar_enabled;
@@ -961,7 +964,9 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     const FR: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
                     format!("{} 通信中…(Escで中断) ", FR[spin % FR.len()])
                 } else { String::new() };
-                let live = if gps_rx.is_some() { "●LIVE(Gで解除) " } else { "" };
+                let live = if gps_rx.is_some() { "●LIVE(Gで解除) " }
+                    else if web_gps_active { "●LIVE(スマホGPS) " }
+                    else { "" };
                 let playing = if play.is_some() { format!("▶再生{play_speed:.2}x([ ]変速/A停止) ") } else { String::new() };
                 // 雨雲レーダー: 表示中の時刻・種別と、タイルの読込状況。ONのときだけ出す。
                 // 出典表記は幅を食うので毎フレームは出さず、ONにした直後のメッセージ(addr)で1回出す。
@@ -2474,6 +2479,29 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                         let n = (TILE as f64) * 2f64.powi(z as i32);
                         if cx < 0.0 { cx += n; } else if cx >= n { cx -= n; }
                         cy = cy.clamp(0.0, n - 1.0);
+                    }
+                }
+            }
+            // web/touch-overlay.js が window.term.paste() で送ってくる、ブラウザの
+            // Geolocation APIによるライブ現在地。SOH(\u{1})区切りの専用マーカーにしているのは、
+            // 普通に貼り付けられるURL/テキストと衝突しない制御文字だから。マーカーに一致しない
+            // 通常のペーストは下の既存分岐(検索欄への入力等)へ素通しする。
+            Some(Event::Paste(s)) if s.starts_with("\u{1}GPS_STOP\u{1}") => {
+                web_gps_active = false;
+                addr = "ライブ現在地(スマホ): OFF".into();
+            }
+            Some(Event::Paste(s)) if s.starts_with("\u{1}GPS\u{1}") => {
+                let rest = &s["\u{1}GPS\u{1}".len()..];
+                let mut parts = rest.splitn(2, '\u{1}');
+                if let (Some(la_s), Some(lo_s)) = (parts.next(), parts.next()) {
+                    if let (Ok(la), Ok(lo)) = (la_s.parse::<f64>(), lo_s.parse::<f64>()) {
+                        if la.is_finite() && lo.is_finite() && (-90.0..=90.0).contains(&la) && (-180.0..=180.0).contains(&lo) {
+                            if !web_gps_active { gps_trail.clear(); addr = "ライブ現在地(スマホ): ON".into(); }
+                            web_gps_active = true;
+                            gps_pos = Some((la, lo));
+                            gps_trail.push((la, lo));
+                            if gps_trail.len() > 300 { gps_trail.remove(0); }
+                        }
                     }
                 }
             }
