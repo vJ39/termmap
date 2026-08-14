@@ -203,8 +203,17 @@ fn tile_distance_to_view(tile_z: u32, tile_x: i64, tile_y: i64, view_cx: f64, vi
 
 // ワーカーが「今どこを見ているか」を知るための共有view。メインが毎フレーム最新化する。
 struct ViewState { cx: f64, cy: f64, z: u32, style: String }
-// 取得依頼中のタイル集合。queued=未着手 / inflight=取得中。両方にもcacheにも無いものだけ新規登録して二重取得を防ぐ。
-struct PendingSet { queued: HashSet<TileKey>, inflight: HashSet<TileKey> }
+// 取得依頼中のタイル集合。queued=未着手 / inflight=取得中 / failed=直近に失敗し再試行クールダウン中。
+// queued/inflightにもcacheにも無いものだけ新規登録して二重取得を防ぐ。failedはさらに、404等の恒久的
+// 失敗をクールダウン明けまで再登録しない(#56)ためのネガティブキャッシュ。
+struct PendingSet { queued: HashSet<TileKey>, inflight: HashSet<TileKey>, failed: HashMap<TileKey, std::time::Instant> }
+
+// 失敗クールダウン期限。直近の失敗からこの時間未満は再登録しない(404等の恒久失敗を~20ms間隔で
+// 無限リトライし続けるのを防ぐ)。期限を過ぎれば通常通り再試行される(一時的な障害からは回復できる)。
+const FAILED_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
+
+// 失敗からの経過時間がクールダウン未満か(時刻取得を伴わない純粋関数)。
+fn in_cooldown(elapsed: std::time::Duration) -> bool { elapsed < FAILED_COOLDOWN }
 
 // 常駐ワーカー数(=非topoの並列上限)。topo時は inflight 数で2に絞るので、余ったワーカーは待機する。
 const LOADER_WORKERS: usize = 8;
@@ -224,7 +233,7 @@ impl TileLoader {
     // 共有キャッシュを受け取ってワーカー群を起こす。以後 interactive の生存中ずっと動く。
     pub fn start(shared: Arc<Mutex<Cache>>) -> Self {
         let view = Arc::new(Mutex::new(ViewState { cx: 0.0, cy: 0.0, z: 0, style: String::new() }));
-        let pending = Arc::new(Mutex::new(PendingSet { queued: HashSet::new(), inflight: HashSet::new() }));
+        let pending = Arc::new(Mutex::new(PendingSet { queued: HashSet::new(), inflight: HashSet::new(), failed: HashMap::new() }));
         let generation = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         for _ in 0..LOADER_WORKERS {
@@ -243,11 +252,18 @@ impl TileLoader {
     }
 
     // build_window_nowait から欠落タイルをまとめて積む(cacheロックは呼び出し側で解放済み)。
-    // 既に queued/inflight にあるものは弾く=二重リクエスト防止。
+    // 既に queued/inflight にあるものは弾く=二重リクエスト防止。直近失敗してクールダウン中のものも
+    // 弾く(#56)。クールダウンを過ぎていればfailedから外して通常通り再試行する。
     fn request_tiles(&self, keys: Vec<TileKey>) {
         let mut p = self.pending.lock().unwrap();
+        let now = std::time::Instant::now();
         for k in keys {
-            if !p.queued.contains(&k) && !p.inflight.contains(&k) { p.queued.insert(k); }
+            if p.queued.contains(&k) || p.inflight.contains(&k) { continue; }
+            if let Some(&failed_at) = p.failed.get(&k) {
+                if in_cooldown(now.duration_since(failed_at)) { continue; }
+                p.failed.remove(&k);
+            }
+            p.queued.insert(k);
         }
     }
 
@@ -313,12 +329,16 @@ fn worker_loop(shared: Arc<Mutex<Cache>>, view: Arc<Mutex<ViewState>>, pending: 
             None => std::thread::sleep(std::time::Duration::from_millis(20)),
             Some(k) => {
                 // ネットワーク取得中はどのロックも握らない(メイン描画をブロックしないため)。
-                if let Ok(img) = fetch_tile(&k.style, k.z, k.x, k.y) {
-                    shared.lock().unwrap().insert(k.clone(), img);
-                    generation.fetch_add(1, Ordering::Relaxed); // 届いた→次フレームで再描画させる
+                match fetch_tile(&k.style, k.z, k.x, k.y) {
+                    Ok(img) => {
+                        shared.lock().unwrap().insert(k.clone(), img);
+                        generation.fetch_add(1, Ordering::Relaxed); // 届いた→次フレームで再描画させる
+                    }
+                    // 失敗はfailedへ記録し、クールダウン明けまで再登録させない(#56)。cache未挿入のままなので
+                    // クールダウンが明けて再登録されれば通常通りリトライされる(一時的な障害からは回復できる)。
+                    Err(_) => { pending.lock().unwrap().failed.insert(k.clone(), std::time::Instant::now()); }
                 }
-                // 成否に関わらず inflight から外す。失敗時は cache 未挿入のまま残り、次フレームでメインが
-                // 再登録して自然にリトライされる。
+                // 成否に関わらず inflight から外す。
                 pending.lock().unwrap().inflight.remove(&k);
             }
         }
@@ -460,6 +480,15 @@ mod tests {
         assert!(!is_tile_fresh(std::time::Duration::from_secs(30 * 24 * 60 * 60)));
         assert!(!is_tile_fresh(std::time::Duration::from_secs(31 * 24 * 60 * 60)));
         assert!(is_tile_fresh(std::time::Duration::from_secs(0)));
+    }
+
+    // 失敗クールダウン境界(#56): 30秒未満はクールダウン中(再登録しない)、30秒以上は明け(再試行してよい)。
+    #[test]
+    fn in_cooldown_boundary() {
+        assert!(in_cooldown(std::time::Duration::from_secs(0)));
+        assert!(in_cooldown(std::time::Duration::from_secs(29)));
+        assert!(!in_cooldown(std::time::Duration::from_secs(30)));
+        assert!(!in_cooldown(std::time::Duration::from_secs(31)));
     }
 
     // 各種 win_w/win_h/shift の組み合わせで、拡大後(scaled_w/h)が要求サイズ(win_w/h)以上に

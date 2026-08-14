@@ -1580,7 +1580,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                     Ok(v) => { cfg.sample_interval_m = v.clamp(100.0, 5000.0); let _ = config::save_config(&cfg); addr = format!("道路の点間隔: {}m", cfg.sample_interval_m as i64); }
                                     Err(_) => { snd.play("error"); addr = "数値を入力してください(例: 800)".into(); }
                                 }
-                            } else if idx == 15 {
+                            } else if idx == 17 {
                                 let v = buf.trim().to_string();
                                 if v.chars().all(|c| c.is_ascii_graphic() || c == ' ') {
                                     cfg.google_maps_api_key = v; let _ = config::save_config(&cfg); addr = "APIキー設定(自動保存)".into();
@@ -1591,7 +1591,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                         KeyCode::Esc => { snd.play("back"); focus = Focus::Settings; } // 編集を破棄
                         // 数値欄(道路の点間隔)は数字/小数点/マイナスのみ受け付ける。APIキー欄は制御文字・改行を弾く。
                         KeyCode::Char(c) if idx == 6 && !(c.is_ascii_digit() || c == '.' || c == '-') => {}
-                        KeyCode::Char(c) if idx == 15 && !(c.is_ascii_graphic() || c == ' ') => {}
+                        KeyCode::Char(c) if idx == 17 && !(c.is_ascii_graphic() || c == ' ') => {}
                         other => { edit_line(&mut buf, &mut input_cur, other); focus = Focus::SettingsEdit(idx, buf); }
                     },
                     Focus::RoadSearch(mut buf) => match k.code { // 道路名/ref で現在view内をルート化
