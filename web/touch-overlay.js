@@ -167,11 +167,14 @@
   // 住所検索(`/`)やスポット名の入力等、文字入力がしたい時だけ本物のフォーカスを呼ぶボタン用。
   // sendKey() 経由の合成keydownでは無効化した focus() を、ここでは意図的に本物のまま呼び出す
   // (ユーザーの実タップの中で同期的に呼ぶので、iOSのソフトキーボードは正常にせり上がる)。
-  function showKeyboard() {
+  // 既にソフトキーボードが出ている(=textareaが本当にフォーカスされている)時は逆に blur() で
+  // 閉じる、というトグル動作にする。blur() は上書きしていないので本物のまま効く。
+  function toggleKeyboard() {
     var ta = findTextarea();
     if (!ta) { return; }
     neutralizeFocus(ta); // 未パッチ(一度もsendKeyしていない)ならここで退避される
-    (ta.__termmapRealFocus || ta.focus).call(ta);
+    if (document.activeElement === ta) { ta.blur(); }
+    else { (ta.__termmapRealFocus || ta.focus).call(ta); }
   }
 
   // キーを1回分(keydown [+ keypress] + keyup)送る
@@ -495,7 +498,7 @@
         e.stopPropagation();
         sawTouch = true;
         flash(btn);
-        if (def.action === 'keyboard') { showKeyboard(); } else { sendKey(def.key); }
+        if (def.action === 'keyboard') { toggleKeyboard(); } else { sendKey(def.key); }
       }, { passive: false });
 
       btn.addEventListener('click', function (e) {
@@ -503,7 +506,7 @@
         e.stopPropagation();
         if (sawTouch) { return; }
         flash(btn);
-        if (def.action === 'keyboard') { showKeyboard(); } else { sendKey(def.key); }
+        if (def.action === 'keyboard') { toggleKeyboard(); } else { sendKey(def.key); }
       });
 
       bar.appendChild(btn);
@@ -553,7 +556,7 @@
     sendPanDelta: sendPanDelta,
     onGestureEnd: onGestureEnd,
     consumePinch: consumePinch,
-    showKeyboard: showKeyboard,
+    toggleKeyboard: toggleKeyboard,
     keys: KEYS,
     findTextarea: findTextarea
   };
