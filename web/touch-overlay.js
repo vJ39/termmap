@@ -97,6 +97,8 @@
 
     // 大文字 A-Z は keydown からは出ないので keypress で送る
     'C':        { key: 'C', code: 'KeyC',  keyCode: 67, charCode: 67, shift: true, mode: 'press' },
+    // ルート一覧(左袖)の表示切替。大文字なので'C'と同じ理由でkeypress経由。
+    'R':        { key: 'R', code: 'KeyR',  keyCode: 82, charCode: 82, shift: true, mode: 'press' },
     // 空白は keyCode 32 で keydown の分岐に乗らないので keypress で送る
     ' ':        { key: ' ', code: 'Space', keyCode: 32, charCode: 32,              mode: 'press' }
   };
@@ -494,7 +496,8 @@
     { label: '⌨',    action: 'keyboard', title: 'ソフトキーボードを開く(住所検索・名前入力用)' },
     // action:'gps'。スマホのGeolocation APIでライブ現在地(トグル)。Gキー(Mac本体の
     // CoreLocationCLI)とは別経路で、こちらはスマホ自身の位置を送る。
-    { label: '📍',   action: 'gps',      title: 'スマホのGPSでライブ現在地(トグル)' }
+    { label: '📍',   action: 'gps',      title: 'スマホのGPSでライブ現在地(トグル)' },
+    { label: '☰',    key: 'R',           title: 'ルート一覧(左袖)の表示/非表示。ルート自体は消えない' }
   ];
 
   // レイアウトの考え方:
@@ -542,10 +545,10 @@
     '#' + BAR_ID + ' button {',
     '  flex: 1 1 0; min-width: 0; margin: 4px 0; padding: 0;',
     '  background: #22262d; color: #d7dbe0; border: 1px solid #343a44; border-radius: 8px;',
-    // 12 個を横並びにすると幅 390px の端末で 1 個あたり約 30px しかない。
-    // "Menu" "Esc" が枠からはみ出さないよう 11px に下げ、念のため溢れも隠す。
-    // これ以上ボタンが増える場合は2段組みを検討する。
-    '  font: 600 11px/1 -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;',
+    // 14 個を横並びにすると幅 390px の端末で 1 個あたり約 28px しかない。
+    // "Menu" "Esc" が枠からはみ出さないよう 10px に下げ、念のため溢れも隠す。
+    // これ以上ボタンが増えるなら2段組みへの変更が要る(横幅がもう厳しい)。
+    '  font: 600 10px/1 -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;',
     '  white-space: nowrap; overflow: hidden; text-overflow: clip;',
     '  -webkit-tap-highlight-color: transparent; touch-action: none; cursor: pointer;',
     '}',

@@ -143,6 +143,10 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     // web/touch-overlay.js からブラウザのGeolocation APIで送られてくるライブ現在地。
     // gps_rx(CoreLocationCLI・Mac本体の位置)とは別経路だが、描画(gps_pos/gps_trail)は共有する。
     let mut web_gps_active = false;
+    // R でルート一覧(左袖)を隠す。ルート自体(wps)は保持したまま表示だけ消す
+    // (画面が狭いWeb版で、ルートがある間ずっと出っぱなしなのが邪魔だという要望への対応)。
+    // Tab等でRoutePanelへ実際にフォーカスした時は隠さない(操作したいのに何も見えないと困るため)。
+    let mut route_panel_hidden = false;
     // 雨雲レーダー(気象庁ナウキャスト・C で ON/OFF、< > で表示時刻を前後)。
     // 起動時の状態は設定 [radar] enabled(既定OFF)に従う。ONにした人だけが外部サービスへ問い合わせる。
     let mut radar_on = cfg.radar_enabled;
@@ -475,7 +479,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         let map_rows = if elev_h > 0 { map_rows.saturating_sub(elev_h + 1).max(3) } else { map_rows };
         let show_routes = matches!(focus, Focus::RouteList);
         let show_wps = matches!(focus, Focus::WaypointList);
-        let show_route = (matches!(focus, Focus::Map) && !wps.is_empty()) || matches!(focus, Focus::RoutePanel); // 地点一覧を左袖に(Map中/パネルフォーカス中)
+        let show_route = (matches!(focus, Focus::Map) && !wps.is_empty() && !route_panel_hidden) || matches!(focus, Focus::RoutePanel); // 地点一覧を左袖に(Map中・R非表示でなければ/パネルフォーカス中は常に)
         let show_splist = matches!(focus, Focus::SpotList);
         let show_catlist = matches!(focus, Focus::SpotCatList);
         let show_settings = matches!(focus, Focus::Settings | Focus::SettingsPick(_));
@@ -2382,6 +2386,16 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                 else { input_cur = 0; focus = Focus::Recommend(String::new()); }
                             }
                             KeyCode::Char('V') => { show_spots = !show_spots; apply_spots(&mut spec, &spots, &spot_cats, show_spots); addr = if show_spots { "マイスポット表示".into() } else { "マイスポット非表示".into() }; }
+                            // ルート一覧(左袖)の表示切替。ルート自体(wps)は消さない。狙いは
+                            // 画面が狭い端末で「ルートがある間ずっと出っぱなし」を隠せるようにすること。
+                            // 左袖はマップ本体の再描画では上書きされない列に描かれているため、隠す方向の
+                            // 切替では全消去してから次フレームで再構築させる(Menu閉じる時と同じ理由)。
+                            KeyCode::Char('R') => {
+                                route_panel_hidden = !route_panel_hidden;
+                                addr = if route_panel_hidden { "ルート一覧: 非表示".into() } else { "ルート一覧: 表示".into() };
+                                if route_panel_hidden { let _ = write!(out, "\x1b[2J"); }
+                                force_reemit = true;
+                            }
                             KeyCode::Char('E') => { // 標高プロファイルの表示/非表示
                                 show_elev = !show_elev;
                                 if show_elev && (spec.routes.is_empty() || !route_ele.iter().any(|&z| z != 0.0)) { addr = "標高: ルート確定後に表示".into(); }
