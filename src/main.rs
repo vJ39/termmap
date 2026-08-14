@@ -34,6 +34,10 @@ mod config;
 #[allow(dead_code)]
 mod recommend;
 mod settings;
+// 雨雲レーダー(気象庁ナウキャスト)のフレーム時刻管理。
+// ui.rs/tiles.rs への配線は後続増分のため、現時点では未wireで dead_code 許容。
+#[allow(dead_code)]
+mod radar;
 
 use image::{RgbImage, imageops::FilterType};
 
