@@ -207,9 +207,13 @@
     // タッチ(本番: iPhone等)
     document.addEventListener('touchstart', function (e) {
       if (!inTerminal(e.target)) { return; }
-      // ブラウザ既定のスクロール/ダブルタップ拡大/フォーカス移動を止める。
-      // ここで止めないと iOS がソフトキーボードを出そうとする。
+      // ブラウザ既定のスクロール/ダブルタップ拡大/フォーカス移動を止める「だけ」では不十分:
+      // preventDefault はブラウザの既定動作を止めるだけで、ttyd 同梱 xterm.js が端末要素に
+      // 直接張っている touchstart/mousedown ハンドラ(タップで .xterm-helper-textarea を
+      // focus してソフトキーボードをせり上げる処理)までは止められない。document の capture
+      // フェーズで stopPropagation して、そのハンドラにイベントを届かせないようにする。
       e.preventDefault();
+      e.stopPropagation();
       sawTouch = true;
       if (e.touches.length !== 1) { gesture = null; return; } // ピンチ等は無視
       var t = e.touches[0];
@@ -219,12 +223,14 @@
     document.addEventListener('touchmove', function (e) {
       if (!inTerminal(e.target)) { return; }
       e.preventDefault();                       // 慣性スクロール/ピンチ拡大の暴発を抑える
+      e.stopPropagation();                       // 理由は touchstart 側のコメント参照
       if (e.touches.length !== 1) { gesture = null; }
     }, { capture: true, passive: false });
 
     document.addEventListener('touchend', function (e) {
       if (!inTerminal(e.target)) { return; }
       e.preventDefault();
+      e.stopPropagation();                       // 理由は touchstart 側のコメント参照
       if (!gesture) { return; }
       var t = e.changedTouches && e.changedTouches[0];
       if (t) { resolveGesture(t.clientX - gesture.x, t.clientY - gesture.y, Date.now() - gesture.t); }

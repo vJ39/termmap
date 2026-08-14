@@ -101,6 +101,8 @@ refresh_sec = 300
 キーボードの無いスマホ(iPhone等)から、スワイプとタップだけで操作するための一式。
 termmap 本体はそのままで、[ttyd](https://github.com/tsl0922/ttyd) の配信ページに
 タッチ操作用のオーバーレイ(`web/touch-overlay.js`)を足して実現している。
+認証は ttyd の Basic 認証ではなく、手前に置く小さな Cookie 認証プロキシ
+(`src/bin/webauth-proxy.rs`)で行う。
 
     brew install ttyd
 
@@ -118,15 +120,38 @@ termmap 本体はそのままで、[ttyd](https://github.com/tsl0922/ttyd) の�
     export TERMMAP_WEB_PASS=十分に長いパスワード
     scripts/serve-web.sh
 
-`127.0.0.1:7681` だけで待ち受ける。Basic 認証が必須で、既定のユーザー名・パスワードは
+`127.0.0.1:7681` だけで待ち受ける。ログインが必須で、既定のユーザー名・パスワードは
 用意していない(環境変数が未設定なら起動せずに終了する)。
+`serve-web.sh` は ttyd(認証なし・`127.0.0.1:17681` の内部ポート)と、その手前の
+`webauth-proxy`(公開ポート 7681)の2プロセスを起こす。Ctrl-C で両方止まる。
 
 **3. 外から繋ぐ**(使う時だけ手で立ち上げる)
 
     cloudflared tunnel --url http://127.0.0.1:7681
 
-表示された `https://....trycloudflare.com` をスマホで開き、Basic 認証を通せば地図が出る。
+表示された `https://....trycloudflare.com` をスマホで開くとログイン画面が出る。
+`TERMMAP_WEB_USER` / `TERMMAP_WEB_PASS` を入れれば地図が出る(以降30日はCookieで素通り)。
 使い終わったら `cloudflared` と `serve-web.sh` を両方止める。
+
+### 認証(webauth-proxy)
+
+ttyd の `-c`(Basic 認証)を使わないのは、iOS Safari が最初のページで通した資格情報を
+裏で走る `/token` の fetch や WebSocket ハンドシェイクへ再利用せず、Cloudflare Tunnel 経由だと
+認証が通らずリロードを繰り返すため。Cookie ならどちらにも自動で付くので、認証だけを
+前段のプロキシに出した(設計: `docs/web-auth-proxy-design.md`)。
+
+    ブラウザ ⇄ (HTTPS) Cloudflare Tunnel ⇄ webauth-proxy:7681 ⇄ ttyd:17681 ⇄ termmap
+
+- `POST /login` の user/pass を環境変数と定数時間比較し、通れば 32byte 乱数のセッション
+  トークンを `termmap_session` Cookie(HttpOnly / Secure / SameSite=Strict / 30日)で渡す
+- Cookie が無い/期限切れ: 通常のページはログインフォーム、WebSocket は 401
+- セッションはプロセス内メモリのみ。`serve-web.sh` を再起動したらログインし直し
+- パスワードを間違えると1秒待たされる(簡易ブルートフォース対策)
+- 変更したいときのつまみ: `TERMMAP_WEB_PORT`(公開・既定7681)、
+  `TERMMAP_WEB_TTYD_PORT`(内部・既定17681)
+- Cookie に `Secure` を付けているため、素の HTTP で直接開く場合はブラウザによっては
+  ログイン状態が保持されない(Safari など)。トンネル越しの HTTPS が本来の使い方で、
+  手元で直に触るならターミナルから termmap を起動すればよい
 
 ### タッチ操作
 
