@@ -54,13 +54,14 @@ command -v ttyd >/dev/null 2>&1 || { echo "error: ttyd が見つからない (br
 echo "termmap web: http://127.0.0.1:$PORT  (user: $TERMMAP_WEB_USER)"
 echo "公開する場合は別ターミナルで: cloudflared tunnel --url http://127.0.0.1:$PORT"
 
-# ブラウザ(xterm.js)は iTerm2 のインライン画像(OSC 1337)に対応していない。
+# web/vendor/xterm-addon-image.js(build-web-index.shが埋め込む、本家 @xterm/addon-image)
+# のおかげで、ブラウザ(xterm.js)側もiTerm2のインライン画像(OSC 1337)を描画できる。
 # ttyd はこのスクリプトを起動したシェルの環境変数をそのまま子プロセスへ渡すため、
-# iTerm2 から起動すると TERM_PROGRAM=iTerm.app / LC_TERMINAL=iTerm2 が termmap まで
-# 届いてしまい、termmap 側の image_capable() が真になって地図を実画像で描こうとする。
-# その結果ブラウザでは地図が何も表示されない(画像用のエスケープが大量に流れるだけ)状態になる。
-# 接続してくるのは iTerm2 ではなくブラウザなので、この3つは子へ渡さない。
-SCRUB_ENV=(env -u TERM_PROGRAM -u LC_TERMINAL -u ITERM_SESSION_ID)
+# TERM_PROGRAM を明示的に iTerm.app にしておく(起動元のターミナルが何であっても
+# termmap 側の image_capable() が真になり、地図を実画像で描けるようにする)。
+# LC_TERMINAL/ITERM_SESSION_ID は不要なので渡さない(TERM_PROGRAMだけで判定は満たせる)。
+# 実際に実画像を使うかは cfg.image_mode(既定OFF・`I`キーか設定画面で切替)の方で決まる。
+CHILD_ENV=(env -u LC_TERMINAL -u ITERM_SESSION_ID TERM_PROGRAM=iTerm.app)
 
 TTYD_PID=""
 PROXY_PID=""
@@ -82,7 +83,7 @@ trap cleanup EXIT INT TERM
 # -W  書き込み可(既定は読み取り専用なので、これが無いと操作できない)
 # -i  127.0.0.1 に限定(直接インターネットへ晒さない)
 # -t  ブラウザ側 xterm.js のオプション
-"${SCRUB_ENV[@]}" ttyd \
+"${CHILD_ENV[@]}" ttyd \
   -i 127.0.0.1 \
   -p "$TTYD_PORT" \
   -W \

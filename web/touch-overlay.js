@@ -140,6 +140,23 @@
     });
   }
 
+  // termmapの実画像モード(iTerm2インラインイメージ・OSC 1337)をブラウザでも描画する。
+  // ttyd同梱のxterm.jsには本家 @xterm/addon-image のコード自体は入っているが、ttyd側の
+  // 初期化スクリプトがloadAddon()していないため何もしない状態だった。web/vendor/配下に
+  // 同じ公式アドオンを別途vendorし(build-web-index.shがtouch-overlay.jsより前に埋め込む)、
+  // こちらから明示的にロードする。sixelはtermmapが使わないので無効化しておく。
+  function bindImageAddon() {
+    [0, 100, 300, 700, 1500].forEach(function (ms) {
+      setTimeout(function () {
+        var t = window.term;
+        if (t && !t.__termmapImageBound && typeof window.ImageAddon === 'function') {
+          t.__termmapImageBound = true;
+          t.loadAddon(new window.ImageAddon({ iipSupport: true, sixelSupport: false }));
+        }
+      }, ms);
+    });
+  }
+
   // ── ライブ現在地(ブラウザのGeolocation APIをtermmapへ送る) ──────────────────────
   // termmap側の G キーは Mac 本体の CoreLocationCLI しか読めず、Web からアクセスしている
   // スマホの位置は取れない。window.term.paste() で SOH()区切りの専用マーカーを
@@ -627,6 +644,7 @@
     buildBar();
     bindGestures();
     bindSoundOsc();
+    bindImageAddon();
     refit();
   }
 
@@ -646,6 +664,7 @@
     consumePinch: consumePinch,
     toggleKeyboard: toggleKeyboard,
     toggleWebGps: toggleWebGps,
+    bindImageAddon: bindImageAddon,
     keys: KEYS,
     findTextarea: findTextarea
   };
