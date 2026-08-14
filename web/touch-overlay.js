@@ -149,9 +149,25 @@
     [0, 100, 300, 700, 1500].forEach(function (ms) {
       setTimeout(function () {
         var t = window.term;
-        if (t && !t.__termmapImageBound && typeof window.ImageAddon === 'function') {
-          t.__termmapImageBound = true;
-          t.loadAddon(new window.ImageAddon({ iipSupport: true, sixelSupport: false }));
+        if (!t) { console.log('[termmap-image] window.term 未検出(ms=' + ms + ')'); return; }
+        if (t.__termmapImageBound) { return; }
+        // UMDのグローバルフォールバックはパッケージのexportsオブジェクトをそのまま
+        // window.ImageAddon に代入するため、実際のコンストラクタは
+        // window.ImageAddon.ImageAddon(名前空間の入れ子)になっている。
+        var ImageAddonCtor = window.ImageAddon && window.ImageAddon.ImageAddon;
+        if (typeof ImageAddonCtor !== 'function') {
+          console.log('[termmap-image] ImageAddon コンストラクタ未検出(vendor埋め込み失敗?)');
+          return;
+        }
+        t.__termmapImageBound = true;
+        try {
+          var addon = new ImageAddonCtor({ iipSupport: true, sixelSupport: false });
+          t.loadAddon(addon);
+          window.__termmapImageAddon = addon; // devtoolsから直接触れるようにしておく
+          console.log('[termmap-image] loadAddon 成功(ms=' + ms + ')');
+        } catch (e) {
+          console.log('[termmap-image] loadAddon 失敗:', e && e.message, e);
+          t.__termmapImageBound = false; // 失敗時は次のリトライで再試行できるようにする
         }
       }, ms);
     });
