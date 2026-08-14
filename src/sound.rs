@@ -103,12 +103,15 @@ impl Sound {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = enabled;
-            Sound { enabled: false }
+            // CoreAudioによるネイティブ再生はできないが、ブラウザ側(OSC信号経由)では
+            // 鳴らせるので、ユーザーの設定値はそのまま保持する(強制falseにしない)。
+            Sound { enabled }
         }
     }
 
-    /// sfx名を鳴らす。無効時や未登録時は何もしない(UIをブロックしない・呼び出しは即座に返る)。
+    /// sfx名を鳴らす。無効時は何もしない(UIをブロックしない・呼び出しは即座に返る)。
+    /// ネイティブ再生(macOSのみ)に加えて、ブラウザ(web/touch-overlay.js)向けにOSC
+    /// エスケープシーケンスも常に送る。認識しない端末では無害に無視される。
     pub fn play(&self, name: &'static str) {
         if !self.enabled {
             return;
@@ -119,7 +122,17 @@ impl Sound {
                 unsafe { coreaudio::AudioServicesPlaySystemSound(id) };
             }
         }
+        emit_web_sound_signal(name);
     }
+}
+
+/// ブラウザ(web/touch-overlay.js)が xterm.js の OSC ハンドラでフックする合図。
+/// ESC ] 9999 ; <名前> BEL の形。9999 は他用途と衝突しないよう選んだ私的な番号
+/// (0-9=タイトル、10-19=色、52=クリップボード、1337=iTerm2画像 等は避けている)。
+fn emit_web_sound_signal(name: &str) {
+    use std::io::Write;
+    print!("\x1b]9999;{name}\x07");
+    let _ = std::io::stdout().flush();
 }
 
 #[cfg(test)]
