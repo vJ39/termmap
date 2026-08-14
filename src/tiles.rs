@@ -4,7 +4,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
-use image::RgbImage;
+use image::{RgbImage, RgbaImage};
 // 近傍優先の距離計算で、異なるズームのタイル中心を同一ズームへ再投影するために座標変換を使う。
 use crate::geo::{TILE, pixel_to_deg, deg_to_pixel};
 
@@ -15,25 +15,46 @@ fn tile_cache_path(style: &str, z: u32, x: i64, y: i64) -> Option<PathBuf> {
     Some(Path::new(&home).join(".config/termmap/tiles").join(style).join(z.to_string()).join(x.to_string()).join(format!("{y}.png")))
 }
 
-// キャッシュキーは style を含む(style違いのタイルが混ざらない。以前は clear() 頼みで危うかった)。
+// タイルの取得元。従来 TileKey.style: String が持っていた「どのタイル群か」の軸を型にする。
+// 今は地図タイル(Base)だけだが、将来ここに Radar { basetime, validtime }(気象庁ナウキャスト)を
+// 足す前提。地図スタイルと雨雲フレームは直交する軸なので String 1本には押し込めない。
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum TileSource {
+    // 通常の地図タイル。値は "osm" / "voyager" / "dark" / "light" / "topo"。
+    Base(String),
+}
+
+impl TileSource {
+    // 取得元のタイルURL。
+    fn url(&self, z: u32, x: i64, y: i64) -> String {
+        match self { TileSource::Base(style) => tile_url(style, z, x, y) }
+    }
+    // ディスクキャッシュ先のパス(保存しない取得元では None)。
+    fn cache_path(&self, z: u32, x: i64, y: i64) -> Option<PathBuf> {
+        match self { TileSource::Base(style) => tile_cache_path(style, z, x, y) }
+    }
+}
+
+// キャッシュキーは取得元(src)を含む(style違いのタイルが混ざらない。以前は clear() 頼みで危うかった)。
 #[derive(Clone, PartialEq, Eq, Hash)]
-struct TileKey { style: String, z: u32, x: i64, y: i64 }
+struct TileKey { src: TileSource, z: u32, x: i64, y: i64 }
 
 // タイルキャッシュ。上限(cap)超過時は最終アクセスが最古のものから捨てる簡易LRU。
 // 長時間パンし続けてもメモリが訪問範囲に比例して無制限に増えないようにする。
-pub struct Cache { map: HashMap<TileKey, (RgbImage, u64)>, tick: u64, cap: usize }
+// 値は RGBA で持つ(将来の半透明タイル用。地図タイルは alpha=255 の不透明画像として入る)。
+pub struct Cache { map: HashMap<TileKey, (RgbaImage, u64)>, tick: u64, cap: usize }
 
 impl Default for Cache { fn default() -> Self { Self::new() } }
 
 impl Cache {
     pub fn new() -> Self { Cache { map: HashMap::new(), tick: 0, cap: 256 } }
     fn contains(&self, k: &TileKey) -> bool { self.map.contains_key(k) }
-    fn get(&mut self, k: &TileKey) -> Option<&RgbImage> {
+    fn get(&mut self, k: &TileKey) -> Option<&RgbaImage> {
         self.tick += 1;
         let t = self.tick;
         match self.map.get_mut(k) { Some(e) => { e.1 = t; Some(&e.0) } None => None }
     }
-    fn insert(&mut self, k: TileKey, img: RgbImage) {
+    fn insert(&mut self, k: TileKey, img: RgbaImage) {
         if self.map.len() >= self.cap && !self.map.contains_key(&k) {
             if let Some(old) = self.map.iter().min_by_key(|(_, (_, t))| *t).map(|(kk, _)| kk.clone()) {
                 self.map.remove(&old); // 最古を1つ退避
@@ -63,9 +84,10 @@ const TILE_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 6
 // mtimeからの経過時間がTTL未満か(ネットワーク/ファイルI/Oを伴わない純粋関数)。
 fn is_tile_fresh(age: std::time::Duration) -> bool { age < TILE_TTL }
 
-pub fn fetch_tile(style: &str, z: u32, x: i64, y: i64) -> Result<RgbImage, String> {
+// 取得結果は RGBA で返す(地図タイルは alpha=255。将来の半透明タイルで透過情報を落とさないため)。
+pub fn fetch_tile(src: &TileSource, z: u32, x: i64, y: i64) -> Result<RgbaImage, String> {
     // 1) ディスクキャッシュを先に見る(在って、かつ30日以内ならネット無しで読む)
-    let cache_path = tile_cache_path(style, z, x, y);
+    let cache_path = src.cache_path(z, x, y);
     if let Some(p) = &cache_path {
         let fresh = std::fs::metadata(p).ok()
             .and_then(|m| m.modified().ok())
@@ -74,19 +96,19 @@ pub fn fetch_tile(style: &str, z: u32, x: i64, y: i64) -> Result<RgbImage, Strin
             .unwrap_or(false); // mtime取得失敗時は期限切れ扱い(安全側)にして取り直す
         if fresh {
             if let Ok(buf) = std::fs::read(p) {
-                if let Ok(img) = image::load_from_memory(&buf) { return Ok(img.to_rgb8()); }
+                if let Ok(img) = image::load_from_memory(&buf) { return Ok(img.to_rgba8()); }
                 // 壊れたキャッシュは無視して取り直す
             }
         }
     }
     // 2) ネットワーク取得
-    let url = tile_url(style, z, x, y);
+    let url = src.url(z, x, y);
     let resp = ureq::get(&url)
         .set("User-Agent", "termmap/0.1 (personal experiment)")
         .timeout(std::time::Duration::from_secs(20)).call().map_err(|e| format!("fetch tile {z}/{x}/{y}: {e}"))?;
     let mut buf = Vec::new();
     resp.into_reader().read_to_end(&mut buf).map_err(|e| e.to_string())?;
-    let img = image::load_from_memory(&buf).map_err(|e| format!("decode tile {z}/{x}/{y}: {e}"))?.to_rgb8();
+    let img = image::load_from_memory(&buf).map_err(|e| format!("decode tile {z}/{x}/{y}: {e}"))?.to_rgba8();
     // 3) ディスクへ保存(元PNGバイトのまま・ベストエフォート)
     if let Some(p) = &cache_path {
         if let Some(d) = p.parent() { let _ = std::fs::create_dir_all(d); }
@@ -143,6 +165,8 @@ pub fn build_window(cx: f64, cy: f64, z: u32, win_w: u32, win_h: u32, style: &st
     let tf = TILE as f64;
     let (tx_min, tx_max, ty_min, ty_max, left, top) = window_tile_range(cx, cy, win_w, win_h);
     let max_t = 2i64.pow(z);
+    // 呼び出し側は従来どおり style 文字列で呼ぶ。取得元の型はここで組み立てる。
+    let src = TileSource::Base(style.to_string());
 
     // 未キャッシュのタイルを列挙
     let mut missing: Vec<(i64, i64)> = Vec::new();
@@ -150,7 +174,7 @@ pub fn build_window(cx: f64, cy: f64, z: u32, win_w: u32, win_h: u32, style: &st
         if ty < 0 || ty >= max_t { continue; }
         for tx in tx_min..=tx_max {
             let wx = ((tx % max_t) + max_t) % max_t;
-            if !cache.contains(&TileKey { style: style.to_string(), z, x: wx, y: ty }) { missing.push((wx, ty)); }
+            if !cache.contains(&TileKey { src: src.clone(), z, x: wx, y: ty }) { missing.push((wx, ty)); }
         }
     }
     missing.sort_unstable();
@@ -160,11 +184,12 @@ pub fn build_window(cx: f64, cy: f64, z: u32, win_w: u32, win_h: u32, style: &st
     // topoのみ並列数を落とす(他スタイルのCDNは8並列でも問題ない)。
     let concurrency: usize = if style == "topo" { 2 } else { 8 };
     for chunk in missing.chunks(concurrency) {
-        let got: Vec<((i64, i64), Result<RgbImage, String>)> = std::thread::scope(|s| {
-            let hs: Vec<_> = chunk.iter().map(|&(wx, ty)| s.spawn(move || ((wx, ty), fetch_tile(style, z, wx, ty)))).collect();
+        let src_ref = &src;
+        let got: Vec<((i64, i64), Result<RgbaImage, String>)> = std::thread::scope(|s| {
+            let hs: Vec<_> = chunk.iter().map(|&(wx, ty)| s.spawn(move || ((wx, ty), fetch_tile(src_ref, z, wx, ty)))).collect();
             hs.into_iter().map(|h| h.join().unwrap()).collect()
         });
-        for ((wx, ty), r) in got { cache.insert(TileKey { style: style.to_string(), z, x: wx, y: ty }, r?); }
+        for ((wx, ty), r) in got { cache.insert(TileKey { src: src.clone(), z, x: wx, y: ty }, r?); }
     }
 
     let cols = (tx_max - tx_min + 1) as u32;
@@ -175,10 +200,11 @@ pub fn build_window(cx: f64, cy: f64, z: u32, win_w: u32, win_h: u32, style: &st
         if ty < 0 || ty >= max_t { continue; }
         for tx in tx_min..=tx_max {
             let wx = ((tx % max_t) + max_t) % max_t;
-            if let Some(t) = cache.get(&TileKey { style: style.to_string(), z, x: wx, y: ty }) {
+            if let Some(t) = cache.get(&TileKey { src: src.clone(), z, x: wx, y: ty }) {
                 let ox = (tx - tx_min) as u32 * TILE;
                 let oy = (ty - ty_min) as u32 * TILE;
-                for (px, py, p) in t.enumerate_pixels() { canvas.put_pixel(ox + px, oy + py, *p); }
+                // 地図タイルは alpha=255 の不透明画像なので、RGB 3成分だけ取って貼る。
+                for (px, py, p) in t.enumerate_pixels() { canvas.put_pixel(ox + px, oy + py, image::Rgb([p[0], p[1], p[2]])); }
             }
         }
     }
@@ -270,8 +296,9 @@ impl TileLoader {
     // ルート確定時、その経路が通るタイルを先読み依頼として登録する(#34)。既存のrequest_tilesを
     // そのまま使う=画面表示中のタイルの方が常にview距離で優先されるため、専用の優先度階層は不要。
     pub fn request_route_tiles(&self, style: &str, z: u32, tile_coords: &[(i64, i64)]) {
+        let src = TileSource::Base(style.to_string());
         let keys = tile_coords.iter()
-            .map(|&(x, y)| TileKey { style: style.to_string(), z, x, y })
+            .map(|&(x, y)| TileKey { src: src.clone(), z, x, y })
             .collect();
         self.request_tiles(keys);
     }
@@ -329,7 +356,7 @@ fn worker_loop(shared: Arc<Mutex<Cache>>, view: Arc<Mutex<ViewState>>, pending: 
             None => std::thread::sleep(std::time::Duration::from_millis(20)),
             Some(k) => {
                 // ネットワーク取得中はどのロックも握らない(メイン描画をブロックしないため)。
-                match fetch_tile(&k.style, k.z, k.x, k.y) {
+                match fetch_tile(&k.src, k.z, k.x, k.y) {
                     Ok(img) => {
                         shared.lock().unwrap().insert(k.clone(), img);
                         generation.fetch_add(1, Ordering::Relaxed); // 届いた→次フレームで再描画させる
@@ -351,10 +378,10 @@ const FALLBACK_STYLES: [&str; 5] = ["osm", "voyager", "dark", "light", "topo"];
 // 未取得タイル(現styleではメモリキャッシュに無い)について、他styleの同一z/x/yがキャッシュにあれば
 // それを仮表示として流用する。Cache::get は &mut self かつ返り値の借用が cache を可変借用し続けるため、
 // 見つかった画像は即 clone して所有権付きで返し、呼び出し側の借用スコープを単純に保つ(256x256のcloneは安価)。
-fn find_fallback_tile(cache: &mut Cache, current_style: &str, z: u32, x: i64, y: i64) -> Option<RgbImage> {
+fn find_fallback_tile(cache: &mut Cache, current_style: &str, z: u32, x: i64, y: i64) -> Option<RgbaImage> {
     for &s in FALLBACK_STYLES.iter() {
         if s == current_style { continue; }
-        let key = TileKey { style: s.to_string(), z, x, y };
+        let key = TileKey { src: TileSource::Base(s.to_string()), z, x, y };
         if let Some(img) = cache.get(&key) { return Some(img.clone()); }
     }
     None
@@ -433,6 +460,8 @@ pub fn build_window_nowait(cx: f64, cy: f64, z: u32, win_w: u32, win_h: u32, sty
     // 透かしのink色は背景(グレー200 or 他style代用タイル)より少し暗いグレーにして薄く目立たせない。
     let watermark_ink = image::Rgb([150u8, 150, 150]);
     let mut canvas = RgbImage::from_pixel(cols * TILE, rows * TILE, bg);
+    // 呼び出し側は従来どおり style 文字列で呼ぶ。取得元の型はここで組み立てる。
+    let src = TileSource::Base(style.to_string());
 
     // cacheロックは1回だけ取り、範囲内タイルの描画/欠落判定をまとめて行いすぐ離す(1タイルごとの取り直しをしない)。
     let mut missing: Vec<TileKey> = Vec::new();
@@ -442,16 +471,17 @@ pub fn build_window_nowait(cx: f64, cy: f64, z: u32, win_w: u32, win_h: u32, sty
             if ty < 0 || ty >= max_t { continue; }
             for tx in tx_min..=tx_max {
                 let wx = ((tx % max_t) + max_t) % max_t;
-                let key = TileKey { style: style.to_string(), z, x: wx, y: ty };
+                let key = TileKey { src: src.clone(), z, x: wx, y: ty };
                 let ox = (tx - tx_min) as u32 * TILE;
                 let oy = (ty - ty_min) as u32 * TILE;
+                // 地図タイルは alpha=255 の不透明画像なので、RGB 3成分だけ取って貼る。
                 if let Some(t) = cache.get(&key) {
-                    for (px, py, p) in t.enumerate_pixels() { canvas.put_pixel(ox + px, oy + py, *p); }
+                    for (px, py, p) in t.enumerate_pixels() { canvas.put_pixel(ox + px, oy + py, image::Rgb([p[0], p[1], p[2]])); }
                 } else {
                     // 未取得: 他styleの同一タイルがキャッシュにあれば仮表示に流用、無ければ薄いグレー。
                     // いずれの場合も本来のスタイルが未達であることが分かるよう LOADING 透かしを必ず重ねる。
                     if let Some(fb) = find_fallback_tile(&mut cache, style, z, wx, ty) {
-                        for (px, py, p) in fb.enumerate_pixels() { canvas.put_pixel(ox + px, oy + py, *p); }
+                        for (px, py, p) in fb.enumerate_pixels() { canvas.put_pixel(ox + px, oy + py, image::Rgb([p[0], p[1], p[2]])); }
                     } else {
                         for py in 0..TILE { for px in 0..TILE { canvas.put_pixel(ox + px, oy + py, placeholder); } }
                     }
@@ -602,17 +632,79 @@ mod tests {
 
         // (a) キャッシュには "dark" だけ。current_style も "dark" なら自分自身は候補外 → None。
         let mut cache = Cache::new();
-        cache.insert(TileKey { style: "dark".to_string(), z, x, y }, RgbImage::from_pixel(TILE, TILE, image::Rgb([1, 2, 3])));
+        cache.insert(TileKey { src: TileSource::Base("dark".to_string()), z, x, y }, RgbaImage::from_pixel(TILE, TILE, image::Rgba([1, 2, 3, 255])));
         assert!(find_fallback_tile(&mut cache, "dark", z, x, y).is_none());
 
         // (b) current_style="osm" なら他style "dark" のタイルがそのまま返る(色も維持)。
         let got = find_fallback_tile(&mut cache, "osm", z, x, y);
         assert!(got.is_some());
-        assert_eq!(*got.unwrap().get_pixel(0, 0), image::Rgb([1, 2, 3]));
+        assert_eq!(*got.unwrap().get_pixel(0, 0), image::Rgba([1, 2, 3, 255]));
 
         // (c) 空キャッシュならどのstyleにも無く None。
         let mut empty = Cache::new();
         assert!(find_fallback_tile(&mut empty, "osm", z, x, y).is_none());
+    }
+
+    // TileSource::Base の url() は従来の tile_url と同じURLを組む(取得元の型化で叩き先が変わっていないこと)。
+    #[test]
+    fn tile_source_base_url_matches_tile_url() {
+        for style in ["osm", "voyager", "dark", "light", "topo", "unknown"] {
+            let src = TileSource::Base(style.to_string());
+            assert_eq!(src.url(10, 20, 30), tile_url(style, 10, 20, 30), "style={style}");
+        }
+    }
+
+    // Cache は RGBA のまま値を保持する(アルファが潰れない)。
+    #[test]
+    fn cache_roundtrip_preserves_rgba() {
+        let mut cache = Cache::new();
+        let key = TileKey { src: TileSource::Base("osm".to_string()), z: 5, x: 1, y: 2 };
+        cache.insert(key.clone(), RgbaImage::from_pixel(2, 2, image::Rgba([10, 20, 30, 128])));
+        assert!(cache.contains(&key));
+        assert_eq!(*cache.get(&key).unwrap().get_pixel(0, 0), image::Rgba([10, 20, 30, 128]));
+    }
+
+    // 取得元が違えば別エントリ(style違いのタイルが混ざらない = 従来 style フィールドが担っていた性質)。
+    #[test]
+    fn cache_key_separates_sources() {
+        let mut cache = Cache::new();
+        let osm = TileKey { src: TileSource::Base("osm".to_string()), z: 5, x: 1, y: 2 };
+        let dark = TileKey { src: TileSource::Base("dark".to_string()), z: 5, x: 1, y: 2 };
+        cache.insert(osm.clone(), RgbaImage::from_pixel(1, 1, image::Rgba([1, 1, 1, 255])));
+        assert!(cache.contains(&osm));
+        assert!(!cache.contains(&dark));
+    }
+
+    // 上限超過で最終アクセスが最古のものから落ちる(簡易LRUが型変更後も効いている)。
+    #[test]
+    fn cache_evicts_oldest_over_cap() {
+        let mut cache = Cache::new();
+        let cap = cache.cap;
+        let key = |i: i64| TileKey { src: TileSource::Base("osm".to_string()), z: 5, x: i, y: 0 };
+        for i in 0..cap as i64 { cache.insert(key(i), RgbaImage::from_pixel(1, 1, image::Rgba([0, 0, 0, 255]))); }
+        assert!(cache.contains(&key(0)));
+        cache.insert(key(cap as i64), RgbaImage::from_pixel(1, 1, image::Rgba([0, 0, 0, 255])));
+        assert!(!cache.contains(&key(0)), "最古のエントリが退避されていない");
+        assert!(cache.contains(&key(cap as i64)));
+    }
+
+    // build_window_nowait: キャッシュ済みタイル(RGBA)の画素が、そのままのRGB値で窓へ貼られる。
+    // 窓は1タイルの内側に収まるサイズにするので未取得タイルは無く、ローダーはネットワークに触れない。
+    #[test]
+    fn build_window_nowait_copies_cached_tile_pixels() {
+        let z = 3u32; // 2^3=8タイル四方。中央付近のタイルを使い範囲外判定に掛からないようにする
+        let (tx, ty) = (4i64, 4i64);
+        let cache = Arc::new(Mutex::new(Cache::new()));
+        cache.lock().unwrap().insert(
+            TileKey { src: TileSource::Base("osm".to_string()), z, x: tx, y: ty },
+            RgbaImage::from_pixel(TILE, TILE, image::Rgba([7, 8, 9, 255])),
+        );
+        let loader = TileLoader::start(Arc::clone(&cache));
+        let cx = (tx as f64 + 0.5) * TILE as f64;
+        let cy = (ty as f64 + 0.5) * TILE as f64;
+        let img = build_window_nowait(cx, cy, z, 64, 64, "osm", &loader).unwrap();
+        assert_eq!(img.dimensions(), (64, 64));
+        for p in img.pixels() { assert_eq!(*p, image::Rgb([7, 8, 9])); }
     }
 
     // draw_loading_watermark: 描画後、ink色のピクセルが1つ以上存在する(=実際に何か描かれている)。
