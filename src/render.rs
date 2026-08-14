@@ -410,7 +410,10 @@ pub fn emit_iterm2_image<W: std::io::Write>(out: &mut W, rgb: &RgbImage, cell_w:
         return Ok(());
     }
     let b64 = base64_encode(&png);
-    write!(out, "\x1b]1337;File=inline=1;width={cell_w};height={cell_h};preserveAspectRatio=0:{b64}\x07")
+    let size = png.len(); // base64化前の生PNGバイト数。addon-image側はsize未指定(既定0)だと
+                          // "!this._header.size" が真になり、本体を1バイトもデコードせず即中断する
+                          // (ブラウザで実画像が常に真っ黒/無表示になっていた原因)。
+    write!(out, "\x1b]1337;File=inline=1;size={size};width={cell_w};height={cell_h};preserveAspectRatio=0:{b64}\x07")
 }
 
 #[cfg(test)]
@@ -748,7 +751,12 @@ mod tests {
         let mut buf: Vec<u8> = Vec::new();
         emit_iterm2_image(&mut buf, &img, 4, 3).unwrap();
         let s = String::from_utf8(buf).unwrap();
-        assert!(s.starts_with("\x1b]1337;File=inline=1;width=4;height=3;preserveAspectRatio=0:"));
+        // size= の値はPNGバイト数に依存するため固定文字列にはできない。整数として付いていて
+        // 後続が期待通りかだけを見る(size省略はaddon-image側の即中断バグを再発させる)。
+        let rest = s.strip_prefix("\x1b]1337;File=inline=1;size=").unwrap();
+        let size_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        assert!(!size_str.is_empty());
+        assert!(rest[size_str.len()..].starts_with(";width=4;height=3;preserveAspectRatio=0:"));
         assert!(s.ends_with('\x07'));
     }
 
@@ -787,12 +795,16 @@ mod tests {
         let mut buf: Vec<u8> = Vec::new();
         emit_iterm2_image(&mut buf, &img, 3, 2).unwrap();
         let s = String::from_utf8(buf).unwrap();
-        let b64 = s
-            .strip_prefix("\x1b]1337;File=inline=1;width=3;height=2;preserveAspectRatio=0:")
+        let rest = s.strip_prefix("\x1b]1337;File=inline=1;size=").unwrap();
+        let size_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        let declared_size: usize = size_str.parse().unwrap();
+        let b64 = rest[size_str.len()..]
+            .strip_prefix(";width=3;height=2;preserveAspectRatio=0:")
             .unwrap()
             .strip_suffix('\x07')
             .unwrap();
         let png = base64_decode(b64);
+        assert_eq!(png.len(), declared_size); // size= が実バイト数と一致すること(addon-image側はこれで即中断するかが決まる)
         let decoded = image::load_from_memory(&png).unwrap().to_rgb8();
         assert_eq!(decoded.dimensions(), (3, 2));
         assert_eq!(decoded.get_pixel(0, 0), &image::Rgb([255, 0, 0]));
