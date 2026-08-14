@@ -1703,7 +1703,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                 }
                             }
                         }
-                        KeyCode::Esc => { snd.play("back"); stay = false; }
+                        KeyCode::Esc => { snd.play("back"); stay = false; let _ = write!(out, "\x1b[2J"); force_reemit = true; } // 閉じる→Map。他の左袖パネルと同じく残像防止に全消去+再emit
                         _ => {}
                     }
                     if changed { // 変更のたびに opts→cfg を同期して即保存(sを押さなくてよい)
