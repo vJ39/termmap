@@ -1,2 +1,7 @@
 /target
 .claude/
+
+# scripts/build-web-index.sh が ttyd の既定ページから生成する成果物(約730KB)。
+# 中身の大半は ttyd 同梱の xterm.js バンドルなので、リポジトリには入れず
+# 手元で生成する(手書き対象は web/touch-overlay.js だけ)。
+/web/index.html
