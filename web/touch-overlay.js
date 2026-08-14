@@ -140,12 +140,29 @@
     return document.querySelector('.xterm-helper-textarea');
   }
 
+  // xterm.js の同梱コードを実際に読むと、_keyDown ハンドラは(特定の修飾キーを除く)
+  // ほぼ全てのキーで this.focus() → this.textarea.focus(...) を呼んでいる
+  // (カーソル/IME状態を合わせるための内部処理と見られる)。つまり sendKey() が合成の
+  // keydown を投げるたびに毎回 textarea が実フォーカスされ、iOS のソフトキーボードが
+  // せり上がってしまう(地図側のタッチ伝播を止めるだけでは防げない)。
+  // 対策: textarea 自身の focus() を、実フォーカスの代わりに合成 focus イベントを
+  // 発火するだけの関数に差し替える。xterm.js 側は addEventListener('focus', ...) で
+  // _isFocused 等の内部状態を更新しているだけなので、このイベントさえ受け取れれば
+  // 実際にDOMフォーカスを移さなくても内部状態は壊れない。1つのtextareaにつき1回だけ適用する。
+  var FOCUS_PATCHED = '__termmapFocusPatched';
+  function neutralizeFocus(ta) {
+    if (!ta || ta[FOCUS_PATCHED]) { return; }
+    ta[FOCUS_PATCHED] = true;
+    ta.focus = function () { ta.dispatchEvent(new Event('focus')); };
+  }
+
   // キーを1回分(keydown [+ keypress] + keyup)送る
   function sendKey(name) {
     var spec = KEYS[name];
     if (!spec) { return false; }
     var ta = findTextarea();
     if (!ta) { return false; } // 端末がまだ描画されていない
+    neutralizeFocus(ta);
 
     fireKeyEvent(ta, 'keydown', spec);
     if (spec.mode === 'press') { fireKeyEvent(ta, 'keypress', spec); }
