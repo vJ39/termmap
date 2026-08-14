@@ -62,13 +62,16 @@
   var TAP_MAX_MS       = 400;  // 接触時間がこれより長いものはタップにしない
   var PX_PER_STEP      = 40;   // パン: 何 px ごとに矢印キー1回か(X/Yそれぞれ独立に判定=斜め対応)
   var PINCH_PX_PER_STEP = 55;  // ピンチ: 指の間隔が何 px 変わるごとにズーム1段か(誤爆軽減でパンより粗め)
-  var MAX_STEPS_PER_TICK = 6;  // touchmove/慣性の1tickで送るキーの上限(暴走防止の保険)
+  // touchmove/慣性の1tickで送るキーの上限(暴走防止の保険)。速いスワイプほど1回の
+  // touchmoveあたりの移動量(dx/dy)が大きくなるので、ここを大きめにしておかないと
+  // 「速く払っても遅く払っても同じ」に頭打ちされ、スピード感が出ない。
+  var MAX_STEPS_PER_TICK = 14;
   var STEP_INTERVAL_MS = 16;   // sendKeyBurst(ピンチの多段ジャンプ用)の連続発火間隔。termmap 側は
                                // 同方向220ms以内の連続入力でpan_streakが伸びて加速する(Rust側既存実装)
   var GLIDE_TICK_MS   = 60;    // 指を離した後の慣性スクロールの1tick間隔
-  var GLIDE_DECAY     = 0.85;  // 1tickごとにこの倍率で速度を減衰させる
+  var GLIDE_DECAY     = 0.75;  // 1tickごとにこの倍率で速度を減衰させる(小さいほど早く止まる)
   var GLIDE_MIN_SPEED = 0.05;  // px/ms。これ未満まで減衰したら慣性を止める
-  var GLIDE_MAX_TICKS = 25;    // 保険の上限(だいたい1.5秒で必ず止まる)
+  var GLIDE_MAX_TICKS = 16;    // 保険の上限(だいたい1秒で必ず止まる)
 
   // スワイプの向き。true = 地図を指でつかんで動かす向き(Googleマップ等と同じ)。
   //   指を右へ払う → 地図が右へ動く → 見えるのは西側 → ArrowLeft を送る
@@ -377,15 +380,19 @@
   // ── 画面下部のボタンバー ────────────────────────────────────────
   // q(終了)は意図的に置いていない。誤タップでセッションごと落ちる方が損失が大きいため、
   // 離脱はブラウザのタブを閉じる操作に任せる。
+  // ▲▼はメニュー(Space)を開いている時のカーソル移動(項目選択)に主に使う。
+  // 地図がフォーカスの時は普通にパン(1段)になる。
   var BUTTONS = [
-    { label: 'Menu', key: ' ',      title: 'メニュー (Space)' },
-    { label: '−',    key: '-',      title: 'ズームアウト' },
-    { label: '＋',   key: '+',      title: 'ズームイン' },
-    { label: '☂',    key: 'C',      title: '雨雲レーダー 表示/非表示' },
-    { label: '◀',    key: '<',      title: '雨雲を5分前へ' },
-    { label: '▶',    key: '>',      title: '雨雲を5分後へ' },
-    { label: 'Esc',  key: 'Escape', title: '戻る / 取消' },
-    { label: '?',    key: '?',      title: 'ヘルプ' }
+    { label: 'Menu', key: ' ',        title: 'メニュー (Space)' },
+    { label: '▲',    key: 'ArrowUp',   title: '上(メニューでは項目選択)' },
+    { label: '▼',    key: 'ArrowDown', title: '下(メニューでは項目選択)' },
+    { label: '−',    key: '-',        title: 'ズームアウト' },
+    { label: '＋',   key: '+',        title: 'ズームイン' },
+    { label: '☂',    key: 'C',        title: '雨雲レーダー 表示/非表示' },
+    { label: '◀',    key: '<',        title: '雨雲を5分前へ' },
+    { label: '▶',    key: '>',        title: '雨雲を5分後へ' },
+    { label: 'Esc',  key: 'Escape',   title: '戻る / 取消' },
+    { label: '?',    key: '?',        title: 'ヘルプ' }
   ];
 
   // レイアウトの考え方:
@@ -433,9 +440,9 @@
     '#' + BAR_ID + ' button {',
     '  flex: 1 1 0; min-width: 0; margin: 4px 0; padding: 0;',
     '  background: #22262d; color: #d7dbe0; border: 1px solid #343a44; border-radius: 8px;',
-    // 8 個を横並びにすると幅 390px の端末で 1 個あたり約 44px しかない。
-    // 17px だと "Menu" が枠からはみ出したため 15px に下げ、念のため溢れも隠す。
-    '  font: 600 15px/1 -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;',
+    // 10 個を横並びにすると幅 390px の端末で 1 個あたり約 36px しかない。
+    // "Menu" "Esc" が枠からはみ出さないよう 12px に下げ、念のため溢れも隠す。
+    '  font: 600 12px/1 -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;',
     '  white-space: nowrap; overflow: hidden; text-overflow: clip;',
     '  -webkit-tap-highlight-color: transparent; touch-action: none; cursor: pointer;',
     '}',
