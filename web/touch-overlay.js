@@ -160,7 +160,18 @@
   function neutralizeFocus(ta) {
     if (!ta || ta[FOCUS_PATCHED]) { return; }
     ta[FOCUS_PATCHED] = true;
+    ta.__termmapRealFocus = ta.focus.bind(ta); // 本物のfocus()はキーボードボタン用に退避しておく
     ta.focus = function () { ta.dispatchEvent(new Event('focus')); };
+  }
+
+  // 住所検索(`/`)やスポット名の入力等、文字入力がしたい時だけ本物のフォーカスを呼ぶボタン用。
+  // sendKey() 経由の合成keydownでは無効化した focus() を、ここでは意図的に本物のまま呼び出す
+  // (ユーザーの実タップの中で同期的に呼ぶので、iOSのソフトキーボードは正常にせり上がる)。
+  function showKeyboard() {
+    var ta = findTextarea();
+    if (!ta) { return; }
+    neutralizeFocus(ta); // 未パッチ(一度もsendKeyしていない)ならここで退避される
+    (ta.__termmapRealFocus || ta.focus).call(ta);
   }
 
   // キーを1回分(keydown [+ keypress] + keyup)送る
@@ -386,13 +397,17 @@
     { label: 'Menu', key: ' ',        title: 'メニュー (Space)' },
     { label: '▲',    key: 'ArrowUp',   title: '上(メニューでは項目選択)' },
     { label: '▼',    key: 'ArrowDown', title: '下(メニューでは項目選択)' },
+    { label: '⏎',    key: 'Enter',     title: '決定(メニュー選択・検索実行等。タップと同じ)' },
     { label: '−',    key: '-',        title: 'ズームアウト' },
     { label: '＋',   key: '+',        title: 'ズームイン' },
     { label: '☂',    key: 'C',        title: '雨雲レーダー 表示/非表示' },
     { label: '◀',    key: '<',        title: '雨雲を5分前へ' },
     { label: '▶',    key: '>',        title: '雨雲を5分後へ' },
     { label: 'Esc',  key: 'Escape',   title: '戻る / 取消' },
-    { label: '?',    key: '?',        title: 'ヘルプ' }
+    { label: '?',    key: '?',        title: 'ヘルプ' },
+    // key ではなく action:'keyboard' 指定。住所検索(`/`)やスポット名入力など、文字入力が
+    // したい時だけ本物のソフトキーボードを呼び出す(他のボタンは意図的にキーボードを出さない)。
+    { label: '⌨',    action: 'keyboard', title: 'ソフトキーボードを開く(住所検索・名前入力用)' }
   ];
 
   // レイアウトの考え方:
@@ -440,9 +455,10 @@
     '#' + BAR_ID + ' button {',
     '  flex: 1 1 0; min-width: 0; margin: 4px 0; padding: 0;',
     '  background: #22262d; color: #d7dbe0; border: 1px solid #343a44; border-radius: 8px;',
-    // 10 個を横並びにすると幅 390px の端末で 1 個あたり約 36px しかない。
-    // "Menu" "Esc" が枠からはみ出さないよう 12px に下げ、念のため溢れも隠す。
-    '  font: 600 12px/1 -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;',
+    // 12 個を横並びにすると幅 390px の端末で 1 個あたり約 30px しかない。
+    // "Menu" "Esc" が枠からはみ出さないよう 11px に下げ、念のため溢れも隠す。
+    // これ以上ボタンが増える場合は2段組みを検討する。
+    '  font: 600 11px/1 -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;',
     '  white-space: nowrap; overflow: hidden; text-overflow: clip;',
     '  -webkit-tap-highlight-color: transparent; touch-action: none; cursor: pointer;',
     '}',
@@ -479,7 +495,7 @@
         e.stopPropagation();
         sawTouch = true;
         flash(btn);
-        sendKey(def.key);
+        if (def.action === 'keyboard') { showKeyboard(); } else { sendKey(def.key); }
       }, { passive: false });
 
       btn.addEventListener('click', function (e) {
@@ -487,7 +503,7 @@
         e.stopPropagation();
         if (sawTouch) { return; }
         flash(btn);
-        sendKey(def.key);
+        if (def.action === 'keyboard') { showKeyboard(); } else { sendKey(def.key); }
       });
 
       bar.appendChild(btn);
@@ -537,6 +553,7 @@
     sendPanDelta: sendPanDelta,
     onGestureEnd: onGestureEnd,
     consumePinch: consumePinch,
+    showKeyboard: showKeyboard,
     keys: KEYS,
     findTextarea: findTextarea
   };
