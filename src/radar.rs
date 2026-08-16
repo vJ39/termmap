@@ -18,6 +18,14 @@ pub const TARGET_TIMES_N1_URL: &str =
 // 予報(未来)の時刻一覧。basetime は最新の実況時刻で固定、validtime が5分刻みに進む(実測12件=+60分)。
 pub const TARGET_TIMES_N2_URL: &str =
     "https://www.jma.go.jp/bosai/jmatile/data/nowc/targetTimes_N2.json";
+// 降水短時間予報(rasrf)の時刻一覧。ナウキャスト(N1/N2)は気象庁API自体の仕様で+60分が上限のため、
+// それより先(+1〜+15時間・1時間刻み)を見るための延長データソース。同じファイルに
+// rasrf(タイル)/rasrf_point/rasrf_nd(マスク)/sjfcstmap(無関係な週間予報)が同居しているため、
+// 取り出す側(parse_rasrf_target_times)で elements に "rasrf" を含む行だけに絞る。
+// タイル自体のパレット(色→降水強度の対応)は実測でhrpnsと完全一致(4bit索引色10色・tRNSも同一)
+// のため、既存のhrpns用デコード経路をそのまま使い回せる。
+pub const TARGET_TIMES_RASRF_URL: &str =
+    "https://www.jma.go.jp/bosai/jmatile/data/rasrf/targetTimes.json";
 
 // 既存のタイル取得(tiles.rs)と同じ User-Agent を使う。
 const USER_AGENT: &str = "termmap/0.1 (personal experiment)";
@@ -41,6 +49,15 @@ pub enum FrameKind {
     Forecast,
 }
 
+// フレームがどのJMAプロダクト由来か。タイルURLの組み立て(element名/パス)を左右する。
+//   Nowcast  … 高解像度降水ナウキャスト(hrpns)。実況〜+60分・5分刻み
+//   ShortTerm… 降水短時間予報(rasrf)。+1〜+15時間・1時間刻み(60分より先を見るための延長分)
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum RadarProduct {
+    Nowcast,
+    ShortTerm,
+}
+
 // 1コマ分の時刻。文字列は JMA が返す "YYYYMMDDHHMMSS"(14桁・区切りなし・UTC)を
 // そのまま保持する。タイルURLの構築にこの文字列をそのまま使うので、日時型へ変換して往復させない。
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -48,6 +65,7 @@ pub struct Frame {
     pub basetime: String,
     pub validtime: String,
     pub kind: FrameKind,
+    pub product: RadarProduct,
 }
 
 // フレーム一覧と「現在」の位置。ui.rs が保持する表示状態の入れ物。
@@ -138,6 +156,8 @@ impl Timeline {
 pub fn fetch_timeline() -> Result<Timeline, String> {
     let obs_body = fetch_body(TARGET_TIMES_N1_URL);
     let fcst_body = fetch_body(TARGET_TIMES_N2_URL);
+    // 延長分(+60分より先)。失敗しても致命的にしない(既存のナウキャスト60分だけは守る)。
+    let ext_body = fetch_body(TARGET_TIMES_RASRF_URL);
 
     if let (Err(e1), Err(e2)) = (&obs_body, &fcst_body) {
         return Err(format!("targetTimes 取得失敗: 実況={e1} / 予報={e2}"));
@@ -146,9 +166,10 @@ pub fn fetch_timeline() -> Result<Timeline, String> {
     let observed = obs_body
         .map(|b| parse_target_times(&b, FrameKind::Observed))
         .unwrap_or_default();
-    let forecast = fcst_body
+    let mut forecast = fcst_body
         .map(|b| parse_target_times(&b, FrameKind::Forecast))
         .unwrap_or_default();
+    forecast.extend(ext_body.map(|b| parse_rasrf_target_times(&b)).unwrap_or_default());
 
     let tl = merge_timeline(observed, forecast);
     if tl.is_empty() {
@@ -204,6 +225,50 @@ pub fn parse_target_times(body: &str, kind_hint: FrameKind) -> Vec<Frame> {
             basetime: basetime.to_string(),
             validtime: validtime.to_string(),
             kind,
+            product: RadarProduct::Nowcast,
+        });
+    }
+    out
+}
+
+// rasrf の targetTimes.json 用パーサ。同じ本文に rasrf(タイル)/rasrf_point/rasrf_nd(マスク)/
+// sjfcstmap(無関係な週間予報)が同居しているため、elements に "rasrf" を含む行だけを対象にする。
+// また rasrf 側の実況相当(basetime==validtimeの過去解析値)はhrpns(N1)で既にカバー済みなので、
+// ここでは予報(validtime>basetime)だけを拾う。
+pub fn parse_rasrf_target_times(body: &str) -> Vec<Frame> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return Vec::new();
+    };
+    let Some(arr) = v.as_array() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in arr {
+        let has_rasrf = item
+            .get("elements")
+            .and_then(|e| e.as_array())
+            .map(|a| a.iter().any(|x| x.as_str() == Some("rasrf")))
+            .unwrap_or(false);
+        if !has_rasrf {
+            continue;
+        }
+        let (Some(basetime), Some(validtime)) = (
+            item.get("basetime").and_then(|x| x.as_str()),
+            item.get("validtime").and_then(|x| x.as_str()),
+        ) else {
+            continue;
+        };
+        if !is_time_token(basetime) || !is_time_token(validtime) {
+            continue;
+        }
+        if validtime <= basetime {
+            continue; // 過去の解析値はhrpns側の担当。ここでは予報のみ
+        }
+        out.push(Frame {
+            basetime: basetime.to_string(),
+            validtime: validtime.to_string(),
+            kind: FrameKind::Forecast,
+            product: RadarProduct::ShortTerm,
         });
     }
     out
@@ -308,9 +373,20 @@ pub fn frame_label(tl: &Timeline, idx: usize) -> String {
         .get(tl.now_idx)
         .and_then(|now| Some(epoch_minutes(&f.validtime)? - epoch_minutes(&now.validtime)?))
         .filter(|d| *d != 0)
-        .map(|d| if d > 0 { format!(" +{d}分") } else { format!(" -{}分", -d) })
+        .map(|d| format!(" {}{}", if d > 0 { "+" } else { "-" }, format_offset_minutes(d.abs())))
         .unwrap_or_default();
     format!("{hhmm} {kind}{rel}")
+}
+
+// 相対時刻の表示整形。降水短時間予報(延長分)は+60分を超えうるため、60分以上は「H時間M分」
+// (M=0ならH時間のみ)、それ未満は従来通り「M分」で出す。
+fn format_offset_minutes(d: i64) -> String {
+    if d < 60 {
+        format!("{d}分")
+    } else {
+        let (h, m) = (d / 60, d % 60);
+        if m == 0 { format!("{h}時間") } else { format!("{h}時間{m}分") }
+    }
 }
 
 // ---- 圏域判定 ----
@@ -390,8 +466,20 @@ mod tests {
  ,{"basetime": "20260814125500", "validtime": "20260814130000", "elements": ["hrpns", "hrpns_nd"]}
 ]"#;
 
+    // 実際の targetTimes_rasrf.json の応答形(2026/08/16 実測)を要約したもの。同じファイルに
+    // rasrf(タイル)/rasrf_point/rasrf_nd(マスク)/sjfcstmap(無関係な週間予報)が同居し、かつ
+    // rasrf は過去の解析値(basetime==validtime)と予報(validtime>basetime)の両方を含む。
+    const RASRF_SAMPLE: &str = r#"[
+  {"basetime": "20260816050000", "validtime": "20260816200000", "member": "none", "elements": ["rasrf", "rasrf_point", "rasrf_nd"]}
+ ,{"basetime": "20260816050000", "validtime": "20260816070000", "member": "none", "elements": ["rasrf", "rasrf_point", "rasrf_nd"]}
+ ,{"basetime": "20260816050000", "validtime": "20260816060000", "member": "none", "elements": ["rasrf", "rasrf_point", "rasrf_nd"]}
+ ,{"basetime": "20260816050000", "validtime": "20260816050000", "member": "none", "elements": ["rasrf", "rasrf_point", "rasrf_nd", "amds_rain10m"]}
+ ,{"basetime": "20260815233000", "validtime": "20260815233000", "member": "none", "elements": ["rasrf", "rasrf_point", "rasrf_nd"]}
+ ,{"basetime": "20260815174000", "validtime": "20260815174000", "member": "none", "elements": ["sjfcstmap"]}
+]"#;
+
     fn f(basetime: &str, validtime: &str, kind: FrameKind) -> Frame {
-        Frame { basetime: basetime.to_string(), validtime: validtime.to_string(), kind }
+        Frame { basetime: basetime.to_string(), validtime: validtime.to_string(), kind, product: RadarProduct::Nowcast }
     }
 
     // ---- parse_target_times ----
@@ -413,6 +501,46 @@ mod tests {
         // basetime は全件共通、validtime だけが進む。
         assert!(got.iter().all(|x| x.basetime == "20260814125500"));
         assert!(got.iter().all(|x| x.validtime > x.basetime));
+    }
+
+    // ---- parse_rasrf_target_times ----
+
+    #[test]
+    fn parse_rasrf_keeps_only_forecast_rasrf_entries() {
+        let got = parse_rasrf_target_times(RASRF_SAMPLE);
+        // 過去解析値2件(basetime==validtime)とsjfcstmap(elementsにrasrfを含まない)は除外され、
+        // 予報の3件(+60分/+120分/+900分ぶん)だけが残る。
+        assert_eq!(got.len(), 3);
+        assert!(got.iter().all(|x| x.kind == FrameKind::Forecast));
+        assert!(got.iter().all(|x| x.product == RadarProduct::ShortTerm));
+        assert!(got.iter().all(|x| x.validtime > x.basetime));
+        assert_eq!(got[0].validtime, "20260816200000");
+        assert_eq!(got[1].validtime, "20260816070000");
+        assert_eq!(got[2].validtime, "20260816060000");
+    }
+
+    #[test]
+    fn parse_rasrf_handles_garbage_like_parse_target_times() {
+        assert!(parse_rasrf_target_times("[]").is_empty());
+        assert!(parse_rasrf_target_times("not json").is_empty());
+        assert!(parse_rasrf_target_times("{}").is_empty());
+    }
+
+    // 60分より先(rasrf由来)を合成した全体タイムラインで、frame_labelが時刻の差分を正しく出す
+    // (5分刻み/1時間刻みが混ざっていても epoch_minutes ベースの差分計算は変わらず動く)。
+    #[test]
+    fn merge_timeline_extends_beyond_60min_with_rasrf() {
+        let obs = parse_target_times(N1_SAMPLE, FrameKind::Observed);
+        let mut fcst = parse_target_times(N2_SAMPLE, FrameKind::Forecast);
+        fcst.extend(parse_rasrf_target_times(RASRF_SAMPLE));
+        let tl = merge_timeline(obs, fcst);
+        // N2の最終validtime(13:10)より先、rasrfの14:00/20:00が末尾に伸びていること。
+        let last = tl.frames.last().unwrap();
+        assert_eq!(last.validtime, "20260816200000");
+        assert_eq!(last.product, RadarProduct::ShortTerm);
+        // frame_label は分刻みの差分表示のままでも正しく計算できる(60分超は分表記のまま出るが壊れない)。
+        let idx = tl.frames.len() - 1;
+        assert!(frame_label(&tl, idx).contains("予報"));
     }
 
     #[test]
@@ -585,6 +713,15 @@ mod tests {
             parse_target_times(N2_SAMPLE, FrameKind::Forecast),
         );
         assert_eq!(frame_label(&tl, 5), "22:10 予報 +15分");
+    }
+
+    // 降水短時間予報(延長分)は+60分を超えるため、その領域では「H時間M分」表記に切り替わる。
+    #[test]
+    fn format_offset_switches_to_hours_over_60min() {
+        assert_eq!(format_offset_minutes(59), "59分");
+        assert_eq!(format_offset_minutes(60), "1時間");
+        assert_eq!(format_offset_minutes(90), "1時間30分");
+        assert_eq!(format_offset_minutes(540), "9時間");
     }
 
     #[test]

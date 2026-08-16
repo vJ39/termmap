@@ -21,9 +21,10 @@ fn tile_cache_path(style: &str, z: u32, x: i64, y: i64) -> Option<PathBuf> {
 pub enum TileSource {
     // 通常の地図タイル。値は "osm" / "voyager" / "dark" / "light" / "topo"。
     Base(String),
-    // 気象庁ナウキャスト(降水)の1コマ。basetime=発表時刻 / validtime=対象時刻(いずれもUTCの14桁)。
+    // 気象庁の降水系タイルの1コマ。basetime=発表時刻 / validtime=対象時刻(いずれもUTCの14桁)。
     // 文字列は radar.rs が JMA の応答から取り出したものをそのまま持つ(URLのパス要素に直接使う)。
-    Radar { basetime: String, validtime: String },
+    // product はどのプロダクト由来か(ナウキャスト/降水短時間予報)で、URLのelement名を左右する。
+    Radar { basetime: String, validtime: String, product: crate::radar::RadarProduct },
 }
 
 impl TileSource {
@@ -31,7 +32,7 @@ impl TileSource {
     fn url(&self, z: u32, x: i64, y: i64) -> String {
         match self {
             TileSource::Base(style) => tile_url(style, z, x, y),
-            TileSource::Radar { basetime, validtime } => radar_tile_url(basetime, validtime, z, x, y),
+            TileSource::Radar { basetime, validtime, product } => radar_tile_url(basetime, validtime, *product, z, x, y),
         }
     }
     // ディスクキャッシュ先のパス(保存しない取得元では None)。
@@ -122,7 +123,7 @@ impl Cache {
 // 雨雲以外(地図タイル)は判定対象外なので常に残す。ネットワークにも状態にも触れない純粋関数。
 fn radar_key_is_kept(k: &TileKey, keep: &[crate::radar::Frame]) -> bool {
     match &k.src {
-        TileSource::Radar { basetime, validtime } =>
+        TileSource::Radar { basetime, validtime, .. } =>
             keep.iter().any(|f| &f.basetime == basetime && &f.validtime == validtime),
         _ => true,
     }
@@ -139,14 +140,22 @@ fn tile_url(style: &str, z: u32, x: i64, y: i64) -> String {
         _         => format!("https://tile.openstreetmap.org/{z}/{x}/{y}.png"),
     }
 }
-// 気象庁ナウキャスト(降水)のタイルURL。背景透過PNGで、降水なしの領域は透明で返る。
+// 気象庁の降水系タイルURL。背景透過PNGで、降水なしの領域は透明で返る。
 // 非公式エンドポイント(開発者向けAPIとして文書化されていない)なので、URL構築はここと
 // radar.rs の targetTimes 定数の2箇所だけに閉じる(壊れたら1箇所直せば済む)。
 // basetime/validtime は radar.rs 側で「ASCII数字のみ」の検証を通ったものだけが渡る。
 // どのz/x/yでもHTTP 200が返る(404は無い)。中身が入っているズームは限られるので、
 // 要求するズームの決定は radar_source_zoom が行う。
-fn radar_tile_url(basetime: &str, validtime: &str, z: u32, x: i64, y: i64) -> String {
-    format!("https://www.jma.go.jp/bosai/jmatile/data/nowc/{basetime}/none/{validtime}/surf/hrpns/{z}/{x}/{y}.png")
+// product で lv2/element が変わる(実測確認済み): ナウキャスト(hrpns)=nowc/hrpns、
+// 降水短時間予報(rasrf)=rasrf/rasrf。パレット(4bit索引色10色・tRNS)は両者で完全一致するため
+// デコード側は分岐不要。
+fn radar_tile_url(basetime: &str, validtime: &str, product: crate::radar::RadarProduct, z: u32, x: i64, y: i64) -> String {
+    match product {
+        crate::radar::RadarProduct::Nowcast =>
+            format!("https://www.jma.go.jp/bosai/jmatile/data/nowc/{basetime}/none/{validtime}/surf/hrpns/{z}/{x}/{y}.png"),
+        crate::radar::RadarProduct::ShortTerm =>
+            format!("https://www.jma.go.jp/bosai/jmatile/data/rasrf/{basetime}/none/{validtime}/surf/rasrf/{z}/{x}/{y}.png"),
+    }
 }
 
 // ディスクキャッシュの有効期限。タイル自体は滅多に変わらないが、無期限だと地図更新(新道路等)が
@@ -653,7 +662,7 @@ fn radar_layout(cx: f64, cy: f64, z: u32, win_w: u32, win_h: u32, frame: &crate:
     let ty_min = (s_top / tf).floor() as i64;
     let ty_max = ((s_bottom - 1e-9) / tf).floor() as i64;
     let max_t = 2i64.pow(sz);
-    let src = TileSource::Radar { basetime: frame.basetime.clone(), validtime: frame.validtime.clone() };
+    let src = TileSource::Radar { basetime: frame.basetime.clone(), validtime: frame.validtime.clone(), product: frame.product };
     let mut tiles = Vec::new();
     for ty in ty_min..=ty_max {
         if ty < 0 || ty >= max_t { continue; } // 世界の上下端の外はタイルが存在しない
@@ -915,10 +924,11 @@ mod tests {
             basetime: basetime.to_string(),
             validtime: validtime.to_string(),
             kind: crate::radar::FrameKind::Observed,
+            product: crate::radar::RadarProduct::Nowcast,
         }
     }
     fn radar_key(basetime: &str, validtime: &str, x: i64) -> TileKey {
-        TileKey { src: TileSource::Radar { basetime: basetime.to_string(), validtime: validtime.to_string() }, z: 10, x, y: 0 }
+        TileKey { src: TileSource::Radar { basetime: basetime.to_string(), validtime: validtime.to_string(), product: crate::radar::RadarProduct::Nowcast }, z: 10, x, y: 0 }
     }
     fn px(v: u8) -> RgbaImage { RgbaImage::from_pixel(1, 1, image::Rgba([v, v, v, 255])) }
     // 東京(35.68,139.76)を中心にした窓のグローバルpx。
@@ -927,17 +937,27 @@ mod tests {
     // 雨雲タイルのURLは JMA ナウキャストの形式で、basetime/validtime が正しい位置に入る。
     #[test]
     fn radar_tile_url_has_basetime_and_validtime_in_place() {
-        let src = TileSource::Radar { basetime: "20260814125500".into(), validtime: "20260814131000".into() };
+        let src = TileSource::Radar { basetime: "20260814125500".into(), validtime: "20260814131000".into(), product: crate::radar::RadarProduct::Nowcast };
         assert_eq!(
             src.url(10, 909, 403),
             "https://www.jma.go.jp/bosai/jmatile/data/nowc/20260814125500/none/20260814131000/surf/hrpns/10/909/403.png"
         );
     }
 
+    // 降水短時間予報(延長分)のタイルURLは lv2/element が rasrf になる。
+    #[test]
+    fn radar_tile_url_short_term_uses_rasrf_path() {
+        let src = TileSource::Radar { basetime: "20260816050000".into(), validtime: "20260816090000".into(), product: crate::radar::RadarProduct::ShortTerm };
+        assert_eq!(
+            src.url(8, 227, 100),
+            "https://www.jma.go.jp/bosai/jmatile/data/rasrf/20260816050000/none/20260816090000/surf/rasrf/8/227/100.png"
+        );
+    }
+
     // 雨雲タイルはディスクキャッシュに乗せない(basetime入りでヒットせず、TTLで古い雨を出す危険)。
     #[test]
     fn radar_tiles_are_not_disk_cached() {
-        let src = TileSource::Radar { basetime: "20260814125500".into(), validtime: "20260814125500".into() };
+        let src = TileSource::Radar { basetime: "20260814125500".into(), validtime: "20260814125500".into(), product: crate::radar::RadarProduct::Nowcast };
         assert!(src.cache_path(10, 1, 2).is_none());
         assert!(src.is_radar());
         assert!(!TileSource::Base("osm".to_string()).is_radar());
@@ -1060,7 +1080,7 @@ mod tests {
         for (x, y, p) in tile.enumerate_pixels_mut() { *p = image::Rgba([x as u8, y as u8, 0, 255]); }
         let cache = Arc::new(Mutex::new(Cache::new()));
         cache.lock().unwrap().insert(
-            TileKey { src: TileSource::Radar { basetime: frame.basetime.clone(), validtime: frame.validtime.clone() }, z, x: tx, y: ty },
+            TileKey { src: TileSource::Radar { basetime: frame.basetime.clone(), validtime: frame.validtime.clone(), product: frame.product }, z, x: tx, y: ty },
             tile,
         );
         let loader = TileLoader::start(Arc::clone(&cache));
@@ -1086,7 +1106,7 @@ mod tests {
         for (x, y, p) in tile.enumerate_pixels_mut() { *p = image::Rgba([x as u8, y as u8, 0, 255]); }
         let cache = Arc::new(Mutex::new(Cache::new()));
         cache.lock().unwrap().insert(
-            TileKey { src: TileSource::Radar { basetime: frame.basetime.clone(), validtime: frame.validtime.clone() }, z: 10, x: stx, y: sty },
+            TileKey { src: TileSource::Radar { basetime: frame.basetime.clone(), validtime: frame.validtime.clone(), product: frame.product }, z: 10, x: stx, y: sty },
             tile,
         );
         let loader = TileLoader::start(Arc::clone(&cache));
@@ -1132,7 +1152,7 @@ mod tests {
         let frame = radar_frame("20260814125500", "20260814125500");
         let cache = Arc::new(Mutex::new(Cache::new()));
         cache.lock().unwrap().insert(
-            TileKey { src: TileSource::Radar { basetime: frame.basetime.clone(), validtime: frame.validtime.clone() }, z, x: tx, y: ty },
+            TileKey { src: TileSource::Radar { basetime: frame.basetime.clone(), validtime: frame.validtime.clone(), product: frame.product }, z, x: tx, y: ty },
             RgbaImage::from_pixel(TILE, TILE, image::Rgba([10, 20, 30, 128])),
         );
         let loader = TileLoader::start(Arc::clone(&cache));
@@ -1155,7 +1175,7 @@ mod tests {
         for (x, y, p) in tile.enumerate_pixels_mut() { *p = image::Rgba([x as u8, y as u8, 0, 255]); }
         let cache = Arc::new(Mutex::new(Cache::new()));
         cache.lock().unwrap().insert(
-            TileKey { src: TileSource::Radar { basetime: frame.basetime.clone(), validtime: frame.validtime.clone() }, z: 10, x: stx, y: sty },
+            TileKey { src: TileSource::Radar { basetime: frame.basetime.clone(), validtime: frame.validtime.clone(), product: frame.product }, z: 10, x: stx, y: sty },
             tile,
         );
         let loader = TileLoader::start(Arc::clone(&cache));
