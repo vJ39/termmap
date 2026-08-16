@@ -704,7 +704,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             let (gx, gy) = deg_to_pixel(p.lat, p.lon, rz);
                             let ix = (gx - (rcx - rw as f64 / 2.0)).floor() as i32;
                             let iy = (gy - (rcy - rh as f64 / 2.0)).floor() as i32;
-                            draw_ring(&mut ov, ix, iy, 2, color, 2);
+                            draw_ring(&mut ov, ix, iy, 3, color, 3);
                         }
                     }
                     last_map_sig = map_sig; // このsigで描いた内容がこのフレームでemitされる
@@ -926,11 +926,22 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                         }
                     }
                 };
+                // 道路交通量: ONのときだけ、取得地点数(または取得中)を出す。0件は「圏外/観測点無し」
+                // (このデータは直轄国道の観測点のみで、それ以外の道路には点が無い)と区別できるようにする。
+                let traffic_txt = if !cfg.traffic_enabled {
+                    String::new()
+                } else if traffic_points.is_empty() && traffic_job.is_some() {
+                    "🚗取得中… ".to_string()
+                } else if traffic_points.is_empty() {
+                    "🚗観測点無し ".to_string()
+                } else {
+                    format!("🚗{}地点 ", traffic_points.len())
+                };
                 // 一時メッセージが無い時は底面にロゴを常時表示。メッセージ発生時はそちらを優先。
                 let msg = if addr.is_empty() { "◉╌╌╌► termmap · terminal touring map   ".to_string() } else { format!("» {addr} « ") };
                 // 下部バーは細く。全操作は Space メニューから選べる
                 let route_hint = if wps.is_empty() { "v=地点を置く".to_string() } else { format!("{}点 v足す w/s選択(操作行までEnterで実行) Tab=左の一覧へ(並替/操作)", wps.len()) };
-                let base = format!(" {spinner}{msg}{live}{playing}{radar_txt}z{z} {lat:.4},{lon:.4} ｜ {route_hint} ｜ Space:メニュー ?ヘルプ q終了");
+                let base = format!(" {spinner}{msg}{live}{playing}{radar_txt}{traffic_txt}z{z} {lat:.4},{lon:.4} ｜ {route_hint} ｜ Space:メニュー ?ヘルプ q終了");
                 match &route_note { Some(rn) => format!("{base} | {rn} "), None => base }
             }
         };
