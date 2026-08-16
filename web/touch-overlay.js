@@ -149,6 +149,12 @@
   // キューに積まれるだけで実際には発声されない(無音)既知の制約がある。OSCハンドラ経由の呼び出しは
   // タップの直接のコールスタックではないため、これに引っかかりうる。最初のタッチ/クリックのタイミングで
   // 無音(volume=0)の発話を1回投げてロックを解いておく。
+  // iOS(Safari/Chrome/Firefox問わずWebKitベース。AppleのポリシーでiOS上の全ブラウザは
+  // WebKitエンジンを使う)かどうかの判定。iPadOSのSafariはUAでMacと偽装するため、
+  // タッチ対応(maxTouchPoints>1)のMacIntelもiPadとして扱う。
+  var isIOS = /iP(hone|ad|od)/.test(navigator.userAgent)
+    || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
   var voiceUnlocked = false;
   function unlockSpeechSynthesisOnce() {
     if (voiceUnlocked || !window.speechSynthesis || typeof window.SpeechSynthesisUtterance !== 'function') { return; }
@@ -188,7 +194,9 @@
     });
     // ChromeはspeechSynthesisが約15秒で内部停止し、以降speak()してもキューされたまま
     // 発声されなくなる既知のバグがある(Bug#679437ほか)。定期的にpause/resumeし直して詰まりを防ぐ。
-    if (window.speechSynthesis) {
+    // iOS(WebKit)ではpause()を挟むとキューそのものが止まり、発話後もspeaking=trueのまま
+    // 戻らない既知の挙動があるため逆効果になる。iOSには適用しない。
+    if (window.speechSynthesis && !isIOS) {
       setInterval(function () {
         if (window.speechSynthesis.speaking) {
           window.speechSynthesis.pause();
@@ -677,6 +685,9 @@
         e.preventDefault();
         e.stopPropagation();
         sawTouch = true;
+        // ボタンバーはinTerminal()の対象外なので、地図を一度もスワイプせず
+        // ボタン操作だけで進んだ場合ここが唯一の解錠機会になる。
+        unlockSpeechSynthesisOnce();
         flash(btn);
         runButtonAction(def);
       }, { passive: false });
@@ -685,6 +696,7 @@
         e.preventDefault();
         e.stopPropagation();
         if (sawTouch) { return; }
+        unlockSpeechSynthesisOnce(); // PC確認用(クリック操作)でも同様
         flash(btn);
         runButtonAction(def);
       });
