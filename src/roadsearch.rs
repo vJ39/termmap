@@ -119,6 +119,29 @@ pub fn fetch(
     Ok(parse_road_fragments(&body))
 }
 
+/// 表示bbox(south,west,north,east)内の主要道路(highway=trunk/primary)を、
+/// 道路交通量(traffic.rs)の観測点をラインへスナップする下地として取得する。
+/// fetchと違い名前/refでは絞らず、タグだけで広く取る(JARTICの観測点がどの路線名かは
+/// 元データに無いため、まず近くの主要道路を全部集めてnearest_way_segmentで最寄りを選ぶ)。
+pub fn fetch_major_roads(s: f64, w: f64, n: f64, e: f64) -> Result<Vec<(Vec<(f64, f64)>, bool)>, String> {
+    let bbox = format!("{s:.5},{w:.5},{n:.5},{e:.5}");
+    let query = format!(
+        "[out:json][timeout:25];way[\"highway\"~\"^(trunk|primary)$\"]({bbox});out geom;"
+    );
+    let url = format!("https://overpass-api.de/api/interpreter?data={}", urlencode(&query));
+
+    let body = ureq::get(&url)
+        .set("User-Agent", "termmap/0.1 (personal experiment)")
+        .set("Accept", "application/json")
+        .timeout(std::time::Duration::from_secs(20))
+        .call()
+        .map_err(|e| format!("overpass主要道路取得: {e}"))?
+        .into_string()
+        .map_err(|e| e.to_string())?;
+
+    Ok(parse_road_fragments(&body))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,5 +224,16 @@ mod tests {
         assert_eq!(frags.len(), 2);
         assert!(!frags[0].1);
         assert!(!frags[1].1);
+    }
+
+    // 実ネットワークを叩く手動確認用(CIでは走らない)。`cargo test --release -- --ignored`で実行。
+    #[test]
+    #[ignore]
+    fn live_fetch_major_roads_returns_real_ways() {
+        // 東京都内、国道1号/4号沿い等が含まれるはずの範囲。
+        let frags = fetch_major_roads(35.6, 139.6, 35.8, 139.9).unwrap();
+        println!("ways: {}", frags.len());
+        assert!(!frags.is_empty(), "都内で主要道路0件は考えにくい");
+        assert!(frags.iter().any(|(pts, _)| pts.len() >= 2), "2点以上のwayが1本も無い");
     }
 }

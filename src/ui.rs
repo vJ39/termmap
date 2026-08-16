@@ -133,6 +133,12 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     let mut traffic_job: Option<std::sync::mpsc::Receiver<Result<Vec<traffic::TrafficPoint>, String>>> = None;
     let mut traffic_last_fetch: Option<std::time::Instant> = None;
     let mut traffic_bbox: Option<(f64, f64, f64, f64)> = None; // 直近フェッチ範囲(lat_min,lon_min,lat_max,lon_max)
+    // 道路交通量の観測点をラインへスナップする下地(#73)。traffic_enabled時のみ、
+    // traffic_*と同じ間引き方針で主要道路(highway=trunk/primary)を取得する。
+    let mut major_roads: Vec<Vec<(f64, f64)>> = Vec::new();
+    let mut major_roads_job: Option<std::sync::mpsc::Receiver<Result<Vec<(Vec<(f64, f64)>, bool)>, String>>> = None;
+    let mut major_roads_last_fetch: Option<std::time::Instant> = None;
+    let mut major_roads_bbox: Option<(f64, f64, f64, f64)> = None;
     // 道路ライブカメラ(cfg.camera_enabled時のみ使う)。取得の間引き方はtraffic_*と同じ方針。
     let mut camera_points: Vec<camera::RoadCamera> = Vec::new();
     let mut camera_job: Option<std::sync::mpsc::Receiver<Vec<camera::RoadCamera>>> = None;
@@ -629,12 +635,16 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     let style = opts.style.clone();
                     let (pw, ph, pz) = (rw, rh, rz);
                     let speed_kmh = cfg.route_play_speed_kmh;
+                    // 再開位置。再生開始直後はplay=Some(0.0)なので先頭からになるが、ズーム変更に
+                    // よる先読み再起動(restart_prefetch_on_zoom!)時はplayが現在の走行距離を持って
+                    // いるので、そこから続ける(先頭に戻さない)。
+                    let start_d = play.unwrap_or(0.0);
                     let cancel2 = std::sync::Arc::clone(&cancel);
                     let speed_bits2 = std::sync::Arc::clone(&speed_bits);
                     std::thread::spawn(move || {
                         let mut local_cache = Cache::new();
                         let total = roadtrace::polyline_len(&route_pts);
-                        let mut d = 0.0f64;
+                        let mut d = start_d;
                         let dt = 0.08; // 80ms刻みで先読み(メインの再描画間隔に合わせる)
                         while d < total {
                             if cancel2.load(std::sync::atomic::Ordering::Relaxed) { break; }
@@ -769,16 +779,37 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                         draw_ring(&mut ov, ix, iy, 3, [255, 255, 255], 1);
                     }
                     if cfg.traffic_enabled { // 道路交通量(混雑度の目安。事故情報・渋滞度そのものではない)
+                        // 観測点を最寄りの主要道路(major_roads)へスナップし、前後
+                        // TRAFFIC_SNAP_RADIUS個ぶんの区間をラインとして色分け表示する。
+                        // OSMのway分割は実測でかなり細かい(2026-08-16 東京都内サンプル:
+                        // ノード間隔中央値約20m・90%タイル74m、1way平均7ノード≒100〜150m)。
+                        // wayを跨いで延長する処理は入れていないため、線の長さはway次第で
+                        // ばらつく(短いwayなら前後にはみ出さずクランプされる)。
+                        // major_roadsが空(未取得中・取得失敗直後)の間は、従来通り観測点を
+                        // 丸で表示するフォールバックにする。
+                        const TRAFFIC_SNAP_RADIUS: usize = 15;
+                        // 周囲に主要道路データが無い観測点を無関係な遠い道へ誤ってスナップしない
+                        // ための上限。500m以内に主要道路の頂点が無ければ点表示のフォールバックへ回る。
+                        const TRAFFIC_SNAP_MAX_DIST_M: f64 = 500.0;
                         for p in &traffic_points {
                             let color = match traffic::classify(p.volume) {
                                 traffic::CongestionLevel::Light => [80, 200, 90],
                                 traffic::CongestionLevel::Moderate => [230, 200, 40],
                                 traffic::CongestionLevel::Heavy => [220, 50, 40],
                             };
-                            let (gx, gy) = deg_to_pixel(p.lat, p.lon, rz);
-                            let ix = (gx - (rcx - rw as f64 / 2.0)).floor() as i32;
-                            let iy = (gy - (rcy - rh as f64 / 2.0)).floor() as i32;
-                            draw_ring(&mut ov, ix, iy, 3, color, 3);
+                            let seg = roadtrace::nearest_way_segment_within(&major_roads, (p.lat, p.lon), TRAFFIC_SNAP_RADIUS, TRAFFIC_SNAP_MAX_DIST_M);
+                            if seg.len() >= 2 {
+                                let pts: Vec<(i32, i32)> = seg.iter().map(|&(la, lo)| {
+                                    let (gx, gy) = deg_to_pixel(la, lo, rz);
+                                    ((gx - (rcx - rw as f64 / 2.0)).floor() as i32, (gy - (rcy - rh as f64 / 2.0)).floor() as i32)
+                                }).collect();
+                                for w in pts.windows(2) { draw_line(&mut ov, w[0].0, w[0].1, w[1].0, w[1].1, color, 3); }
+                            } else {
+                                let (gx, gy) = deg_to_pixel(p.lat, p.lon, rz);
+                                let ix = (gx - (rcx - rw as f64 / 2.0)).floor() as i32;
+                                let iy = (gy - (rcy - rh as f64 / 2.0)).floor() as i32;
+                                draw_ring(&mut ov, ix, iy, 3, color, 3);
+                            }
                         }
                     }
                     if cfg.camera_enabled { // 道路ライブカメラ(紫系。Nで中心近くのカメラの写真を表示)
@@ -971,6 +1002,37 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 Ok(Err(_e)) => { traffic_job = None; } // 失敗時は前回の点をそのまま表示継続
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => { traffic_job = None; }
+            }
+        }
+        // 道路交通量の観測点をラインへスナップする下地(#73)。traffic_enabled時のみ、
+        // traffic_*と同じ間引き方針で主要道路(highway=trunk/primary)を取得する。
+        if cfg.traffic_enabled && major_roads_job.is_none() {
+            const MARGIN_PX: f64 = 900.0;
+            const REFRESH: std::time::Duration = std::time::Duration::from_secs(90);
+            let (lat_max, lon_min) = pixel_to_deg(cx - MARGIN_PX, cy - MARGIN_PX, z);
+            let (lat_min, lon_max) = pixel_to_deg(cx + MARGIN_PX, cy + MARGIN_PX, z);
+            let out_of_bbox = match major_roads_bbox {
+                Some((blat_min, blon_min, blat_max, blon_max)) => {
+                    let (clat, clon) = pixel_to_deg(cx, cy, z);
+                    clat < blat_min || clat > blat_max || clon < blon_min || clon > blon_max
+                }
+                None => true,
+            };
+            let stale = major_roads_last_fetch.map_or(true, |t| t.elapsed() >= REFRESH);
+            if out_of_bbox || stale {
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || { let _ = tx.send(roadsearch::fetch_major_roads(lat_min, lon_min, lat_max, lon_max)); });
+                major_roads_job = Some(rx);
+                major_roads_bbox = Some((lat_min, lon_min, lat_max, lon_max));
+                major_roads_last_fetch = Some(std::time::Instant::now());
+            }
+        }
+        if let Some(job) = &major_roads_job {
+            match job.try_recv() {
+                Ok(Ok(frags)) => { major_roads = frags.into_iter().map(|(pts, _)| pts).collect(); major_roads_job = None; }
+                Ok(Err(_e)) => { major_roads_job = None; } // 失敗時は前回の道路データをそのまま使う
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => { major_roads_job = None; }
             }
         }
         // 道路ライブカメラ: traffic_*と同じ間引き方針(視野が範囲外に出たら即時、それ以外は90秒毎)。

@@ -270,6 +270,34 @@ pub fn nearest_segment(poly: &[(f64, f64)], center: (f64, f64), gap_m: f64) -> V
     segments.into_iter().nth(best_seg).unwrap_or_default()
 }
 
+/// 複数の道路断片(ways、それぞれ別の道)の中から point に最も近い頂点を探し、
+/// その道の中で頂点の前後 radius 個ぶんの部分列を返す(観測点1つを短い区間として
+/// 色付け表示するための切り出し)。ways が空、または全断片が空なら空Vecを返す。
+/// 距離上限を付けたい場合は nearest_way_segment_within を使う。
+pub fn nearest_way_segment(ways: &[Vec<(f64, f64)>], point: (f64, f64), radius: usize) -> Vec<(f64, f64)> {
+    nearest_way_segment_within(ways, point, radius, f64::INFINITY)
+}
+
+/// nearest_way_segment に「最寄り頂点までの距離が max_dist_m を超えたら空Vecを返す」制限を
+/// 加えた版。周囲に該当する道路データが無い観測点を、無関係な遠い道へスナップしてしまうのを防ぐ。
+pub fn nearest_way_segment_within(ways: &[Vec<(f64, f64)>], point: (f64, f64), radius: usize, max_dist_m: f64) -> Vec<(f64, f64)> {
+    let mut best: Option<(usize, usize, f64)> = None; // (way_idx, vertex_idx, dist_m)
+    for (wi, way) in ways.iter().enumerate() {
+        for (vi, &p) in way.iter().enumerate() {
+            let d = haversine_m(point, p);
+            if best.map_or(true, |(_, _, bd)| d < bd) {
+                best = Some((wi, vi, d));
+            }
+        }
+    }
+    let Some((wi, vi, dist)) = best else { return Vec::new() };
+    if dist > max_dist_m { return Vec::new(); }
+    let way = &ways[wi];
+    let lo = vi.saturating_sub(radius);
+    let hi = (vi + radius).min(way.len() - 1);
+    way[lo..=hi].to_vec()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -472,5 +500,55 @@ mod tests {
         assert_eq!(nearest_segment(&poly, (35.001, 139.0), 500.0), cluster_a);
         // 中心をB側に置く → B の塊だけ残る
         assert_eq!(nearest_segment(&poly, (36.001, 139.0), 500.0), cluster_b);
+    }
+
+    #[test]
+    fn nearest_way_segment_picks_the_closer_way_and_windows_around_the_vertex() {
+        let way_a = vec![(35.0, 139.0), (35.001, 139.0), (35.002, 139.0), (35.003, 139.0), (35.004, 139.0)];
+        let way_b = vec![(36.0, 140.0), (36.001, 140.0)];
+        let ways = vec![way_a.clone(), way_b];
+        // way_aの中央頂点(index 2)ぴったりに問い合わせ→radius=1で前後1個ずつ=3点
+        let got = nearest_way_segment(&ways, (35.002, 139.0), 1);
+        assert_eq!(got, vec![way_a[1], way_a[2], way_a[3]]);
+    }
+
+    #[test]
+    fn nearest_way_segment_clamps_window_at_the_ends_of_the_way() {
+        let way = vec![(35.0, 139.0), (35.001, 139.0), (35.002, 139.0)];
+        // 先頭頂点(index 0)に最も近い→前方向にはみ出さずクランプされる
+        let got = nearest_way_segment(&[way.clone()], (35.0, 139.0), 2);
+        assert_eq!(got, way); // 0..=2(末尾)全部
+    }
+
+    #[test]
+    fn nearest_way_segment_empty_ways_or_all_empty_fragments_returns_empty() {
+        assert!(nearest_way_segment(&[], (35.0, 139.0), 2).is_empty());
+        let empty_frags: Vec<Vec<(f64, f64)>> = vec![Vec::new(), Vec::new()];
+        assert!(nearest_way_segment(&empty_frags, (35.0, 139.0), 2).is_empty());
+    }
+
+    #[test]
+    fn nearest_way_segment_within_returns_empty_when_nearest_vertex_is_too_far() {
+        let way = vec![(35.0, 139.0), (35.001, 139.0), (35.002, 139.0)];
+        // wayまで約1.1km離れた点。上限500mを超えるので空を返す。
+        let got = nearest_way_segment_within(&[way], (35.01, 139.0), 1, 500.0);
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn nearest_way_segment_within_returns_segment_when_within_max_dist() {
+        let way = vec![(35.0, 139.0), (35.001, 139.0), (35.002, 139.0)];
+        let got = nearest_way_segment_within(&[way.clone()], (35.001, 139.0), 1, 500.0);
+        assert_eq!(got, way);
+    }
+
+    #[test]
+    fn nearest_way_segment_is_nearest_way_segment_within_with_no_limit() {
+        // nearest_way_segment は距離上限を掛けない場合と同じ結果になること。
+        let way = vec![(35.0, 139.0), (35.001, 139.0), (35.002, 139.0)];
+        let got_plain = nearest_way_segment(&[way.clone()], (35.01, 139.0), 1);
+        let got_unlimited = nearest_way_segment_within(&[way], (35.01, 139.0), 1, f64::INFINITY);
+        assert_eq!(got_plain, got_unlimited);
+        assert!(!got_plain.is_empty(), "十分遠くても上限なしなら最寄りwayを返す");
     }
 }
