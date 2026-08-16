@@ -47,6 +47,12 @@ mod voice; // ルート音声案内(曲がり角の距離ベース読み上げ)
 // 道路交通量(JARTICオープンデータ)。ui.rsへの配線は後続増分のため現時点では未wire。
 #[allow(dead_code)]
 mod traffic;
+// 通行規制(通行止め・車線規制等)。ui.rsへの配線は後続増分のため現時点では未wire。
+#[allow(dead_code)]
+mod regulation;
+// 道路ライブカメラ(road-info-prvs.mlit.go.jp)。ui.rsへの配線は後続増分のため現時点では未wire。
+#[allow(dead_code)]
+mod camera;
 
 use image::{RgbImage, RgbaImage, imageops::FilterType};
 
