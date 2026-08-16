@@ -301,6 +301,40 @@ pub(crate) fn draw_disaster_panel<W: Write>(
     }
 }
 
+// 通行規制の詳細(中央パネル・Tキーで開く。何かキーで消える)。
+// draw_disaster_panel と同じ組み方だが、脚注が「なぜ通れないか」用に固定文言なので別関数にする。
+pub(crate) fn draw_regulation_detail_panel<W: Write>(
+    out: &mut W,
+    cols: u32,
+    map_rows: u32,
+    title: &str,
+    lines: &[String],
+) {
+    const BG: &str = "\x1b[30;47m";
+    const RST: &str = "\x1b[0m";
+    let iw = (cols as usize).saturating_sub(6).clamp(24, 96);
+    const CHROME_ROWS: usize = 7;
+    let max_body = (map_rows as usize).saturating_sub(CHROME_ROWS).max(1);
+    let shown = lines.len().min(max_body);
+    let rule = format!(" {}", "─".repeat(iw.saturating_sub(2)));
+    let mut rows: Vec<String> = vec![String::new(), format!(" {title}"), rule.clone()];
+    for l in lines.iter().take(shown) {
+        rows.push(format!(" {l}"));
+    }
+    if lines.len() > shown {
+        rows.push(format!(" …ほか{}行(画面に収まらない)", lines.len() - shown));
+    }
+    rows.push(rule);
+    rows.push(" 出典: 国土交通省 道路情報提供システム".to_string());
+    rows.push(" 任意のキー(Esc/q)で閉じる".to_string());
+    rows.push(String::new());
+    let r0 = ((map_rows as usize).saturating_sub(rows.len()) / 2).max(1) as u32;
+    let c0 = ((cols as usize).saturating_sub(iw) / 2).max(1) as u32;
+    for (i, ln) in rows.iter().enumerate() {
+        let _ = write!(out, "\x1b[{};{}H{}{}{}", r0 + i as u32, c0, BG, fit_cells(ln, iw), RST);
+    }
+}
+
 // 初回起動の操作案内(中央パネル・何かキーで消える)
 pub(crate) fn draw_onboarding<W: Write>(out: &mut W, cols: u32, map_rows: u32) {
     const RST: &str = "\x1b[0m";

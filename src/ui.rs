@@ -148,6 +148,9 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     // 集計(1段目)には事例の名称も日付も入っていないので、押したときだけ引く。結果は保存しない。
     let mut disaster_view: Option<(String, Vec<String>)> = None; // (見出し, 本文行)
     let mut disaster_job: Option<std::sync::mpsc::Receiver<Result<(String, Vec<String>), String>>> = None;
+    // 通行規制の詳細(Tキー。なぜ通れないかの規制原因等)。disaster_viewと同じ「見出し+本文行」形。
+    let mut regulation_detail_view: Option<(String, Vec<String>)> = None;
+    let mut regulation_detail_job: Option<std::sync::mpsc::Receiver<Result<regulation::ClosureDetail, String>>> = None;
     // 読み上げの声(#78)の試聴。SettingsPick(27)でSpace=試聴/Enter確定後の1回再生の両方で使う。
     let mut voice_preview_job: Option<std::sync::mpsc::Receiver<Result<(), String>>> = None;
     // ルート計算と同じ非同期パターンで、検索/周辺/実写/おすすめの通信もバックグラウンド化する。
@@ -945,7 +948,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         }
         // ステータス行の文面組み立ては ui_status.rs へ切り出し済み。通信中スピナーの判定に使う
         // 各ジョブは有無しか見ないのでここで1つのフラグに畳んでから渡す。
-        let jobs_active = route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || cam_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some() || wander_job.is_some() || disaster_job.is_some();
+        let jobs_active = route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || cam_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some() || wander_job.is_some() || disaster_job.is_some() || regulation_detail_job.is_some();
         // 次の曲がり角の画面表示。音声案内(maybe_speak_turn)と同じくturn_points+現在地から
         // 求めるが、読み上げ済みかの状態は見ない(何度描画しても同じ内容を出したいため)。
         let next_turn = spec.routes.last()
@@ -998,6 +1001,9 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         if let Some((title, lines)) = &disaster_view {
             ui_overlay::draw_disaster_panel(&mut out, cols, map_rows, title, lines, disaster::truncation_seen());
         }
+        if let Some((title, lines)) = &regulation_detail_view {
+            ui_overlay::draw_regulation_detail_panel(&mut out, cols, map_rows, title, lines);
+        }
         if let Some(QrView::Text(q)) = &qr_view { ui_overlay::draw_qr_text(&mut out, cols, map_rows, tr, q); }
         if let Some(QrView::Image(img)) = &qr_view { ui_overlay::draw_qr_image(&mut out, cols, map_rows, tr, img); }
         if let Focus::SpotForm { name, url, field } = &focus { ui_overlay::draw_spot_form(&mut out, cols, map_rows, name, url, *field, input_cur, &cur_cat); }
@@ -1009,7 +1015,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         if onboard { ui_overlay::draw_onboarding(&mut out, cols, map_rows); }
         // 地図矩形を覆う中央オーバーレイ/パネルが「閉じた」フレーム(エッジ)でだけ画像を再emitして
         // 残像を消す。覆われている間(検索文字入力中など)は毎打鍵で強制再emitしない(メモリ/負荷対策)。
-        let map_covered = popup.is_some() || qr_view.is_some() || onboard || quit_confirm || disaster_view.is_some()
+        let map_covered = popup.is_some() || qr_view.is_some() || onboard || quit_confirm || disaster_view.is_some() || regulation_detail_view.is_some()
             || matches!(focus,
                 Focus::SpotForm { .. } | Focus::Search(_) | Focus::SaveName(_) | Focus::NearSearch(_)
                 | Focus::NewCat(_) | Focus::RoadSearch(_) | Focus::Recommend(_)
@@ -1080,6 +1086,14 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 Ok(Err(e)) => { snd.play("error"); addr = format!("災害事例: {e}"); disaster_job = None; got_result = true; }
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => { disaster_job = None; }
+            }
+        }
+        if let Some(job) = &regulation_detail_job { // Tキーで頼んだ規制詳細の到着
+            match job.try_recv() {
+                Ok(Ok(d)) => { regulation_detail_view = Some(regulation::detail_panel_content(&d)); regulation_detail_job = None; got_result = true; }
+                Ok(Err(e)) => { snd.play("error"); addr = format!("通行規制: {e}"); regulation_detail_job = None; got_result = true; }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => { regulation_detail_job = None; }
             }
         }
         if let Some(job) = &voice_preview_job { // 読み上げの声(#78)の試聴結果
@@ -1277,7 +1291,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             // 主要道路は以前この条件から漏れていたが、4レイヤとも同じ扱いにする。
             || traffic_layer.job_active() || roads_layer.job_active()
             || camera_layer.job_active() || regulation_layer.job_active() || disaster_layer.job_active()
-            || disaster_job.is_some() || voice_preview_job.is_some();
+            || disaster_job.is_some() || voice_preview_job.is_some() || regulation_detail_job.is_some();
         let mut ev: Option<Event> = if got_result {
             None
         } else if polling {
@@ -1362,10 +1376,10 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             None => {} // 再描画のみ(計算待ち)
             Some(Event::Key(k)) if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) => {
                 // Ctrl-C: 進行中の全ジョブを中断(アプリは終了しない)
-                let any = route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || cam_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some() || wander_job.is_some() || disaster_job.is_some();
+                let any = route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || cam_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some() || wander_job.is_some() || disaster_job.is_some() || regulation_detail_job.is_some();
                 if any {
                     if route_job.is_some() { route_note = Some("中断".to_string()); }
-                    route_job = None; search_job = None; near_job = None; street_job = None; cam_job = None; recommend_job = None; road_job = None; catpoi_job = None; wander_job = None; disaster_job = None;
+                    route_job = None; search_job = None; near_job = None; street_job = None; cam_job = None; recommend_job = None; road_job = None; catpoi_job = None; wander_job = None; disaster_job = None; regulation_detail_job = None;
                     addr = "中断".into();
                 }
             }
@@ -1388,6 +1402,8 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             // ここで全キーを受け止めないと、パネルに覆われた地図側のキー(v で地点追加等)が
             // 見えないまま発火してしまう。
             Some(Event::Key(_)) if disaster_view.is_some() => { disaster_view = None; force_reemit = true; }
+            // 通行規制の詳細パネルを閉じる。disaster_view と同じく任意キーで閉じる。
+            Some(Event::Key(_)) if regulation_detail_view.is_some() => { regulation_detail_view = None; force_reemit = true; }
             Some(Event::Key(k)) if spot_move_confirm.is_some() => { // 「中心へ移動」の確認(y=実行/他=取消)
                 let gi = spot_move_confirm.take().unwrap();
                 if let KeyCode::Char('y') = k.code {
@@ -1415,9 +1431,9 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             }
             // Map表示中のEscは進行中ジョブの中断に使う(サブ画面のEscは各Focusの取消のまま)
             Some(Event::Key(k)) if k.code == KeyCode::Esc && matches!(focus, Focus::Map)
-                && (route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || cam_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some() || wander_job.is_some() || disaster_job.is_some()) => {
+                && (route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || cam_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some() || wander_job.is_some() || disaster_job.is_some() || regulation_detail_job.is_some()) => {
                 if route_job.is_some() { route_note = Some("中断".to_string()); }
-                route_job = None; search_job = None; near_job = None; street_job = None; cam_job = None; recommend_job = None; road_job = None; catpoi_job = None; wander_job = None; disaster_job = None;
+                route_job = None; search_job = None; near_job = None; street_job = None; cam_job = None; recommend_job = None; road_job = None; catpoi_job = None; wander_job = None; disaster_job = None; regulation_detail_job = None;
                 addr = "中断".into();
             }
             Some(Event::Key(k)) => {
@@ -2375,6 +2391,30 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                             });
                                             disaster_job = Some(rx);
                                             addr = "🌊災害事例を取得中…".into();
+                                        }
+                                    }
+                                }
+                            }
+                            // 通行規制の詳細(なぜ通れないか): 中心に一番近い区間の規制原因を中央パネルへ。
+                            KeyCode::Char('T') => {
+                                if !cfg.regulation_enabled { snd.play("error"); addr = "通行規制: OFF(設定で有効化)".into(); }
+                                else {
+                                    // B/Nと同じく、フレーム先頭で切り出した一覧の借用はここまで生きられないので層から直接引く。
+                                    let nearest = regulation_layer.items(plotlayer::view_bbox(cx, cy, z)).into_iter()
+                                        .filter(|ev| !ev.detail_id.is_empty())
+                                        .min_by(|a, b| {
+                                            let da = a.line.iter().map(|&p| (p.0 - lat).powi(2) + (p.1 - lon).powi(2)).fold(f64::INFINITY, f64::min);
+                                            let db = b.line.iter().map(|&p| (p.0 - lat).powi(2) + (p.1 - lon).powi(2)).fold(f64::INFINITY, f64::min);
+                                            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                                        });
+                                    match nearest {
+                                        None => { snd.play("error"); addr = "通行規制: 周辺に詳細あり区間無し".into(); }
+                                        Some(ev) => {
+                                            let id = ev.detail_id.clone();
+                                            let (tx, rx) = std::sync::mpsc::channel();
+                                            std::thread::spawn(move || { let _ = tx.send(regulation::fetch_detail(&id)); });
+                                            regulation_detail_job = Some(rx);
+                                            addr = "🚧規制詳細を取得中…".into();
                                         }
                                     }
                                 }
