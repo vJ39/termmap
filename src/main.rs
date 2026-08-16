@@ -28,6 +28,8 @@ mod roadseg;
 mod ui;
 mod ui_helpers; // interactive() の外にあった小さなヘルパー群
 mod focus;      // 対話UIの画面状態(Focus)
+#[allow(dead_code)] // ui.rs への配線(OSC 9997 送出)はこれから
+mod dragmode;   // web版ドラッグの軸モード(Focusから X/Y 各軸の意味を決める)
 mod ui_overlay; // 中央パネル/ポップアップ・標高帯の描画
 mod ui_gutter;  // 左袖リストの行組み立て
 mod ui_status;  // 最下段ステータス行の文面組み立て
