@@ -259,6 +259,48 @@ pub(crate) fn draw_shape_pick<W: Write>(out: &mut W, cols: u32, map_rows: u32, s
     let _ = write!(out, "\x1b[{};{}H{}{}{}", r0 + 5, c0, BG, blank, RST);
 }
 
+// 過去災害の事例一覧(中央パネル・Bキーで開く。何かキーで消える)。
+// draw_popup が1行専用なので、draw_onboarding と同じ組み方の複数行パネルとして別に持つ。
+// 地点は市区町村の代表点なので「災害が起きた場所そのもの」ではない。それを取り違えられないよう、
+// 出典と一緒に「市区町村単位の記録」であることを常時1行で出す。
+pub(crate) fn draw_disaster_panel<W: Write>(
+    out: &mut W,
+    cols: u32,
+    map_rows: u32,
+    title: &str,
+    lines: &[String],
+    truncated: bool,
+) {
+    const BG: &str = "\x1b[30;47m";
+    const RST: &str = "\x1b[0m";
+    let iw = (cols as usize).saturating_sub(6).clamp(24, 96);
+    // 枠(空行・見出し・区切り2本・脚注・操作案内)を除いた残りが本文に使える行数。
+    const CHROME_ROWS: usize = 9;
+    let max_body = (map_rows as usize).saturating_sub(CHROME_ROWS).max(1);
+    let shown = lines.len().min(max_body);
+    let rule = format!(" {}", "─".repeat(iw.saturating_sub(2)));
+    let mut rows: Vec<String> = vec![String::new(), format!(" {title}"), rule.clone()];
+    for l in lines.iter().take(shown) {
+        rows.push(format!(" {l}"));
+    }
+    if lines.len() > shown {
+        rows.push(format!(" …ほか{}件(画面に収まらない)", lines.len() - shown));
+    }
+    rows.push(rule);
+    if truncated {
+        // 集計が上限で打ち切られると件数が黙って過少になる。黙って過少にしない。
+        rows.push(" ※取得上限で打ち切られた集計がある(件数は下限)".to_string());
+    }
+    rows.push(" 市区町村単位の記録  出典: 防災科学技術研究所 災害事例データベース".to_string());
+    rows.push(" 任意のキー(Esc/q)で閉じる".to_string());
+    rows.push(String::new());
+    let r0 = ((map_rows as usize).saturating_sub(rows.len()) / 2).max(1) as u32;
+    let c0 = ((cols as usize).saturating_sub(iw) / 2).max(1) as u32;
+    for (i, ln) in rows.iter().enumerate() {
+        let _ = write!(out, "\x1b[{};{}H{}{}{}", r0 + i as u32, c0, BG, fit_cells(ln, iw), RST);
+    }
+}
+
 // 初回起動の操作案内(中央パネル・何かキーで消える)
 pub(crate) fn draw_onboarding<W: Write>(out: &mut W, cols: u32, map_rows: u32) {
     const RST: &str = "\x1b[0m";

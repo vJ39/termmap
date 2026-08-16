@@ -1,8 +1,8 @@
-// 地図に重ねるプロットデータ(道路交通量・主要道路・道路ライブカメラ・通行規制)の
+// 地図に重ねるプロットデータ(道路交通量・主要道路・道路ライブカメラ・通行規制・過去災害)の
 // ディスク層。キー1件=1ファイルのJSONで保存し、種別ごとに違うTTLで期限切れにする。
 // 設計は docs/plot-data-disk-cache-design.md §3/§5/§8。
 //
-// 保存先: ~/.config/termmap/plot-cache/v1/{traffic,roads,camera,regulation}/{キー}.json
+// 保存先: ~/.config/termmap/plot-cache/v1/{traffic,roads,camera,regulation,disaster}/{キー}.json
 //   {"v":1,"key":"5339","fetched_at":1755330000,"data_at":1755328500,"items":[ ... ]}
 //
 // このファイルはディスクしか知らない(ネットワークにもデータ型にも触れない)。種別ごとの差
@@ -26,9 +26,11 @@ pub enum Layer {
     Roads,
     Camera,
     Regulation,
+    Disaster,
 }
 
-pub const ALL_LAYERS: [Layer; 4] = [Layer::Traffic, Layer::Roads, Layer::Camera, Layer::Regulation];
+pub const ALL_LAYERS: [Layer; 5] =
+    [Layer::Traffic, Layer::Roads, Layer::Camera, Layer::Regulation, Layer::Disaster];
 
 const MINUTE: u64 = 60;
 const HOUR: u64 = 60 * MINUTE;
@@ -42,6 +44,7 @@ impl Layer {
             Layer::Roads => "roads",
             Layer::Camera => "camera",
             Layer::Regulation => "regulation",
+            Layer::Disaster => "disaster",
         }
     }
 
@@ -50,12 +53,15 @@ impl Layer {
     /// 新しい値は存在しない。主要道路30日=OSMのtrunk/primary幾何は月単位でしか変わらない
     /// (tiles.rs のタイルTTLと同じ値)。カメラ7日=設置位置の新設・撤去は週〜月単位。
     /// 通行規制10分=数十分〜数日で変わり、かつ通行止めは安全に直結するので短くする。
+    /// 過去災害30日=起きた災害そのものは変わらない。変わるのは「新しい災害が起きて登録される」
+    /// 「既存事例の記述が修正される」の2つで、いずれも月単位(主要道路・地図タイルと同じ性格)。
     pub fn fresh_ttl(&self) -> Duration {
         Duration::from_secs(match self {
             Layer::Traffic => 5 * MINUTE,
             Layer::Roads => 30 * DAY,
             Layer::Camera => 7 * DAY,
             Layer::Regulation => 10 * MINUTE,
+            Layer::Disaster => 30 * DAY,
         })
     }
 
@@ -63,11 +69,12 @@ impl Layer {
     /// 交通量60分=これを超えると時間帯による交通量プロファイルが変わるので現況として示さない。
     /// 通行規制24時間=災害・工事の通行止めは日単位で続くため、それまでは「N時間前時点の規制」
     /// として出す価値がある。道路とカメラは古くても実害が無い(新設が出ないだけ)ので上限なし。
+    /// 過去災害も同じで、古い集計が誤りになることはない(新しい事例が出ないだけ)。
     pub fn stale_limit(&self) -> Option<Duration> {
         match self {
             Layer::Traffic => Some(Duration::from_secs(60 * MINUTE)),
             Layer::Regulation => Some(Duration::from_secs(24 * HOUR)),
-            Layer::Roads | Layer::Camera => None,
+            Layer::Roads | Layer::Camera | Layer::Disaster => None,
         }
     }
 
@@ -78,6 +85,7 @@ impl Layer {
             Layer::Roads => 300,
             Layer::Camera => 16,
             Layer::Regulation => 200,
+            Layer::Disaster => 200,
         }
     }
 
@@ -88,6 +96,8 @@ impl Layer {
             Layer::Roads => 64 * MB,
             Layer::Camera => 10 * MB,
             Layer::Regulation => 20 * MB,
+            // 1次メッシュ1枚が実測25KB以下なので、200セルでも約5MB。他レイヤと桁を揃えた余裕値。
+            Layer::Disaster => 20 * MB,
         }
     }
 }

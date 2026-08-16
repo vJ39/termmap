@@ -127,14 +127,16 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     let mut turn_points: Vec<route::TurnPoint> = Vec::new();
     let mut turn_job: Option<route::TurnRx> = None;
     let mut voice_guide: Option<voice::VoiceGuide> = None;
-    // 地図に重ねる4種のプロットデータ。取得単位(メッシュ/整備局)・TTL・ズーム下限・ディスク
+    // 地図に重ねる5種のプロットデータ。取得単位(メッシュ/整備局)・TTL・ズーム下限・ディスク
     // 永続化はすべて plotlayer/plotcache 側が持つ。ここは毎フレーム tick して結果を読むだけ。
-    // 道路交通量は cfg.traffic_enabled、カメラは camera_enabled、規制は regulation_enabled で
-    // ON/OFFする。主要道路(#73)は交通量の観測点をラインへスナップする下地なので交通量と連動する。
+    // 道路交通量は cfg.traffic_enabled、カメラは camera_enabled、規制は regulation_enabled、
+    // 過去災害は disaster_enabled で ON/OFFする。
+    // 主要道路(#73)は交通量の観測点をラインへスナップする下地なので交通量と連動する。
     let mut traffic_layer = plotlayer::traffic();
     let mut roads_layer = plotlayer::roads();
     let mut camera_layer = plotlayer::camera();
     let mut regulation_layer = plotlayer::regulation();
+    let mut disaster_layer = plotlayer::disaster();
     // 期限切れ/上限超過のキャッシュ掃除は1セッション1回、最初のアイドル到達時に別スレッドで走らせる
     // (起動を遅くせず、無操作のたびにディレクトリを走査もしない)。
     let mut plot_gc_done = false;
@@ -142,6 +144,10 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     // 早期returnパターン)。パン/ズームは無い(道路カメラは固定視点の1枚画像のため)。
     let mut cam_view: Option<(RgbImage, camera::RoadCamera)> = None;
     let mut cam_job: Option<std::sync::mpsc::Receiver<(camera::RoadCamera, Result<RgbImage, String>)>> = None;
+    // Bキーで中心近くの災害履歴の地点を選び、その地点の事例一覧(2段目)を取って中央パネルに出す。
+    // 集計(1段目)には事例の名称も日付も入っていないので、押したときだけ引く。結果は保存しない。
+    let mut disaster_view: Option<(String, Vec<String>)> = None; // (見出し, 本文行)
+    let mut disaster_job: Option<std::sync::mpsc::Receiver<Result<(String, Vec<String>), String>>> = None;
     // ルート計算と同じ非同期パターンで、検索/周辺/実写/おすすめの通信もバックグラウンド化する。
     // 新規spawn時に古いrxはdropされる=最新のみ採用(generation ID不要)。
     let mut search_job: Option<std::sync::mpsc::Receiver<(String, String, Result<Vec<(f64, f64, String)>, String>)>> = None; // (ckey, query, geocode結果)
@@ -614,6 +620,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             roads_layer.items(plot_view).into_iter().map(|r| r.pts.as_slice()).collect();
         let camera_points = camera_layer.items(plot_view);
         let regulation_events = regulation_layer.items(plot_view);
+        let disaster_sites = disaster_layer.items(plot_view);
 
         // 移動検知(解像度非依存): 直近に描画したフレームと(cx,cy,z)が違えば「動いた」。
         // 動いた直後〜350ms は低解像度(delta=0)で速く描き、動きが止まって350ms経ったら
@@ -744,6 +751,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             roads_layer.generation().hash(&mut h);
             camera_layer.generation().hash(&mut h);
             regulation_layer.generation().hash(&mut h);
+            disaster_layer.generation().hash(&mut h);
             Some(h.finish())
         };
 
@@ -857,6 +865,20 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             for w in pts.windows(2) { draw_line(&mut ov, w[0].0, w[0].1, w[1].0, w[1].1, ev.kind.color(), 3); }
                         }
                     }
+                    if cfg.disaster_enabled { // 過去災害(Bでその地点の事例一覧)
+                        // 座標が市区町村の代表点で1点に何十件も重なるため、事例1件=1マーカーには
+                        // しない。1座標=1マーカーにして、件数を外周リングの半径、最も多い種別を
+                        // 色で表す。外周を細くするのは地図と他レイヤを覆い隠さないため
+                        // (中心の塊があるので細くても位置は読める)。
+                        for s in &disaster_sites {
+                            let (gx, gy) = deg_to_pixel(s.lat, s.lon, rz);
+                            let ix = (gx - (rcx - rw as f64 / 2.0)).floor() as i32;
+                            let iy = (gy - (rcy - rh as f64 / 2.0)).floor() as i32;
+                            let color = s.dominant().color();
+                            draw_ring(&mut ov, ix, iy, 1, color, 2);
+                            draw_ring(&mut ov, ix, iy, disaster::marker_radius(s.total()), color, 1);
+                        }
+                    }
                     last_map_sig = map_sig; // このsigで描いた内容がこのフレームでemitされる
                     if img_inline {
                         // 実画像モード: 取得画像に overlay を焼き込んで保持し、AA文字列は空にする。
@@ -921,7 +943,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         }
         // ステータス行の文面組み立ては ui_status.rs へ切り出し済み。通信中スピナーの判定に使う
         // 各ジョブは有無しか見ないのでここで1つのフラグに畳んでから渡す。
-        let jobs_active = route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || cam_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some() || wander_job.is_some();
+        let jobs_active = route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || cam_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some() || wander_job.is_some() || disaster_job.is_some();
         // 次の曲がり角の画面表示。音声案内(maybe_speak_turn)と同じくturn_points+現在地から
         // 求めるが、読み上げ済みかの状態は見ない(何度描画しても同じ内容を出したいため)。
         let next_turn = spec.routes.last()
@@ -955,6 +977,14 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 stale_age_secs: regulation_layer.stale_age_secs(plot_now),
                 wide_area: regulation_layer.suppressed(),
             },
+            // 過去災害は事例数でなく地点数を出す(1地点に最大166件が重なるため)。
+            // 事例一覧(Bキー)の取得中もスピナーではなくこのレイヤの表示で分かるようにする。
+            disaster: ui_status::PlotStatus {
+                count: disaster_sites.len(),
+                job_active: disaster_layer.job_active() || disaster_job.is_some(),
+                stale_age_secs: disaster_layer.stale_age_secs(plot_now),
+                wide_area: disaster_layer.suppressed(),
+            },
             addr: &addr, wps: &wps, z, lat, lon, next_turn: &next_turn,
         });
         let status = fit_cells_scroll(&status, cols as usize, spin);
@@ -963,6 +993,9 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         // 中央に重ねるパネル/ポップアップ類の描画は ui_overlay.rs へ切り出し済み。
         if quit_confirm { ui_overlay::draw_quit_confirm(&mut out, cols, map_rows); }
         if let Some(msg) = &popup { ui_overlay::draw_popup(&mut out, cols, map_rows, msg); }
+        if let Some((title, lines)) = &disaster_view {
+            ui_overlay::draw_disaster_panel(&mut out, cols, map_rows, title, lines, disaster::truncation_seen());
+        }
         if let Some(QrView::Text(q)) = &qr_view { ui_overlay::draw_qr_text(&mut out, cols, map_rows, tr, q); }
         if let Some(QrView::Image(img)) = &qr_view { ui_overlay::draw_qr_image(&mut out, cols, map_rows, tr, img); }
         if let Focus::SpotForm { name, url, field } = &focus { ui_overlay::draw_spot_form(&mut out, cols, map_rows, name, url, *field, input_cur, &cur_cat); }
@@ -974,7 +1007,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         if onboard { ui_overlay::draw_onboarding(&mut out, cols, map_rows); }
         // 地図矩形を覆う中央オーバーレイ/パネルが「閉じた」フレーム(エッジ)でだけ画像を再emitして
         // 残像を消す。覆われている間(検索文字入力中など)は毎打鍵で強制再emitしない(メモリ/負荷対策)。
-        let map_covered = popup.is_some() || qr_view.is_some() || onboard || quit_confirm
+        let map_covered = popup.is_some() || qr_view.is_some() || onboard || quit_confirm || disaster_view.is_some()
             || matches!(focus,
                 Focus::SpotForm { .. } | Focus::Search(_) | Focus::SaveName(_) | Focus::NearSearch(_)
                 | Focus::NewCat(_) | Focus::RoadSearch(_) | Focus::Recommend(_)
@@ -1038,6 +1071,15 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         got_result |= roads_layer.tick(cx, cy, z, cfg.traffic_enabled);
         got_result |= camera_layer.tick(cx, cy, z, cfg.camera_enabled);
         got_result |= regulation_layer.tick(cx, cy, z, cfg.regulation_enabled);
+        got_result |= disaster_layer.tick(cx, cy, z, cfg.disaster_enabled);
+        if let Some(job) = &disaster_job { // Bキーで頼んだ事例一覧(2段目)の到着
+            match job.try_recv() {
+                Ok(Ok(panel)) => { disaster_view = Some(panel); disaster_job = None; got_result = true; }
+                Ok(Err(e)) => { snd.play("error"); addr = format!("災害事例: {e}"); disaster_job = None; got_result = true; }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => { disaster_job = None; }
+            }
+        }
         if let Some(job) = &cam_job {
             match job.try_recv() {
                 Ok((c, Ok(img))) => { cam_view = Some((img, c)); cam_job = None; }
@@ -1224,7 +1266,8 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             // 取りこぼさない(結果が最大60秒(IDLE_SAVE_INTERVAL)反映されない事故を防ぐ)。
             // 主要道路は以前この条件から漏れていたが、4レイヤとも同じ扱いにする。
             || traffic_layer.job_active() || roads_layer.job_active()
-            || camera_layer.job_active() || regulation_layer.job_active();
+            || camera_layer.job_active() || regulation_layer.job_active() || disaster_layer.job_active()
+            || disaster_job.is_some();
         let mut ev: Option<Event> = if got_result {
             None
         } else if polling {
@@ -1309,10 +1352,10 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             None => {} // 再描画のみ(計算待ち)
             Some(Event::Key(k)) if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) => {
                 // Ctrl-C: 進行中の全ジョブを中断(アプリは終了しない)
-                let any = route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || cam_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some() || wander_job.is_some();
+                let any = route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || cam_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some() || wander_job.is_some() || disaster_job.is_some();
                 if any {
                     if route_job.is_some() { route_note = Some("中断".to_string()); }
-                    route_job = None; search_job = None; near_job = None; street_job = None; cam_job = None; recommend_job = None; road_job = None; catpoi_job = None; wander_job = None;
+                    route_job = None; search_job = None; near_job = None; street_job = None; cam_job = None; recommend_job = None; road_job = None; catpoi_job = None; wander_job = None; disaster_job = None;
                     addr = "中断".into();
                 }
             }
@@ -1331,6 +1374,10 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             }
             Some(Event::Key(_)) if qr_view.is_some() => { qr_view = None; force_reemit = true; } // ポップアップを閉じる(即座に再emitして残像を消す)
             Some(Event::Key(_)) if popup.is_some() => { popup = None; force_reemit = true; } // 名前ポップアップを閉じる(同上)
+            // 災害事例パネルを閉じる。qr_view/popup と同じく任意キーで閉じる(Esc/qを含む)。
+            // ここで全キーを受け止めないと、パネルに覆われた地図側のキー(v で地点追加等)が
+            // 見えないまま発火してしまう。
+            Some(Event::Key(_)) if disaster_view.is_some() => { disaster_view = None; force_reemit = true; }
             Some(Event::Key(k)) if spot_move_confirm.is_some() => { // 「中心へ移動」の確認(y=実行/他=取消)
                 let gi = spot_move_confirm.take().unwrap();
                 if let KeyCode::Char('y') = k.code {
@@ -1358,9 +1405,9 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             }
             // Map表示中のEscは進行中ジョブの中断に使う(サブ画面のEscは各Focusの取消のまま)
             Some(Event::Key(k)) if k.code == KeyCode::Esc && matches!(focus, Focus::Map)
-                && (route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || cam_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some() || wander_job.is_some()) => {
+                && (route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || cam_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some() || wander_job.is_some() || disaster_job.is_some()) => {
                 if route_job.is_some() { route_note = Some("中断".to_string()); }
-                route_job = None; search_job = None; near_job = None; street_job = None; cam_job = None; recommend_job = None; road_job = None; catpoi_job = None; wander_job = None;
+                route_job = None; search_job = None; near_job = None; street_job = None; cam_job = None; recommend_job = None; road_job = None; catpoi_job = None; wander_job = None; disaster_job = None;
                 addr = "中断".into();
             }
             Some(Event::Key(k)) => {
@@ -1518,6 +1565,10 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                     23 => { cfg.voice_speak_local = !cfg.voice_speak_local; }
                                     24 => { cfg.camera_enabled = !cfg.camera_enabled; }
                                     25 => { cfg.regulation_enabled = !cfg.regulation_enabled; }
+                                    26 => { // 過去災害: ONにした直後だけ出典を1回出す(雨雲レーダーと同じ扱い)
+                                        cfg.disaster_enabled = !cfg.disaster_enabled;
+                                        if cfg.disaster_enabled { addr = "過去災害: 防災科学技術研究所 災害事例データベース".into(); }
+                                    }
                                     _ => {}
                                 }
                             }
@@ -2272,6 +2323,37 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             }
                             // キー選定: C/K/L/V/P/I等の自然な字は全て他機能で使用済みのため空いている'N'を割当
                             KeyCode::Char('N') => run_action!(MenuAction::ViewCamera, lat, lon, cols, tr),
+                            // 過去災害: 中心に一番近い地点の事例一覧を中央パネルへ(防災のB)。
+                            KeyCode::Char('B') => {
+                                if !cfg.disaster_enabled { snd.play("error"); addr = "過去災害: OFF(設定で有効化)".into(); }
+                                else {
+                                    // 視野内で中心に一番近い地点。カメラのNと同じく、フレーム先頭で
+                                    // 切り出した一覧の借用はここ(tick後)まで生きられないので層から直接引く。
+                                    let nearest = disaster_layer.items(plotlayer::view_bbox(cx, cy, z)).into_iter()
+                                        .min_by(|a, b| {
+                                            let da = (a.lat - lat).powi(2) + (a.lon - lon).powi(2);
+                                            let db = (b.lat - lat).powi(2) + (b.lon - lon).powi(2);
+                                            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                                        })
+                                        .cloned();
+                                    match nearest {
+                                        None => { snd.play("error"); addr = "過去災害: 周辺に記録無し".into(); }
+                                        Some(s) => {
+                                            // 事例本体(名称・日付・被害統計)は集計に入っていないので、
+                                            // ここで初めて取りに行く。保存はしない(押したときだけ)。
+                                            let since = plotlayer::disaster_since();
+                                            let (tx, rx) = std::sync::mpsc::channel();
+                                            std::thread::spawn(move || {
+                                                let r = disaster::fetch_events(s.lat, s.lon, since, disaster::EVENT_LIMIT)
+                                                    .map(|evs| disaster::panel_content(&evs, &s, since));
+                                                let _ = tx.send(r);
+                                            });
+                                            disaster_job = Some(rx);
+                                            addr = "🌊災害事例を取得中…".into();
+                                        }
+                                    }
+                                }
+                            }
                             KeyCode::Char('n') => { // BRouter の代替ルート候補を巡回
                                 if wps.len() >= 2 {
                                     route_alt = (route_alt + 1) % 4;

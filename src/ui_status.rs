@@ -10,7 +10,7 @@ use crate::settings;
 use crate::spots::Spot;
 use crate::tiles::{radar_progress, TileLoader};
 
-// プロットレイヤ(道路交通量・道路ライブカメラ・通行規制)1つぶんの表示状態。
+// プロットレイヤ(道路交通量・道路ライブカメラ・通行規制・過去災害)1つぶんの表示状態。
 // 件数しか見ないので、アイテムそのものではなく畳んだ値を受け取る。
 pub(crate) struct PlotStatus {
     /// 表示範囲に出ている件数。
@@ -56,6 +56,7 @@ pub(crate) struct StatusCtx<'a> {
     pub traffic: PlotStatus,
     pub camera: PlotStatus,
     pub regulation: PlotStatus,
+    pub disaster: PlotStatus,
     pub addr: &'a str,
     pub wps: &'a [(f64, f64)],
     pub z: u32,
@@ -112,7 +113,7 @@ pub(crate) fn build_status_line(c: StatusCtx) -> String {
         focus, save_confirm, spot_move_confirm, spots, cur_cat, pending_spot, set_sel, poi_label,
         route_note, clear_route_confirm, jobs_active, spin, gps_live, web_gps_active, play,
         play_speed, radar_on, radar_tl, radar_idx, radar_follow, loader, rcx, rcy, rz, rw, rh,
-        cfg, traffic, camera, regulation,
+        cfg, traffic, camera, regulation, disaster,
         addr, wps, z, lat, lon, next_turn,
     } = c;
     match focus {
@@ -198,13 +199,16 @@ pub(crate) fn build_status_line(c: StatusCtx) -> String {
             let camera_txt = plot_label(cfg.camera_enabled, "📷", "台", "(N)", "カメラ無し", &camera);
             // 通行規制: ONのときだけ件数を出す(考え方はtraffic_txtと同じ)。
             let regulation_txt = plot_label(cfg.regulation_enabled, "⚠", "件", "", "規制無し", &regulation);
+            // 過去災害: 件数ではなく**地点数**を出す(事例数だと数千になり他レイヤと桁が合わない)。
+            // (B)はカメラの(N)と同じで、押すと詳細が出るキーがあることを示す。
+            let disaster_txt = plot_label(cfg.disaster_enabled, "🌊", "地点", "(B)", "記録無し", &disaster);
             // 一時メッセージが無い時は底面にロゴを常時表示。メッセージ発生時はそちらを優先。
             let msg = if addr.is_empty() { "◉╌╌╌► termmap · terminal touring map   ".to_string() } else { format!("» {addr} « ") };
             // 下部バーは細く。全操作は Space メニューから選べる
             let route_hint = if wps.is_empty() { "v=地点を置く".to_string() } else { format!("{}点 v足す w/s選択(操作行までEnterで実行) Tab=左の一覧へ(並替/操作)", wps.len()) };
             // 次の曲がり角(音声案内と同じデータソース。ONでルート走行中のみ出る)。
             let turn_txt = next_turn.as_deref().unwrap_or("");
-            let base = format!(" {spinner}{msg}{live}{playing}{radar_txt}{traffic_txt}{camera_txt}{regulation_txt}{turn_txt}z{z} {lat:.4},{lon:.4} ｜ {route_hint} ｜ Space:メニュー ?ヘルプ q終了");
+            let base = format!(" {spinner}{msg}{live}{playing}{radar_txt}{traffic_txt}{camera_txt}{regulation_txt}{disaster_txt}{turn_txt}z{z} {lat:.4},{lon:.4} ｜ {route_hint} ｜ Space:メニュー ?ヘルプ q終了");
             match route_note { Some(rn) => format!("{base} | {rn} "), None => base }
         }
     }
@@ -250,6 +254,7 @@ mod tests {
         traffic: PlotStatus,
         camera: PlotStatus,
         regulation: PlotStatus,
+        disaster: PlotStatus,
         addr: String,
         wps: Vec<(f64, f64)>,
         z: u32,
@@ -267,7 +272,7 @@ mod tests {
                 gps_live: false, web_gps_active: false, play: None, play_speed: 1.0,
                 radar_on: false, radar_tl: radar::Timeline::default(), radar_idx: 0, radar_follow: true,
                 cfg: Config::default(),
-                traffic: idle_plot(), camera: idle_plot(), regulation: idle_plot(),
+                traffic: idle_plot(), camera: idle_plot(), regulation: idle_plot(), disaster: idle_plot(),
                 addr: String::new(), wps: Vec::new(), z: 14, lat: 35.0, lon: 139.0, next_turn: None,
             }
         }
@@ -287,6 +292,7 @@ mod tests {
                 traffic: clone_plot(&self.traffic),
                 camera: clone_plot(&self.camera),
                 regulation: clone_plot(&self.regulation),
+                disaster: clone_plot(&self.disaster),
                 addr: &self.addr, wps: &self.wps, z: self.z, lat: self.lat, lon: self.lon,
                 next_turn: &self.next_turn,
             })
@@ -496,6 +502,50 @@ mod tests {
         assert!(f.line().contains("⚠1件 "));
         f.regulation.job_active = true; // 取得済みなら取得中でも件数を優先する
         assert!(f.line().contains("⚠1件 "));
+    }
+
+    #[test]
+    fn disaster_label_counts_sites_and_advertises_the_detail_key() {
+        let mut f = Fixture::new(Focus::Map);
+        assert!(!f.line().contains('🌊'), "OFFのときは出さない");
+        f.cfg.disaster_enabled = true;
+        f.disaster.job_active = true;
+        assert!(f.line().contains("🌊取得中… "));
+        f.disaster.job_active = false;
+        assert!(f.line().contains("🌊記録無し "));
+        f.disaster.count = 12;
+        assert!(f.line().contains("🌊12地点(B) "), "事例数ではなく地点数");
+        f.disaster.wide_area = true;
+        f.disaster.count = 0;
+        assert!(f.line().contains("🌊広域では非表示 "));
+    }
+
+    #[test]
+    fn a_stale_disaster_layer_keeps_the_detail_key_hint_after_the_age() {
+        let mut f = Fixture::new(Focus::Map);
+        f.cfg.disaster_enabled = true;
+        f.disaster.count = 7;
+        f.disaster.stale_age_secs = Some(31 * 24 * 3600);
+        assert!(f.line().contains("🌊7地点(31日前)(B) "));
+    }
+
+    #[test]
+    fn the_five_plot_layers_do_not_collide_in_the_status_line() {
+        // 5レイヤ全てONでも、それぞれのアイコンが1つずつ出る(記号の衝突が無い)。
+        let mut f = Fixture::new(Focus::Map);
+        f.cfg.traffic_enabled = true;
+        f.cfg.camera_enabled = true;
+        f.cfg.regulation_enabled = true;
+        f.cfg.disaster_enabled = true;
+        f.traffic.count = 1;
+        f.camera.count = 2;
+        f.regulation.count = 3;
+        f.disaster.count = 4;
+        let line = f.line();
+        for icon in ['🚗', '📷', '⚠', '🌊'] {
+            assert_eq!(line.matches(icon).count(), 1, "{icon} が {line}");
+        }
+        assert!(line.contains("🚗1地点 📷2台(N) ⚠3件 🌊4地点(B) "), "{line}");
     }
 
     // fresh を過ぎた値を出している間だけ経過時間を添える(今の状態とは限らないことを示す)。

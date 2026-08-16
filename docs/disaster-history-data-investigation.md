@@ -63,6 +63,10 @@ https://agis.bosai.go.jp/webgis/rest/services/dil-db/saigai/MapServer/0/query
 
 ## 次のステップ
 
+調査時に未確定だった災害種別コード(6分類・詳細36種)・被害統計のコード値・地点の粒度
+(市区町村の代表点で1点に最大166件が重なる)は、設計時の実測で確定した。値の一覧は
+`docs/disaster-history-overlay-design.md` §2 にある。
+
 設計フェーズへ進める。既存の`traffic.rs`/`camera.rs`/`regulation.rs`と同じ構成
 (fetch関数・パース関数・ui.rsへの配線)に倣う想定。表示は災害種別ごとに色分けした
 マーカー(既存の交通量・カメラマーカーと同系統)が妥当と考えられるが、データ量の多さを

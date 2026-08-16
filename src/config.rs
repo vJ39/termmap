@@ -58,6 +58,7 @@ pub struct Config {
     pub traffic_enabled: bool,        // 道路交通量(JARTICオープンデータ)を地図に重ねるか。既定false(ONにした人だけが外部サービスへ問い合わせる)
     pub camera_enabled: bool,         // 道路ライブカメラ(road-info-prvs.mlit.go.jp)を地図に重ねるか。既定false(ONにした人だけが外部サービスへ問い合わせる)
     pub regulation_enabled: bool,     // 通行規制(通行止め・車線規制等、road-info-prvs.mlit.go.jp)を地図に重ねるか。既定false(ONにした人だけが外部サービスへ問い合わせる)
+    pub disaster_enabled: bool,       // 過去災害の発生履歴(NIED 災害事例データベース)を地図に重ねるか。既定false(ONにした人だけが外部サービスへ問い合わせる)
 }
 
 impl Default for Config {
@@ -91,6 +92,7 @@ impl Default for Config {
             traffic_enabled: false,
             camera_enabled: false,
             regulation_enabled: false,
+            disaster_enabled: false,
         }
     }
 }
@@ -238,6 +240,7 @@ pub fn load_config_from(path: &Path) -> Config {
             ("traffic", "enabled") => { if let Some(b) = parse_bool(value) { cfg.traffic_enabled = b; } }
             ("camera", "enabled") => { if let Some(b) = parse_bool(value) { cfg.camera_enabled = b; } }
             ("regulation", "enabled") => { if let Some(b) = parse_bool(value) { cfg.regulation_enabled = b; } }
+            ("disaster", "enabled") => { if let Some(b) = parse_bool(value) { cfg.disaster_enabled = b; } }
             // 旧スキーマ後方互換: [streetview] api_key を google_maps_api_key に取り込む(未設定時のみ)
             ("streetview", "api_key") => {
                 if cfg.google_maps_api_key.is_empty() {
@@ -310,6 +313,9 @@ pub fn save_config_to(path: &Path, c: &Config) -> Result<(), String> {
          enabled = {}\n\
          \n\
          [regulation]\n\
+         enabled = {}\n\
+         \n\
+         [disaster]\n\
          enabled = {}\n",
         c.llm_recommend_enabled,
         c.llm_model,
@@ -339,6 +345,7 @@ pub fn save_config_to(path: &Path, c: &Config) -> Result<(), String> {
         c.traffic_enabled,
         c.camera_enabled,
         c.regulation_enabled,
+        c.disaster_enabled,
     );
 
     // APIキーを含むので unix では 0600。書込中クラッシュで壊さないよう atomic。
@@ -492,6 +499,7 @@ mod tests {
             traffic_enabled: true,
             camera_enabled: true,
             regulation_enabled: true,
+            disaster_enabled: true,
         };
         save_config_to(&path, &original).expect("save should succeed");
         let loaded = load_config_from(&path);
@@ -593,6 +601,20 @@ show_spots = maybe
         let cfg2 = load_config_from(&path2);
         assert_eq!(cfg2.qr_style, Config::default().qr_style);
         cleanup(&path2);
+    }
+
+    #[test]
+    fn disaster_defaults_to_off_and_is_read_from_its_own_section() {
+        // 外部データレイヤは既定OFF(ONにした人だけが外部サービスへ問い合わせる)。
+        assert!(!Config::default().disaster_enabled);
+        let path = unique_temp_path("disaster_section");
+        std::fs::write(&path, "[disaster]\nenabled = true\n").unwrap();
+        let cfg = load_config_from(&path);
+        assert!(cfg.disaster_enabled);
+        // 他の外部レイヤを巻き込まない。
+        assert!(!cfg.regulation_enabled);
+        assert!(!cfg.camera_enabled);
+        cleanup(&path);
     }
 
     #[test]
@@ -781,6 +803,7 @@ profile = "custom-profile"
             traffic_enabled: false,
             camera_enabled: false,
             regulation_enabled: false,
+            disaster_enabled: false,
         };
         save_config_to(&path, &cfg).unwrap();
         let loaded = load_config_from(&path);

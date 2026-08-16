@@ -1,5 +1,5 @@
-// 地図に重ねるプロットデータ(道路交通量・主要道路・道路ライブカメラ・通行規制)の取得段取り。
-// ui.rs にほぼ同一の取得ブロックが4つ並んでいたものを1つにまとめたもの。
+// 地図に重ねるプロットデータ(道路交通量・主要道路・道路ライブカメラ・通行規制・過去災害)の
+// 取得段取り。ui.rs にほぼ同一の取得ブロックが4つ並んでいたものを1つにまとめたもの。
 // 設計は docs/plot-data-disk-cache-design.md §6.3/§7。
 //
 // 旧実装との違いは3点。
@@ -11,9 +11,10 @@
 //      受信コードの形(try_recv + Disconnected で畳む)は旧実装と同じ。
 
 use crate::plotcache::{self, Cached, Layer};
-use crate::{camera, mesh, regulation, roadsearch, traffic};
+use crate::{camera, disaster, mesh, regulation, roadsearch, traffic};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 /// (lat_min, lon_min, lat_max, lon_max)。geo.rs の pixel_to_deg と同じ緯度経度。
@@ -86,6 +87,11 @@ impl PlotItem for camera::RoadCamera {
 impl PlotItem for regulation::ClosureEvent {
     fn bounds(&self) -> Bbox {
         line_bounds(&self.line)
+    }
+}
+impl PlotItem for disaster::DisasterSite {
+    fn bounds(&self) -> Bbox {
+        (self.lat, self.lon, self.lat, self.lon)
     }
 }
 
@@ -339,6 +345,40 @@ fn bureau_cells(b: Bbox) -> Vec<String> {
     vec![camera::nearest_bureau((b.0 + b.2) / 2.0, (b.1 + b.3) / 2.0).to_string()]
 }
 
+// 過去災害の年代しきい値(この年以降の事例だけを数える)。取得元が年をグループ化キーに
+// 入れさせてくれず where で絞るしかないため、しきい値が変わるとセルの中身も変わる。
+// CellsFn/FetchFn は fn ポインタ(環境を捕まえられない)なので、被覆側と取得側の両方から
+// 同じ値を読むにはプロセス全体の値として置くしかない。
+static DISASTER_SINCE: AtomicI32 = AtomicI32::new(disaster::DEFAULT_SINCE_YEAR);
+
+pub fn disaster_since() -> i32 {
+    DISASTER_SINCE.load(Ordering::Relaxed)
+}
+
+/// しきい値年を変える。**変えたらレイヤを作り直すこと**(古いキーのセルがセル表に残り、
+/// items() が全セルを舐めるため、作り直さないと別の年代のデータが混ざる)。
+/// 現状は設定に出していないので呼び出し元は無い(#75 Stage2 で設定行を足すときに使う)。
+#[allow(dead_code)]
+pub fn set_disaster_since(year: i32) {
+    DISASTER_SINCE.store(year.max(0), Ordering::Relaxed);
+}
+
+// 過去災害は交通量・規制と同じ1次メッシュだが、キーに年代しきい値を足した複合キーにする
+// (例 "5339_1926"、全期間は "5339_0")。しきい値を切り替えても別ファイルになって混ざらない。
+fn disaster_cells(b: Bbox) -> Vec<String> {
+    let since = disaster_since().max(0);
+    mesh::primary_codes(b.0, b.1, b.2, b.3).iter().map(|c| format!("{c}_{since}")).collect()
+}
+
+// "5339_1926" → (5339, 1926)。
+fn split_disaster_key(key: &str) -> Result<(u32, i32), String> {
+    let bad = || format!("不正なセルキー: {key}");
+    let (code, since) = key.split_once('_').ok_or_else(bad)?;
+    let code = code.parse::<u32>().map_err(|_| bad())?;
+    let since = since.parse::<i32>().map_err(|_| bad())?;
+    Ok((code, since))
+}
+
 // ---- セル取得(セルキー → データ) ----
 
 fn parse_code(key: &str) -> Result<u32, String> {
@@ -382,7 +422,13 @@ fn fetch_regulation_cell(key: &str, scratch: &mut Option<String>) -> Result<Vec<
     regulation::fetch_mesh(base, mesh_code)
 }
 
-// ---- 4レイヤの組み立て ----
+fn fetch_disaster_cell(key: &str, _scratch: &mut Option<String>) -> Result<Vec<disaster::DisasterSite>, String> {
+    let (code, since) = split_disaster_key(key)?;
+    let (s, w, n, e) = mesh::shrink(mesh::primary_bbox(code));
+    disaster::fetch_sites(s, w, n, e, since)
+}
+
+// ---- 5レイヤの組み立て ----
 
 /// 道路交通量(JARTIC)。1次メッシュ単位・z11未満では取得しない。
 pub fn traffic() -> PlotLayer<traffic::TrafficPoint> {
@@ -410,6 +456,13 @@ pub fn camera() -> PlotLayer<camera::RoadCamera> {
 /// 通行規制。取得元が1次メッシュ単位でファイルを分けているのでそれに合わせる。z11未満では取得しない。
 pub fn regulation() -> PlotLayer<regulation::ClosureEvent> {
     PlotLayer::new(Layer::Regulation, 11, 0, primary_cells, fetch_regulation_cell)
+}
+
+/// 過去災害の発生履歴(NIED 災害事例データベース)。1次メッシュ+年代しきい値の複合キー単位。
+/// 交通量・規制と同じ格子・同じズーム下限(z11)にしてあるので、複数レイヤを同時にONにしても
+/// 「このレイヤだけ端が欠けている」状態にならない。
+pub fn disaster() -> PlotLayer<disaster::DisasterSite> {
+    PlotLayer::new(Layer::Disaster, 11, 0, disaster_cells, fetch_disaster_cell)
 }
 
 #[cfg(test)]
@@ -814,10 +867,51 @@ mod tests {
         assert!(parse_code("").is_err());
     }
 
-    // 4種の実データ型が、実際にディスクへ書いて読み戻せること
+    #[test]
+    fn disaster_cells_tag_the_mesh_code_with_the_year_threshold() {
+        let (cx, cy) = tokyo_center(12);
+        let cells = disaster_cells(view_bbox(cx, cy, 12));
+        assert!(cells.contains(&format!("5339_{}", disaster::DEFAULT_SINCE_YEAR)), "{cells:?}");
+        // 交通量/規制と同じ格子(接尾辞を外すと同じコードの集合になる)。
+        let bare: Vec<String> = cells.iter().map(|k| k.split('_').next().unwrap().to_string()).collect();
+        assert_eq!(bare, primary_cells(view_bbox(cx, cy, 12)));
+    }
+
+    #[test]
+    fn disaster_cell_keys_are_accepted_by_the_disk_cache() {
+        // plotcache::valid_key は英数字と - _ の16文字以内しか許さない("5339_1926" は9文字)。
+        let _env = TestEnv::new("diskey");
+        let (cx, cy) = tokyo_center(11);
+        for k in disaster_cells(view_bbox(cx, cy, 11)) {
+            assert!(
+                plotcache::store(&_env.root, Layer::Disaster, &k, &[test_item(1.0)], 0, 0).is_ok(),
+                "キー {k} がディスク層に弾かれる"
+            );
+        }
+    }
+
+    #[test]
+    fn split_disaster_key_round_trips_with_disaster_cells() {
+        assert_eq!(split_disaster_key("5339_1926").unwrap(), (5339, 1926));
+        assert_eq!(split_disaster_key("6441_0").unwrap(), (6441, 0), "全期間");
+        for bad in ["5339", "", "_1926", "5339_", "abc_1926", "5339_x", "5339-1926"] {
+            assert!(split_disaster_key(bad).is_err(), "key={bad:?}");
+        }
+    }
+
+    #[test]
+    fn disaster_cells_stay_within_the_job_cap_at_the_zoom_floor() {
+        for (lat, lon) in [(35.68, 139.77), (43.06, 141.35), (26.21, 127.68)] {
+            let (cx, cy) = deg_to_pixel(lat, lon, 11);
+            let n = disaster_cells(view_bbox(cx, cy, 11)).len();
+            assert!(n <= MAX_CELLS_PER_JOB, "z11 {lat},{lon} で {n} セル");
+        }
+    }
+
+    // 5種の実データ型が、実際にディスクへ書いて読み戻せること
     // (型ごとの serde 単体テストとは別に、plotcache を通した往復を1本で押さえる)。
     #[test]
-    fn all_four_real_item_types_survive_a_trip_through_the_disk_cache() {
+    fn all_five_real_item_types_survive_a_trip_through_the_disk_cache() {
         let _env = TestEnv::new("realtypes");
         let root = _env.root.clone();
         let now = plotcache::now_secs();
@@ -856,16 +950,36 @@ mod tests {
             plotcache::load::<regulation::ClosureEvent>(&root, Layer::Regulation, "5339", now).unwrap().items,
             g
         );
+
+        let d = vec![disaster::DisasterSite {
+            lat: 35.955106,
+            lon: 139.874828,
+            kinds: vec![disaster::KindCount {
+                kind: disaster::DisasterKind::Storm,
+                count: 60,
+                year_min: 1926,
+                year_max: 2019,
+            }],
+        }];
+        plotcache::store(&root, Layer::Disaster, "5339_1926", &d, now, now).unwrap();
+        assert_eq!(
+            plotcache::load::<disaster::DisasterSite>(&root, Layer::Disaster, "5339_1926", now).unwrap().items,
+            d
+        );
     }
 
     #[test]
-    fn the_four_real_layers_use_the_ttls_and_zoom_floors_from_the_design() {
+    fn the_five_real_layers_use_the_ttls_and_zoom_floors_from_the_design() {
         assert_eq!(traffic().min_zoom, 11);
         assert_eq!(traffic().data_lag_secs, 25 * 60);
         assert_eq!(roads().min_zoom, 14);
         assert_eq!(camera().min_zoom, 0);
         assert_eq!(regulation().min_zoom, 11);
+        assert_eq!(disaster().min_zoom, 11);
         assert_eq!(traffic().layer.fresh_ttl().as_secs(), 300);
         assert_eq!(regulation().layer.fresh_ttl().as_secs(), 600);
+        assert_eq!(disaster().layer.fresh_ttl().as_secs(), 30 * 24 * 3600, "過去災害は30日");
+        assert_eq!(disaster().layer.stale_limit(), None, "古い集計が誤りになることはない");
+        assert_eq!(disaster().data_lag_secs, 0);
     }
 }
