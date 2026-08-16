@@ -59,6 +59,8 @@ fn radar_opacity_value(cfg: &config::Config) -> f64 {
 // targetTimes(フレーム時刻一覧)の再取得間隔(秒)の既定。ナウキャスト自体が5分更新なので、
 // これより短くしても新しい情報は無い。設定 [radar] refresh_sec で変えられる。
 const RADAR_REFRESH_SECS: u64 = 300;
+// 無操作が続いた時の状態保存(#69)の間隔。強制終了/クラッシュ対策なので長すぎず短すぎず。
+const IDLE_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 // 設定の再取得間隔(秒・f64)を RadarClock に渡す u64 へ。壊れた値なら既定値へ落として必ず動かす。
 fn radar_refresh_secs(cfg: &config::Config) -> u64 {
@@ -82,6 +84,16 @@ fn maybe_speak_turn(cfg: &config::Config, spec: &render::OverlaySpec, turn_point
     if let Some(phrase) = guide.tick(turn_points, progress_m) {
         voice::speak(&phrase);
     }
+}
+
+// 位置/ルート(last.txt)と直接キーで変えたcfg項目をまとめて保存。終了時とアイドル時の両方から呼ぶ。
+fn persist_full_state(cx: f64, cy: f64, z: u32, opts: &Args, wps: &[(f64, f64)], mode: &str, cfg: &mut config::Config, radar_on: bool, show_spots: bool) {
+    let (lat, lon) = pixel_to_deg(cx, cy, z);
+    save_state(lat, lon, z, &opts.style, wps, mode);
+    cfg.braille = opts.braille; cfg.classify = opts.classify; cfg.edge = opts.edge; cfg.mono = opts.mono; cfg.style = opts.style.clone();
+    cfg.radar_enabled = radar_on;
+    cfg.show_spots = show_spots;
+    let _ = config::save_config(cfg);
 }
 
 // ---- 対話モード (crossterm) ----
@@ -1520,8 +1532,14 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         } else if polling {
             let ms = if settling { 60 } else { 80 };
             if event::poll(std::time::Duration::from_millis(ms))? { Some(event::read()?) } else { None }
-        } else {
+        } else if event::poll(IDLE_SAVE_INTERVAL)? {
             Some(event::read()?)
+        } else {
+            // 無操作がIDLE_SAVE_INTERVALだけ続いた。read()で無限ブロックする代わりにpollで
+            // 区切り、強制終了/クラッシュに備えて状態を保存する(#69)。キー入力があれば
+            // pollは即trueを返すため応答性への影響は無い。
+            persist_full_state(cx, cy, z, &opts, &wps, &mode, &mut cfg, radar_on, show_spots);
+            None
         };
         // 押しっぱなし/連打でパン系イベントが溜まっている間は、都度の再描画を待たずに
         // 溜まった分を最新の1個へ間引く(SSH等で1回の再描画に往復が乗ると、律速して
@@ -2589,14 +2607,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     // 雨雲の背景ポーラーは drop でスレッドを join する。終了時にちょうど取得中だと、その分
     // (HTTPは最大20秒)終了が固まって見えるので join を別スレッドへ逃がす(プロセス終了で消える)。
     if let Some(rc) = radar_clock.take() { std::thread::spawn(move || drop(rc)); }
-    let (lat, lon) = pixel_to_deg(cx, cy, z);
-    save_state(lat, lon, z, &opts.style, &wps, &mode); // 終了時の位置とルートを --resume 用に保存
-    // 直接キー(Cキー・Vキー等)で変えた項目は設定画面を経由しないと即保存されないため、
-    // 終了時にまとめて cfg へ反映して保存する(次回起動が「終了時と全く同じ状態」になるように)。
-    cfg.braille = opts.braille; cfg.classify = opts.classify; cfg.edge = opts.edge; cfg.mono = opts.mono; cfg.style = opts.style.clone();
-    cfg.radar_enabled = radar_on;
-    cfg.show_spots = show_spots;
-    let _ = config::save_config(&cfg);
+    persist_full_state(cx, cy, z, &opts, &wps, &mode, &mut cfg, radar_on, show_spots);
     Ok(())
 }
 
