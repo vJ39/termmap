@@ -118,7 +118,8 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     let mut popup: Option<String> = None; // 中央に出す一時ポップアップ(スポット名等・任意キーで閉じる)
     // ルート計算のバックグラウンド受信(マーカーは即時、ルート線は別スレッド)
     let (mut route_note, mut route_job) = {
-        let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0, &cfg.google_maps_api_key);
+        // ループ開始前(regulation_layerがまだ何も取得していない)なので通行止め回避は無し。
+        let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0, &cfg.google_maps_api_key, "");
         (n_, j_)
     };
     // ルート音声案内(cfg.voice_guide_enabled時のみ使う)。曲がり角一覧はルートが決まる
@@ -224,8 +225,8 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     }; }
 
     // メニュー項目/直接キー どちらからでも同じ処理を走らせる。
-    // lat/lon/cols/tr は各ループで再計算されるフレーム値。マクロ衛生性のため引数で受け取る。
-    macro_rules! run_action { ($act:expr, $lat:expr, $lon:expr, $cols:expr, $tr:expr) => {{
+    // lat/lon/cols/tr/route_nogos は各ループで再計算されるフレーム値。マクロ衛生性のため引数で受け取る。
+    macro_rules! run_action { ($act:expr, $lat:expr, $lon:expr, $cols:expr, $tr:expr, $nogos:expr) => {{
         match $act {
             MenuAction::SearchPlace => { input_cur = 0; focus = Focus::Search(String::new()); }
             MenuAction::SearchPoi => { focus = Focus::PoiMenu; }
@@ -236,14 +237,14 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 else { input_cur = 0; focus = Focus::Recommend(String::new()); }
             }
             MenuAction::RouteForm => { if wps.is_empty() { addr = "先に v で地点を置いてね".into(); } else { wp_sel = 0; grab = false; focus = Focus::WaypointList; } }
-            MenuAction::AddVia => { snd.play("pop"); wp_add(&mut wps, ($lat, $lon)); let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0, &cfg.google_maps_api_key); route_note = n_; route_job = j_; addr = format!("地点を追加 #{}", wps.len()); }
+            MenuAction::AddVia => { snd.play("pop"); wp_add(&mut wps, ($lat, $lon)); let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0, &cfg.google_maps_api_key, $nogos); route_note = n_; route_job = j_; addr = format!("地点を追加 #{}", wps.len()); }
             MenuAction::RoadRoute => { input_cur = 0; focus = Focus::RoadSearch(String::new()); }
             MenuAction::Wander => { focus = Focus::WanderForm { dist_km: a.dist.unwrap_or(40.0) }; } // 距離ゲージを開く(Enterで検索開始)
-            MenuAction::CycleMode => { mode = match mode_label(&mode) { "下道" => "highway", "高速" => "short", _ => "surface" }.to_string(); let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0, &cfg.google_maps_api_key); route_note = n_; route_job = j_; }
+            MenuAction::CycleMode => { mode = match mode_label(&mode) { "下道" => "highway", "高速" => "short", _ => "surface" }.to_string(); let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0, &cfg.google_maps_api_key, $nogos); route_note = n_; route_job = j_; }
             MenuAction::AltRoute => {
                 if wps.len() >= 2 {
                     route_alt = (route_alt + 1) % 4;
-                    let (nn, jj) = trigger_route(&mut spec, &wps, &pois, &mode, route_alt, &cfg.google_maps_api_key);
+                    let (nn, jj) = trigger_route(&mut spec, &wps, &pois, &mode, route_alt, &cfg.google_maps_api_key, $nogos);
                     route_note = nn; route_job = jj;
                 } else { snd.play("error"); addr = "ルート未確定".into(); }
             }
@@ -626,6 +627,24 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         let camera_points = camera_layer.items(plot_view);
         let regulation_events = regulation_layer.items(plot_view);
         let disaster_sites = disaster_layer.items(plot_view);
+
+        // 通行止めルート回避(#通行止めを推奨しない)。表示中の視野(plot_view)ではなく、
+        // 経由地全体を覆うbboxで実施中の通行止めを見て、BRouterのnogosへ変換する。
+        // 通行規制の設定(cfg.regulation_enabled)と連動させる: OFFなら外部へ問い合わせず
+        // regulation_layerにデータ自体が無いため、ここでも自然に空になる。
+        let (route_nogos, route_nogos_truncated) = if cfg.regulation_enabled {
+            match route::waypoints_bbox_with_margin(&wps, 0.05) {
+                Some(bbox) => {
+                    let closures = regulation_layer.items(bbox);
+                    let center = ((bbox.0 + bbox.2) / 2.0, (bbox.1 + bbox.3) / 2.0);
+                    let (circles, truncated) = route::closures_to_nogos(&closures, center);
+                    (route::nogos_query_param(&circles), truncated)
+                }
+                None => (String::new(), false),
+            }
+        } else {
+            (String::new(), false)
+        };
 
         // 移動検知(解像度非依存): 直近に描画したフレームと(cx,cy,z)が違えば「動いた」。
         // 動いた直後〜350ms は低解像度(delta=0)で速く描き、動きが止まって350ms経ったら
@@ -1044,6 +1063,11 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 Ok(Ok(r)) => {
                     spec.routes.clear();
                     route_note = Some(route_summary(&mode, &r));
+                    // 通行止め回避が件数上限で一部反映できなかった場合、黙って進めると
+                    // 「回避できた」と誤解されるのでひとこと添える。
+                    if route_nogos_truncated {
+                        route_note = route_note.map(|n| format!("{n} (通行止めの一部は回避対象外)"));
+                    }
                     route_ele = r.ele;
                     route_ascend = r.ascend_m;
                     let tile_coords = geo::route_tile_coords(&r.pts, z);
@@ -1053,7 +1077,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     turn_points = Vec::new();
                     voice_guide = None;
                     if cfg.voice_guide_enabled {
-                        turn_job = Some(trigger_turn_points(&wps, &mode, 0, &r.pts));
+                        turn_job = Some(trigger_turn_points(&wps, &mode, 0, &r.pts, &route_nogos));
                     }
                     spec.routes.push(Route { pts: r.pts, color: [0, 220, 255], thickness: 2 });
                     route_job = None; got_result = true;
@@ -1217,7 +1241,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             match wander_job.as_ref().unwrap().try_recv() {
                 Ok(res) => {
                     match res {
-                        Ok(w) => { wps = w; wp_sel = 0; route_sel = 0; let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0, &cfg.google_maps_api_key); route_note = n_; route_job = j_; }
+                        Ok(w) => { wps = w; wp_sel = 0; route_sel = 0; let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0, &cfg.google_maps_api_key, &route_nogos); route_note = n_; route_job = j_; }
                         Err(e) => { snd.play("error"); addr = format!("({e})"); }
                     }
                     wander_job = None; got_result = true;
@@ -1425,7 +1449,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 clear_route_confirm = false;
                 if let KeyCode::Char('y') = k.code {
                     wps.clear(); wp_sel = 0; route_sel = 0; road_segs.clear(); spec.roads.clear();
-                    let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0, &cfg.google_maps_api_key); route_note = n_; route_job = j_;
+                    let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0, &cfg.google_maps_api_key, &route_nogos); route_note = n_; route_job = j_;
                     addr = "ルート消去".into();
                 } else { addr = "消去を取消".into(); }
             }
@@ -1580,7 +1604,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                         cfg.voice_guide_enabled = !cfg.voice_guide_enabled;
                                         if cfg.voice_guide_enabled {
                                             if let Some(pts) = spec.routes.last().map(|rt| rt.pts.clone()) {
-                                                turn_job = Some(trigger_turn_points(&wps, &mode, 0, &pts));
+                                                turn_job = Some(trigger_turn_points(&wps, &mode, 0, &pts, &route_nogos));
                                             }
                                         }
                                     }
@@ -1940,7 +1964,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             if let Some(p) = pois.get(poi_sel) {
                                 snd.play("pop");
                                 wp_add(&mut wps, (p.0, p.1));
-                                let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0, &cfg.google_maps_api_key); route_note = n_; route_job = j_;
+                                let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0, &cfg.google_maps_api_key, &route_nogos); route_note = n_; route_job = j_;
                                 addr = format!("地点を追加 #{}", wps.len());
                             }
                             focus = Focus::PoiList;
@@ -1995,7 +2019,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                     let (nx, ny) = deg_to_pixel(w[0].0, w[0].1, z); cx = nx; cy = ny;
                                     wps = w; mode = m; wp_sel = 0;
                                     route_name_hint = name.clone(); // 保存時にこの名前をそのまま提示する
-                                    { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0, &cfg.google_maps_api_key); route_note = n_; route_job = j_; }
+                                    { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0, &cfg.google_maps_api_key, &route_nogos); route_note = n_; route_job = j_; }
                                 }
                             }
                         }
@@ -2026,7 +2050,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     Focus::WaypointList => match k.code {
                         KeyCode::Up | KeyCode::BackTab | KeyCode::Char('w') => {
                             if !wps.is_empty() {
-                                if grab && wp_sel > 0 { wps.swap(wp_sel, wp_sel - 1); wp_sel -= 1; let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0, &cfg.google_maps_api_key); route_note = n_; route_job = j_; }
+                                if grab && wp_sel > 0 { wps.swap(wp_sel, wp_sel - 1); wp_sel -= 1; let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0, &cfg.google_maps_api_key, &route_nogos); route_note = n_; route_job = j_; }
                                 else { wp_sel = (wp_sel + wps.len() - 1) % wps.len(); }
                                 if let Some(&(la, lo)) = wps.get(wp_sel) { let (nx, ny) = deg_to_pixel(la, lo, z); cx = nx; cy = ny; }
                             }
@@ -2034,7 +2058,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                         }
                         KeyCode::Down | KeyCode::Tab | KeyCode::Char('s') => {
                             if !wps.is_empty() {
-                                if grab && wp_sel + 1 < wps.len() { wps.swap(wp_sel, wp_sel + 1); wp_sel += 1; let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0, &cfg.google_maps_api_key); route_note = n_; route_job = j_; }
+                                if grab && wp_sel + 1 < wps.len() { wps.swap(wp_sel, wp_sel + 1); wp_sel += 1; let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0, &cfg.google_maps_api_key, &route_nogos); route_note = n_; route_job = j_; }
                                 else { wp_sel = (wp_sel + 1) % wps.len(); }
                                 if let Some(&(la, lo)) = wps.get(wp_sel) { let (nx, ny) = deg_to_pixel(la, lo, z); cx = nx; cy = ny; }
                             }
@@ -2043,10 +2067,10 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                         KeyCode::Char(' ') => { if !wps.is_empty() { grab = !grab; snd.play(if grab { "blip" } else { "pop" }); } focus = Focus::WaypointList; }
                         KeyCode::Char('+') | KeyCode::Char('=') => { if z < 19 { z += 1; cx *= 2.0; cy *= 2.0; restart_prefetch_on_zoom!(); } focus = Focus::WaypointList; }
                         KeyCode::Char('-') | KeyCode::Char('_') => { if z > 2 { z -= 1; cx /= 2.0; cy /= 2.0; restart_prefetch_on_zoom!(); } focus = Focus::WaypointList; }
-                        KeyCode::Char('[') => { if wp_sel > 0 && wp_sel < wps.len() { wps.swap(wp_sel, wp_sel - 1); wp_sel -= 1; let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0, &cfg.google_maps_api_key); route_note = n_; route_job = j_; if let Some(&(la, lo)) = wps.get(wp_sel) { let (nx, ny) = deg_to_pixel(la, lo, z); cx = nx; cy = ny; } } focus = Focus::WaypointList; }
-                        KeyCode::Char(']') => { if wp_sel + 1 < wps.len() { wps.swap(wp_sel, wp_sel + 1); wp_sel += 1; let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0, &cfg.google_maps_api_key); route_note = n_; route_job = j_; if let Some(&(la, lo)) = wps.get(wp_sel) { let (nx, ny) = deg_to_pixel(la, lo, z); cx = nx; cy = ny; } } focus = Focus::WaypointList; }
+                        KeyCode::Char('[') => { if wp_sel > 0 && wp_sel < wps.len() { wps.swap(wp_sel, wp_sel - 1); wp_sel -= 1; let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0, &cfg.google_maps_api_key, &route_nogos); route_note = n_; route_job = j_; if let Some(&(la, lo)) = wps.get(wp_sel) { let (nx, ny) = deg_to_pixel(la, lo, z); cx = nx; cy = ny; } } focus = Focus::WaypointList; }
+                        KeyCode::Char(']') => { if wp_sel + 1 < wps.len() { wps.swap(wp_sel, wp_sel + 1); wp_sel += 1; let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0, &cfg.google_maps_api_key, &route_nogos); route_note = n_; route_job = j_; if let Some(&(la, lo)) = wps.get(wp_sel) { let (nx, ny) = deg_to_pixel(la, lo, z); cx = nx; cy = ny; } } focus = Focus::WaypointList; }
                         KeyCode::Char('x') => {
-                            if !wps.is_empty() { let i = wp_sel.min(wps.len() - 1); wps.remove(i); if wp_sel >= wps.len() && wp_sel > 0 { wp_sel -= 1; } let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0, &cfg.google_maps_api_key); route_note = n_; route_job = j_; }
+                            if !wps.is_empty() { let i = wp_sel.min(wps.len() - 1); wps.remove(i); if wp_sel >= wps.len() && wp_sel > 0 { wp_sel -= 1; } let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0, &cfg.google_maps_api_key, &route_nogos); route_note = n_; route_job = j_; }
                             grab = false;
                             if !wps.is_empty() { if let Some(&(la, lo)) = wps.get(wp_sel) { let (nx, ny) = deg_to_pixel(la, lo, z); cx = nx; cy = ny; } focus = Focus::WaypointList; } // 空になったら閉じる
                         }
@@ -2055,7 +2079,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             wp_add(&mut wps, (lat, lon));
                             wp_sel = wps.len().saturating_sub(1);
                             grab = false;
-                            let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0, &cfg.google_maps_api_key); route_note = n_; route_job = j_;
+                            let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0, &cfg.google_maps_api_key, &route_nogos); route_note = n_; route_job = j_;
                             addr = format!("地点を追加 #{}", wps.len());
                             focus = Focus::WaypointList;
                         }
@@ -2073,7 +2097,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                         // 次フレームで確実に再構築させる(Resize時の扱いと同じ)。
                         KeyCode::Esc => { snd.play("back"); focus = Focus::Map; let _ = write!(out, "\x1b[2J"); force_reemit = true; }
                         KeyCode::Char(c) => match menu_action_for_key(c) {
-                            Some(act) => run_action!(act, lat, lon, cols, tr),
+                            Some(act) => run_action!(act, lat, lon, cols, tr, &route_nogos),
                             None => focus = Focus::Menu(MenuLevel::Categories),
                         },
                         _ => focus = Focus::Menu(MenuLevel::Categories),
@@ -2084,10 +2108,10 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                         match k.code {
                             KeyCode::Up | KeyCode::Char('w') if !items.iter().any(|it| it.key == 'w') => { snd.play("click"); menu_item_sel = menu_item_sel.saturating_sub(1); focus = Focus::Menu(MenuLevel::Items(ci)); }
                             KeyCode::Down | KeyCode::Char('s') if !items.iter().any(|it| it.key == 's') => { snd.play("click"); if menu_item_sel + 1 < items.len() { menu_item_sel += 1; } focus = Focus::Menu(MenuLevel::Items(ci)); }
-                            KeyCode::Enter => run_action!(items[menu_item_sel].action, lat, lon, cols, tr),
+                            KeyCode::Enter => run_action!(items[menu_item_sel].action, lat, lon, cols, tr, &route_nogos),
                             KeyCode::Esc => { snd.play("back"); focus = Focus::Menu(MenuLevel::Categories); } // 上位カテゴリへ戻る
                             KeyCode::Char(c) => match items.iter().find(|it| it.key == c) {
-                                Some(it) => run_action!(it.action, lat, lon, cols, tr),
+                                Some(it) => run_action!(it.action, lat, lon, cols, tr, &route_nogos),
                                 None => focus = Focus::Menu(MenuLevel::Items(ci)),
                             },
                             _ => focus = Focus::Menu(MenuLevel::Items(ci)),
@@ -2173,16 +2197,16 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             KeyCode::Enter | KeyCode::Char(' ') => {
                                 if route_sel >= wps.len() { // 操作行を実行(run_action側でfocus遷移する場合あり=その時はそちら優先)
                                     let ai = route_sel - wps.len();
-                                    if ai < ROUTE_ACTS.len() { let act = ROUTE_ACTS[ai].1; run_action!(act, lat, lon, cols, tr); }
+                                    if ai < ROUTE_ACTS.len() { let act = ROUTE_ACTS[ai].1; run_action!(act, lat, lon, cols, tr, &route_nogos); }
                                 } else { // 点を選択中: 地図を寄せてパネルに留まる
                                     let (la, lo) = wps[route_sel]; let (nx, ny) = deg_to_pixel(la, lo, z); cx = nx; cy = ny;
                                     focus = Focus::RoutePanel;
                                 }
                             }
-                            KeyCode::Char('[') => { if route_sel < wps.len() && route_sel > 0 { wps.swap(route_sel, route_sel - 1); route_sel -= 1; wp_sel = route_sel; let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0, &cfg.google_maps_api_key); route_note = n_; route_job = j_; } focus = Focus::RoutePanel; }
-                            KeyCode::Char(']') => { if route_sel + 1 < wps.len() { wps.swap(route_sel, route_sel + 1); route_sel += 1; wp_sel = route_sel; let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0, &cfg.google_maps_api_key); route_note = n_; route_job = j_; } focus = Focus::RoutePanel; }
+                            KeyCode::Char('[') => { if route_sel < wps.len() && route_sel > 0 { wps.swap(route_sel, route_sel - 1); route_sel -= 1; wp_sel = route_sel; let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0, &cfg.google_maps_api_key, &route_nogos); route_note = n_; route_job = j_; } focus = Focus::RoutePanel; }
+                            KeyCode::Char(']') => { if route_sel + 1 < wps.len() { wps.swap(route_sel, route_sel + 1); route_sel += 1; wp_sel = route_sel; let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0, &cfg.google_maps_api_key, &route_nogos); route_note = n_; route_job = j_; } focus = Focus::RoutePanel; }
                             KeyCode::Char('x') => {
-                                if route_sel < wps.len() { wps.remove(route_sel); if route_sel >= wps.len() && route_sel > 0 { route_sel -= 1; } wp_sel = route_sel.min(wps.len().saturating_sub(1)); let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0, &cfg.google_maps_api_key); route_note = n_; route_job = j_; }
+                                if route_sel < wps.len() { wps.remove(route_sel); if route_sel >= wps.len() && route_sel > 0 { route_sel -= 1; } wp_sel = route_sel.min(wps.len().saturating_sub(1)); let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0, &cfg.google_maps_api_key, &route_nogos); route_note = n_; route_job = j_; }
                                 if !wps.is_empty() { focus = Focus::RoutePanel; }
                                 else { // 空になったら地図へ。左袖の残像を残さないよう全消去する
                                     focus = Focus::Map;
@@ -2190,7 +2214,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                     force_reemit = true;
                                 }
                             }
-                            KeyCode::Char('v') => { snd.play("pop"); wp_add(&mut wps, (lat, lon)); let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0, &cfg.google_maps_api_key); route_note = n_; route_job = j_; addr = format!("地点を追加 #{}", wps.len()); focus = Focus::RoutePanel; }
+                            KeyCode::Char('v') => { snd.play("pop"); wp_add(&mut wps, (lat, lon)); let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0, &cfg.google_maps_api_key, &route_nogos); route_note = n_; route_job = j_; addr = format!("地点を追加 #{}", wps.len()); focus = Focus::RoutePanel; }
                             KeyCode::Char('+') | KeyCode::Char('=') => { if z < 19 { z += 1; cx *= 2.0; cy *= 2.0; restart_prefetch_on_zoom!(); } focus = Focus::RoutePanel; }
                             KeyCode::Char('-') | KeyCode::Char('_') => { if z > 2 { z -= 1; cx /= 2.0; cy /= 2.0; restart_prefetch_on_zoom!(); } focus = Focus::RoutePanel; }
                             // 地図へ戻る。左袖(ルート一覧)の残像を残さないよう全消去する(Menu閉じる時と同じ理由)。
@@ -2238,7 +2262,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                 // w/sで操作行(保存/GPX等)を選択中はEnterでその操作を実行
                                 let ai = route_sel - wps.len();
                                 let act = ROUTE_ACTS[ai].1;
-                                run_action!(act, lat, lon, cols, tr);
+                                run_action!(act, lat, lon, cols, tr, &route_nogos);
                             }
                             KeyCode::Enter => { // 中心付近の最寄りお気に入りにスナップ＋名前表示
                                 let mut best: Option<(f64, usize)> = None;
@@ -2264,7 +2288,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             KeyCode::Char('v') => { // 地図中心に地点を追加(末尾)。役割は並び順で自動(先頭=始点/末尾=終点)
                                 snd.play("pop"); wp_add(&mut wps, (lat, lon));
                                 wp_sel = wps.len() - 1; route_sel = wp_sel; // 追加した点を選択状態にする(左袖のハイライトが追従)
-                                let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0, &cfg.google_maps_api_key); route_note = n_; route_job = j_;
+                                let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0, &cfg.google_maps_api_key, &route_nogos); route_note = n_; route_job = j_;
                                 addr = format!("地点を追加 #{}", wps.len());
                             }
                             // w/s: Tabで一覧へ入らなくても、地図(パン)はそのまま左袖(ルート点+操作行)の
@@ -2330,7 +2354,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                     addr = format!("雨雲 {}", radar::frame_label(&radar_tl, radar_idx));
                                 }
                             }
-                            KeyCode::Char('A') => run_action!(MenuAction::PlayRoute, lat, lon, cols, tr),
+                            KeyCode::Char('A') => run_action!(MenuAction::PlayRoute, lat, lon, cols, tr, &route_nogos),
                             KeyCode::Char('G') => { // ライブ現在地(ブレッドクラム)の ON/OFF
                                 if gps_rx.is_some() { gps_rx = None; addr = "ライブ現在地: OFF".into(); }
                                 else {
@@ -2363,7 +2387,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                 } else { "実画像モード: OFF".into() };
                             }
                             // キー選定: C/K/L/V/P/I等の自然な字は全て他機能で使用済みのため空いている'N'を割当
-                            KeyCode::Char('N') => run_action!(MenuAction::ViewCamera, lat, lon, cols, tr),
+                            KeyCode::Char('N') => run_action!(MenuAction::ViewCamera, lat, lon, cols, tr, &route_nogos),
                             // 過去災害: 中心に一番近い地点の事例一覧を中央パネルへ(防災のB)。
                             KeyCode::Char('B') => {
                                 if !cfg.disaster_enabled { snd.play("error"); addr = "過去災害: OFF(設定で有効化)".into(); }
@@ -2422,7 +2446,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             KeyCode::Char('n') => { // BRouter の代替ルート候補を巡回
                                 if wps.len() >= 2 {
                                     route_alt = (route_alt + 1) % 4;
-                                    let (nn, jj) = trigger_route(&mut spec, &wps, &pois, &mode, route_alt, &cfg.google_maps_api_key);
+                                    let (nn, jj) = trigger_route(&mut spec, &wps, &pois, &mode, route_alt, &cfg.google_maps_api_key, &route_nogos);
                                     route_note = nn; route_job = jj;
                                 } else { snd.play("error"); addr = "ルート未確定".into(); }
                             }
@@ -2436,11 +2460,11 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                     }
                                 } else { snd.play("error"); addr = "ルート未確定".into(); }
                             }
-                            KeyCode::Char('x') => { wp_remove(&mut wps, &mut wp_sel); route_sel = wp_sel; { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0, &cfg.google_maps_api_key); route_note = n_; route_job = j_; } }
-                            KeyCode::Char('[') => { if play.is_some() { play_speed = (play_speed / 1.5).max(0.1); play_speed_bits.store(play_speed.to_bits(), std::sync::atomic::Ordering::Relaxed); addr = format!("再生速度 {:.2}x", play_speed); } else { wp_swap(&mut wps, &mut wp_sel, true); route_sel = wp_sel; { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0, &cfg.google_maps_api_key); route_note = n_; route_job = j_; } } }
-                            KeyCode::Char(']') => { if play.is_some() { play_speed = (play_speed * 1.5).min(32.0); play_speed_bits.store(play_speed.to_bits(), std::sync::atomic::Ordering::Relaxed); addr = format!("再生速度 {:.2}x", play_speed); } else { wp_swap(&mut wps, &mut wp_sel, false); route_sel = wp_sel; { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0, &cfg.google_maps_api_key); route_note = n_; route_job = j_; } } }
-                            KeyCode::Char('m') => { mode = match mode_label(&mode) { "下道" => "highway", "高速" => "short", _ => "surface" }.to_string(); { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0, &cfg.google_maps_api_key); route_note = n_; route_job = j_; } }
-                            KeyCode::Char('c') => run_action!(MenuAction::ClearRoute, lat, lon, cols, tr),
+                            KeyCode::Char('x') => { wp_remove(&mut wps, &mut wp_sel); route_sel = wp_sel; { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0, &cfg.google_maps_api_key, &route_nogos); route_note = n_; route_job = j_; } }
+                            KeyCode::Char('[') => { if play.is_some() { play_speed = (play_speed / 1.5).max(0.1); play_speed_bits.store(play_speed.to_bits(), std::sync::atomic::Ordering::Relaxed); addr = format!("再生速度 {:.2}x", play_speed); } else { wp_swap(&mut wps, &mut wp_sel, true); route_sel = wp_sel; { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0, &cfg.google_maps_api_key, &route_nogos); route_note = n_; route_job = j_; } } }
+                            KeyCode::Char(']') => { if play.is_some() { play_speed = (play_speed * 1.5).min(32.0); play_speed_bits.store(play_speed.to_bits(), std::sync::atomic::Ordering::Relaxed); addr = format!("再生速度 {:.2}x", play_speed); } else { wp_swap(&mut wps, &mut wp_sel, false); route_sel = wp_sel; { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0, &cfg.google_maps_api_key, &route_nogos); route_note = n_; route_job = j_; } } }
+                            KeyCode::Char('m') => { mode = match mode_label(&mode) { "下道" => "highway", "高速" => "short", _ => "surface" }.to_string(); { let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0, &cfg.google_maps_api_key, &route_nogos); route_note = n_; route_job = j_; } }
+                            KeyCode::Char('c') => run_action!(MenuAction::ClearRoute, lat, lon, cols, tr, &route_nogos),
                             KeyCode::Char('g') => match spec.routes.last() {
                                 Some(rt) => addr = match write_gpx("termmap-route.gpx", &rt.pts) { Ok(_) => "GPX保存: termmap-route.gpx".into(), Err(e) => format!("({e})") },
                                 None => { snd.play("error"); addr = "ルート未確定".into(); }

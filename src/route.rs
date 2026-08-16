@@ -1,9 +1,66 @@
 // ルーティング (BRouter 公開API)・高速料金/expressway 計算・GPX 出力
 use crate::render::{OverlaySpec, Poi, PoiCat};
+use crate::regulation::{ClosureEvent, RegulationKind};
+use crate::roadtrace::sample_every;
 use serde::Deserialize;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct RouteResult { pub pts: Vec<(f64, f64)>, pub ele: Vec<f64>, pub dist_m: f64, pub time_s: f64, pub hw_m: f64, pub ascend_m: f64, #[serde(default)] pub via_google: bool }
+
+// ---- 通行止め回避(#通行止めを推奨しない) ----
+//
+// BRouterのnogosパラメータ(lon,lat,半径m,weight|...)で、実施中の通行止め区間を
+// 絶対回避エリア(weight省略)として渡す。対象はRegulationKind::Closed かつ
+// ClosureEvent::active(kisei_jishi_jyokyo=="1")のみ。車線規制等は通れなくはないので
+// 対象外、予定段階(まだ始まっていない)の通行止めも対象外にする(過剰回避を避ける)。
+pub const NOGO_RADIUS_M: f64 = 100.0; // 道幅+GPS誤差を吸収しつつ、近くの別の道路まで塞がない程度
+const NOGO_SAMPLE_INTERVAL_M: f64 = 150.0; // 半径100mの円が隣同士で重なるよう、直径200mより狭い間隔でサンプリング
+pub const NOGO_MAX_COUNT: usize = 200; // BRouterへ渡すURLが長大にならないための上限
+
+// 通行止めのラインを円の列へ変換する。center(経由地の中心等)に近い円を優先し、
+// 上限(NOGO_MAX_COUNT)を超えたら遠い分を切り捨てる。戻り値の bool は切り捨てが発生したか。
+pub fn closures_to_nogos(closures: &[&ClosureEvent], center: (f64, f64)) -> (Vec<(f64, f64, f64)>, bool) {
+    let mut circles: Vec<(f64, f64, f64)> = Vec::new();
+    for ev in closures {
+        if ev.kind != RegulationKind::Closed || !ev.active {
+            continue;
+        }
+        for &(lat, lon) in &sample_every(&ev.line, NOGO_SAMPLE_INTERVAL_M) {
+            circles.push((lat, lon, NOGO_RADIUS_M));
+        }
+    }
+    let truncated = circles.len() > NOGO_MAX_COUNT;
+    if truncated {
+        circles.sort_by(|a, b| {
+            let da = (a.0 - center.0).powi(2) + (a.1 - center.1).powi(2);
+            let db = (b.0 - center.0).powi(2) + (b.1 - center.1).powi(2);
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        circles.truncate(NOGO_MAX_COUNT);
+    }
+    (circles, truncated)
+}
+
+// BRouterのnogosクエリパラメータ値("lon,lat,半径|lon,lat,半径|..."形式)を組み立てる。
+// weightは付けない(省略=絶対回避)。circlesが空なら空文字(呼び出し側は&nogos=を付けない)。
+pub fn nogos_query_param(circles: &[(f64, f64, f64)]) -> String {
+    circles.iter().map(|(lat, lon, r)| format!("{lon},{lat},{r:.0}")).collect::<Vec<_>>().join("|")
+}
+
+// 経由地(始点〜終点、経由点全部)を全部覆うbboxに、実際の道はカーブして直線から外れる分の
+// マージンを足す。regulation_layer.items(bbox)へ渡す(lat_min,lon_min,lat_max,lon_max)形式。
+pub fn waypoints_bbox_with_margin(wps: &[(f64, f64)], margin_deg: f64) -> Option<(f64, f64, f64, f64)> {
+    if wps.is_empty() {
+        return None;
+    }
+    let (mut lat_min, mut lat_max) = (f64::INFINITY, f64::NEG_INFINITY);
+    let (mut lon_min, mut lon_max) = (f64::INFINITY, f64::NEG_INFINITY);
+    for &(la, lo) in wps {
+        lat_min = lat_min.min(la); lat_max = lat_max.max(la);
+        lon_min = lon_min.min(lo); lon_max = lon_max.max(lo);
+    }
+    Some((lat_min - margin_deg, lon_min - margin_deg, lat_max + margin_deg, lon_max + margin_deg))
+}
 
 // BRouter geojson の応答。features[0] の geometry.coordinates([[lon,lat,ele?],...]) と
 // properties(track-length/total-time/filtered ascend は全て文字列, messages は文字列表)を読む。
@@ -110,11 +167,13 @@ fn parse_geojson_props(body: &str) -> (f64, f64, f64) {
         None => (0.0, 0.0, 0.0),
     }
 }
-// ルート結果のディスクキャッシュ先。キーは (profile, alt, 丸めたwps列) の FNV-1a ハッシュ。
+// ルート結果のディスクキャッシュ先。キーは (profile, alt, 丸めたwps列, nogos) の FNV-1a ハッシュ。
 // profile で正規化するので 下道/surface/quiet 等は同一ルートを共有。プロット不変なら再起動後も再利用。
-fn route_cache_path(wps: &[(f64, f64)], mode: &str, alt: u32) -> Option<std::path::PathBuf> {
+// nogos をキーに含めるのは必須(#通行止め回避): 含めないと、新しい通行止めが出現した後も
+// 通行止めを無視した古いキャッシュ済みルートを出し続けてしまう。
+fn route_cache_path(wps: &[(f64, f64)], mode: &str, alt: u32, nogos: &str) -> Option<std::path::PathBuf> {
     let home = std::env::var_os("HOME")?;
-    let mut key = format!("{}|{}", route_profile(mode), alt);
+    let mut key = format!("{}|{}|{}", route_profile(mode), alt, nogos);
     for (la, lo) in wps { key.push_str(&format!("|{la:.6},{lo:.6}")); }
     let mut h: u64 = 0xcbf29ce4_84222325;
     for b in key.as_bytes() { h ^= *b as u64; h = h.wrapping_mul(0x100000001b3); }
@@ -123,11 +182,13 @@ fn route_cache_path(wps: &[(f64, f64)], mode: &str, alt: u32) -> Option<std::pat
 
 // mode: "short"=最短(shortest) / それ以外=裏道(safety)。wps は (lat,lon) 列。
 // key: Google Maps APIキー。BRouterが最終的に失敗した時だけ Google Directions へフォールバックする(空なら試さない)。
-pub fn fetch_route(wps: &[(f64, f64)], mode: &str, alt: u32, key: &str) -> Result<RouteResult, String> {
+// nogos: BRouterのnogosパラメータ値(nogos_query_paramで組み立てた"lon,lat,半径|..."形式)。
+// 空文字なら付けない(#通行止め回避が無効、または周辺に対象が無い場合)。
+pub fn fetch_route(wps: &[(f64, f64)], mode: &str, alt: u32, key: &str, nogos: &str) -> Result<RouteResult, String> {
     if wps.len() < 2 { return Err("--route は始点と終点(2点以上)が必要".into()); }
     let alt = alt.min(3); // BRouter の代替ルートは 0..=3
-    // ディスクキャッシュ: 同じプロット(wps,profile,alt)なら BRouter を叩かず再利用(再起動後も)
-    let cpath = route_cache_path(wps, mode, alt);
+    // ディスクキャッシュ: 同じプロット(wps,profile,alt,nogos)なら BRouter を叩かず再利用(再起動後も)
+    let cpath = route_cache_path(wps, mode, alt, nogos);
     if let Some(p) = &cpath {
         if let Ok(s) = std::fs::read_to_string(p) {
             if let Ok(r) = serde_json::from_str::<RouteResult>(&s) { return Ok(r); }
@@ -136,13 +197,15 @@ pub fn fetch_route(wps: &[(f64, f64)], mode: &str, alt: u32, key: &str) -> Resul
     let primary = route_profile(mode);
     // まず希望プロファイルで。target island(その道路網に点が繋がらない)なら car-fast で必ず線を出す。
     // BRouter が(ISLAND救済含め)最終的に失敗した場合のみ、key があれば Google へフォールバックする。
-    let result = match fetch_route_once(wps, primary, alt) {
+    // 注意: Google Directionsはnogosを知らないため、この最終フォールバックだけは通行止めを
+    // 避けられない可能性がある(BRouterが絶対回避に失敗する場合自体まれなので許容する)。
+    let result = match fetch_route_once(wps, primary, alt, nogos) {
         Ok(r) => r,
         Err(e) if e == "ISLAND" => {
             if primary == "car-fast" {
                 return Err("この点は道路網に繋がらない(点を道路上へ動かして)".to_string());
             }
-            match fetch_route_once(wps, "car-fast", alt) {
+            match fetch_route_once(wps, "car-fast", alt, nogos) {
                 Ok(r) => r, // 下道で繋がらないので車道優先で表示
                 Err(e2) if e2 == "ISLAND" => return Err("この点は道路網に繋がらない(点を道路上へ動かして)".to_string()),
                 Err(e2) => match fetch_google_route(wps, mode, key) {
@@ -165,9 +228,10 @@ pub fn fetch_route(wps: &[(f64, f64)], mode: &str, alt: u32, key: &str) -> Resul
 }
 
 // 1プロファイル分の取得。target island は sentinel "ISLAND" を返し、呼び出し側でフォールバック判定する。
-fn fetch_route_once(wps: &[(f64, f64)], profile: &str, alt: u32) -> Result<RouteResult, String> {
+fn fetch_route_once(wps: &[(f64, f64)], profile: &str, alt: u32, nogos: &str) -> Result<RouteResult, String> {
     let lonlats = wps.iter().map(|(la, lo)| format!("{lo},{la}")).collect::<Vec<_>>().join("|");
-    let url = format!("https://brouter.de/brouter?lonlats={lonlats}&profile={profile}&alternativeidx={alt}&format=geojson");
+    let nogos_param = if nogos.is_empty() { String::new() } else { format!("&nogos={nogos}") };
+    let url = format!("https://brouter.de/brouter?lonlats={lonlats}&profile={profile}&alternativeidx={alt}&format=geojson{nogos_param}");
     let body = match ureq::get(&url)
         .set("User-Agent", "termmap/0.1 (personal experiment)")
         .timeout(std::time::Duration::from_secs(20)).call() {
@@ -205,23 +269,26 @@ pub struct TurnPoint {
 // trigger_route(RouteRx)と同じ非ブロッキング方針。バックグラウンドスレッドで取得し、
 // 受信チャネルをUIループ側でポーリングする。
 pub type TurnRx = std::sync::mpsc::Receiver<Vec<TurnPoint>>;
-pub fn trigger_turn_points(wps: &[(f64, f64)], mode: &str, alt: u32, pts: &[(f64, f64)]) -> TurnRx {
+// nogos: trigger_routeへ渡したのと同じ値を渡すこと(でないと表示中のルートと違う経路の
+// 曲がり案内になってしまう)。
+pub fn trigger_turn_points(wps: &[(f64, f64)], mode: &str, alt: u32, pts: &[(f64, f64)], nogos: &str) -> TurnRx {
     let (tx, rx) = std::sync::mpsc::channel();
-    let (w, m, p) = (wps.to_vec(), mode.to_string(), pts.to_vec());
-    std::thread::spawn(move || { let _ = tx.send(fetch_turn_points(&w, &m, alt, &p)); });
+    let (w, m, p, n) = (wps.to_vec(), mode.to_string(), pts.to_vec(), nogos.to_string());
+    std::thread::spawn(move || { let _ = tx.send(fetch_turn_points(&w, &m, alt, &p, &n)); });
     rx
 }
 
 // 失敗しても呼び出し側は「曲がり案内なし」に静かにフォールバックできるよう常にVecを返す
 // (ルート自体の表示は既存のgeojson取得に依存しており、こちらの失敗で壊さない)。
-pub fn fetch_turn_points(wps: &[(f64, f64)], mode: &str, alt: u32, pts: &[(f64, f64)]) -> Vec<TurnPoint> {
+pub fn fetch_turn_points(wps: &[(f64, f64)], mode: &str, alt: u32, pts: &[(f64, f64)], nogos: &str) -> Vec<TurnPoint> {
     if wps.len() < 2 || pts.is_empty() {
         return Vec::new();
     }
     let alt = alt.min(3);
     let profile = route_profile(mode);
     let lonlats = wps.iter().map(|(la, lo)| format!("{lo},{la}")).collect::<Vec<_>>().join("|");
-    let url = format!("https://brouter.de/brouter?lonlats={lonlats}&profile={profile}&alternativeidx={alt}&format=gpx&turnInstructionMode=3");
+    let nogos_param = if nogos.is_empty() { String::new() } else { format!("&nogos={nogos}") };
+    let url = format!("https://brouter.de/brouter?lonlats={lonlats}&profile={profile}&alternativeidx={alt}&format=gpx&turnInstructionMode=3{nogos_param}");
     let body = match ureq::get(&url)
         .set("User-Agent", "termmap/0.1 (personal experiment)")
         .timeout(std::time::Duration::from_secs(20))
@@ -424,13 +491,13 @@ pub fn set_markers(spec: &mut OverlaySpec, wps: &[(f64, f64)], pois: &[(f64, f64
 pub type RouteRx = std::sync::mpsc::Receiver<Result<RouteResult, String>>;
 // マーカーは即反映し、ルートはバックグラウンドスレッドで計算する(受信チャネルを返す)。
 // Ctrl+C で受信側を捨てれば計算を中断できる(スレッドはtimeoutまで走るが結果は無視)。
-pub fn trigger_route(spec: &mut OverlaySpec, wps: &[(f64, f64)], pois: &[(f64, f64, String, PoiCat)], mode: &str, alt: u32, key: &str) -> (Option<String>, Option<RouteRx>) {
+pub fn trigger_route(spec: &mut OverlaySpec, wps: &[(f64, f64)], pois: &[(f64, f64, String, PoiCat)], mode: &str, alt: u32, key: &str, nogos: &str) -> (Option<String>, Option<RouteRx>) {
     set_markers(spec, wps, pois);
     spec.routes.clear();
     if wps.len() >= 2 {
         let (tx, rx) = std::sync::mpsc::channel();
-        let (w, m, k) = (wps.to_vec(), mode.to_string(), key.to_string());
-        std::thread::spawn(move || { let _ = tx.send(fetch_route(&w, &m, alt, &k)); });
+        let (w, m, k, n) = (wps.to_vec(), mode.to_string(), key.to_string(), nogos.to_string());
+        std::thread::spawn(move || { let _ = tx.send(fetch_route(&w, &m, alt, &k, &n)); });
         (Some("計算中… (Ctrl+Cで中断)".to_string()), Some(rx))
     } else {
         (None, None)
@@ -640,5 +707,75 @@ mod tests {
     fn turn_points_from_gpx_empty_on_garbage() {
         assert!(turn_points_from_gpx("not xml at all", &[(35.0, 139.0)]).is_empty());
         assert!(turn_points_from_gpx(GPX_TURNS_SAMPLE, &[]).is_empty());
+    }
+
+    fn closure(line: Vec<(f64, f64)>, kind: RegulationKind, active: bool) -> ClosureEvent {
+        ClosureEvent { line, kind, detail_id: String::new(), active }
+    }
+
+    #[test]
+    fn closures_to_nogos_ignores_non_closed_and_inactive_kinds() {
+        let events = vec![
+            closure(vec![(35.0, 139.0), (35.01, 139.0)], RegulationKind::LaneRestriction, true), // 通行止めではない
+            closure(vec![(36.0, 140.0), (36.01, 140.0)], RegulationKind::Closed, false), // まだ予定段階
+        ];
+        let refs: Vec<&ClosureEvent> = events.iter().collect();
+        let (circles, truncated) = closures_to_nogos(&refs, (35.0, 139.0));
+        assert!(circles.is_empty(), "車線規制・予定段階の通行止めはnogo対象外");
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn closures_to_nogos_converts_active_closed_line_to_overlapping_circles() {
+        // 経線に沿った約1.1kmの直線(0.01度)。150m間隔サンプリングで複数円が並ぶはず。
+        let ev = closure(vec![(35.0, 139.0), (35.01, 139.0)], RegulationKind::Closed, true);
+        let refs = vec![&ev];
+        let (circles, truncated) = closures_to_nogos(&refs, (35.0, 139.0));
+        assert!(!truncated);
+        assert!(circles.len() >= 5, "1.1kmを150m間隔で刻めば7点前後になるはず: {}", circles.len());
+        for (_, _, r) in &circles {
+            assert_eq!(*r, NOGO_RADIUS_M);
+        }
+    }
+
+    #[test]
+    fn closures_to_nogos_truncates_to_max_count_keeping_nearest_to_center() {
+        // 経線に沿った約55km分の長い通行止め(150m間隔で刻むと370点前後になり上限200を超える)。
+        let far_line: Vec<(f64, f64)> = (0..5000).map(|i| (35.0 + i as f64 * 0.0001, 139.0)).collect();
+        let ev = closure(far_line, RegulationKind::Closed, true);
+        let refs = vec![&ev];
+        let center = (35.0, 139.0); // ラインの先頭付近を中心にする
+        let (circles, truncated) = closures_to_nogos(&refs, center);
+        assert!(truncated, "上限(NOGO_MAX_COUNT)を超えるはず");
+        assert_eq!(circles.len(), NOGO_MAX_COUNT);
+        // 中心に一番近い(先頭側)点が残っているはず(末尾側=遠い点は切り捨てられる)。
+        let has_near_start = circles.iter().any(|(lat, _, _)| (*lat - 35.0).abs() < 0.001);
+        assert!(has_near_start, "中心に近い点が優先して残るはず");
+    }
+
+    #[test]
+    fn nogos_query_param_formats_as_lon_lat_radius_pipe_separated() {
+        let circles = vec![(35.5, 139.5, 100.0), (36.0, 140.0, 100.0)];
+        assert_eq!(nogos_query_param(&circles), "139.5,35.5,100|140,36,100");
+    }
+
+    #[test]
+    fn nogos_query_param_empty_for_no_circles() {
+        assert_eq!(nogos_query_param(&[]), "");
+    }
+
+    #[test]
+    fn waypoints_bbox_with_margin_covers_all_points_plus_margin() {
+        let wps = vec![(35.0, 139.0), (35.5, 139.8), (35.2, 139.3)];
+        let (lat_min, lon_min, lat_max, lon_max) = waypoints_bbox_with_margin(&wps, 0.05).unwrap();
+        assert!((lat_min - (35.0 - 0.05)).abs() < 1e-9);
+        assert!((lon_min - (139.0 - 0.05)).abs() < 1e-9);
+        assert!((lat_max - (35.5 + 0.05)).abs() < 1e-9);
+        assert!((lon_max - (139.8 + 0.05)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn waypoints_bbox_with_margin_none_for_empty_waypoints() {
+        assert!(waypoints_bbox_with_margin(&[], 0.05).is_none());
     }
 }

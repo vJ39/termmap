@@ -83,7 +83,14 @@ pub struct ClosureEvent {
     // 既存ディスクキャッシュとの互換のためdefault(空文字=詳細取得不可)を許容する。
     #[serde(default)]
     pub detail_id: String,
+    // kisei_jishi_jyokyo=="1"(実施中)か。"0"(予定)は地図表示では従来通り出すが、
+    // ルート回避(nogo)の対象にはしない(まだ始まっていない規制で道を塞ぐと過剰回避になる)。
+    // 既存ディスクキャッシュとの互換のためdefault(true=実施中扱い)にする。
+    #[serde(default = "default_true")]
+    pub active: bool,
 }
+
+fn default_true() -> bool { true }
 
 // pcTukokiseiDetail_{id}.html(規制1件の詳細ページ)から取れる、地図の線だけでは
 // わからない情報。「なぜ通れないか」に answer するのが目的なので cause が主役。
@@ -168,8 +175,15 @@ pub fn parse_closures(body: &str) -> Vec<ClosureEvent> {
         if line.len() < 2 {
             continue; // 線として描けない(座標欠損)ものは黙って捨てる
         }
+        // kisei_jishi_jyokyo(規制実施状況): "1"=実施中/"0"=予定/"2"=解除相当。
+        // 公式サイト(Tukokisei.js)も"2"は地図に出さないため、ここでも除外する。
+        let jishi_jyokyo = item.get("kisei_jishi_jyokyo").and_then(|x| x.as_str());
+        if jishi_jyokyo == Some("2") {
+            continue;
+        }
+        let active = jishi_jyokyo != Some("0"); // "0"(予定)以外(既定含む)は実施中扱い
         let detail_id = item.get("same_tukokisei_info_id").and_then(|x| x.as_str()).unwrap_or("").to_string();
-        out.push(ClosureEvent { line, kind: RegulationKind::from_code(code), detail_id });
+        out.push(ClosureEvent { line, kind: RegulationKind::from_code(code), detail_id, active });
     }
     out
 }
@@ -381,11 +395,12 @@ mod tests {
             line: vec![(35.64085, 139.733125), (35.64044, 139.732903)],
             kind: RegulationKind::Closed,
             detail_id: "2431834e238b1115".to_string(),
+            active: true,
         };
         let json = serde_json::to_string(&ev).unwrap();
         assert_eq!(
             json,
-            r#"{"line":[[35.64085,139.733125],[35.64044,139.732903]],"kind":"Closed","detail_id":"2431834e238b1115"}"#
+            r#"{"line":[[35.64085,139.733125],[35.64044,139.732903]],"kind":"Closed","detail_id":"2431834e238b1115","active":true}"#
         );
         assert_eq!(serde_json::from_str::<ClosureEvent>(&json).unwrap(), ev);
     }
@@ -397,6 +412,30 @@ mod tests {
         let json = r#"{"line":[[35.0,139.0],[35.1,139.1]],"kind":"Closed"}"#;
         let ev: ClosureEvent = serde_json::from_str(json).unwrap();
         assert_eq!(ev.detail_id, "");
+        assert!(ev.active, "activeキー導入前のキャッシュは実施中扱い(既定true)にする");
+    }
+
+    #[test]
+    fn parse_closures_excludes_jishi_jyokyo_2_and_marks_0_as_inactive() {
+        let body = r#"[
+            {"kisei_naiyo_cd":"01","kisei_jishi_jyokyo":"1","geo_json":"{\"geometry\":{\"type\":\"LineString\",\"coordinates\":[[139.0,35.0],[139.1,35.1]]}}"},
+            {"kisei_naiyo_cd":"01","kisei_jishi_jyokyo":"0","geo_json":"{\"geometry\":{\"type\":\"LineString\",\"coordinates\":[[139.2,35.2],[139.3,35.3]]}}"},
+            {"kisei_naiyo_cd":"01","kisei_jishi_jyokyo":"2","geo_json":"{\"geometry\":{\"type\":\"LineString\",\"coordinates\":[[139.4,35.4],[139.5,35.5]]}}"}
+        ]"#;
+        let got = parse_closures(body);
+        // "2"(解除相当)は公式サイトと同じく除外するので、"1"と"0"の2件だけ残る。
+        assert_eq!(got.len(), 2);
+        assert!(got[0].active, "\"1\"(実施中)はactive");
+        assert!(!got[1].active, "\"0\"(予定)はまだ始まっていないのでinactive(nogo対象外)");
+    }
+
+    #[test]
+    fn parse_closures_missing_jishi_jyokyo_key_defaults_to_active() {
+        // キー自体が無い実データも除外せずactive扱いにする(値が不明なだけで解除済みとは限らない)。
+        let body = r#"[{"kisei_naiyo_cd":"01","geo_json":"{\"geometry\":{\"type\":\"LineString\",\"coordinates\":[[139.0,35.0],[139.1,35.1]]}}"}]"#;
+        let got = parse_closures(body);
+        assert_eq!(got.len(), 1);
+        assert!(got[0].active);
     }
 
     #[test]

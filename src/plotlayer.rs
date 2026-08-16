@@ -945,6 +945,7 @@ mod tests {
             line: vec![(35.64, 139.73), (35.641, 139.732)],
             kind: regulation::RegulationKind::Closed,
             detail_id: "2431834e238b1115".to_string(),
+            active: true,
         }];
         plotcache::store(&root, Layer::Regulation, "5339", &g, now, now).unwrap();
         assert_eq!(
