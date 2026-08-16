@@ -142,6 +142,11 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     // 早期returnパターン)。パン/ズームは無い(道路カメラは固定視点の1枚画像のため)。
     let mut cam_view: Option<(RgbImage, camera::RoadCamera)> = None;
     let mut cam_job: Option<std::sync::mpsc::Receiver<(camera::RoadCamera, Result<RgbImage, String>)>> = None;
+    // 通行規制(cfg.regulation_enabled時のみ使う)。取得の間引き方はtraffic_*/camera_*と同じ方針。
+    let mut regulation_events: Vec<regulation::ClosureEvent> = Vec::new();
+    let mut regulation_job: Option<std::sync::mpsc::Receiver<Vec<regulation::ClosureEvent>>> = None;
+    let mut regulation_last_fetch: Option<std::time::Instant> = None;
+    let mut regulation_bbox: Option<(f64, f64, f64, f64)> = None;
     // ルート計算と同じ非同期パターンで、検索/周辺/実写/おすすめの通信もバックグラウンド化する。
     // 新規spawn時に古いrxはdropされる=最新のみ採用(generation ID不要)。
     let mut search_job: Option<std::sync::mpsc::Receiver<(String, String, Result<Vec<(f64, f64, String)>, String>)>> = None; // (ckey, query, geocode結果)
@@ -776,12 +781,21 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             draw_ring(&mut ov, ix, iy, 3, color, 3);
                         }
                     }
-                    if cfg.camera_enabled { // 道路ライブカメラ(紫系。Kで中心近くのカメラの写真を表示)
+                    if cfg.camera_enabled { // 道路ライブカメラ(紫系。Nで中心近くのカメラの写真を表示)
                         for c in &camera_points {
                             let (gx, gy) = deg_to_pixel(c.lat, c.lon, rz);
                             let ix = (gx - (rcx - rw as f64 / 2.0)).floor() as i32;
                             let iy = (gy - (rcy - rh as f64 / 2.0)).floor() as i32;
                             draw_ring(&mut ov, ix, iy, 3, [170, 90, 220], 2);
+                        }
+                    }
+                    if cfg.regulation_enabled { // 通行規制(通行止め/車線規制等の区間を種別ごとの色で線描画)
+                        for ev in &regulation_events {
+                            let pts: Vec<(i32, i32)> = ev.line.iter().map(|&(la, lo)| {
+                                let (gx, gy) = deg_to_pixel(la, lo, rz);
+                                ((gx - (rcx - rw as f64 / 2.0)).floor() as i32, (gy - (rcy - rh as f64 / 2.0)).floor() as i32)
+                            }).collect();
+                            for w in pts.windows(2) { draw_line(&mut ov, w[0].0, w[0].1, w[1].0, w[1].1, ev.kind.color(), 3); }
                         }
                     }
                     last_map_sig = map_sig; // このsigで描いた内容がこのフレームでemitされる
@@ -864,6 +878,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             loader: &loader, rcx, rcy, rz, rw, rh,
             cfg: &cfg, traffic_points: &traffic_points, traffic_job_active: traffic_job.is_some(),
             camera_points: &camera_points, camera_job_active: camera_job.is_some(),
+            regulation_events: &regulation_events, regulation_job_active: regulation_job.is_some(),
             addr: &addr, wps: &wps, z, lat, lon, next_turn: &next_turn,
         });
         let status = fit_cells_scroll(&status, cols as usize, spin);
@@ -985,6 +1000,35 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 Ok(pts) => { camera_points = pts; camera_job = None; }
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => { camera_job = None; }
+            }
+        }
+        // 通行規制: traffic_*/camera_*と同じ間引き方針(視野が範囲外に出たら即時、それ以外は90秒毎)。
+        if cfg.regulation_enabled && regulation_job.is_none() {
+            const MARGIN_PX: f64 = 900.0;
+            const REFRESH: std::time::Duration = std::time::Duration::from_secs(90);
+            let (lat_max, lon_min) = pixel_to_deg(cx - MARGIN_PX, cy - MARGIN_PX, z);
+            let (lat_min, lon_max) = pixel_to_deg(cx + MARGIN_PX, cy + MARGIN_PX, z);
+            let out_of_bbox = match regulation_bbox {
+                Some((blat_min, blon_min, blat_max, blon_max)) => {
+                    let (clat, clon) = pixel_to_deg(cx, cy, z);
+                    clat < blat_min || clat > blat_max || clon < blon_min || clon > blon_max
+                }
+                None => true,
+            };
+            let stale = regulation_last_fetch.map_or(true, |t| t.elapsed() >= REFRESH);
+            if out_of_bbox || stale {
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || { let _ = tx.send(regulation::fetch_closures(lat_min, lon_min, lat_max, lon_max)); });
+                regulation_job = Some(rx);
+                regulation_bbox = Some((lat_min, lon_min, lat_max, lon_max));
+                regulation_last_fetch = Some(std::time::Instant::now());
+            }
+        }
+        if let Some(job) = &regulation_job {
+            match job.try_recv() {
+                Ok(evs) => { regulation_events = evs; regulation_job = None; }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => { regulation_job = None; }
             }
         }
         if let Some(job) = &cam_job {
@@ -1169,7 +1213,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         // is_busy()だけではその1枚の反映漏れを検知できずread()でブロックしてしまうため。
         let polling = route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || cam_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some() || wander_job.is_some() || gps_rx.is_some() || play.is_some() || settling || loader.is_busy() || loader.generation() != loader_gen_snapshot
             || radar_clock.is_some() // 雨雲: 背景ポーラーからの時刻一覧を取りこぼさない
-            || traffic_job.is_some() || camera_job.is_some(); // 道路交通量/ライブカメラの背景取得完了を、キー入力無しでも取りこぼさない(結果が最大60秒(IDLE_SAVE_INTERVAL)反映されない事故を防ぐ)
+            || traffic_job.is_some() || camera_job.is_some() || regulation_job.is_some(); // 道路交通量/ライブカメラ/通行規制の背景取得完了を、キー入力無しでも取りこぼさない(結果が最大60秒(IDLE_SAVE_INTERVAL)反映されない事故を防ぐ)
         let mut ev: Option<Event> = if got_result {
             None
         } else if polling {
@@ -1415,6 +1459,10 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                     24 => { // 道路ライブカメラ: ONにした時、次のポーリングで即座に取得されるようbboxをクリア
                                         cfg.camera_enabled = !cfg.camera_enabled;
                                         if cfg.camera_enabled { camera_bbox = None; }
+                                    }
+                                    25 => { // 通行規制: ONにした時、次のポーリングで即座に取得されるようbboxをクリア
+                                        cfg.regulation_enabled = !cfg.regulation_enabled;
+                                        if cfg.regulation_enabled { regulation_bbox = None; }
                                     }
                                     _ => {}
                                 }

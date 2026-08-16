@@ -56,6 +56,8 @@ impl RegulationKind {
             RegulationKind::Other => [150, 150, 150],
         }
     }
+    // 現状は地図に色分けした線を引くだけでui.rsからは未使用(将来の詳細表示用に残す)。
+    #[allow(dead_code)]
     pub fn label(&self) -> &'static str {
         match self {
             RegulationKind::Closed => "通行止め",

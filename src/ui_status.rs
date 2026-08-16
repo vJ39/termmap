@@ -11,6 +11,7 @@ use crate::spots::Spot;
 use crate::tiles::{radar_progress, TileLoader};
 use crate::traffic::TrafficPoint;
 use crate::camera::RoadCamera;
+use crate::regulation::ClosureEvent;
 
 // build_status_line が読むループ状態。Option のうち有無しか見ないもの(通信中ジョブ・GPS)は
 // 呼び出し側で bool に畳んで渡す。
@@ -46,6 +47,8 @@ pub(crate) struct StatusCtx<'a> {
     pub traffic_job_active: bool,
     pub camera_points: &'a [RoadCamera],
     pub camera_job_active: bool,
+    pub regulation_events: &'a [ClosureEvent],
+    pub regulation_job_active: bool,
     pub addr: &'a str,
     pub wps: &'a [(f64, f64)],
     pub z: u32,
@@ -60,6 +63,7 @@ pub(crate) fn build_status_line(c: StatusCtx) -> String {
         route_note, clear_route_confirm, jobs_active, spin, gps_live, web_gps_active, play,
         play_speed, radar_on, radar_tl, radar_idx, radar_follow, loader, rcx, rcy, rz, rw, rh,
         cfg, traffic_points, traffic_job_active, camera_points, camera_job_active,
+        regulation_events, regulation_job_active,
         addr, wps, z, lat, lon, next_turn,
     } = c;
     match focus {
@@ -159,13 +163,23 @@ pub(crate) fn build_status_line(c: StatusCtx) -> String {
             } else {
                 format!("📷{}台(N) ", camera_points.len())
             };
+            // 通行規制: ONのときだけ件数を出す(考え方はtraffic_txtと同じ)。
+            let regulation_txt = if !cfg.regulation_enabled {
+                String::new()
+            } else if regulation_events.is_empty() && regulation_job_active {
+                "⚠取得中… ".to_string()
+            } else if regulation_events.is_empty() {
+                "⚠規制無し ".to_string()
+            } else {
+                format!("⚠{}件 ", regulation_events.len())
+            };
             // 一時メッセージが無い時は底面にロゴを常時表示。メッセージ発生時はそちらを優先。
             let msg = if addr.is_empty() { "◉╌╌╌► termmap · terminal touring map   ".to_string() } else { format!("» {addr} « ") };
             // 下部バーは細く。全操作は Space メニューから選べる
             let route_hint = if wps.is_empty() { "v=地点を置く".to_string() } else { format!("{}点 v足す w/s選択(操作行までEnterで実行) Tab=左の一覧へ(並替/操作)", wps.len()) };
             // 次の曲がり角(音声案内と同じデータソース。ONでルート走行中のみ出る)。
             let turn_txt = next_turn.as_deref().unwrap_or("");
-            let base = format!(" {spinner}{msg}{live}{playing}{radar_txt}{traffic_txt}{camera_txt}{turn_txt}z{z} {lat:.4},{lon:.4} ｜ {route_hint} ｜ Space:メニュー ?ヘルプ q終了");
+            let base = format!(" {spinner}{msg}{live}{playing}{radar_txt}{traffic_txt}{camera_txt}{regulation_txt}{turn_txt}z{z} {lat:.4},{lon:.4} ｜ {route_hint} ｜ Space:メニュー ?ヘルプ q終了");
             match route_note { Some(rn) => format!("{base} | {rn} "), None => base }
         }
     }
@@ -212,6 +226,8 @@ mod tests {
         traffic_job_active: bool,
         camera_points: Vec<RoadCamera>,
         camera_job_active: bool,
+        regulation_events: Vec<ClosureEvent>,
+        regulation_job_active: bool,
         addr: String,
         wps: Vec<(f64, f64)>,
         z: u32,
@@ -230,6 +246,7 @@ mod tests {
                 radar_on: false, radar_tl: radar::Timeline::default(), radar_idx: 0, radar_follow: true,
                 cfg: Config::default(), traffic_points: Vec::new(), traffic_job_active: false,
                 camera_points: Vec::new(), camera_job_active: false,
+                regulation_events: Vec::new(), regulation_job_active: false,
                 addr: String::new(), wps: Vec::new(), z: 14, lat: 35.0, lon: 139.0, next_turn: None,
             }
         }
@@ -248,6 +265,7 @@ mod tests {
                 cfg: &self.cfg, traffic_points: &self.traffic_points,
                 traffic_job_active: self.traffic_job_active,
                 camera_points: &self.camera_points, camera_job_active: self.camera_job_active,
+                regulation_events: &self.regulation_events, regulation_job_active: self.regulation_job_active,
                 addr: &self.addr, wps: &self.wps, z: self.z, lat: self.lat, lon: self.lon,
                 next_turn: &self.next_turn,
             })
@@ -436,6 +454,24 @@ mod tests {
         assert!(f.line().contains("📷1台(N) "));
         f.camera_job_active = true; // 取得済みなら取得中でも件数を優先する
         assert!(f.line().contains("📷1台(N) "));
+    }
+
+    #[test]
+    fn regulation_label_distinguishes_loading_from_no_regulations() {
+        let mut f = Fixture::new(Focus::Map);
+        assert!(!f.line().contains('⚠'), "OFFのときは出さない");
+        f.cfg.regulation_enabled = true;
+        f.regulation_job_active = true;
+        assert!(f.line().contains("⚠取得中… "));
+        f.regulation_job_active = false;
+        assert!(f.line().contains("⚠規制無し "));
+        f.regulation_events = vec![ClosureEvent {
+            line: vec![(35.0, 139.0), (35.1, 139.1)],
+            kind: crate::regulation::RegulationKind::Closed,
+        }];
+        assert!(f.line().contains("⚠1件 "));
+        f.regulation_job_active = true; // 取得済みなら取得中でも件数を優先する
+        assert!(f.line().contains("⚠1件 "));
     }
 
     #[test]

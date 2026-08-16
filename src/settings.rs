@@ -35,7 +35,7 @@ pub(crate) const CHOICES: &[SettingChoice] = &[
 
 // 設定画面の項目行数(アコーディオン未展開時)。ui.rs のカーソル下移動の上限がこれを参照する。
 // settings_rows() が返す行数と必ず一致すること(下の回帰テスト settings_row_count_matches_rows で固定)。
-pub(crate) const SETTINGS_ROW_COUNT: usize = 25;
+pub(crate) const SETTINGS_ROW_COUNT: usize = 26;
 
 fn choice_for(idx: usize) -> Option<&'static SettingChoice> { CHOICES.iter().find(|c| c.idx == idx) }
 
@@ -113,7 +113,8 @@ pub(crate) fn setting_description(idx: usize) -> &'static str {
         21 => "ルート音声案内: 曲がり角の300m手前/直前でmacOSの読み上げ(sayコマンド)またはブラウザの読み上げで案内する。ONにした人だけがBRouterへ追加問い合わせする",
         22 => "道路交通量: 国道の実測交通量(JARTICオープンデータ)を混雑度の目安として地図に重ねる。事故情報・渋滞度そのものではない。ONにした人だけが外部サービスへ問い合わせる",
         23 => "音声案内をこの端末でも再生: OFFにするとmacOSのsayコマンドでは鳴らさず、ブラウザ側(web版)の読み上げだけになる。web版で見ている時に手元のMac本体が同時に喋るのを避けたい場合はOFF",
-        24 => "道路ライブカメラ: 国交省の道路カメラを地図に重ねる(Kキーで中心近くのカメラの写真を表示)。ONにした人だけが外部サービスへ問い合わせる",
+        24 => "道路ライブカメラ: 国交省の道路カメラを地図に重ねる(Nキーで中心近くのカメラの写真を表示)。ONにした人だけが外部サービスへ問い合わせる",
+        25 => "通行規制: 通行止め・車線規制等の区間(国交省road-info-prvs)を地図に線で重ねる。事故・工事・冬期閉鎖等の原因は区別しない。ONにした人だけが外部サービスへ問い合わせる",
         _ => "Google APIキー: 検索(Geocoding)とStreet View共通。Enterで入力欄を開く(Cmd+V貼付も可)。環境変数TERMMAP_GOOGLE_API_KEYでも可",
     }
 }
@@ -158,6 +159,7 @@ pub(crate) fn settings_rows(opts: &Args, cfg: &Config, picking: Option<usize>, o
         format!("道路交通量 {}", onoff(cfg.traffic_enabled)),
         format!("音声をこの端末でも再生 {}", onoff(cfg.voice_speak_local)),
         format!("道路ライブカメラ {}", onoff(cfg.camera_enabled)),
+        format!("通行規制 {}", onoff(cfg.regulation_enabled)),
     ];
     debug_assert_eq!(its.len(), SETTINGS_ROW_COUNT, "SETTINGS_ROW_COUNT と行数がずれている");
     // アコーディオン展開: 選択中の項目がpickable(3択以上)ならその直下に候補をインデント挿入し、他行を押し下げる

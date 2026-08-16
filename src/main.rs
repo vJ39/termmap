@@ -39,17 +39,10 @@ mod config;
 #[allow(dead_code)]
 mod recommend;
 mod settings;
-// 雨雲レーダー(気象庁ナウキャスト)のフレーム時刻管理。
-// ui.rs/tiles.rs への配線は後続増分のため、現時点では未wireで dead_code 許容。
-#[allow(dead_code)]
-mod radar;
+mod radar; // 雨雲レーダー(気象庁ナウキャスト)のフレーム時刻管理
 mod voice; // ルート音声案内(曲がり角の距離ベース読み上げ)
-// 道路交通量(JARTICオープンデータ)。ui.rsへの配線は後続増分のため現時点では未wire。
-#[allow(dead_code)]
-mod traffic;
-// 通行規制(通行止め・車線規制等)。ui.rsへの配線は後続増分のため現時点では未wire。
-#[allow(dead_code)]
-mod regulation;
+mod traffic; // 道路交通量(JARTICオープンデータ)
+mod regulation; // 通行規制(通行止め・車線規制等、road-info-prvs.mlit.go.jp)
 mod camera; // 道路ライブカメラ(road-info-prvs.mlit.go.jp)。Nキーで中心近くのカメラの写真を表示
 
 use image::{RgbImage, RgbaImage, imageops::FilterType};
