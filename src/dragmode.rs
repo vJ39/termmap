@@ -142,6 +142,44 @@ pub(crate) fn pan_ratio_to_px(fx: f64, fy: f64, lay: &Layout) -> (f64, f64) {
     (dx, dy)
 }
 
+/// 合算したパン量(比)を地図中心へ適用する。設計書 §6.2 の「適用条件」をここに閉じてある:
+///
+/// - 該当軸が `Axis::Pan` のときだけ動かす。X軸とY軸は独立に判定する(`PoiList` は X だけ)。
+/// - 指と同じ向きに地図が流れるよう、中心は逆向きに動かす(設計書 §3.1)。
+/// - 世界ピクセル座標へ正規化する。X は `rem_euclid` で巻き、Y は端でクランプする。
+///   合算値は1マーカーの上限(±1)を超えうるので、キー経路のような1回ぶんの加減算では
+///   足りない(何周ぶん動いても確実に範囲へ収まる形にしてある)。
+///
+/// 戻り値は (新しいcx, 新しいcy, 実際に動かしたか)。動かさなかった場合は入力をそのまま返す。
+pub(crate) fn apply_pan(
+    cx: f64,
+    cy: f64,
+    z: u32,
+    axes: (Axis, Axis),
+    fx: f64,
+    fy: f64,
+    lay: &Layout,
+) -> (f64, f64, bool) {
+    let moved_x = axes.0 == Axis::Pan && fx != 0.0;
+    let moved_y = axes.1 == Axis::Pan && fy != 0.0;
+    if !moved_x && !moved_y {
+        return (cx, cy, false);
+    }
+    let (dx, dy) = pan_ratio_to_px(fx, fy, lay);
+    let mut ncx = cx;
+    let mut ncy = cy;
+    if moved_x {
+        ncx -= dx;
+    }
+    if moved_y {
+        ncy -= dy;
+    }
+    let n = (crate::geo::TILE as f64) * 2f64.powi(z as i32);
+    ncx = ncx.rem_euclid(n);
+    ncy = ncy.clamp(0.0, n - 1.0);
+    (ncx, ncy, true)
+}
+
 /// pan_ratio_to_px() に渡す画面レイアウトの寸法。同じ型(u32)の値が6つ並ぶので、
 /// 位置引数で渡すと cols と rows、ow と oh の取り違えが静かに通ってしまう。
 /// 名前付きで束ねて取り違えを防ぐ。
@@ -385,6 +423,13 @@ mod tests {
     }
 
     #[test]
+    fn parse_pan_marker_ignores_extra_fields() {
+        // 3個目以降のフィールドは黙って無視する(将来 JS 側がフィールドを足しても、
+        // 古い termmap が fx/fy だけ読んで動き続けられるようにするため)。
+        assert_eq!(parse_pan_marker("\u{1}PAN\u{1}0.1\u{1}0.2\u{1}0.3\u{1}"), Some((0.1, 0.2)));
+    }
+
+    #[test]
     fn parse_pan_marker_rejects_other_pastes() {
         // 通常のペーストや他のマーカーを取り違えない(検索欄への貼り付けを食わない)。
         assert_eq!(parse_pan_marker("\u{1}GPS\u{1}35.0\u{1}139.0"), None);
@@ -455,6 +500,108 @@ mod tests {
         // 0除算でNaNを返さない(NaNがcx/cyへ入ると以降の描画が全部壊れる)。
         assert_eq!(pan_ratio_to_px(0.5, 0.5, &lay(100, 40, 0, 39, 144, 156)), (0.0, 0.0));
         assert_eq!(pan_ratio_to_px(0.5, 0.5, &lay(100, 40, 72, 0, 144, 156)), (0.0, 0.0));
+    }
+
+    // ── パン量の適用(設計書 §6.2 の適用条件) ────────────────────────
+
+    /// z=10 のときの世界ピクセル幅。テストの期待値を書くのに使う。
+    fn world_px(z: u32) -> f64 {
+        (crate::geo::TILE as f64) * 2f64.powi(z as i32)
+    }
+
+    #[test]
+    fn apply_pan_moves_map_opposite_to_finger() {
+        // 指を右下へ→中心は左上へ動く(=地図の絵が指と同じ右下へ流れる)。
+        let l = lay(100, 40, 100, 39, 200, 156);
+        let (cx, cy, moved) = apply_pan(50_000.0, 50_000.0, 10, (Pan, Pan), 0.25, 0.25, &l);
+        assert!(moved);
+        assert!(cx < 50_000.0, "指を右へ→中心は西(cxが減る)。got {cx}");
+        assert!(cy < 50_000.0, "指を下へ→中心は北(cyが減る)。got {cy}");
+        // 移動量は pan_ratio_to_px と一致する。
+        let (dx, dy) = pan_ratio_to_px(0.25, 0.25, &l);
+        assert!((cx - (50_000.0 - dx)).abs() < 1e-9);
+        assert!((cy - (50_000.0 - dy)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn apply_pan_applies_only_the_pan_axis() {
+        // PoiList 相当 (Pan, Cursor): Xだけ動き、Yの値は捨てられる。
+        let l = lay(100, 40, 72, 39, 144, 156);
+        let (cx, cy, moved) = apply_pan(50_000.0, 50_000.0, 10, (Pan, Cursor), 0.2, 0.2, &l);
+        assert!(moved);
+        assert!(cx != 50_000.0, "X軸(Pan)は動く");
+        assert_eq!(cy, 50_000.0, "Y軸(Cursor)は動かない");
+    }
+
+    #[test]
+    fn apply_pan_ignores_non_pan_axes_entirely() {
+        let l = lay(100, 40, 72, 39, 144, 156);
+        // 一覧/メニュー相当・設定相当・入力欄相当: どの軸もPanでないので一切動かない。
+        for axes in [(Nothing, Cursor), (Cursor, Cursor), (Cursor, Nothing), (Nothing, Nothing)] {
+            let (cx, cy, moved) = apply_pan(50_000.0, 40_000.0, 10, axes, 0.5, 0.5, &l);
+            assert!(!moved, "{axes:?} では動かないこと");
+            assert_eq!((cx, cy), (50_000.0, 40_000.0));
+        }
+    }
+
+    #[test]
+    fn apply_pan_reports_not_moved_for_zero_delta() {
+        let l = lay(100, 40, 72, 39, 144, 156);
+        let (cx, cy, moved) = apply_pan(1_000.0, 2_000.0, 10, (Pan, Pan), 0.0, 0.0, &l);
+        assert!(!moved, "移動量0なら「動いた」と報告しない(pan_streakを無駄にリセットしない)");
+        assert_eq!((cx, cy), (1_000.0, 2_000.0));
+    }
+
+    #[test]
+    fn apply_pan_wraps_x_around_the_world() {
+        let l = lay(100, 40, 100, 39, 200, 156);
+        let n = world_px(10);
+        // 世界の西端(cx≈0)で指を右へ払う = 中心はさらに西へ動く → 東端へ回り込む
+        // (地図は経度方向に連続しているので、ここで止まると世界一周できなくなる)。
+        let (cx, _, moved) = apply_pan(10.0, 1_000.0, 10, (Pan, Pan), 0.5, 0.0, &l);
+        assert!(moved);
+        assert!((0.0..n).contains(&cx), "範囲内に収まること。got {cx} (n={n})");
+        assert!(cx > n / 2.0, "西端を越えて東端側へ回り込むこと。got {cx}");
+        // 逆向き(指を左へ)は中心が東へ動く。東端を越えれば西端へ回り込む。
+        let (cx2, _, _) = apply_pan(n - 10.0, 1_000.0, 10, (Pan, Pan), -0.5, 0.0, &l);
+        assert!((0.0..n).contains(&cx2), "範囲内に収まること。got {cx2}");
+        assert!(cx2 < n / 2.0, "東端を越えて西端側へ回り込むこと。got {cx2}");
+    }
+
+    #[test]
+    fn apply_pan_wraps_even_when_the_sum_exceeds_one_screen() {
+        // 合算値は1マーカーの上限(±1)を超えうる。何周ぶんでも範囲内に収まること
+        // (キー経路のような1回だけの ±n 加減算では収まらないケース)。
+        let l = lay(100, 40, 100, 39, 200, 156);
+        let n = world_px(4); // 小さい世界(4096px)で、1回のパン量が複数周ぶんになる状況を作る
+        for fx in [5.0, -5.0, 50.0, -50.0] {
+            let (cx, _, moved) = apply_pan(100.0, 100.0, 4, (Pan, Pan), fx, 0.0, &l);
+            assert!(moved);
+            assert!(cx.is_finite(), "NaN/Infにならない。fx={fx}");
+            assert!((0.0..n).contains(&cx), "fx={fx} で範囲外: {cx} (n={n})");
+        }
+    }
+
+    #[test]
+    fn apply_pan_clamps_y_at_the_poles() {
+        let l = lay(100, 40, 100, 39, 200, 156);
+        let n = world_px(10);
+        // 北端を越えて上へ払っても 0 で止まる(Yは巻かない)。
+        let (_, cy, _) = apply_pan(1_000.0, 5.0, 10, (Pan, Pan), 0.0, 1.0, &l);
+        assert_eq!(cy, 0.0, "北端でクランプ");
+        // 南端も同様。
+        let (_, cy2, _) = apply_pan(1_000.0, n - 5.0, 10, (Pan, Pan), 0.0, -1.0, &l);
+        assert_eq!(cy2, n - 1.0, "南端でクランプ");
+    }
+
+    #[test]
+    fn apply_pan_never_produces_nan() {
+        // 地図領域が0セルという壊れたレイアウトでも、cx/cy に NaN を入れない
+        // (NaN が入ると以降のタイル計算・描画が全部壊れる)。
+        let broken = lay(100, 40, 0, 0, 144, 156);
+        let (cx, cy, _) = apply_pan(1_000.0, 2_000.0, 10, (Pan, Pan), 0.5, 0.5, &broken);
+        assert!(cx.is_finite() && cy.is_finite());
+        assert_eq!((cx, cy), (1_000.0, 2_000.0), "換算が0なら位置は変わらない");
     }
 
     #[test]

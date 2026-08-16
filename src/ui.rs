@@ -1289,15 +1289,13 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             }
         }
         if got_pan {
-            // 適用は該当軸が Pan のときだけ。X/Yは独立に判定する(PoiList は X だけ適用される)。
-            let (ax, ay) = dragmode::axes(&focus);
-            let moved_x = ax == dragmode::Axis::Pan && pan_fx != 0.0;
-            let moved_y = ay == dragmode::Axis::Pan && pan_fy != 0.0;
-            if moved_x || moved_y {
-                let lay = dragmode::Layout { cols, rows: tr as u32, map_cols, map_rows, ow, oh };
-                let (dx_out, dy_out) = dragmode::pan_ratio_to_px(pan_fx, pan_fy, &lay);
-                if moved_x { cx -= dx_out; } // 指と同じ向きに地図が流れる(設計書 §3.1)
-                if moved_y { cy -= dy_out; }
+            // 軸ゲート・向きの反転・座標の正規化は dragmode::apply_pan に閉じてある
+            // (ここに直書きするとテストが書けないため。設計書 §6.2 の適用条件)。
+            let lay = dragmode::Layout { cols, rows: tr as u32, map_cols, map_rows, ow, oh };
+            let (ncx, ncy, moved) = dragmode::apply_pan(cx, cy, z, dragmode::axes(&focus), pan_fx, pan_fy, &lay);
+            if moved {
+                cx = ncx;
+                cy = ncy;
                 // 中心が動いたので、'a'で引いた住所表示は古くなる。矢印キーでのパンと同じく
                 // 地図フォーカスのときだけ消す(PoiListの微パンはキー経路でも消していない)。
                 if matches!(focus, Focus::Map) { addr.clear(); }
@@ -1305,11 +1303,6 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 // 指の移動量そのものが移動量なので、加速を掛けると1:1でなくなる。
                 pan_streak = 0;
                 last_pan_dir = None;
-                // 地図キーのパンと同じ正規化。合算値は1マーカーの上限(±1)を超えうるので、
-                // 1回ぶんの加減算ではなく rem_euclid で確実に範囲へ収める。
-                let n = (TILE as f64) * 2f64.powi(z as i32);
-                cx = cx.rem_euclid(n);
-                cy = cy.clamp(0.0, n - 1.0);
             }
         }
         match ev {

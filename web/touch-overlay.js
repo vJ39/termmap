@@ -55,7 +55,7 @@
 
   if (window.__termmapTouch) { return; } // 二重読み込み防止
 
-  var OVERLAY_VERSION = '1.3.0';
+  var OVERLAY_VERSION = '1.3.1';
 
   // ── 調整パラメータ ───────────────────────────────────────────────
   var TAP_SLOP_PX      = 12;   // 移動量がこれ以下ならタップ(Enter)扱い
@@ -69,6 +69,12 @@
   var FALLBACK_PX_PER_STEP = 24;
   // パン量マーカーの送信レート上限(約30Hz)。間引いた分は捨てずに次回へ繰り越す。
   var PAN_MIN_INTERVAL_MS = 33;
+  // OSC 9997 ハンドラの束縛リトライ(束縛できないと追従改善が丸ごと無効になるので粘る)。
+  var OSC_BIND_INTERVAL_MS = 250;
+  var OSC_BIND_MAX_TRIES = 80;            // 約20秒
+  // 軸モード要求のリトライ。bracketed paste が有効になる(=termmap起動)まで空振りする前提。
+  var DRAG_MODE_PROBE_INTERVAL_MS = 500;
+  var DRAG_MODE_PROBE_MAX_TRIES = 40;     // 約20秒
   var PINCH_PX_PER_STEP = 55;  // ピンチ: 指の間隔が何 px 変わるごとにズーム1段か(誤爆軽減でパンより粗め)
   // touchmove/慣性の1tickで送るキーの上限(暴走防止の保険)。速いスワイプほど1回の
   // touchmoveあたりの移動量(dx/dy)が大きくなるので、ここを大きめにしておかないと
@@ -242,16 +248,30 @@
     return true;
   }
 
+  // 効果音(9999)・音声案内(9998)の bind は数回試して諦める作りだが、こちらは諦めると
+  // #87 の追従改善が丸ごと無効(常に従来のキー変換)になり、しかも見た目は「前と同じ」で
+  // 気づけない。回線やマシンが遅くて window.term の出現が 1.5 秒に間に合わない場合に
+  // 備え、束縛できるまで一定間隔で粘る(上限つき)。
   function bindDragModeOsc() {
-    [0, 100, 300, 700, 1500].forEach(function (ms) {
-      setTimeout(function () {
-        var t = window.term;
-        if (t && !t.__termmapDragModeBound && typeof t.registerOscHandler === 'function') {
+    var tries = 0;
+    var timer = null;
+    var attempt = function () {
+      var t = window.term;
+      if (t && typeof t.registerOscHandler === 'function') {
+        if (!t.__termmapDragModeBound) {
           t.__termmapDragModeBound = true;
           t.registerOscHandler(9997, function (data) { applyDragModeData(data); return true; });
+          // 束縛前に流れた最初のフレームぶんを取りこぼしている可能性があるので取り直す。
+          requestDragMode(false);
         }
-      }, ms);
-    });
+        if (timer) { clearInterval(timer); timer = null; }
+        return true;
+      }
+      if (++tries > OSC_BIND_MAX_TRIES && timer) { clearInterval(timer); timer = null; }
+      return false;
+    };
+    if (attempt()) { return; }
+    timer = setInterval(attempt, OSC_BIND_INTERVAL_MS);
   }
 
   // termmapの実画像モード(iTerm2インラインイメージ・OSC 1337)をブラウザでも描画する。
@@ -298,11 +318,28 @@
   var GPS_MIN_INTERVAL_MS = 3000; // 送信間隔の下限(pty/描画を圧迫しないよう間引く)
   var gpsLastSentAt = 0;
 
+  // bracketed paste が有効かどうか。無効のまま term.paste() すると、xterm.js は
+  // ESC[200~ で包まずテキストをそのまま pty へ流す(同梱版の paste 実装で確認)。
+  // するとマーカーの制御文字が「生のキー入力」として termmap に解釈され、
+  // DRAGMODE? が Ctrl-A(住所取得のブロッキングHTTP)・A(ルート再生)・
+  // ?(ヘルプ)等の誤発火になる。termmap は起動時に EnableBracketedPaste を出すので、
+  // これが立つまでは「termmap がまだ起動しきっていない」とみなして送らない。
+  // modes を持たない実装では判定できないので、その場合は従来どおり送る。
+  function bracketedPasteReady() {
+    var t = window.term;
+    if (!t) { return false; }
+    try {
+      var m = t.modes;
+      return !m || m.bracketedPasteMode !== false;
+    } catch (e) { return true; } // 判定できない実装は従来どおり
+  }
+
   // termmap への専用マーカー送信。先頭に SOH(U+0001) を付けて term.paste() で送る。
   // ライブ現在地(GPS…)・パン量(PAN…)・軸モードの再送要求(DRAGMODE?…)の3種で共用する。
   function sendMarkerPaste(text) {
     var t = window.term;
     if (!t || typeof t.paste !== 'function') { return; }
+    if (!bracketedPasteReady()) { return; }
     t.paste('' + text);
   }
 
@@ -336,9 +373,16 @@
   var panLastSentAt = 0;
   var panFlushTimer = null;
 
-  // 端末領域の CSS px 寸法。比の分母になる。回転やURLバーの伸縮で変わるので都度読む。
+  // 比の分母になる寸法。回転やURLバーの伸縮で変わるので都度読む。
+  // 分母は「実際に cols×rows のセルが占めている矩形」でなければならない。
+  // #terminal-container の矩形には、fit addon が切り捨てた1セル未満の余り・padding・
+  // スクロールバー幅が含まれるぶん余分があり、そのまま使うと比が小さく出て地図が指より
+  // わずかに遅れる。.xterm-screen は幅=cols*cellWidth・高さ=rows*cellHeight に一致するので
+  // そちらを優先し、取れない場合だけコンテナへフォールバックする。
   function terminalViewportSize() {
-    var el = document.querySelector(TERMINAL_SELECTOR);
+    var t = window.term;
+    var el = (t && t.element && t.element.querySelector) ? t.element.querySelector('.xterm-screen') : null;
+    if (!el) { el = document.querySelector(TERMINAL_SELECTOR); }
     var r = (el && el.getBoundingClientRect) ? el.getBoundingClientRect() : null;
     var w = (r && r.width) || window.innerWidth || 0;
     var h = (r && r.height) || window.innerHeight || 0;
@@ -362,7 +406,9 @@
     var fy = clampRatio(panPending.y / size.h);
     var sx = fx.toFixed(4), sy = fy.toFixed(4);
     var vx = parseFloat(sx), vy = parseFloat(sy);
-    if (vx === 0 && vy === 0) { return; } // 丸めて0になる微小移動。溜めたまま次の機会を待つ
+    // 丸めて0になる微小移動。溜めたまま、次に queuePan が呼ばれる機会を待つ
+    // (ここでタイマーを張り直さないのは、0.005%未満の端数のために起き続けるのを避けるため)。
+    if (vx === 0 && vy === 0) { return; }
     panLastSentAt = now;
     panPending.x -= vx * size.w; // 送った分だけ差し引く(丸めの端数は次回へ繰り越す)
     panPending.y -= vy * size.h;
@@ -376,17 +422,44 @@
     flushPan();
   }
 
+  // 溜まっている未送信のパン量を捨てる。新しいジェスチャーが始まったときに使う:
+  // 慣性 tick が積んだ分が最大 PAN_MIN_INTERVAL_MS 遅れで送られると、指を置いて
+  // 止めたはずの地図がその後わずかに動いてしまう(「流れている地図を指で押さえて止める」
+  // が効かない)。ドラッグ中の繰り越しとは別物なので、ここでだけ捨てる。
+  function cancelPendingPan() {
+    panPending.x = 0;
+    panPending.y = 0;
+    if (panFlushTimer) { clearTimeout(panFlushTimer); panFlushTimer = null; }
+  }
+
   // 軸モードの再送要求(設計書 §5.3)。ページを再読み込みすると JS 側の状態は消えるが、
-  // termmap 側の Focus は変わらないので OSC 9997 が飛んでこない。初期化時と復帰時に要求する。
-  // 初期化時は window.term や pty がまだ準備できていないことがあるため、受け取れるまで数回試す。
+  // termmap 側の Focus は変わらないので OSC 9997 が飛んでこない。
+  //
+  // 初期化時(force=false): 受け取れるまで粘る。termmap の最初のフレームが OSC ハンドラの
+  //   登録より前だと取りこぼし、そのままでは従来のキー変換方式に固定されてしまうため。
+  //   bracketed paste が有効になるまでは sendMarkerPaste 側で握り潰されるので、その間の
+  //   試行は空振りする。空振り前提で間隔を空けて繰り返す。
+  // 復帰時(force=true): 一度でも軸モードを受け取れている相手("DRAGMODE? を解釈できる
+  //   termmap"と確認済み)のときだけ送る。未確認の相手へ送ると、このマーカーを知らない
+  //   古い termmap では通常のペーストとして扱われ、検索欄への文字入力や、設定画面の
+  //   APIキー行(貼り付けで即保存される)の上書きになるため。
+  var dragModeProbeTimer = null;
   function requestDragMode(force) {
-    if (force) { sendMarkerPaste('DRAGMODE?'); return; }
-    [0, 150, 500, 1200, 2500].forEach(function (ms) {
-      setTimeout(function () {
-        if (dragModeSeen) { return; } // 既に受け取っていれば要求しない
-        sendMarkerPaste('DRAGMODE?');
-      }, ms);
-    });
+    if (force) {
+      if (dragModeSeen) { sendMarkerPaste('DRAGMODE?'); }
+      return;
+    }
+    if (dragModeProbeTimer || dragModeSeen) { return; } // 既に粘っている/もう要らない
+    var tries = 0;
+    sendMarkerPaste('DRAGMODE?'); // 1回目は即座に
+    dragModeProbeTimer = setInterval(function () {
+      if (dragModeSeen || ++tries > DRAG_MODE_PROBE_MAX_TRIES) {
+        clearInterval(dragModeProbeTimer);
+        dragModeProbeTimer = null;
+        return;
+      }
+      sendMarkerPaste('DRAGMODE?');
+    }, DRAG_MODE_PROBE_INTERVAL_MS);
   }
 
   // ── キーイベント合成 ────────────────────────────────────────────
@@ -623,7 +696,21 @@
     startGlide(estimateVelocity());
   }
 
-  var gesture = null;   // { x, y, t } タップ判定用(1本指ジェスチャーの開始点)
+  // タップのブレで地図がずれないようにするデッドゾーン。'p' 軸は量子化をやめたので、
+  // これまで PX_PER_STEP(24px)の量子化が吸収していた「タップ時の十数pxのブレ」が
+  // そのままパン量として送られ、タップのたびに地図が少しずつずれて戻らなくなる。
+  // ジェスチャー開始点から TAP_SLOP_PX を超えるまでは送らない。panLast を進めないので、
+  // 超えた時点で溜まった分がまとめて流れる(移動量は失われない)。
+  // 閾値はタップ判定(onGestureEnd)と同じものを使う。
+  function passedTapSlop(x, y) {
+    if (!gesture || gesture.moved) { return true; }
+    var ddx = x - gesture.x, ddy = y - gesture.y;
+    if (Math.sqrt(ddx * ddx + ddy * ddy) <= TAP_SLOP_PX) { return false; }
+    gesture.moved = true;
+    return true;
+  }
+
+  var gesture = null;   // { x, y, t, moved } タップ判定用(1本指ジェスチャーの開始点)
   var panLast = null;   // { x, y } ここまで消費した位置(ライブパン用)
   var pinch = null;     // { baseDist, sentSteps } 2本指ピンチ
   var sawTouch = false; // タッチ端末ではマウス側の代替処理を止める
@@ -642,6 +729,7 @@
       sawTouch = true;
       unlockSpeechSynthesisOnce(); // 最初のタッチでspeechSynthesisのロックを解いておく
       stopGlide(); // 新しい操作が始まったら前の慣性は打ち切る
+      cancelPendingPan(); // 慣性が積んだ未送信分も捨てる(指を置いた後に動き続けないように)
       if (e.touches.length === 2) {
         gesture = null; panLast = null;
         pinch = { baseDist: touchDist(e.touches[0], e.touches[1]), sentSteps: 0 };
@@ -667,6 +755,7 @@
       if (e.touches.length !== 1 || !panLast) { gesture = null; panLast = null; return; }
       var t = e.touches[0];
       trackVelocity(t.clientX, t.clientY);
+      if (!passedTapSlop(t.clientX, t.clientY)) { return; } // タップのブレでは動かさない
       var dx = t.clientX - panLast.x, dy = t.clientY - panLast.y;
       var used = sendPanDelta(dx, dy);
       panLast.x += used.usedX; panLast.y += used.usedY;
@@ -692,6 +781,7 @@
       if (sawTouch || !inTerminal(e.target)) { return; }
       unlockSpeechSynthesisOnce(); // 最初のクリックでspeechSynthesisのロックを解いておく(PC確認用)
       stopGlide();
+      cancelPendingPan(); // 理由は touchstart 側と同じ
       gesture = { x: e.clientX, y: e.clientY, t: Date.now() };
       panLast = { x: e.clientX, y: e.clientY };
       velTrack = [{ x: e.clientX, y: e.clientY, t: Date.now() }];
@@ -700,6 +790,7 @@
     document.addEventListener('mousemove', function (e) {
       if (sawTouch || !gesture || !panLast) { return; }
       trackVelocity(e.clientX, e.clientY);
+      if (!passedTapSlop(e.clientX, e.clientY)) { return; } // クリック時のブレでは動かさない
       var dx = e.clientX - panLast.x, dy = e.clientY - panLast.y;
       var used = sendPanDelta(dx, dy);
       panLast.x += used.usedX; panLast.y += used.usedY;
@@ -920,6 +1011,8 @@
     },
     applyDragModeData: applyDragModeData,
     requestDragMode: requestDragMode,
-    terminalViewportSize: terminalViewportSize
+    terminalViewportSize: terminalViewportSize,
+    bracketedPasteReady: bracketedPasteReady,
+    cancelPendingPan: cancelPendingPan
   };
 })();
