@@ -55,7 +55,7 @@
 
   if (window.__termmapTouch) { return; } // 二重読み込み防止
 
-  var OVERLAY_VERSION = '1.3.1';
+  var OVERLAY_VERSION = '1.4.0';
 
   // ── 調整パラメータ ───────────────────────────────────────────────
   var TAP_SLOP_PX      = 12;   // 移動量がこれ以下ならタップ(Enter)扱い
@@ -189,6 +189,42 @@
     } catch (e) { /* 非対応環境は無視 */ }
   }
 
+  // 読み上げの声(#78)。日本語ボイスを確定してu.voiceへ明示指定する(#86対策候補F)。
+  // getVoices()は初回に空配列を返す実装(iOS Safari含む)があるため、voiceschangedと
+  // タイマーの両方で確定を試みる(bindSoundOsc/bindVoiceGuideOscと同じ粘り方)。
+  var jaVoices = null;    // 確定済みのjaボイス配列(null=未確定)
+  var chosenVoice = null; // 実際にu.voiceへ入れるもの(null=見つからない/未確定)
+
+  function resolveVoices() {
+    if (!window.speechSynthesis || typeof window.speechSynthesis.getVoices !== 'function') { return false; }
+    var all = window.speechSynthesis.getVoices();
+    if (!all || all.length === 0) { return false; } // 空配列は「ボイス無し」と確定させない
+    jaVoices = all.filter(function (v) { return /^ja(-|_|$)/i.test(v.lang || ''); });
+    var override = null;
+    try { override = window.localStorage.getItem('termmap.voiceName'); } catch (e) { /* localStorage不可の環境は無視 */ }
+    chosenVoice = null;
+    if (override) {
+      var ov = override.toLowerCase();
+      chosenVoice = jaVoices.find(function (v) { return v.name.toLowerCase() === ov; })
+        || jaVoices.find(function (v) { return v.name.toLowerCase().indexOf(ov) === 0; })
+        || null;
+    }
+    if (!chosenVoice) { chosenVoice = jaVoices.find(function (v) { return v.default === true; }) || null; }
+    if (!chosenVoice) { chosenVoice = jaVoices.find(function (v) { return v.localService === true; }) || null; }
+    if (!chosenVoice && jaVoices.length > 0) { chosenVoice = jaVoices[0]; }
+    return true;
+  }
+
+  function bindVoiceList() {
+    if (resolveVoices()) { return; }
+    if (window.speechSynthesis && typeof window.speechSynthesis.addEventListener === 'function') {
+      window.speechSynthesis.addEventListener('voiceschanged', resolveVoices);
+    }
+    [100, 300, 700, 1500, 3000].forEach(function (ms) {
+      setTimeout(function () { if (!jaVoices) { resolveVoices(); } }, ms);
+    });
+  }
+
   function speakVoiceGuide(b64) {
     if (!window.speechSynthesis || typeof window.SpeechSynthesisUtterance !== 'function') { return; }
     var text;
@@ -200,9 +236,37 @@
     } catch (e) { return; } // base64/UTF-8デコード失敗は諦める
     try {
       var u = new SpeechSynthesisUtterance(text);
-      u.lang = 'ja-JP';
+      u.lang = 'ja-JP'; // voiceを入れられない/失敗する実装向けのフォールバックとして残す
+      if (!chosenVoice) { resolveVoices(); } // 発話時にもう一度だけ引く(遅延確定の取りこぼし対策)
+      if (chosenVoice) { u.voice = chosenVoice; }
       window.speechSynthesis.speak(u);
     } catch (e) { /* 非対応環境は無視 */ }
+  }
+
+  // #86の実機切り分け用診断入口。Safari Webインスペクタから叩く。
+  function getVoiceInfo() {
+    var toInfo = function (v) { return v && { name: v.name, lang: v.lang, localService: v.localService, default: v.default }; };
+    var override = null;
+    try { override = window.localStorage.getItem('termmap.voiceName'); } catch (e) { /* ignore */ }
+    var total = (window.speechSynthesis && typeof window.speechSynthesis.getVoices === 'function')
+      ? window.speechSynthesis.getVoices().length : 0;
+    return {
+      resolved: jaVoices !== null,
+      chosen: toInfo(chosenVoice),
+      ja: (jaVoices || []).map(toInfo),
+      total: total,
+      override: override || null,
+    };
+  }
+
+  // 明示指定の逃げ道(自動選択が外れた場合の上書き)。nullで解除。
+  function setVoiceName(name) {
+    try {
+      if (name) { window.localStorage.setItem('termmap.voiceName', name); }
+      else { window.localStorage.removeItem('termmap.voiceName'); }
+    } catch (e) { /* localStorage不可の環境は無視 */ }
+    resolveVoices();
+    return getVoiceInfo();
   }
 
   function bindVoiceGuideOsc() {
@@ -968,6 +1032,7 @@
     bindGestures();
     bindSoundOsc();
     bindVoiceGuideOsc();
+    bindVoiceList();
     bindDragModeOsc();
     bindImageAddon();
     // 軸モードを要求する。termmap は最初のフレームでも1回送ってくるが、そのフレームが
@@ -999,6 +1064,8 @@
     toggleWebGps: toggleWebGps,
     bindImageAddon: bindImageAddon,
     speakVoiceGuide: speakVoiceGuide,
+    getVoiceInfo: getVoiceInfo,
+    setVoiceName: setVoiceName,
     keys: KEYS,
     findTextarea: findTextarea,
     // ドラッグ軸モードの確認・手動注入(設計書 §11 の実機確認手順で使う)。
