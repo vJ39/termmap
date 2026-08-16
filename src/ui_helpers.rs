@@ -58,7 +58,7 @@ pub(crate) fn maybe_speak_turn(cfg: &config::Config, spec: &render::OverlaySpec,
     let Some(pts) = spec.routes.last().map(|rt| &rt.pts) else { return };
     let Some(progress_m) = route::progress_along_route(pos, pts) else { return };
     if let Some(phrase) = guide.tick(turn_points, progress_m) {
-        voice::speak(&phrase);
+        voice::speak(&phrase, cfg.voice_speak_local);
     }
 }
 

@@ -48,6 +48,7 @@ pub(crate) struct StatusCtx<'a> {
     pub z: u32,
     pub lat: f64,
     pub lon: f64,
+    pub next_turn: &'a Option<String>,
 }
 
 pub(crate) fn build_status_line(c: StatusCtx) -> String {
@@ -55,7 +56,7 @@ pub(crate) fn build_status_line(c: StatusCtx) -> String {
         focus, save_confirm, spot_move_confirm, spots, cur_cat, pending_spot, set_sel, poi_label,
         route_note, clear_route_confirm, jobs_active, spin, gps_live, web_gps_active, play,
         play_speed, radar_on, radar_tl, radar_idx, radar_follow, loader, rcx, rcy, rz, rw, rh,
-        cfg, traffic_points, traffic_job_active, addr, wps, z, lat, lon,
+        cfg, traffic_points, traffic_job_active, addr, wps, z, lat, lon, next_turn,
     } = c;
     match focus {
         Focus::Search(_) => " 中央フォームに入力中 ".to_string(),
@@ -148,7 +149,9 @@ pub(crate) fn build_status_line(c: StatusCtx) -> String {
             let msg = if addr.is_empty() { "◉╌╌╌► termmap · terminal touring map   ".to_string() } else { format!("» {addr} « ") };
             // 下部バーは細く。全操作は Space メニューから選べる
             let route_hint = if wps.is_empty() { "v=地点を置く".to_string() } else { format!("{}点 v足す w/s選択(操作行までEnterで実行) Tab=左の一覧へ(並替/操作)", wps.len()) };
-            let base = format!(" {spinner}{msg}{live}{playing}{radar_txt}{traffic_txt}z{z} {lat:.4},{lon:.4} ｜ {route_hint} ｜ Space:メニュー ?ヘルプ q終了");
+            // 次の曲がり角(音声案内と同じデータソース。ONでルート走行中のみ出る)。
+            let turn_txt = next_turn.as_deref().unwrap_or("");
+            let base = format!(" {spinner}{msg}{live}{playing}{radar_txt}{traffic_txt}{turn_txt}z{z} {lat:.4},{lon:.4} ｜ {route_hint} ｜ Space:メニュー ?ヘルプ q終了");
             match route_note { Some(rn) => format!("{base} | {rn} "), None => base }
         }
     }
@@ -198,6 +201,7 @@ mod tests {
         z: u32,
         lat: f64,
         lon: f64,
+        next_turn: Option<String>,
     }
 
     impl Fixture {
@@ -209,7 +213,7 @@ mod tests {
                 gps_live: false, web_gps_active: false, play: None, play_speed: 1.0,
                 radar_on: false, radar_tl: radar::Timeline::default(), radar_idx: 0, radar_follow: true,
                 cfg: Config::default(), traffic_points: Vec::new(), traffic_job_active: false,
-                addr: String::new(), wps: Vec::new(), z: 14, lat: 35.0, lon: 139.0,
+                addr: String::new(), wps: Vec::new(), z: 14, lat: 35.0, lon: 139.0, next_turn: None,
             }
         }
         fn line(&self) -> String {
@@ -227,6 +231,7 @@ mod tests {
                 cfg: &self.cfg, traffic_points: &self.traffic_points,
                 traffic_job_active: self.traffic_job_active,
                 addr: &self.addr, wps: &self.wps, z: self.z, lat: self.lat, lon: self.lon,
+                next_turn: &self.next_turn,
             })
         }
     }

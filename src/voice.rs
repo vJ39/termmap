@@ -67,8 +67,18 @@ impl VoiceGuide {
     }
 }
 
+// 画面表示用: 現在地から見て次に案内すべき曲がり角までの残り距離(m)と案内文。
+// tick()と違い読み上げ済みかの状態は持たない(呼んでも状態を変えない・何度呼んでも同じ結果)。
+// 単に「まだ通過していない最初の曲がり角」を返すだけなので、Near/Imminentの区別なく常に出せる。
+pub fn next_turn_display(turns: &[crate::route::TurnPoint], progress_m: f64) -> Option<(f64, &'static str)> {
+    turns.iter().find_map(|t| {
+        let remaining = t.dist_from_start_m - progress_m;
+        if remaining < PASSED_M { None } else { Some((remaining.max(0.0), turn_phrase(&t.turn))) }
+    })
+}
+
 // 距離を50m刻みに丸める(「287メートル先」より「300メートル先」の方が聞き取りやすい)。
-fn round_to_50(m: f64) -> i64 {
+pub(crate) fn round_to_50(m: f64) -> i64 {
     ((m.max(0.0) / 50.0).round() as i64) * 50
 }
 
@@ -82,8 +92,10 @@ fn turn_phrase(code: &str) -> &'static str {
         "TSLR" => "緩やかに右です",
         "TSHL" => "急に左です",
         "TSHR" => "急に右です",
-        "KL" => "分岐を左です",
-        "KR" => "分岐を右です",
+        // 「分岐」は漢字だとmacOSのsay(Kyoko)が「うんき」等に誤読することがあるため、
+        // 読み間違えようのないひらがな表記にする(実機で確認済みの回避策)。
+        "KL" => "ぶんきを左です",
+        "KR" => "ぶんきを右です",
         "TU" => "この先Uターンです",
         "C" => "この先道なりです",
         "ARRIVE" => "まもなく到着です",
@@ -93,8 +105,12 @@ fn turn_phrase(code: &str) -> &'static str {
 }
 
 // 読み上げ実行。sound.rs::Sound::play と同じ方針で、対応する経路だけが実際に鳴る。
-pub fn speak(text: &str) {
-    speak_local(text);
+// native_local: この端末(macOSのsay)でも鳴らすか。falseならブラウザ側(speak_web)だけが鳴る。
+// web版で見ている間、手元のMac本体が同時に喋るのを避けたい場合にfalseで呼ぶ。
+pub fn speak(text: &str, native_local: bool) {
+    if native_local {
+        speak_local(text);
+    }
     speak_web(text);
 }
 
@@ -180,6 +196,39 @@ mod tests {
         assert!(g.matches_len(&turns));
         let other = vec![tp("TL", 100.0), tp("TR", 200.0)];
         assert!(!g.matches_len(&other));
+    }
+
+    #[test]
+    fn next_turn_display_returns_nearest_unpassed_turn() {
+        let turns = vec![tp("TL", 1000.0), tp("TR", 5000.0)];
+        let (remaining, phrase) = next_turn_display(&turns, 700.0).unwrap();
+        assert_eq!(remaining, 300.0);
+        assert_eq!(phrase, "左折です");
+    }
+
+    #[test]
+    fn next_turn_display_skips_passed_turns() {
+        // 1つ目(100m地点)は既に通過済み(500m地点にいる)なので、2つ目(900m地点)を返す。
+        let turns = vec![tp("TL", 100.0), tp("ARRIVE", 900.0)];
+        let (remaining, phrase) = next_turn_display(&turns, 500.0).unwrap();
+        assert_eq!(remaining, 400.0);
+        assert_eq!(phrase, "まもなく到着です");
+    }
+
+    #[test]
+    fn next_turn_display_none_when_all_turns_passed_or_empty() {
+        assert!(next_turn_display(&[], 0.0).is_none());
+        let turns = vec![tp("TL", 100.0)];
+        assert!(next_turn_display(&turns, 1000.0).is_none());
+    }
+
+    #[test]
+    fn next_turn_display_does_not_consume_state_repeated_calls_match() {
+        // tick()と違い、同じ引数で何度呼んでも同じ結果(状態を変えない)。
+        let turns = vec![tp("TR", 1000.0)];
+        let a = next_turn_display(&turns, 800.0);
+        let b = next_turn_display(&turns, 800.0);
+        assert_eq!(a, b);
     }
 
     #[test]

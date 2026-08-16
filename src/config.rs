@@ -37,6 +37,7 @@ pub struct Config {
     pub sample_interval_m: f64,
     pub route_play_speed_kmh: f64, // ルート再生(プレビュー走行)の想定巡航速度。既定40km/h(等倍1.00xの基準)
     pub voice_guide_enabled: bool, // ルート音声案内(曲がり角を距離ベースで読み上げ)。既定false(ONにした人だけがBRouterへ追加問い合わせする)
+    pub voice_speak_local: bool, // 音声案内をこの端末(macOSのsay)でも鳴らすか。既定true。web版で見ている時に手元のMacが同時に喋るのを避けたい場合にOFFにする(ブラウザ側の読み上げは常に鳴る)
     pub style: String,
     pub show_spots: bool,
     pub braille: bool,
@@ -67,6 +68,7 @@ impl Default for Config {
             sample_interval_m: 800.0,
             route_play_speed_kmh: 40.0,
             voice_guide_enabled: false,
+            voice_speak_local: true,
             style: "osm".to_string(),
             show_spots: true,
             braille: false,
@@ -170,6 +172,7 @@ pub fn load_config_from(path: &Path) -> Config {
                 }
             }
             ("route", "voice_guide_enabled") => { if let Some(b) = parse_bool(value) { cfg.voice_guide_enabled = b; } }
+            ("route", "voice_speak_local") => { if let Some(b) = parse_bool(value) { cfg.voice_speak_local = b; } }
             ("display", "style") => {
                 if let Some(s) = parse_string(value) {
                     cfg.style = s;
@@ -265,6 +268,7 @@ pub fn save_config_to(path: &Path, c: &Config) -> Result<(), String> {
          sample_interval_m = {}\n\
          play_speed_kmh = {}\n\
          voice_guide_enabled = {}\n\
+         voice_speak_local = {}\n\
          \n\
          [display]\n\
          style = \"{}\"\n\
@@ -302,6 +306,7 @@ pub fn save_config_to(path: &Path, c: &Config) -> Result<(), String> {
         c.sample_interval_m,
         c.route_play_speed_kmh,
         c.voice_guide_enabled,
+        c.voice_speak_local,
         c.style,
         c.show_spots,
         c.braille,
@@ -453,6 +458,7 @@ mod tests {
             sample_interval_m: 12.5,
             route_play_speed_kmh: 55.0,
             voice_guide_enabled: true,
+            voice_speak_local: false,
             style: "satellite".to_string(),
             show_spots: false,
             braille: true,
@@ -739,6 +745,7 @@ profile = "custom-profile"
             sample_interval_m: 1.0,
             route_play_speed_kmh: 30.0,
             voice_guide_enabled: false,
+            voice_speak_local: true,
             style: "s".to_string(),
             show_spots: false,
             braille: false,

@@ -499,6 +499,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                         play = Some(d);
                         let (pla, plo) = roadtrace::point_at(&rt, d);
                         let (nx, ny) = deg_to_pixel(pla, plo, z); cx = nx; cy = ny;
+                        maybe_speak_turn(&cfg, &spec, &turn_points, &mut voice_guide, (pla, plo));
                     }
                 } else {
                     play = None; play_last_tick = None;
@@ -771,6 +772,12 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         // ステータス行の文面組み立ては ui_status.rs へ切り出し済み。通信中スピナーの判定に使う
         // 各ジョブは有無しか見ないのでここで1つのフラグに畳んでから渡す。
         let jobs_active = route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some() || wander_job.is_some();
+        // 次の曲がり角の画面表示。音声案内(maybe_speak_turn)と同じくturn_points+現在地から
+        // 求めるが、読み上げ済みかの状態は見ない(何度描画しても同じ内容を出したいため)。
+        let next_turn = spec.routes.last()
+            .and_then(|rt| route::progress_along_route((lat, lon), &rt.pts))
+            .and_then(|progress_m| voice::next_turn_display(&turn_points, progress_m))
+            .map(|(remaining, phrase)| format!("↳{}m {phrase} ", voice::round_to_50(remaining)));
         let status = ui_status::build_status_line(ui_status::StatusCtx {
             focus: &focus, save_confirm: &save_confirm, spot_move_confirm, spots: &spots,
             cur_cat: &cur_cat, pending_spot: pending_spot.is_some(), set_sel, poi_label: &poi_label,
@@ -779,7 +786,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             radar_on, radar_tl: &radar_tl, radar_idx, radar_follow,
             loader: &loader, rcx, rcy, rz, rw, rh,
             cfg: &cfg, traffic_points: &traffic_points, traffic_job_active: traffic_job.is_some(),
-            addr: &addr, wps: &wps, z, lat, lon,
+            addr: &addr, wps: &wps, z, lat, lon, next_turn: &next_turn,
         });
         let status = fit_cells(&status, cols as usize);
         write!(out, "\x1b[{};1H\x1b[7m{status}\x1b[0m", tr)?;
@@ -1288,6 +1295,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                         cfg.traffic_enabled = !cfg.traffic_enabled;
                                         if cfg.traffic_enabled { traffic_bbox = None; }
                                     }
+                                    23 => { cfg.voice_speak_local = !cfg.voice_speak_local; }
                                     _ => {}
                                 }
                             }
