@@ -8,7 +8,7 @@ pub(crate) enum MenuAction {
     SearchPlace, SearchPoi, ShowAddress, Recommend,                                    // 検索・移動
     RouteForm, AddVia, RoadRoute, ManageRoads, Wander, CycleMode, AltRoute, ClearRoute, // ルート作成(RouteForm=並べ替えを開く / AddVia=中心に地点を置く / ManageRoads=道路の塊を管理)
     ManageSpots, ToggleSpots,                                                          // スポット
-    ToggleElevation, StreetView, PlayRoute, ToggleGps, ToggleRadar,                    // ナビ・表示(ToggleRadar=雨雲レーダー)
+    ToggleElevation, StreetView, PlayRoute, ToggleGps, ToggleRadar, ViewCamera,        // ナビ・表示(ToggleRadar=雨雲レーダー/ViewCamera=道路ライブカメラ)
     SaveRoute, LoadRoute, SaveGpx, ShareQr,                                            // 保存・共有
     Settings, Help,                                                                    // 設定・ヘルプ
 }
@@ -43,6 +43,7 @@ pub(crate) const MENU_CATEGORIES: &[MenuCategory] = &[
         MenuItem { label: "ルートを再生",      key: 'A', action: MenuAction::PlayRoute },
         MenuItem { label: "ライブ現在地",      key: 'G', action: MenuAction::ToggleGps },
         MenuItem { label: "雨雲レーダー",      key: 'C', action: MenuAction::ToggleRadar },
+        MenuItem { label: "道路カメラを見る",  key: 'N', action: MenuAction::ViewCamera },
     ]},
     MenuCategory { label: "保存・共有", items: &[
         MenuItem { label: "ルートを保存",      key: 'S', action: MenuAction::SaveRoute },

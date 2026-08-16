@@ -50,9 +50,7 @@ mod traffic;
 // 通行規制(通行止め・車線規制等)。ui.rsへの配線は後続増分のため現時点では未wire。
 #[allow(dead_code)]
 mod regulation;
-// 道路ライブカメラ(road-info-prvs.mlit.go.jp)。ui.rsへの配線は後続増分のため現時点では未wire。
-#[allow(dead_code)]
-mod camera;
+mod camera; // 道路ライブカメラ(road-info-prvs.mlit.go.jp)。Nキーで中心近くのカメラの写真を表示
 
 use image::{RgbImage, RgbaImage, imageops::FilterType};
 

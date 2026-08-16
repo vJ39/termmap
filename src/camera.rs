@@ -18,6 +18,7 @@
 // gpslive.rs/radar.rs/traffic.rs/regulation.rsと同じ方針でstd+ureq+serde_jsonのみに依存し、
 // crate::を参照しない。
 
+use std::io::Read;
 use std::time::Duration;
 
 const HTML_BASE: &str = "https://www.road-info-prvs.mlit.go.jp/roadinfo/pc/pcImage_";
@@ -136,6 +137,18 @@ pub fn parse_cameras(html: &str) -> Vec<RoadCamera> {
         }
     }
     out
+}
+
+// カメラのフル画像(url=RoadCamera::full_url)をRgbImageとして取得する。
+pub fn fetch_image(url: &str) -> Result<image::RgbImage, String> {
+    let resp = ureq::get(url)
+        .set("User-Agent", USER_AGENT)
+        .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
+        .call()
+        .map_err(|e| format!("camera image: {e}"))?;
+    let mut buf = Vec::new();
+    resp.into_reader().read_to_end(&mut buf).map_err(|e| format!("camera image read: {e}"))?;
+    image::load_from_memory(&buf).map(|i| i.to_rgb8()).map_err(|e| format!("画像デコード: {e}"))
 }
 
 #[cfg(test)]

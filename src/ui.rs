@@ -133,6 +133,15 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     let mut traffic_job: Option<std::sync::mpsc::Receiver<Result<Vec<traffic::TrafficPoint>, String>>> = None;
     let mut traffic_last_fetch: Option<std::time::Instant> = None;
     let mut traffic_bbox: Option<(f64, f64, f64, f64)> = None; // 直近フェッチ範囲(lat_min,lon_min,lat_max,lon_max)
+    // 道路ライブカメラ(cfg.camera_enabled時のみ使う)。取得の間引き方はtraffic_*と同じ方針。
+    let mut camera_points: Vec<camera::RoadCamera> = Vec::new();
+    let mut camera_job: Option<std::sync::mpsc::Receiver<Vec<camera::RoadCamera>>> = None;
+    let mut camera_last_fetch: Option<std::time::Instant> = None;
+    let mut camera_bbox: Option<(f64, f64, f64, f64)> = None;
+    // Kキーで中心近くのカメラを選び、フル画像を取得して全画面表示する(実写Street Viewと同じ
+    // 早期returnパターン)。パン/ズームは無い(道路カメラは固定視点の1枚画像のため)。
+    let mut cam_view: Option<(RgbImage, camera::RoadCamera)> = None;
+    let mut cam_job: Option<std::sync::mpsc::Receiver<(camera::RoadCamera, Result<RgbImage, String>)>> = None;
     // ルート計算と同じ非同期パターンで、検索/周辺/実写/おすすめの通信もバックグラウンド化する。
     // 新規spawn時に古いrxはdropされる=最新のみ採用(generation ID不要)。
     let mut search_job: Option<std::sync::mpsc::Receiver<(String, String, Result<Vec<(f64, f64, String)>, String>)>> = None; // (ckey, query, geocode結果)
@@ -274,6 +283,30 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 }
             }
             MenuAction::ToggleRadar => { radar_toggle!(); } // 雨雲レーダー(地図の C キーと同じ)
+            MenuAction::ViewCamera => { // 道路ライブカメラ(地図の N キーと同じ)
+                if !cfg.camera_enabled { snd.play("error"); addr = "道路ライブカメラ: OFF(設定で有効化)".into(); }
+                else if camera_points.is_empty() { snd.play("error"); addr = "道路ライブカメラ: 周辺に無し".into(); }
+                else {
+                    let nearest = camera_points.iter()
+                        .min_by(|a, b| {
+                            let da = (a.lat - $lat).powi(2) + (a.lon - $lon).powi(2);
+                            let db = (b.lat - $lat).powi(2) + (b.lon - $lon).powi(2);
+                            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                        .cloned();
+                    match nearest.and_then(|c| c.full_url.clone().map(|u| (c, u))) {
+                        Some((c, url)) => {
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            std::thread::spawn(move || {
+                                let r = camera::fetch_image(&url);
+                                let _ = tx.send((c, r));
+                            });
+                            cam_job = Some(rx);
+                        }
+                        None => { snd.play("error"); addr = "道路ライブカメラ: 画像URL無し".into(); }
+                    }
+                }
+            }
             MenuAction::SaveRoute => { input_cur = route_name_hint.chars().count(); focus = Focus::SaveName(route_name_hint.clone()); }
             MenuAction::LoadRoute => { route_names = list_named_routes(); rn_sel = 0; if route_names.is_empty() { addr = "お気に入り無し".into(); } else { focus = Focus::RouteList; } }
             MenuAction::SaveGpx => match spec.routes.last() {
@@ -431,6 +464,42 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 }
             }
             force_reemit = true; // 実写で全画面を覆った→地図に戻ったら画像を再emit
+            continue;
+        }
+        if cam_view.is_some() { // 道路ライブカメラの写真を全画面表示。streetと同じ早期returnパターン
+            // 道路カメラは固定視点の1枚画像なのでstreetと違いパン/ズームは無い(Esc/qで戻るのみ)。
+            { // 描画(不変借用のスコープ)
+                let (img, cam) = cam_view.as_ref().unwrap();
+                if cfg.image_mode && image_capable() {
+                    let _ = write!(out, "\x1b[H");
+                    let _ = emit_iterm2_image(&mut out, img, cols, map_rows);
+                } else {
+                    let rs = image::imageops::resize(img, cols.max(10), map_rows * 2, FilterType::Triangle);
+                    let art = render_halfblock(&rs, truecolor_safe());
+                    let cam_lines: Vec<&str> = art.split("\r\n").collect();
+                    let _ = write!(out, "\x1b[H");
+                    for i in 0..map_rows as usize {
+                        let ln = cam_lines.get(i).copied().unwrap_or("");
+                        let _ = write!(out, "\x1b[{};1H{}\x1b[K", i + 1, ln);
+                    }
+                }
+                let st = fit_cells_scroll(&format!(" 道路カメラ {}({})  Esc/q戻る  {:.4},{:.4} ", cam.name, cam.taken_at, cam.lat, cam.lon), cols as usize, spin);
+                let _ = write!(out, "\x1b[{};1H\x1b[7m{st}\x1b[0m\x1b[K", tr);
+                let _ = out.flush();
+            }
+            if let Event::Key(k) = event::read()? {
+                match k.code {
+                    KeyCode::Esc | KeyCode::Char('q') => cam_view = None,
+                    KeyCode::Char('I') => { // 表示中も画像モードON/OFFを切替できるように(Map focusと同じキー)
+                        cfg.image_mode = !cfg.image_mode;
+                        addr = if cfg.image_mode {
+                            if image_capable() { "実画像モード: ON".into() } else { "実画像モード: ON(この端末は非対応・AA継続)".into() }
+                        } else { "実画像モード: OFF".into() };
+                    }
+                    _ => {}
+                }
+            }
+            force_reemit = true;
             continue;
         }
         // 標高プロファイル帯を出すぶん地図の行数を減らす(E)
@@ -707,6 +776,14 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             draw_ring(&mut ov, ix, iy, 3, color, 3);
                         }
                     }
+                    if cfg.camera_enabled { // 道路ライブカメラ(紫系。Kで中心近くのカメラの写真を表示)
+                        for c in &camera_points {
+                            let (gx, gy) = deg_to_pixel(c.lat, c.lon, rz);
+                            let ix = (gx - (rcx - rw as f64 / 2.0)).floor() as i32;
+                            let iy = (gy - (rcy - rh as f64 / 2.0)).floor() as i32;
+                            draw_ring(&mut ov, ix, iy, 3, [170, 90, 220], 2);
+                        }
+                    }
                     last_map_sig = map_sig; // このsigで描いた内容がこのフレームでemitされる
                     if img_inline {
                         // 実画像モード: 取得画像に overlay を焼き込んで保持し、AA文字列は空にする。
@@ -771,7 +848,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         }
         // ステータス行の文面組み立ては ui_status.rs へ切り出し済み。通信中スピナーの判定に使う
         // 各ジョブは有無しか見ないのでここで1つのフラグに畳んでから渡す。
-        let jobs_active = route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some() || wander_job.is_some();
+        let jobs_active = route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || cam_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some() || wander_job.is_some();
         // 次の曲がり角の画面表示。音声案内(maybe_speak_turn)と同じくturn_points+現在地から
         // 求めるが、読み上げ済みかの状態は見ない(何度描画しても同じ内容を出したいため)。
         let next_turn = spec.routes.last()
@@ -786,6 +863,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             radar_on, radar_tl: &radar_tl, radar_idx, radar_follow,
             loader: &loader, rcx, rcy, rz, rw, rh,
             cfg: &cfg, traffic_points: &traffic_points, traffic_job_active: traffic_job.is_some(),
+            camera_points: &camera_points, camera_job_active: camera_job.is_some(),
             addr: &addr, wps: &wps, z, lat, lon, next_turn: &next_turn,
         });
         let status = fit_cells_scroll(&status, cols as usize, spin);
@@ -878,6 +956,43 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 Ok(Err(_e)) => { traffic_job = None; } // 失敗時は前回の点をそのまま表示継続
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => { traffic_job = None; }
+            }
+        }
+        // 道路ライブカメラ: traffic_*と同じ間引き方針(視野が範囲外に出たら即時、それ以外は90秒毎)。
+        if cfg.camera_enabled && camera_job.is_none() {
+            const MARGIN_PX: f64 = 900.0;
+            const REFRESH: std::time::Duration = std::time::Duration::from_secs(90);
+            let (lat_max, lon_min) = pixel_to_deg(cx - MARGIN_PX, cy - MARGIN_PX, z);
+            let (lat_min, lon_max) = pixel_to_deg(cx + MARGIN_PX, cy + MARGIN_PX, z);
+            let out_of_bbox = match camera_bbox {
+                Some((blat_min, blon_min, blat_max, blon_max)) => {
+                    let (clat, clon) = pixel_to_deg(cx, cy, z);
+                    clat < blat_min || clat > blat_max || clon < blon_min || clon > blon_max
+                }
+                None => true,
+            };
+            let stale = camera_last_fetch.map_or(true, |t| t.elapsed() >= REFRESH);
+            if out_of_bbox || stale {
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || { let _ = tx.send(camera::fetch_cameras(lat_min, lon_min, lat_max, lon_max)); });
+                camera_job = Some(rx);
+                camera_bbox = Some((lat_min, lon_min, lat_max, lon_max));
+                camera_last_fetch = Some(std::time::Instant::now());
+            }
+        }
+        if let Some(job) = &camera_job {
+            match job.try_recv() {
+                Ok(pts) => { camera_points = pts; camera_job = None; }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => { camera_job = None; }
+            }
+        }
+        if let Some(job) = &cam_job {
+            match job.try_recv() {
+                Ok((c, Ok(img))) => { cam_view = Some((img, c)); cam_job = None; }
+                Ok((_, Err(e))) => { addr = format!("カメラ画像取得失敗: {e}"); cam_job = None; }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => { cam_job = None; }
             }
         }
         if search_job.is_some() {
@@ -1052,8 +1167,9 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         // is_busy()に加えgenerationのスナップショット比較も見る(#53): このフレームの再構築後、
         // is_busy()を読むまでの間に最後の1枚がちょうど着地しinflightが空になっていた場合、
         // is_busy()だけではその1枚の反映漏れを検知できずread()でブロックしてしまうため。
-        let polling = route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some() || wander_job.is_some() || gps_rx.is_some() || play.is_some() || settling || loader.is_busy() || loader.generation() != loader_gen_snapshot
-            || radar_clock.is_some(); // 雨雲: 背景ポーラーからの時刻一覧を取りこぼさない
+        let polling = route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || cam_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some() || wander_job.is_some() || gps_rx.is_some() || play.is_some() || settling || loader.is_busy() || loader.generation() != loader_gen_snapshot
+            || radar_clock.is_some() // 雨雲: 背景ポーラーからの時刻一覧を取りこぼさない
+            || traffic_job.is_some() || camera_job.is_some(); // 道路交通量/ライブカメラの背景取得完了を、キー入力無しでも取りこぼさない(結果が最大60秒(IDLE_SAVE_INTERVAL)反映されない事故を防ぐ)
         let mut ev: Option<Event> = if got_result {
             None
         } else if polling {
@@ -1089,10 +1205,10 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             None => {} // 再描画のみ(計算待ち)
             Some(Event::Key(k)) if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) => {
                 // Ctrl-C: 進行中の全ジョブを中断(アプリは終了しない)
-                let any = route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some() || wander_job.is_some();
+                let any = route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || cam_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some() || wander_job.is_some();
                 if any {
                     if route_job.is_some() { route_note = Some("中断".to_string()); }
-                    route_job = None; search_job = None; near_job = None; street_job = None; recommend_job = None; road_job = None; catpoi_job = None; wander_job = None;
+                    route_job = None; search_job = None; near_job = None; street_job = None; cam_job = None; recommend_job = None; road_job = None; catpoi_job = None; wander_job = None;
                     addr = "中断".into();
                 }
             }
@@ -1138,9 +1254,9 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             }
             // Map表示中のEscは進行中ジョブの中断に使う(サブ画面のEscは各Focusの取消のまま)
             Some(Event::Key(k)) if k.code == KeyCode::Esc && matches!(focus, Focus::Map)
-                && (route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some() || wander_job.is_some()) => {
+                && (route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || cam_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some() || wander_job.is_some()) => {
                 if route_job.is_some() { route_note = Some("中断".to_string()); }
-                route_job = None; search_job = None; near_job = None; street_job = None; recommend_job = None; road_job = None; catpoi_job = None; wander_job = None;
+                route_job = None; search_job = None; near_job = None; street_job = None; cam_job = None; recommend_job = None; road_job = None; catpoi_job = None; wander_job = None;
                 addr = "中断".into();
             }
             Some(Event::Key(k)) => {
@@ -1296,6 +1412,10 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                         if cfg.traffic_enabled { traffic_bbox = None; }
                                     }
                                     23 => { cfg.voice_speak_local = !cfg.voice_speak_local; }
+                                    24 => { // 道路ライブカメラ: ONにした時、次のポーリングで即座に取得されるようbboxをクリア
+                                        cfg.camera_enabled = !cfg.camera_enabled;
+                                        if cfg.camera_enabled { camera_bbox = None; }
+                                    }
                                     _ => {}
                                 }
                             }
@@ -2048,6 +2168,8 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                     if image_capable() { "実画像モード: ON".into() } else { "実画像モード: ON(この端末は非対応・AA継続)".into() }
                                 } else { "実画像モード: OFF".into() };
                             }
+                            // キー選定: C/K/L/V/P/I等の自然な字は全て他機能で使用済みのため空いている'N'を割当
+                            KeyCode::Char('N') => run_action!(MenuAction::ViewCamera, lat, lon, cols, tr),
                             KeyCode::Char('n') => { // BRouter の代替ルート候補を巡回
                                 if wps.len() >= 2 {
                                     route_alt = (route_alt + 1) % 4;
