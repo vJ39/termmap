@@ -144,6 +144,22 @@
 
   // ルート音声案内(Rust側 voice.rs の speak_web)。OSC 9998 の payload は base64(UTF-8の日本語文)。
   // Web Speech API で読み上げる。非対応環境(speechSynthesis無し等)は無害に無視する。
+  //
+  // iOS Safari等は「ユーザー操作のコールスタック外」からspeechSynthesis.speak()を初めて呼ぶと、
+  // キューに積まれるだけで実際には発声されない(無音)既知の制約がある。OSCハンドラ経由の呼び出しは
+  // タップの直接のコールスタックではないため、これに引っかかりうる。最初のタッチ/クリックのタイミングで
+  // 無音(volume=0)の発話を1回投げてロックを解いておく。
+  var voiceUnlocked = false;
+  function unlockSpeechSynthesisOnce() {
+    if (voiceUnlocked || !window.speechSynthesis || typeof window.SpeechSynthesisUtterance !== 'function') { return; }
+    voiceUnlocked = true;
+    try {
+      var u = new SpeechSynthesisUtterance(' ');
+      u.volume = 0;
+      window.speechSynthesis.speak(u);
+    } catch (e) { /* 非対応環境は無視 */ }
+  }
+
   function speakVoiceGuide(b64) {
     if (!window.speechSynthesis || typeof window.SpeechSynthesisUtterance !== 'function') { return; }
     var text;
@@ -170,6 +186,16 @@
         }
       }, ms);
     });
+    // ChromeはspeechSynthesisが約15秒で内部停止し、以降speak()してもキューされたまま
+    // 発声されなくなる既知のバグがある(Bug#679437ほか)。定期的にpause/resumeし直して詰まりを防ぐ。
+    if (window.speechSynthesis) {
+      setInterval(function () {
+        if (window.speechSynthesis.speaking) {
+          window.speechSynthesis.pause();
+          window.speechSynthesis.resume();
+        }
+      }, 5000);
+    }
   }
 
   // termmapの実画像モード(iTerm2インラインイメージ・OSC 1337)をブラウザでも描画する。
@@ -462,6 +488,7 @@
       e.preventDefault();
       e.stopPropagation();
       sawTouch = true;
+      unlockSpeechSynthesisOnce(); // 最初のタッチでspeechSynthesisのロックを解いておく
       stopGlide(); // 新しい操作が始まったら前の慣性は打ち切る
       if (e.touches.length === 2) {
         gesture = null; panLast = null;
@@ -511,6 +538,7 @@
     // マウス(PCブラウザでの動作確認用。タッチが一度でも来たら無効化する)
     document.addEventListener('mousedown', function (e) {
       if (sawTouch || !inTerminal(e.target)) { return; }
+      unlockSpeechSynthesisOnce(); // 最初のクリックでspeechSynthesisのロックを解いておく(PC確認用)
       stopGlide();
       gesture = { x: e.clientX, y: e.clientY, t: Date.now() };
       panLast = { x: e.clientX, y: e.clientY };
