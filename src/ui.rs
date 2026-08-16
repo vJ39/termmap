@@ -66,6 +66,24 @@ fn radar_refresh_secs(cfg: &config::Config) -> u64 {
     if s.is_finite() && s >= 1.0 { s as u64 } else { RADAR_REFRESH_SECS }
 }
 
+// GPS位置(Mac本体のGキー経由/スマホの📍ボタン経由のどちらでもよい)を1件取り込むたびに呼ぶ。
+// 曲がり角の残り距離が閾値を切っていれば読み上げる。ルート未確定/音声案内OFF/曲がり角取得前
+// (turn_job待ち)は何もしない(=呼び出し側で毎回呼んでも無害)。
+fn maybe_speak_turn(cfg: &config::Config, spec: &render::OverlaySpec, turn_points: &[route::TurnPoint], voice_guide: &mut Option<voice::VoiceGuide>, pos: (f64, f64)) {
+    if !cfg.voice_guide_enabled || turn_points.is_empty() {
+        return;
+    }
+    let Some(guide) = voice_guide else { return };
+    if !guide.matches_len(turn_points) {
+        return; // ルート更新直後の一時的なズレ。turn_job完了でvoice_guideが作り直されるまで待つ
+    }
+    let Some(pts) = spec.routes.last().map(|rt| &rt.pts) else { return };
+    let Some(progress_m) = route::progress_along_route(pos, pts) else { return };
+    if let Some(phrase) = guide.tick(turn_points, progress_m) {
+        voice::speak(&phrase);
+    }
+}
+
 // ---- 対話モード (crossterm) ----
 // 端末状態を RAII で復元する。パニック/早期return でも Drop で raw mode と代替スクリーンを必ず戻す。
 struct TermGuard;
@@ -173,6 +191,12 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         let (n_, j_) = trigger_route(&mut spec, &wps, &pois, &mode, 0, &cfg.google_maps_api_key);
         (n_, j_)
     };
+    // ルート音声案内(cfg.voice_guide_enabled時のみ使う)。曲がり角一覧はルートが決まる
+    // (route_jobが完了する)たびに背景取得し直す。voice_guideはturn_pointsと対で持ち、
+    // ルートが変わったら作り直す(VoiceGuide::matches_lenで長さ不一致を検知)。
+    let mut turn_points: Vec<route::TurnPoint> = Vec::new();
+    let mut turn_job: Option<route::TurnRx> = None;
+    let mut voice_guide: Option<voice::VoiceGuide> = None;
     // ルート計算と同じ非同期パターンで、検索/周辺/実写/おすすめの通信もバックグラウンド化する。
     // 新規spawn時に古いrxはdropされる=最新のみ採用(generation ID不要)。
     let mut search_job: Option<std::sync::mpsc::Receiver<(String, String, Result<Vec<(f64, f64, String)>, String>)>> = None; // (ckey, query, geocode結果)
@@ -496,6 +520,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 gps_trail.push((la, lo));
                 if gps_trail.len() > 300 { gps_trail.remove(0); }
                 let (nx, ny) = deg_to_pixel(la, lo, z); cx = nx; cy = ny;
+                maybe_speak_turn(&cfg, &spec, &turn_points, &mut voice_guide, (la, lo));
             }
         }
         let img_inline = cfg.image_mode && image_capable(); // 実画像モード(iTerm2系端末のみ)。play処理より先に要る
@@ -1294,12 +1319,26 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     route_ascend = r.ascend_m;
                     let tile_coords = geo::route_tile_coords(&r.pts, z);
                     loader.request_route_tiles(&opts.style, z, &tile_coords);
+                    // ルートが変わった(=曲がり角も変わりうる)ので、音声案内の状態は一旦捨てる。
+                    // 取得は ON にした人だけがBRouterへ追加問い合わせする(既定OFF)。
+                    turn_points = Vec::new();
+                    voice_guide = None;
+                    if cfg.voice_guide_enabled {
+                        turn_job = Some(trigger_turn_points(&wps, &mode, 0, &r.pts));
+                    }
                     spec.routes.push(Route { pts: r.pts, color: [0, 220, 255], thickness: 2 });
                     route_job = None; got_result = true;
                 }
                 Ok(Err(e)) => { route_note = Some(format!("({e})")); route_job = None; got_result = true; }
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => { route_job = None; got_result = true; }
+            }
+        }
+        if turn_job.is_some() {
+            match turn_job.as_ref().unwrap().try_recv() {
+                Ok(v) => { turn_points = v; voice_guide = Some(voice::VoiceGuide::new(&turn_points)); turn_job = None; }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => { turn_job = None; }
             }
         }
         if search_job.is_some() {
@@ -1698,6 +1737,14 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                     19 => { // 雨雲レーダー: 起動時の既定を切り替え、いま表示中の地図にも即反映する
                                         cfg.radar_enabled = !cfg.radar_enabled;
                                         if cfg.radar_enabled != radar_on { radar_toggle!(); }
+                                    }
+                                    21 => { // ルート音声案内: ONにした時、既にルートがあれば曲がり角を取りに行く
+                                        cfg.voice_guide_enabled = !cfg.voice_guide_enabled;
+                                        if cfg.voice_guide_enabled {
+                                            if let Some(pts) = spec.routes.last().map(|rt| rt.pts.clone()) {
+                                                turn_job = Some(trigger_turn_points(&wps, &mode, 0, &pts));
+                                            }
+                                        }
                                     }
                                     _ => {}
                                 }
@@ -2515,6 +2562,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             gps_pos = Some((la, lo));
                             gps_trail.push((la, lo));
                             if gps_trail.len() > 300 { gps_trail.remove(0); }
+                            maybe_speak_turn(&cfg, &spec, &turn_points, &mut voice_guide, (la, lo));
                         }
                     }
                 }

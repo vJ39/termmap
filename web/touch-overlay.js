@@ -142,6 +142,36 @@
     });
   }
 
+  // ルート音声案内(Rust側 voice.rs の speak_web)。OSC 9998 の payload は base64(UTF-8の日本語文)。
+  // Web Speech API で読み上げる。非対応環境(speechSynthesis無し等)は無害に無視する。
+  function speakVoiceGuide(b64) {
+    if (!window.speechSynthesis || typeof window.SpeechSynthesisUtterance !== 'function') { return; }
+    var text;
+    try {
+      var bin = atob(b64);
+      var bytes = new Uint8Array(bin.length);
+      for (var i = 0; i < bin.length; i++) { bytes[i] = bin.charCodeAt(i); }
+      text = new TextDecoder('utf-8').decode(bytes);
+    } catch (e) { return; } // base64/UTF-8デコード失敗は諦める
+    try {
+      var u = new SpeechSynthesisUtterance(text);
+      u.lang = 'ja-JP';
+      window.speechSynthesis.speak(u);
+    } catch (e) { /* 非対応環境は無視 */ }
+  }
+
+  function bindVoiceGuideOsc() {
+    [0, 100, 300, 700, 1500].forEach(function (ms) {
+      setTimeout(function () {
+        var t = window.term;
+        if (t && !t.__termmapVoiceBound && typeof t.registerOscHandler === 'function') {
+          t.__termmapVoiceBound = true;
+          t.registerOscHandler(9998, function (data) { speakVoiceGuide(data); return true; });
+        }
+      }, ms);
+    });
+  }
+
   // termmapの実画像モード(iTerm2インラインイメージ・OSC 1337)をブラウザでも描画する。
   // ttyd同梱のxterm.jsには本家 @xterm/addon-image のコード自体は入っているが、ttyd側の
   // 初期化スクリプトがloadAddon()していないため何もしない状態だった。web/vendor/配下に
@@ -662,6 +692,7 @@
     buildBar();
     bindGestures();
     bindSoundOsc();
+    bindVoiceGuideOsc();
     bindImageAddon();
     refit();
   }
@@ -683,6 +714,7 @@
     toggleKeyboard: toggleKeyboard,
     toggleWebGps: toggleWebGps,
     bindImageAddon: bindImageAddon,
+    speakVoiceGuide: speakVoiceGuide,
     keys: KEYS,
     findTextarea: findTextarea
   };

@@ -49,6 +49,7 @@ Linux(x86_64)は `--target x86_64-unknown-linux-musl` でのクロスコンパ�
 - **標高プロファイル・ルート再生・ライブ現在地**: 確定ルートの高低差表示、プレビュー走行アニメ、CoreLocationCLI経由の現在地トラッキング
 - **実写(Street View)**: 中心地点の実写を全画面表示(要 Google APIキー)
 - **雨雲レーダー**: 気象庁ナウキャストの降水を地図に半透明で重ねる(`C`)。`<` `>` で表示時刻を過去〜未来へ動かせる(直近60分は5分刻み、それより先は降水短時間予報で最大+15時間まで1時間刻み)ので、走る前に雨雲の抜けるタイミングを見られる
+- **ルート音声案内**: 設定画面でONにすると、確定ルートの曲がり角へ300m手前/直前の2段階で読み上げ案内する(BRouterのturnInstructionModeから取得)。実行環境がmacOSローカルならsayコマンド、web(ttyd)経由ならブラウザのWeb Speech APIで読み上げる
 - **QR共有**: ルートをGoogleマップ経路URL化し、端末にQRコードを表示してスマホで開ける
 - **2階層Spaceメニュー**: 全操作をキー無しでも選べる(カテゴリ→項目)。熟練者は各項目のキーを直打ちしてもよい
 - **設定画面**: 描画スタイル・ルート既定・APIキー等を実行中に切り替え、`config.toml` へ保存できる
@@ -66,6 +67,7 @@ command = "claude"
 [route]
 profile = "car-fast"
 sample_interval_m = 800.0
+voice_guide_enabled = false
 
 [display]
 style = "osm"
@@ -91,6 +93,7 @@ refresh_sec = 300
 - `[radar] enabled`: 起動時に雨雲レーダーをONにするか。既定 `false`(`C` を押した人だけが気象庁へ問い合わせる)
 - `[radar] opacity`: 雨雲の濃さ `light`(0.35) / `mid`(0.55) / `strong`(0.75)
 - `[radar] refresh_sec`: フレーム時刻一覧(targetTimes)の再取得間隔(秒)。既定300(ナウキャスト自体が5分更新なのでこれより短くしても新しい情報は無い)。設定画面には出さない。下限60秒
+- `[route] voice_guide_enabled`: ルート音声案内(曲がり角の読み上げ)をONにするか。既定 `false`(ONにした人だけがBRouterへ曲がり角情報を追加問い合わせする)
 - 旧スキーマ `[streetview] api_key` は後方互換で読める(`[google] maps_api_key` が空のときのみ採用)
 - 未設定でも動く。地名検索は Nominatim のみに、実写は「APIキー未設定」表示になる
 

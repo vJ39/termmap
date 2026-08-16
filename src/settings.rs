@@ -35,7 +35,7 @@ pub(crate) const CHOICES: &[SettingChoice] = &[
 
 // 設定画面の項目行数(アコーディオン未展開時)。ui.rs のカーソル下移動の上限がこれを参照する。
 // settings_rows() が返す行数と必ず一致すること(下の回帰テスト settings_row_count_matches_rows で固定)。
-pub(crate) const SETTINGS_ROW_COUNT: usize = 21;
+pub(crate) const SETTINGS_ROW_COUNT: usize = 22;
 
 fn choice_for(idx: usize) -> Option<&'static SettingChoice> { CHOICES.iter().find(|c| c.idx == idx) }
 
@@ -108,8 +108,9 @@ pub(crate) fn setting_description(idx: usize) -> &'static str {
         15 => "オンボーディング: 毎回表示/非表示を切替(dキーでも次回から非表示にできる)",
         16 => "中心十字の色: 地図中心のクロスヘアの色。Enterで一覧を開いて選択(spots.rsの配色から選択)",
         18 => "QR表示方式: スマホ共有QRの表示方法。Enterで一覧を開いて選択(標準=文字描画・全端末対応 / 画像(小型)=iTerm2等のインライン画像でモジュール数に関係なく小さく表示。画像非対応端末では自動的に標準へフォールバック)",
-        19 => "雨雲レーダー: 気象庁ナウキャストの降水を地図に重ねる。ここでのON/OFFは起動時の既定にもなる(Cキーでも切替・< > で表示時刻を過去〜+60分に移動)",
+        19 => "雨雲レーダー: 気象庁ナウキャストの降水を地図に重ねる。ここでのON/OFFは起動時の既定にもなる(Cキーでも切替・< > で表示時刻を過去〜未来(直近60分は5分刻み、それより先は降水短時間予報で最大+15時間まで1時間刻み)に移動)",
         20 => "雨雲の濃さ: 重ねる強さ。Enterで一覧を開いて選択(薄い=地図優先 / 標準 / 濃い=雨優先)",
+        21 => "ルート音声案内: 曲がり角の300m手前/直前でmacOSの読み上げ(sayコマンド)またはブラウザの読み上げで案内する。ONにした人だけがBRouterへ追加問い合わせする",
         _ => "Google APIキー: 検索(Geocoding)とStreet View共通。Enterで入力欄を開く(Cmd+V貼付も可)。環境変数TERMMAP_GOOGLE_API_KEYでも可",
     }
 }
@@ -150,6 +151,7 @@ pub(crate) fn settings_rows(opts: &Args, cfg: &Config, picking: Option<usize>, o
         format!("{} QR表示方式 {}", arrow(18), match cfg.qr_style.as_str() { "image" => "画像(小型)", _ => "標準" }),
         format!("雨雲レーダー {}", onoff(cfg.radar_enabled)),
         format!("{} 雨雲の濃さ {}", arrow(20), match cfg.radar_opacity.as_str() { "light" => "薄い", "strong" => "濃い", _ => "標準" }),
+        format!("ルート音声案内 {}", onoff(cfg.voice_guide_enabled)),
     ];
     debug_assert_eq!(its.len(), SETTINGS_ROW_COUNT, "SETTINGS_ROW_COUNT と行数がずれている");
     // アコーディオン展開: 選択中の項目がpickable(3択以上)ならその直下に候補をインデント挿入し、他行を押し下げる

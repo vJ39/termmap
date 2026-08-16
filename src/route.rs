@@ -186,6 +186,155 @@ fn fetch_route_once(wps: &[(f64, f64)], profile: &str, alt: u32) -> Result<Route
     Ok(RouteResult { pts, ele, dist_m, time_s, hw_m, ascend_m, via_google: false })
 }
 
+// ---- 曲がり角(ターンバイターン音声案内用) ----
+//
+// BRouterは format=geojson だと曲がり角情報を返さないが、format=gpx に
+// turnInstructionMode=3 を付けると <rtept> ごとに <turn>コード</turn>(TL/TR/TSLL/TSLR/
+// TSHL/TSHR/KL/KR/C/TU等)と <turn-angle> が入った出力になる(実測確認済み)。start/destination
+// にはturnタグが無く <desc>start</desc>/<desc>destination</desc> だけが入る。
+// 座標系はgeojson版と同じ経路なので、pts(既存取得済みのポリライン)へ最近傍投影して
+// 「ルート起点からの累積距離」を求め、音声案内側は距離だけで残り時間を判断できるようにする。
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TurnPoint {
+    pub lat: f64,
+    pub lon: f64,
+    pub turn: String, // BRouterのコード、または到着を表す "ARRIVE"(自前の印)
+    pub dist_from_start_m: f64,
+}
+
+// trigger_route(RouteRx)と同じ非ブロッキング方針。バックグラウンドスレッドで取得し、
+// 受信チャネルをUIループ側でポーリングする。
+pub type TurnRx = std::sync::mpsc::Receiver<Vec<TurnPoint>>;
+pub fn trigger_turn_points(wps: &[(f64, f64)], mode: &str, alt: u32, pts: &[(f64, f64)]) -> TurnRx {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (w, m, p) = (wps.to_vec(), mode.to_string(), pts.to_vec());
+    std::thread::spawn(move || { let _ = tx.send(fetch_turn_points(&w, &m, alt, &p)); });
+    rx
+}
+
+// 失敗しても呼び出し側は「曲がり案内なし」に静かにフォールバックできるよう常にVecを返す
+// (ルート自体の表示は既存のgeojson取得に依存しており、こちらの失敗で壊さない)。
+pub fn fetch_turn_points(wps: &[(f64, f64)], mode: &str, alt: u32, pts: &[(f64, f64)]) -> Vec<TurnPoint> {
+    if wps.len() < 2 || pts.is_empty() {
+        return Vec::new();
+    }
+    let alt = alt.min(3);
+    let profile = route_profile(mode);
+    let lonlats = wps.iter().map(|(la, lo)| format!("{lo},{la}")).collect::<Vec<_>>().join("|");
+    let url = format!("https://brouter.de/brouter?lonlats={lonlats}&profile={profile}&alternativeidx={alt}&format=gpx&turnInstructionMode=3");
+    let body = match ureq::get(&url)
+        .set("User-Agent", "termmap/0.1 (personal experiment)")
+        .timeout(std::time::Duration::from_secs(20))
+        .call()
+    {
+        Ok(r) => match r.into_string() {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        },
+        Err(_) => return Vec::new(),
+    };
+    turn_points_from_gpx(&body, pts)
+}
+
+// GPX本文 → TurnPoint一覧。ネットワークに触れない純関数(テスト容易性のためfetch_turn_pointsから分離)。
+fn turn_points_from_gpx(body: &str, pts: &[(f64, f64)]) -> Vec<TurnPoint> {
+    let cum = cumulative_distances_m(pts);
+    parse_gpx_turnpoints(body)
+        .into_iter()
+        .filter_map(|(lat, lon, desc, turn)| {
+            let turn = if desc == "start" {
+                return None; // 出発点は案内不要
+            } else if desc == "destination" {
+                "ARRIVE".to_string()
+            } else if turn.is_empty() {
+                return None; // 想定外(コード無し)は黙ってスキップ
+            } else {
+                turn
+            };
+            let dist_from_start_m = project_onto_route((lat, lon), pts, &cum)?;
+            Some(TurnPoint { lat, lon, turn, dist_from_start_m })
+        })
+        .collect()
+}
+
+// <rtept lat=".." lon="..">...<desc>..</desc>...<turn>..</turn>...</rtept> を抜き出す。
+// 一般XMLパーサではなく、BRouterが実際に出す構造だけを対象にした最小限の手書きスキャナ
+// (依存追加なし。config.tomlの自前パーサと同じ方針)。
+fn parse_gpx_turnpoints(body: &str) -> Vec<(f64, f64, String, String)> {
+    let mut out = Vec::new();
+    let mut rest = body;
+    while let Some(start) = rest.find("<rtept ") {
+        rest = &rest[start..];
+        let Some(tag_end) = rest.find('>') else { break };
+        let (lat, lon) = {
+            let tag = &rest[..tag_end];
+            (xml_attr(tag, "lat").and_then(|s| s.parse::<f64>().ok()), xml_attr(tag, "lon").and_then(|s| s.parse::<f64>().ok()))
+        };
+        let Some(block_end) = rest.find("</rtept>") else { break };
+        let block = &rest[tag_end..block_end];
+        let desc = xml_tag(block, "desc").unwrap_or_default();
+        let turn = xml_tag(block, "turn").unwrap_or_default();
+        if let (Some(la), Some(lo)) = (lat, lon) {
+            out.push((la, lo, desc, turn));
+        }
+        rest = &rest[block_end + "</rtept>".len()..];
+    }
+    out
+}
+
+fn xml_attr(tag: &str, name: &str) -> Option<String> {
+    let needle = format!("{name}=\"");
+    let i = tag.find(&needle)? + needle.len();
+    let j = tag[i..].find('"')?;
+    Some(tag[i..i + j].to_string())
+}
+
+fn xml_tag(block: &str, name: &str) -> Option<String> {
+    let open = format!("<{name}>");
+    let close = format!("</{name}>");
+    let i = block.find(&open)? + open.len();
+    let j = block[i..].find(&close)?;
+    Some(block[i..i + j].to_string())
+}
+
+// pts(ルートのポリライン)に沿った、各点の起点からの累積距離(メートル)。pts と同じ長さ。
+fn cumulative_distances_m(pts: &[(f64, f64)]) -> Vec<f64> {
+    let mut acc = Vec::with_capacity(pts.len());
+    let mut d = 0.0;
+    for i in 0..pts.len() {
+        if i > 0 {
+            d += crate::geo::haversine_km(pts[i - 1], pts[i]) * 1000.0;
+        }
+        acc.push(d);
+    }
+    acc
+}
+
+// 現在地(lat,lon)をルートのポリラインへ投影し、起点からの進捗距離(メートル)を返す。
+// voice::VoiceGuide::tick に渡す progress_m はこれで求める(TurnPoint.dist_from_start_mと
+// 同じ物差し=同じcumulative_distances_m/project_onto_routeを使うので、直接比較できる)。
+pub fn progress_along_route(pos: (f64, f64), pts: &[(f64, f64)]) -> Option<f64> {
+    if pts.is_empty() {
+        return None;
+    }
+    let cum = cumulative_distances_m(pts);
+    project_onto_route(pos, pts, &cum)
+}
+
+// 曲がり角(lat,lon)を pts 上の最近傍点に投影し、その点の累積距離を返す。
+fn project_onto_route(pt: (f64, f64), pts: &[(f64, f64)], cum: &[f64]) -> Option<f64> {
+    let mut best_i = 0usize;
+    let mut best_d = f64::MAX;
+    for (i, p) in pts.iter().enumerate() {
+        let d = crate::geo::haversine_km(pt, *p);
+        if d < best_d {
+            best_d = d;
+            best_i = i;
+        }
+    }
+    cum.get(best_i).copied()
+}
+
 // Google Directions API(旧・レガシー版、Routes APIではない)でのフォールバック取得。
 // BRouterが失敗した時だけ最終手段として呼ばれる。標高データは提供されないため ele は空Vec、
 // 高速区間の判定手段が無いため hw_m は 0.0(料金概算は出ない=呼び出し側で自然にスキップされる)。
@@ -423,5 +572,73 @@ mod tests {
         let old = r#"{"pts":[],"ele":[],"dist_m":0.0,"time_s":0.0,"hw_m":0.0,"ascend_m":0.0}"#;
         let r: RouteResult = serde_json::from_str(old).expect("旧JSONが読めること");
         assert!(!r.via_google);
+    }
+
+    // ---- 曲がり角(ターンバイターン) ----
+
+    // 実際の BRouter format=gpx&turnInstructionMode=3 応答の抜粋(2026/08/16 実測、要約)。
+    const GPX_TURNS_SAMPLE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<gpx>
+<rte>
+ <rtept lat="35.681006" lon="139.765553">
+   <desc>start</desc>
+   <extensions><time>21</time><offset>0</offset></extensions>
+ </rtept>
+ <rtept lat="35.680748" lon="139.765058">
+   <desc>left</desc>
+   <extensions><time>13</time><turn>TL</turn><turn-angle>-78</turn-angle><offset>11</offset></extensions>
+ </rtept>
+ <rtept lat="35.658316" lon="139.745120">
+   <desc>destination</desc>
+   <extensions><time>0</time><offset>137</offset></extensions>
+ </rtept>
+</rte>
+</gpx>"#;
+
+    #[test]
+    fn parse_gpx_turnpoints_extracts_desc_and_turn() {
+        let got = parse_gpx_turnpoints(GPX_TURNS_SAMPLE);
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0], (35.681006, 139.765553, "start".to_string(), String::new()));
+        assert_eq!(got[1], (35.680748, 139.765058, "left".to_string(), "TL".to_string()));
+        assert_eq!(got[2], (35.658316, 139.745120, "destination".to_string(), String::new()));
+    }
+
+    #[test]
+    fn cumulative_distances_start_at_zero_and_increase() {
+        let pts = vec![(35.68, 139.76), (35.681, 139.761), (35.682, 139.762)];
+        let cum = cumulative_distances_m(&pts);
+        assert_eq!(cum.len(), 3);
+        assert_eq!(cum[0], 0.0);
+        assert!(cum[1] > 0.0);
+        assert!(cum[2] > cum[1]);
+    }
+
+    #[test]
+    fn project_onto_route_picks_nearest_point() {
+        let pts = vec![(35.680, 139.760), (35.681, 139.761), (35.682, 139.762)];
+        let cum = cumulative_distances_m(&pts);
+        // pts[1]のすぐ近くの点はpts[1]の累積距離に投影されるはず。
+        let d = project_onto_route((35.6811, 139.7611), &pts, &cum).unwrap();
+        assert_eq!(d, cum[1]);
+    }
+
+    // start(出発点)は案内対象から除外、destinationは"ARRIVE"、通常のturnはコードのまま残る。
+    #[test]
+    fn turn_points_from_gpx_skips_start_and_marks_arrival() {
+        // GPX_TURNS_SAMPLEの3点にほぼ一致する経路ポリライン(投影先)を用意
+        let pts = vec![(35.681006, 139.765553), (35.680748, 139.765058), (35.658316, 139.745120)];
+        let got = turn_points_from_gpx(GPX_TURNS_SAMPLE, &pts);
+        assert_eq!(got.len(), 2, "startは除外され、left+destinationの2件になる");
+        assert_eq!(got[0].turn, "TL");
+        assert!(got[0].dist_from_start_m > 0.0);
+        assert_eq!(got[1].turn, "ARRIVE");
+        assert!(got[1].dist_from_start_m > got[0].dist_from_start_m);
+    }
+
+    #[test]
+    fn turn_points_from_gpx_empty_on_garbage() {
+        assert!(turn_points_from_gpx("not xml at all", &[(35.0, 139.0)]).is_empty());
+        assert!(turn_points_from_gpx(GPX_TURNS_SAMPLE, &[]).is_empty());
     }
 }

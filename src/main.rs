@@ -38,6 +38,7 @@ mod settings;
 // ui.rs/tiles.rs への配線は後続増分のため、現時点では未wireで dead_code 許容。
 #[allow(dead_code)]
 mod radar;
+mod voice; // ルート音声案内(曲がり角の距離ベース読み上げ)
 
 use image::{RgbImage, RgbaImage, imageops::FilterType};
 
