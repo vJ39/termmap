@@ -157,6 +157,7 @@ pub(crate) fn build_status_line(c: StatusCtx) -> String {
         Focus::WaypointList => " 並べ替え: ↑↓/ws選択(地図追従)  Space掴む↔置く(掴み中↑↓/wsで移動)  x削除  +/-拡縮  Esc閉 ".to_string(),
         Focus::ColorPick { .. } => " 色を選択: ←→ Enter=決定 Esc=取消 ".to_string(),
         Focus::ShapePick { .. } => " 形を選択: ←→ Enter=決定 Esc=取消 ".to_string(),
+        Focus::SettingsPick(27) => " 候補を選択: ↑↓/ws選択 Space=試聴 Enter=決定 Esc=取消(展開を閉じる) ".to_string(),
         Focus::SettingsPick(_) => " 候補を選択: ↑↓/ws選択 Enter=決定 Esc=取消(展開を閉じる) ".to_string(),
         Focus::Menu(MenuLevel::Categories) => " ↑↓カテゴリ Enter展開 / 文字キーで直接実行 Esc閉 ".to_string(),
         Focus::Menu(MenuLevel::Items(_)) => " ↑↓選択 Enter実行 / 右端キーでも実行 Esc戻る ".to_string(),

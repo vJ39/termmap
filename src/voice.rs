@@ -107,21 +107,132 @@ fn turn_phrase(code: &str) -> &'static str {
 // 読み上げ実行。sound.rs::Sound::play と同じ方針で、対応する経路だけが実際に鳴る。
 // native_local: この端末(macOSのsay)でも鳴らすか。falseならブラウザ側(speak_web)だけが鳴る。
 // web版で見ている間、手元のMac本体が同時に喋るのを避けたい場合にfalseで呼ぶ。
-pub fn speak(text: &str, native_local: bool) {
+// voice: sayに渡す音声名(空=OS既定、cfg.voice_nameを渡す)。
+pub fn speak(text: &str, native_local: bool, voice: &str) {
     if native_local {
-        speak_local(text);
+        speak_local_with(voice, text);
     }
     speak_web(text);
 }
 
+// sayの引数を組み立てる純関数(macOS以外でも単体テストできるよう分離)。
+// voiceが空なら-vを付けずOS既定の声に任せる。
+pub(crate) fn say_args(voice: &str, text: &str) -> Vec<String> {
+    if voice.is_empty() {
+        vec![text.to_string()]
+    } else {
+        vec!["-v".to_string(), voice.to_string(), text.to_string()]
+    }
+}
+
 #[cfg(target_os = "macos")]
-fn speak_local(text: &str) {
-    // 起動して待たない(Sound::playや効果音と同じ非ブロッキング方針)。Kyokoが無い環境では
+fn speak_local_with(voice: &str, text: &str) {
+    // 起動して待たない(Sound::playや効果音と同じ非ブロッキング方針)。指定した声が無い環境では
     // sayコマンド自体は失敗するが、spawnの戻り値は握りつぶすだけで実害はない。
-    let _ = std::process::Command::new("say").arg("-v").arg("Kyoko").arg(text).spawn();
+    // stdout/stderrは破棄する(存在しない音声名だと`Voice 'X' not found.`をstderrへ出し、
+    // 代替スクリーンで描画中のTUIへそのまま文字列が流れ込むため)。
+    let _ = std::process::Command::new("say")
+        .args(say_args(voice, text))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
 }
 #[cfg(not(target_os = "macos"))]
-fn speak_local(_text: &str) {}
+fn speak_local_with(_voice: &str, _text: &str) {}
+
+// 試聴(設定画面でEnter確定時)。アンインストール済み等で実際には鳴らない場合を拾うため、
+// spawnして捨てるのではなく終了コードを別スレッドで待って結果を返す
+// (route::trigger_turn_points と同じ、mpsc受信側を返してUIループでポーリングする形)。
+#[cfg(target_os = "macos")]
+pub(crate) fn preview_voice(voice: &str, text: &str) -> std::sync::mpsc::Receiver<Result<(), String>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let voice = voice.to_string();
+    let text = text.to_string();
+    std::thread::spawn(move || {
+        let result = std::process::Command::new("say")
+            .args(say_args(&voice, &text))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let _ = tx.send(match result {
+            Ok(status) if status.success() => Ok(()),
+            Ok(_) => Err(format!("この声は再生できませんでした: {voice}")),
+            Err(e) => Err(format!("この声は再生できませんでした: {voice} ({e})")),
+        });
+    });
+    rx
+}
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn preview_voice(_voice: &str, _text: &str) -> std::sync::mpsc::Receiver<Result<(), String>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _ = tx.send(Ok(()));
+    rx
+}
+
+// `say -v '?'`で列挙したja始まりロケールの音声名一覧(OnceLockで1回だけ実行し使い回す)。
+// 非macOSでは常に空を返す。
+static JA_VOICES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+pub(crate) fn japanese_voices() -> &'static [String] {
+    JA_VOICES.get_or_init(fetch_japanese_voices)
+}
+
+// Focus::Settingsに入った時点で呼ぶ。japanese_voices()を叩くだけのスレッドを1本投げて
+// 事前にOnceLockを温める(設定画面を開いてから声の行までカーソルを下げる間に完了させる)。
+pub(crate) fn warm_voice_list() {
+    std::thread::spawn(|| { japanese_voices(); });
+}
+
+#[cfg(target_os = "macos")]
+fn fetch_japanese_voices() -> Vec<String> {
+    let out = std::process::Command::new("say").arg("-v").arg("?").output();
+    match out {
+        Ok(o) => parse_say_voices(&String::from_utf8_lossy(&o.stdout)),
+        Err(_) => Vec::new(),
+    }
+}
+#[cfg(not(target_os = "macos"))]
+fn fetch_japanese_voices() -> Vec<String> {
+    Vec::new()
+}
+
+// `say -v '?'`の出力("Kyoko               ja_JP    # こんにちは!..."形式)からja始まりロケールの
+// 音声名だけを取り出す純関数(ネットワーク/プロセス起動に触れないのでmacOS以外でもテスト可能)。
+// 名前は空白を含みうるため列位置での切り出しはしない: 最初の'#'より左を見て、末尾の
+// 空白区切りトークンをロケールとし、残りをtrimしたものを名前とする。同名は先勝ちで畳む。
+pub(crate) fn parse_say_voices(stdout: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        let left = line.split('#').next().unwrap_or("");
+        let left = left.trim_end();
+        let Some((name_part, locale)) = left.rsplit_once(char::is_whitespace) else { continue };
+        let name = name_part.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let locale_norm = locale.replace('-', "_");
+        if locale_norm != "ja" && !locale_norm.starts_with("ja_") {
+            continue; // "java_XX"等、"ja"を含むが別ロケールの語を拾わない
+        }
+        if !out.iter().any(|n: &String| n == name) {
+            out.push(name.to_string());
+        }
+    }
+    out
+}
+
+// 一覧表示専用: 末尾の括弧グループ(ロケール表記)を落として短くする。保存する値は常に
+// 生の名前のままで、これは表示だけに使う。
+pub(crate) fn display_voice_name(raw: &str) -> &str {
+    if raw.ends_with(')') {
+        if let Some(i) = raw.rfind(" (") {
+            if i > 0 {
+                return &raw[..i];
+            }
+        }
+    }
+    raw
+}
 
 // ブラウザ(web/touch-overlay.js)が xterm.js の OSC ハンドラでフックする合図。
 // ESC ] 9998 ; <base64> BEL の形。9998 はsound.rsの9999(効果音)の隣で、他用途と
@@ -238,5 +349,86 @@ mod tests {
         assert_eq!(turn_phrase("ARRIVE"), "まもなく到着です");
         assert_eq!(turn_phrase("RNDB2"), "この先ロータリーです");
         assert_eq!(turn_phrase("謎コード"), "この先進行方向に注意してください");
+    }
+
+    #[test]
+    fn say_args_omits_dash_v_when_voice_is_empty() {
+        assert_eq!(say_args("", "300メートル先、左折です"), vec!["300メートル先、左折です".to_string()]);
+    }
+
+    #[test]
+    fn say_args_adds_dash_v_when_voice_is_set() {
+        assert_eq!(say_args("Kyoko", "hello"), vec!["-v".to_string(), "Kyoko".to_string(), "hello".to_string()]);
+    }
+
+    #[test]
+    fn say_args_keeps_a_space_containing_name_as_one_element() {
+        let got = say_args("Eddy (英語（アメリカ）)", "hi");
+        assert_eq!(got, vec!["-v".to_string(), "Eddy (英語（アメリカ）)".to_string(), "hi".to_string()]);
+    }
+
+    #[test]
+    fn parse_say_voices_extracts_ja_names_only() {
+        let stdout = "Kyoko               ja_JP    # こんにちは! 私の名前はKyokoです。\n\
+                       Eddy (英語（アメリカ）)     en_US    # Hello! My name is Eddy.\n\
+                       Otoya               ja_JP    # こんにちは! 私の名前はOtoyaです。\n";
+        assert_eq!(parse_say_voices(stdout), vec!["Kyoko".to_string(), "Otoya".to_string()]);
+    }
+
+    #[test]
+    fn parse_say_voices_accepts_hyphenated_locale_form() {
+        let stdout = "Kyoko               ja-JP    # sample\n";
+        assert_eq!(parse_say_voices(stdout), vec!["Kyoko".to_string()]);
+    }
+
+    #[test]
+    fn parse_say_voices_does_not_match_locales_that_merely_start_with_ja_like_java() {
+        let stdout = "Weird               java_XX    # sample\n";
+        assert!(parse_say_voices(stdout).is_empty());
+    }
+
+    #[test]
+    fn parse_say_voices_handles_names_with_parens_and_sample_text_containing_hash() {
+        let stdout = "Eddy (日本語（日本）)     ja_JP    # コメント中に # が入っていても平気\n";
+        assert_eq!(parse_say_voices(stdout), vec!["Eddy (日本語（日本）)".to_string()]);
+    }
+
+    #[test]
+    fn parse_say_voices_handles_empty_and_blank_input_without_panicking() {
+        assert!(parse_say_voices("").is_empty());
+        assert!(parse_say_voices("\n\n").is_empty());
+        assert!(parse_say_voices("   \n").is_empty());
+    }
+
+    #[test]
+    fn parse_say_voices_dedupes_by_name_keeping_first_occurrence_and_order() {
+        let stdout = "Kyoko               ja_JP    # 1回目\n\
+                       Otoya               ja_JP    # 別の声\n\
+                       Kyoko               ja_JP    # 2回目(重複)\n";
+        assert_eq!(parse_say_voices(stdout), vec!["Kyoko".to_string(), "Otoya".to_string()]);
+    }
+
+    #[test]
+    fn display_voice_name_drops_trailing_parenthetical_locale() {
+        assert_eq!(display_voice_name("Eddy (日本語（日本）)"), "Eddy");
+        assert_eq!(display_voice_name("Kyoko"), "Kyoko");
+    }
+
+    #[test]
+    fn display_voice_name_keeps_the_raw_name_when_stripping_would_empty_it() {
+        assert_eq!(display_voice_name("(日本語（日本）)"), "(日本語（日本）)");
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn japanese_voices_is_empty_on_non_macos() {
+        assert!(japanese_voices().is_empty());
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn preview_voice_succeeds_immediately_on_non_macos() {
+        let rx = preview_voice("Kyoko", "test");
+        assert_eq!(rx.recv().unwrap(), Ok(()));
     }
 }

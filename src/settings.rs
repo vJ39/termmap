@@ -35,16 +35,40 @@ pub(crate) const CHOICES: &[SettingChoice] = &[
 
 // 設定画面の項目行数(アコーディオン未展開時)。ui.rs のカーソル下移動の上限がこれを参照する。
 // settings_rows() が返す行数と必ず一致すること(下の回帰テスト settings_row_count_matches_rows で固定)。
-pub(crate) const SETTINGS_ROW_COUNT: usize = 27;
+pub(crate) const SETTINGS_ROW_COUNT: usize = 28;
 
 fn choice_for(idx: usize) -> Option<&'static SettingChoice> { CHOICES.iter().find(|c| c.idx == idx) }
 
-// idx が SettingsPick(一覧選択)の対象か。中心十字の色(16)も対象に含む。
-pub(crate) fn is_pickable(idx: usize) -> bool { idx == 16 || choice_for(idx).is_some() }
+// idx が SettingsPick(一覧選択)の対象か。中心十字の色(16)・読み上げの声(27)も対象に含む。
+pub(crate) fn is_pickable(idx: usize) -> bool { idx == 16 || idx == 27 || choice_for(idx).is_some() }
+
+// 読み上げの声(idx=27)の候補一覧。他の項目と違い実行環境と現在値の両方に依存するため
+// CHOICESの静的テーブルには載せず、ここで組み立てる。戻り値は(保存値, 表示名)。
+// 先頭は常に"システム既定"(空文字)。cfg.voice_nameが列挙結果に無く、かつ列挙結果が
+// 空でない場合だけ末尾に"<表示名> (未検出)"を足す(音声をアンインストール/config手書き後に
+// 現在値が一覧から消えて黙って別の声に置き換わるのを防ぐ)。
+pub(crate) fn voice_choices(cfg: &Config) -> Vec<(String, String)> {
+    let mut out = vec![("".to_string(), "システム既定".to_string())];
+    let installed = crate::voice::japanese_voices();
+    for name in installed {
+        out.push((name.clone(), crate::voice::display_voice_name(name).to_string()));
+    }
+    if !cfg.voice_name.is_empty() && !installed.iter().any(|n| n == &cfg.voice_name) && !installed.is_empty() {
+        out.push((cfg.voice_name.clone(), format!("{} (未検出)", crate::voice::display_voice_name(&cfg.voice_name))));
+    }
+    out
+}
 
 // 一覧に出す表示ラベル(現在値のハイライト位置は pick_current で別途求める)。
-pub(crate) fn pick_labels(idx: usize) -> Vec<&'static str> {
-    if idx == 16 { PALETTE_NAMES.to_vec() } else { choice_for(idx).map(|c| c.labels.to_vec()).unwrap_or_default() }
+// idx=27(読み上げの声)は実行時に決まるため所有文字列を返す(他は静的テーブルからの&'static str)。
+pub(crate) fn pick_labels(idx: usize, cfg: &Config) -> Vec<String> {
+    if idx == 16 {
+        PALETTE_NAMES.iter().map(|s| s.to_string()).collect()
+    } else if idx == 27 {
+        voice_choices(cfg).into_iter().map(|(_, label)| label).collect()
+    } else {
+        choice_for(idx).map(|c| c.labels.iter().map(|s| s.to_string()).collect()).unwrap_or_default()
+    }
 }
 
 // 現在の設定値が一覧の何番目かを返す(未知の値は0扱い)。
@@ -58,6 +82,7 @@ pub(crate) fn pick_current(idx: usize, cfg: &Config, style: &str) -> usize {
         16 => cfg.cross_color_idx as usize % PALETTE_NAMES.len(),
         18 => choice_for(18).and_then(|c| c.values.iter().position(|v| *v == cfg.qr_style)).unwrap_or(0),
         20 => choice_for(20).and_then(|c| c.values.iter().position(|v| *v == cfg.radar_opacity)).unwrap_or(0),
+        27 => voice_choices(cfg).iter().position(|(v, _)| *v == cfg.voice_name).unwrap_or(0),
         _ => 0,
     }
 }
@@ -81,6 +106,7 @@ pub(crate) fn apply_pick(idx: usize, sel: usize, cfg: &mut Config, style: &mut S
         18 => if let Some(v) = choice_for(18).and_then(|c| c.values.get(sel)) { cfg.qr_style = v.to_string(); }
         // 雨雲の濃さは今表示している地図の見た目が変わるので、確定した時点で描き直す。
         20 => if let Some(v) = choice_for(20).and_then(|c| c.values.get(sel)) { cfg.radar_opacity = v.to_string(); eff.force_reemit = true; }
+        27 => if let Some((v, _)) = voice_choices(cfg).get(sel) { cfg.voice_name = v.clone(); }
         _ => {}
     }
     eff
@@ -116,6 +142,11 @@ pub(crate) fn setting_description(idx: usize) -> &'static str {
         24 => "道路ライブカメラ: 国交省の道路カメラを地図に重ねる(Nキーで中心近くのカメラの写真を表示)。ONにした人だけが外部サービスへ問い合わせる",
         25 => "通行規制: 通行止め・車線規制等の区間(国交省road-info-prvs)を地図に線で重ねる。事故・工事・冬期閉鎖等の原因は区別しない。ONにした人だけが外部サービスへ問い合わせる",
         26 => "過去災害: 豪雨・地震・台風等が過去に記録された地点(防災科学技術研究所 災害事例データベース・1926年以降)を地図に重ねる。件数で丸が大きく・種別で色が変わる(Bキーでその地点の事例一覧)。今の危険度ではなく履歴。ONにした人だけが外部サービスへ問い合わせる",
+        27 => if cfg!(target_os = "macos") {
+            "読み上げの声: ルート音声案内をこの端末(macOSのsay)で読み上げるときの声。Enterで一覧を開いて選択(Spaceで試聴)。インストール済みの日本語音声だけが並ぶ。web版(ブラウザ)の声はブラウザ側が自動で選ぶのでここでは変わらない"
+        } else {
+            "読み上げの声: この端末(macOS以外)では読み上げ自体が動かないため効果は無い"
+        },
         _ => "Google APIキー: 検索(Geocoding)とStreet View共通。Enterで入力欄を開く(Cmd+V貼付も可)。環境変数TERMMAP_GOOGLE_API_KEYでも可",
     }
 }
@@ -162,12 +193,13 @@ pub(crate) fn settings_rows(opts: &Args, cfg: &Config, picking: Option<usize>, o
         format!("道路ライブカメラ {}", onoff(cfg.camera_enabled)),
         format!("通行規制 {}", onoff(cfg.regulation_enabled)),
         format!("過去災害 {}", onoff(cfg.disaster_enabled)),
+        format!("{} 読み上げの声 {}", arrow(27), if cfg.voice_name.is_empty() { "システム既定".to_string() } else { crate::voice::display_voice_name(&cfg.voice_name).to_string() }),
     ];
     debug_assert_eq!(its.len(), SETTINGS_ROW_COUNT, "SETTINGS_ROW_COUNT と行数がずれている");
     // アコーディオン展開: 選択中の項目がpickable(3択以上)ならその直下に候補をインデント挿入し、他行を押し下げる
     let mut sel = set_sel;
     if let Some(idx) = picking {
-        let labels = pick_labels(idx);
+        let labels = pick_labels(idx, cfg);
         let sub: Vec<String> = labels.iter().map(|l| format!("    {l}")).collect();
         let at = idx + 1;
         for (i, s) in sub.into_iter().enumerate() { its.insert(at + i, s); }
@@ -183,7 +215,7 @@ mod tests {
 
     #[test]
     fn pickable_covers_the_multi_choice_items_and_cross_color() {
-        for idx in [4usize, 5, 9, 12, 16, 18, 20] {
+        for idx in [4usize, 5, 9, 12, 16, 18, 20, 27] {
             assert!(is_pickable(idx), "idx {idx} should be pickable");
         }
         for idx in [0usize, 1, 2, 3, 6, 7, 8, 10, 11, 13, 14, 15, 17, 19] {
@@ -248,11 +280,76 @@ mod tests {
 
     #[test]
     fn pick_labels_len_matches_choice_values_len() {
+        let cfg = Config::default();
         for idx in [4usize, 5, 9, 12, 18, 20] {
             let c = choice_for(idx).unwrap();
-            assert_eq!(pick_labels(idx).len(), c.values.len());
+            assert_eq!(pick_labels(idx, &cfg).len(), c.values.len());
         }
-        assert_eq!(pick_labels(16).len(), PALETTE_NAMES.len());
+        assert_eq!(pick_labels(16, &cfg).len(), PALETTE_NAMES.len());
+    }
+
+    // voice_choices/pick_labels(27,..)は実行環境にインストール済みの音声(say -v '?')に依存する
+    // ため、具体的な件数・名前には依存しない不変条件だけを確認する。
+    #[test]
+    fn voice_choices_always_starts_with_system_default() {
+        let cfg = Config::default();
+        assert_eq!(voice_choices(&cfg)[0], ("".to_string(), "システム既定".to_string()));
+    }
+
+    #[test]
+    fn voice_choices_never_flags_not_found_when_voice_name_is_empty() {
+        let mut cfg = Config::default();
+        cfg.voice_name = "".to_string();
+        assert!(voice_choices(&cfg).iter().all(|(_, label)| !label.contains("(未検出)")));
+    }
+
+    #[test]
+    fn voice_choices_flags_unknown_voice_name_as_not_found_only_when_some_voice_is_installed() {
+        let mut cfg = Config::default();
+        cfg.voice_name = "TermmapTestVoiceThatDoesNotExist".to_string();
+        let choices = voice_choices(&cfg);
+        if crate::voice::japanese_voices().is_empty() {
+            // 列挙できていない(非macOS/say失敗)ときは「未検出」と断定しない(システム既定のみ)。
+            assert_eq!(choices.len(), 1);
+        } else {
+            let last = choices.last().unwrap();
+            assert_eq!(last.0, cfg.voice_name);
+            assert!(last.1.contains("(未検出)"), "{:?}", last);
+        }
+    }
+
+    #[test]
+    fn pick_current_and_apply_pick_roundtrip_voice_name_system_default() {
+        let mut cfg = Config::default();
+        cfg.voice_name = "".to_string();
+        let mut style = "osm".to_string();
+        assert_eq!(pick_current(27, &cfg, &style), 0); // システム既定は常に先頭
+        let eff = apply_pick(27, 0, &mut cfg, &mut style);
+        assert_eq!(cfg.voice_name, "");
+        assert!(!eff.cache_clear);
+        assert!(!eff.force_reemit);
+    }
+
+    #[test]
+    fn apply_pick_voice_name_out_of_range_sel_is_ignored() {
+        let mut cfg = Config::default();
+        cfg.voice_name = "Kyoko".to_string();
+        let mut style = "osm".to_string();
+        let eff = apply_pick(27, 9999, &mut cfg, &mut style);
+        assert_eq!(cfg.voice_name, "Kyoko");
+        assert!(!eff.force_reemit);
+    }
+
+    #[test]
+    fn settings_rows_shows_system_default_label_for_empty_voice_name() {
+        let mut cfg = Config::default();
+        cfg.voice_name = "".to_string();
+        let (_, its, _) = settings_rows(&test_args(), &cfg, None, false, 27, 0);
+        assert_eq!(its[27], "▸ 読み上げの声 システム既定");
+        // 既存項目(24〜26)の並びが動いていないことの回帰確認
+        assert!(its[24].starts_with("道路ライブカメラ"));
+        assert!(its[25].starts_with("通行規制"));
+        assert!(its[26].starts_with("過去災害"));
     }
 
     #[test]
@@ -269,13 +366,13 @@ mod tests {
 
     #[test]
     fn setting_description_covers_every_known_row_distinctly() {
-        // 0〜16,18〜20 は個別の説明文を持つ(idx=11は端末対応有無で文言が変わるが、いずれにせよ空でない。
-        // 17=Google APIキーはフォールバック経由で別テストで確認するためここでは含めない)。
+        // 0〜16,18〜27 は個別の説明文を持つ(idx=11/27は端末対応有無で文言が変わるが、いずれにせよ
+        // 空でない。17=Google APIキーはフォールバック経由で別テストで確認するためここでは含めない)。
         let mut seen = Vec::new();
-        for idx in (0usize..=16).chain(18..=20) {
+        for idx in (0usize..=16).chain(18..=27) {
             let d = setting_description(idx);
             assert!(!d.is_empty(), "idx {idx} should have a description");
-            if idx != 11 { seen.push(d); } // 11は環境依存で文言が2通りあるため一意性判定から除外
+            if idx != 11 && idx != 27 { seen.push(d); } // 11/27は環境依存で文言が2通りあるため一意性判定から除外
         }
         let mut uniq = seen.clone();
         uniq.sort();
@@ -360,6 +457,13 @@ mod tests {
         assert!(d.contains("防災科学技術研究所"), "出典を出す: {d}");
         assert!(d.contains("B"), "詳細表示のキーに触れる: {d}");
         assert_ne!(d, setting_description(25), "通行規制の説明と混ざっていない");
+    }
+
+    #[test]
+    fn setting_description_for_voice_row_never_falls_back_to_google_key() {
+        let d = setting_description(27);
+        assert!(d.contains("読み上げの声"), "{d}");
+        assert_ne!(d, setting_description(17), "27がフォールバック(Google APIキー)と混ざっていない");
     }
 
     #[test]

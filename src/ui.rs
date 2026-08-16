@@ -148,6 +148,8 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     // 集計(1段目)には事例の名称も日付も入っていないので、押したときだけ引く。結果は保存しない。
     let mut disaster_view: Option<(String, Vec<String>)> = None; // (見出し, 本文行)
     let mut disaster_job: Option<std::sync::mpsc::Receiver<Result<(String, Vec<String>), String>>> = None;
+    // 読み上げの声(#78)の試聴。SettingsPick(27)でSpace=試聴/Enter確定後の1回再生の両方で使う。
+    let mut voice_preview_job: Option<std::sync::mpsc::Receiver<Result<(), String>>> = None;
     // ルート計算と同じ非同期パターンで、検索/周辺/実写/おすすめの通信もバックグラウンド化する。
     // 新規spawn時に古いrxはdropされる=最新のみ採用(generation ID不要)。
     let mut search_job: Option<std::sync::mpsc::Receiver<(String, String, Result<Vec<(f64, f64, String)>, String>)>> = None; // (ckey, query, geocode結果)
@@ -343,7 +345,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     }
                 } else { snd.play("error"); addr = "ルート未確定".into(); }
             }
-            MenuAction::Settings => { set_sel = 0; focus = Focus::Settings; }
+            MenuAction::Settings => { set_sel = 0; focus = Focus::Settings; voice::warm_voice_list(); }
             MenuAction::Help => { help = true; help_page = 0; }
         }
     }};}
@@ -1080,6 +1082,14 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 Err(TryRecvError::Disconnected) => { disaster_job = None; }
             }
         }
+        if let Some(job) = &voice_preview_job { // 読み上げの声(#78)の試聴結果
+            match job.try_recv() {
+                Ok(Ok(())) => { voice_preview_job = None; got_result = true; }
+                Ok(Err(e)) => { snd.play("error"); addr = e; voice_preview_job = None; got_result = true; }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => { voice_preview_job = None; }
+            }
+        }
         if let Some(job) = &cam_job {
             match job.try_recv() {
                 Ok((c, Ok(img))) => { cam_view = Some((img, c)); cam_job = None; }
@@ -1267,7 +1277,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             // 主要道路は以前この条件から漏れていたが、4レイヤとも同じ扱いにする。
             || traffic_layer.job_active() || roads_layer.job_active()
             || camera_layer.job_active() || regulation_layer.job_active() || disaster_layer.job_active()
-            || disaster_job.is_some();
+            || disaster_job.is_some() || voice_preview_job.is_some();
         let mut ev: Option<Event> = if got_result {
             None
         } else if polling {
@@ -2096,10 +2106,19 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     }
                     // 設定画面の一覧ピッカー: 地図種別/既定ルート/AIモデル/画像解像度/中心十字の色を↑↓/w・sで選びEnterで確定
                     Focus::SettingsPick(idx) => {
-                        let n = settings::pick_labels(idx).len().max(1);
+                        let n = settings::pick_labels(idx, &cfg).len().max(1);
                         match k.code {
                             KeyCode::Up | KeyCode::Char('w') => { set_pick_sel = (set_pick_sel + n - 1) % n; focus = Focus::SettingsPick(idx); }
                             KeyCode::Down | KeyCode::Char('s') => { set_pick_sel = (set_pick_sel + 1) % n; focus = Focus::SettingsPick(idx); }
+                            // 読み上げの声(27)だけ: Spaceでカーソル位置の声を試聴(確定せず一覧も閉じない)。
+                            KeyCode::Char(' ') if idx == 27 => {
+                                if let Some((v, _)) = settings::voice_choices(&cfg).get(set_pick_sel) {
+                                    voice_preview_job = Some(voice::preview_voice(v, "300メートル先、左折です"));
+                                    let name = if v.is_empty() { "システム既定".to_string() } else { voice::display_voice_name(v).to_string() };
+                                    addr = format!("試聴: {name}(この端末で再生)");
+                                }
+                                focus = Focus::SettingsPick(idx);
+                            }
                             KeyCode::Enter => {
                                 let eff = settings::apply_pick(idx, set_pick_sel, &mut cfg, &mut opts.style);
                                 // スタイル変更時、キャッシュ自体はもう消さない(TileKeyがstyleを含むため
@@ -2109,6 +2128,12 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                 if eff.cache_clear { loader.clear_pending(); }
                                 if eff.force_reemit { force_reemit = true; }
                                 let _ = config::save_config(&cfg);
+                                // 読み上げの声(27)は確定した声が実際に使えるか、確定時にも1回再生して確かめる。
+                                if idx == 27 {
+                                    voice_preview_job = Some(voice::preview_voice(&cfg.voice_name, "300メートル先、左折です"));
+                                    let name = if cfg.voice_name.is_empty() { "システム既定".to_string() } else { voice::display_voice_name(&cfg.voice_name).to_string() };
+                                    addr = format!("試聴: {name}(この端末で再生)");
+                                }
                                 focus = Focus::Settings;
                             }
                             KeyCode::Esc => { snd.play("back"); focus = Focus::Settings; } // 変更せず閉じる
@@ -2248,7 +2273,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             KeyCode::Char(' ') => { snd.play("click"); menu_cat_sel = 0; focus = Focus::Menu(MenuLevel::Categories); } // Space=メニュー(カテゴリ→展開の2階層)
                             KeyCode::Char('?') => { help = true; help_page = 0; }
                             KeyCode::Char('P') => { cat_sel = 0; focus = Focus::SpotCatList; } // マイスポット(カテゴリ一覧)
-                            KeyCode::Char(',') => { set_sel = 0; focus = Focus::Settings; } // 設定画面
+                            KeyCode::Char(',') => { set_sel = 0; focus = Focus::Settings; voice::warm_voice_list(); } // 設定画面
                             KeyCode::Char('r') => { input_cur = 0; focus = Focus::RoadSearch(String::new()); } // 道路名でルート(現在view内)
                             KeyCode::Char('@') => { // おすすめツーリングスポット提案(claude -p)
                                 if !cfg.llm_recommend_enabled { snd.play("error"); addr = "おすすめ: 設定でOFF(,でON)".into(); }

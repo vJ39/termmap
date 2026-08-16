@@ -38,6 +38,7 @@ pub struct Config {
     pub route_play_speed_kmh: f64, // ルート再生(プレビュー走行)の想定巡航速度。既定40km/h(等倍1.00xの基準)
     pub voice_guide_enabled: bool, // ルート音声案内(曲がり角を距離ベースで読み上げ)。既定false(ONにした人だけがBRouterへ追加問い合わせする)
     pub voice_speak_local: bool, // 音声案内をこの端末(macOSのsay)でも鳴らすか。既定true。web版で見ている時に手元のMacが同時に喋るのを避けたい場合にOFFにする(ブラウザ側の読み上げは常に鳴る)
+    pub voice_name: String, // sayに渡す音声名(空=-vを付けずOS既定)。既定"Kyoko"(従来の埋め込み値と同じ)
     pub style: String,
     pub show_spots: bool,
     pub braille: bool,
@@ -72,6 +73,7 @@ impl Default for Config {
             route_play_speed_kmh: 40.0,
             voice_guide_enabled: false,
             voice_speak_local: true,
+            voice_name: "Kyoko".to_string(),
             style: "osm".to_string(),
             show_spots: true,
             braille: false,
@@ -179,6 +181,7 @@ pub fn load_config_from(path: &Path) -> Config {
             }
             ("route", "voice_guide_enabled") => { if let Some(b) = parse_bool(value) { cfg.voice_guide_enabled = b; } }
             ("route", "voice_speak_local") => { if let Some(b) = parse_bool(value) { cfg.voice_speak_local = b; } }
+            ("route", "voice_name") => { if let Some(s) = parse_string(value) { if valid_voice_name(&s) { cfg.voice_name = s; } } }
             ("display", "style") => {
                 if let Some(s) = parse_string(value) {
                     cfg.style = s;
@@ -278,6 +281,7 @@ pub fn save_config_to(path: &Path, c: &Config) -> Result<(), String> {
          play_speed_kmh = {}\n\
          voice_guide_enabled = {}\n\
          voice_speak_local = {}\n\
+         voice_name = \"{}\"\n\
          \n\
          [display]\n\
          style = \"{}\"\n\
@@ -325,6 +329,7 @@ pub fn save_config_to(path: &Path, c: &Config) -> Result<(), String> {
         c.route_play_speed_kmh,
         c.voice_guide_enabled,
         c.voice_speak_local,
+        c.voice_name,
         c.style,
         c.show_spots,
         c.braille,
@@ -393,6 +398,15 @@ fn parse_string(v: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+// sayに渡す音声名として安全な値か。以下を弾く(弾いた場合は既定値のまま黙って無視)。
+// - "-"始まり: Command::new("say").arg(name)がsayのオプションとして解釈されうる
+// - '"'を含む: save_config_toが素のformat!でvoice_name = "{}"と書き出すため、次回のパースが壊れる
+// - 制御文字を含む: 1行1キーの前提が崩れる
+// 空文字自体は有効(-vを付けずOS既定を使う、という意味を持つ)。
+fn valid_voice_name(s: &str) -> bool {
+    !s.starts_with('-') && !s.contains('"') && !s.chars().any(|c| c.is_control())
 }
 
 fn parse_number(v: &str) -> Option<f64> {
@@ -480,6 +494,7 @@ mod tests {
             route_play_speed_kmh: 55.0,
             voice_guide_enabled: true,
             voice_speak_local: false,
+            voice_name: "Otoya".to_string(),
             style: "satellite".to_string(),
             show_spots: false,
             braille: true,
@@ -722,6 +737,46 @@ profile = "custom-profile"
     }
 
     #[test]
+    fn valid_voice_name_rejects_dash_prefix_quotes_and_control_chars() {
+        assert!(valid_voice_name("Kyoko"));
+        assert!(valid_voice_name("Eddy (日本語（日本）)"));
+        assert!(valid_voice_name("")); // 空文字はOS既定の意味を持つ有効値
+        assert!(!valid_voice_name("-o"));
+        assert!(!valid_voice_name("-v"));
+        assert!(!valid_voice_name("na\"me"));
+        assert!(!valid_voice_name("na\nme"));
+    }
+
+    #[test]
+    fn voice_name_missing_key_defaults_to_kyoko_for_backward_compat() {
+        let path = unique_temp_path("voice_name_missing_key");
+        std::fs::write(&path, "[route]\nvoice_guide_enabled = true\n").unwrap();
+        let cfg = load_config_from(&path);
+        assert_eq!(cfg.voice_name, "Kyoko");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn voice_name_empty_string_is_kept_distinct_from_missing_key() {
+        let path = unique_temp_path("voice_name_empty");
+        std::fs::write(&path, "[route]\nvoice_name = \"\"\n").unwrap();
+        let cfg = load_config_from(&path);
+        assert_eq!(cfg.voice_name, "");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn voice_name_invalid_values_are_ignored_and_keep_default() {
+        for bad in ["\"-o\"", "\"na\"me\""] {
+            let path = unique_temp_path("voice_name_invalid");
+            std::fs::write(&path, format!("[route]\nvoice_name = {bad}\n")).unwrap();
+            let cfg = load_config_from(&path);
+            assert_eq!(cfg.voice_name, "Kyoko", "input was {bad}");
+            cleanup(&path);
+        }
+    }
+
+    #[test]
     fn parse_number_accepts_ints_and_floats() {
         assert_eq!(parse_number("800"), Some(800.0));
         assert_eq!(parse_number("800.0"), Some(800.0));
@@ -784,6 +839,7 @@ profile = "custom-profile"
             route_play_speed_kmh: 30.0,
             voice_guide_enabled: false,
             voice_speak_local: true,
+            voice_name: "".to_string(),
             style: "s".to_string(),
             show_spots: false,
             braille: false,
