@@ -46,6 +46,9 @@ mod voice; // ルート音声案内(曲がり角の距離ベース読み上げ)
 mod traffic; // 道路交通量(JARTICオープンデータ)
 mod regulation; // 通行規制(通行止め・車線規制等、road-info-prvs.mlit.go.jp)
 mod camera; // 道路ライブカメラ(road-info-prvs.mlit.go.jp)。Nキーで中心近くのカメラの写真を表示
+mod mesh; // JIS X 0410 地域メッシュ(プロットデータのキャッシュ単位)
+mod plotcache; // プロットデータのディスク層(TTL付き・種別ごとに1キー1ファイル)
+mod plotlayer; // 上の2つを束ねた4レイヤ共通の取得段取り
 
 use image::{RgbImage, RgbaImage, imageops::FilterType};
 

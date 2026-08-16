@@ -54,14 +54,19 @@ pub struct RoadCamera {
     pub taken_at: String,           // フル画像の撮影時刻(get_datetime をそのまま)
 }
 
-pub fn fetch_cameras(lat_min, lon_min, lat_max, lon_max) -> Vec<RoadCamera>
+pub fn nearest_bureau(lat: f64, lon: f64) -> u32              // 代表点の最近傍で1局選ぶ
+pub fn fetch_bureau(cd: u32) -> Result<Vec<RoadCamera>, String>   // その局の全カメラ(bboxで絞らない)
 pub fn parse_cameras(html: &str) -> Vec<RoadCamera>          // 純関数
 pub fn fetch_image(url: &str) -> Result<image::RgbImage, String>
 ```
 
-- `fetch_cameras` は「bbox 中心に最も近い局のページを1回取得 → `parse_cameras` → bbox で絞り込み」。
-  **失敗しても常に `Vec` を返す**(HTTP エラー・本文取得失敗はいずれも空 Vec)。呼び出し側が
-  「カメラなし」に静かにフォールバックでき、地図表示自体はこの機能の失敗で壊れない。
+- `fetch_bureau` は「その局のページを1回取得 → `parse_cameras`」。bbox での絞り込みはしない
+  (呼び出し側がメモリ上で絞る)。失敗と0件を区別できるよう `Result` を返す。以前は両方 `Vec::new()`
+  だったため、圏外に入った瞬間に呼び出し側が「カメラ0台」で上書きし、直前まで見えていたカメラが
+  消えていた。`Err` を受けた側(`plotlayer`)は手元の値を保持する。
+- `RoadCamera` は serde の derive を持つが、**写真URL3項目(`thumb_url` / `full_url` / `taken_at`)は
+  保存しない**(`#[serde(skip)]`)。URLに15分ごとの撮影ディレクトリが入るため、保存すると1時間後には
+  404になる。読み戻すと `None` / 空文字になり、必要になった時点(N キーを押したとき)だけ取り直す。
 - `parse_cameras` は `id` / `gis_point` の lon,lat が揃わない要素を黙って除外する(座標が無いと地図に置けない)。
   `fileList` が空なら URL は `None`、`taken_at` は空文字。
 - `extract_kokudo_json` は `id="kokudoJson"` の後の `value='...'` を素朴に切り出す(HTMLパーサは使わない)。
@@ -69,35 +74,36 @@ pub fn fetch_image(url: &str) -> Result<image::RgbImage, String>
 
 ## 3. ui.rs の配線
 
-### 3.1 状態 (`src/ui.rs:142-150`)
+### 3.1 状態
 
 ```rust
-camera_points: Vec<camera::RoadCamera>
-camera_job: Option<Receiver<Vec<camera::RoadCamera>>>
-camera_last_fetch: Option<Instant>
-camera_bbox: Option<(lat_min, lon_min, lat_max, lon_max)>
+camera_layer: PlotLayer<camera::RoadCamera>                 // plotlayer::camera()
 cam_view: Option<(RgbImage, camera::RoadCamera)>            // 全画面表示中の写真
 cam_job: Option<Receiver<(camera::RoadCamera, Result<RgbImage, String>)>>
 ```
 
-### 3.2 一覧の取得スケジュール (`src/ui.rs:1013-1041`)
+セル表(整備局CD→カメラ一覧)・進行中ジョブ・ディスク永続化はすべて `PlotLayer` が持つ。
+以前あった `camera_points` / `camera_job` / `camera_last_fetch` / `camera_bbox` はこの1つに畳まれた。
 
-道路交通量・通行規制と同じ形の独立ブロック。
+### 3.2 一覧の取得スケジュール
+
+道路交通量・通行規制・主要道路と共通の仕組み(`src/plotlayer.rs`)。設計は
+`docs/plot-data-disk-cache-design.md`。
 
 | 項目 | 値 |
 |---|---|
-| 発火条件 | `cfg.camera_enabled` かつ `camera_job` が無い |
-| 取得範囲 | 画面中心から `MARGIN_PX = 900` ピクセル分を広げた bbox |
-| 定期更新 | `REFRESH = 90秒` |
-| 即時更新 | 画面中心が `camera_bbox` の外に出たとき |
-| 実行方法 | `std::thread::spawn` + `mpsc`、毎ループ `try_recv()` |
+| 発火条件 | `cfg.camera_enabled` かつ、視野中心の局が手元に fresh で無い |
+| 取得単位 | 地方整備局1局(局は全国で10しかないので必ず1件) |
+| 再取得の抑止 | fresh TTL 7日。この間は通信しない |
+| オフライン表示 | 上限なし(位置が数日古くても実害が無い) |
+| ズーム下限 | なし |
+| 実行方法 | `std::thread::spawn` + `mpsc`、毎ループ `tick()` |
 
-`camera_job` が生きている間はポーリング側に倒す(`src/ui.rs:1253`)。キー入力が無いまま取得が
-完了しても結果が反映される。
+ジョブが生きている間はポーリング側に倒す。キー入力が無いまま取得が完了しても結果が反映される。
+表示範囲での絞り込みは `PlotLayer::items(視野bbox)` がメモリ上で行う。
 
-**失敗時の挙動**: `fetch_cameras` は失敗を `Err` でなく空 `Vec` で返すため、受信すると
-`camera_points` が空で置き換わる(交通量のように前回値を保持しない)。通信に失敗した回は
-マーカーが消え、ステータス行が `📷カメラ無し` になる。
+**失敗時の挙動**: `fetch_bureau` が `Err` を返しても手元の値は消さない。ディスクに控えがあれば
+それを表示し、無ければマーカーが出ないままステータス行が `📷カメラ無し` になる。
 
 ### 3.3 地図マーカー (`src/ui.rs:790-796`)
 
@@ -111,11 +117,17 @@ cam_job: Option<Receiver<(camera::RoadCamera, Result<RgbImage, String>)>>
 
 ```
 cfg.camera_enabled == false → 効果音(error) + "道路ライブカメラ: OFF(設定で有効化)"
-camera_points が空          → 効果音(error) + "道路ライブカメラ: 周辺に無し"
+視野内にカメラが無い        → 効果音(error) + "道路ライブカメラ: 周辺に無し"
 それ以外                    → 地図中心に最も近いカメラを選ぶ(緯度経度の二乗和で比較)
                               full_url があれば背景スレッドで fetch_image → cam_job
-                              full_url が無ければ "道路ライブカメラ: 画像URL無し"
+                              full_url が無ければ(キャッシュ由来のカメラ)、同じ背景スレッドで
+                              その局を取り直して URL を補ってから fetch_image。
+                              ステータスは "📷カメラ情報を更新中…"
 ```
+
+キャッシュから読んだカメラは写真URLを持たない(§2 の `#[serde(skip)]`)。取り直しは
+**押したときだけ**の1回で、以前のように押す/押さないに関わらず90秒ごとに局ページを
+取り直すことはしない。
 
 `cam_job` の受信(`src/ui.rs:1071-1078`)で `cam_view` に入り、以後は対話ループ冒頭の早期 return
 (`src/ui.rs:480-515`)で全画面表示になる。実写(Street View)と同じパターンだが、道路カメラは
@@ -134,7 +146,7 @@ camera_points が空          → 効果音(error) + "道路ライブカメラ: 
 画像取得中は `cam_job` が `jobs_active` に含まれるためスピナーが回る(`src/ui.rs:871`)。
 `Esc` や `Ctrl+C` によるジョブ一括キャンセルの対象にも入っている(`src/ui.rs:1289-1292, 1338-1340`)。
 
-### 3.5 ステータス行 (`src/ui_status.rs:156-165`)
+### 3.5 ステータス行 (`src/ui_status.rs` の `plot_label`)
 
 | 状態 | 表示 |
 |---|---|
@@ -142,6 +154,7 @@ camera_points が空          → 効果音(error) + "道路ライブカメラ: 
 | 0件かつ取得中 | `📷取得中… ` |
 | 0件かつ取得完了 | `📷カメラ無し ` |
 | 取得済み | `📷{件数}台(N) ` |
+| 取得済みだが fresh(7日)を過ぎている | `📷{件数}台(9日前)(N) ` |
 
 `(N)` は「`N` キーで見られる」ことの案内。取得済みなら取得中でも件数を優先する。
 
@@ -167,7 +180,6 @@ camera_points が空          → 効果音(error) + "道路ライブカメラ: 
   複数局にまたがる広域表示でも取得は1局分。
 - 1回の取得でその局の全カメラ一覧(HTMLページ1枚)を落としてから bbox で絞る。表示範囲が狭くても
   転送量は同じ。
-- 取得失敗が空 Vec と区別できないため、通信断とカメラ0件が同じ表示(`📷カメラ無し`)になる。
 - 表示するのは `fileList` の先頭(最新)1枚のみ。過去コマの切り替えは無い。
 - 撮影時刻はソースの `get_datetime` をそのまま出す(タイムゾーン変換・整形はしない)。
 - `thumb_url` は構造体には入っているが、現在 UI からは使っていない(全画面表示は `full_url` のみ)。
@@ -177,6 +189,7 @@ camera_points が空          → 効果音(error) + "道路ライブカメラ: 
 ## 6. テスト (`src/camera.rs` の `mod tests`)
 
 - `nearest_bureau`: 北海道・東京・沖縄でそれぞれ 81 / 83 / 90 を選ぶ。
+- serde: 位置(id/lat/lon/name)は往復し、写真URL3項目は保存されず読み戻しで `None` / 空文字になる。
 - `extract_kokudo_json`: シングルクォートの `value` を取り出す / 無いときは `None`。
 - `parse_cameras`: 実 HTML の抜粋(2026/08/16 実測、1カメラ)から id・座標・地点名・撮影時刻・
   サムネイルURL・フル画像URL(`/s_` 除去)を組み立てる。
@@ -188,5 +201,4 @@ camera_points が空          → 効果音(error) + "道路ライブカメラ: 
 
 ## 7. 既知の記述ずれ・残作業
 
-- `src/ui.rs:147` のコメントが「Kキーで中心近くのカメラを選び」となっているが、実際の割当は `N`。
 - `README.md` と `docs/MANUAL.md` にこの機能の記載が無い(ヘルプ `src/keymap.rs` にはある)。

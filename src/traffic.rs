@@ -10,6 +10,7 @@
 //   - このデータセットの道路種別は実測で "3"(一般国道)のみが返る。高速道路は含まれない
 // gpslive.rs/radar.rsと同じ方針でstd+ureq+serde_jsonのみに依存し、crate::を参照しない。
 
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 const ENDPOINT: &str = "https://api.jartic-open-traffic.org/geoserver";
@@ -17,10 +18,12 @@ const USER_AGENT: &str = "termmap/0.1 (personal experiment)";
 const HTTP_TIMEOUT_SECS: u64 = 20;
 // 観測から実際に取得可能になるまでのラグ(公式案内: 観測から約20分後)。安全側に見て
 // 25分前を起点に10分幅で取る(直近の確定値を確実に拾う)。
-const OBSERVE_LAG_MIN: i64 = 25;
+// 取得した直後でもデータ自身はこの分だけ過去のものなので、キャッシュの「データの時刻」も
+// この値ぶん遡らせる(呼び出し側が経過時間の表示に使う)。
+pub const OBSERVE_LAG_MIN: i64 = 25;
 const WINDOW_MIN: i64 = 10;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TrafficPoint {
     pub lat: f64,
     pub lon: f64,
@@ -197,6 +200,15 @@ mod tests {
         assert!(parse_traffic("not json").is_empty());
         assert!(parse_traffic("{}").is_empty());
         assert!(parse_traffic(r#"{"features":[]}"#).is_empty());
+    }
+
+    // ディスクキャッシュ(plotcache)へ保存する形。
+    #[test]
+    fn traffic_points_round_trip_through_json() {
+        let p = TrafficPoint { lat: 35.58550262, lon: 139.7049058, volume: 135 };
+        let json = serde_json::to_string(&p).unwrap();
+        assert_eq!(json, r#"{"lat":35.58550262,"lon":139.7049058,"volume":135}"#);
+        assert_eq!(serde_json::from_str::<TrafficPoint>(&json).unwrap(), p);
     }
 
     #[test]

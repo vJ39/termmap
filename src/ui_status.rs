@@ -9,9 +9,19 @@ use crate::radar;
 use crate::settings;
 use crate::spots::Spot;
 use crate::tiles::{radar_progress, TileLoader};
-use crate::traffic::TrafficPoint;
-use crate::camera::RoadCamera;
-use crate::regulation::ClosureEvent;
+
+// プロットレイヤ(道路交通量・道路ライブカメラ・通行規制)1つぶんの表示状態。
+// 件数しか見ないので、アイテムそのものではなく畳んだ値を受け取る。
+pub(crate) struct PlotStatus {
+    /// 表示範囲に出ている件数。
+    pub count: usize,
+    /// 背景取得が走っているか。
+    pub job_active: bool,
+    /// fresh を過ぎた値を出しているときだけ Some(経過秒)。交通量は観測からの経過。
+    pub stale_age_secs: Option<u64>,
+    /// ズーム下限より広域で、取得を止めているか。
+    pub wide_area: bool,
+}
 
 // build_status_line が読むループ状態。Option のうち有無しか見ないもの(通信中ジョブ・GPS)は
 // 呼び出し側で bool に畳んで渡す。
@@ -43,12 +53,9 @@ pub(crate) struct StatusCtx<'a> {
     pub rw: u32,
     pub rh: u32,
     pub cfg: &'a Config,
-    pub traffic_points: &'a [TrafficPoint],
-    pub traffic_job_active: bool,
-    pub camera_points: &'a [RoadCamera],
-    pub camera_job_active: bool,
-    pub regulation_events: &'a [ClosureEvent],
-    pub regulation_job_active: bool,
+    pub traffic: PlotStatus,
+    pub camera: PlotStatus,
+    pub regulation: PlotStatus,
     pub addr: &'a str,
     pub wps: &'a [(f64, f64)],
     pub z: u32,
@@ -57,13 +64,55 @@ pub(crate) struct StatusCtx<'a> {
     pub next_turn: &'a Option<String>,
 }
 
+// プロットレイヤ1つぶんの表記を組む。
+//   fresh                → 🚗12地点
+//   stale(表示継続中)   → 🚗12地点(32分前)     ← 今の状態とは限らないことを示す
+//   stale + 再取得中     → 🚗12地点(32分前)…
+//   0件 + 取得中         → 🚗取得中…
+//   0件 + ズーム下限外   → 🚗広域では非表示     ← 取りに行っていないので「無し」とは言えない
+//   0件                  → 🚗観測点無し
+// fresh の間は経過時間を出さない(常時出すと情報量が増えるだけなので)。
+fn plot_label(enabled: bool, icon: &str, unit: &str, suffix: &str, none_txt: &str, s: &PlotStatus) -> String {
+    if !enabled {
+        return String::new();
+    }
+    if s.count == 0 {
+        if s.job_active {
+            return format!("{icon}取得中… ");
+        }
+        if s.wide_area {
+            return format!("{icon}広域では非表示 ");
+        }
+        return format!("{icon}{none_txt} ");
+    }
+    let age = match s.stale_age_secs {
+        Some(secs) => format!("({})", format_age(secs)),
+        None => String::new(),
+    };
+    // 古い値を出したまま裏で取り直しているときだけ、続きがあることを示す。
+    let updating = if s.stale_age_secs.is_some() && s.job_active { "…" } else { "" };
+    format!("{icon}{}{unit}{age}{suffix}{updating} ", s.count)
+}
+
+// 経過時間の粗い表記(ステータス行は幅が限られるので1単位だけ出す)。
+fn format_age(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}秒前")
+    } else if secs < 3600 {
+        format!("{}分前", secs / 60)
+    } else if secs < 24 * 3600 {
+        format!("{}時間前", secs / 3600)
+    } else {
+        format!("{}日前", secs / (24 * 3600))
+    }
+}
+
 pub(crate) fn build_status_line(c: StatusCtx) -> String {
     let StatusCtx {
         focus, save_confirm, spot_move_confirm, spots, cur_cat, pending_spot, set_sel, poi_label,
         route_note, clear_route_confirm, jobs_active, spin, gps_live, web_gps_active, play,
         play_speed, radar_on, radar_tl, radar_idx, radar_follow, loader, rcx, rcy, rz, rw, rh,
-        cfg, traffic_points, traffic_job_active, camera_points, camera_job_active,
-        regulation_events, regulation_job_active,
+        cfg, traffic, camera, regulation,
         addr, wps, z, lat, lon, next_turn,
     } = c;
     match focus {
@@ -144,35 +193,11 @@ pub(crate) fn build_status_line(c: StatusCtx) -> String {
             };
             // 道路交通量: ONのときだけ、取得地点数(または取得中)を出す。0件は「圏外/観測点無し」
             // (このデータは直轄国道の観測点のみで、それ以外の道路には点が無い)と区別できるようにする。
-            let traffic_txt = if !cfg.traffic_enabled {
-                String::new()
-            } else if traffic_points.is_empty() && traffic_job_active {
-                "🚗取得中… ".to_string()
-            } else if traffic_points.is_empty() {
-                "🚗観測点無し ".to_string()
-            } else {
-                format!("🚗{}地点 ", traffic_points.len())
-            };
+            let traffic_txt = plot_label(cfg.traffic_enabled, "🚗", "地点", "", "観測点無し", &traffic);
             // 道路ライブカメラ: ONのときだけ件数を出す(考え方はtraffic_txtと同じ)。
-            let camera_txt = if !cfg.camera_enabled {
-                String::new()
-            } else if camera_points.is_empty() && camera_job_active {
-                "📷取得中… ".to_string()
-            } else if camera_points.is_empty() {
-                "📷カメラ無し ".to_string()
-            } else {
-                format!("📷{}台(N) ", camera_points.len())
-            };
+            let camera_txt = plot_label(cfg.camera_enabled, "📷", "台", "(N)", "カメラ無し", &camera);
             // 通行規制: ONのときだけ件数を出す(考え方はtraffic_txtと同じ)。
-            let regulation_txt = if !cfg.regulation_enabled {
-                String::new()
-            } else if regulation_events.is_empty() && regulation_job_active {
-                "⚠取得中… ".to_string()
-            } else if regulation_events.is_empty() {
-                "⚠規制無し ".to_string()
-            } else {
-                format!("⚠{}件 ", regulation_events.len())
-            };
+            let regulation_txt = plot_label(cfg.regulation_enabled, "⚠", "件", "", "規制無し", &regulation);
             // 一時メッセージが無い時は底面にロゴを常時表示。メッセージ発生時はそちらを優先。
             let msg = if addr.is_empty() { "◉╌╌╌► termmap · terminal touring map   ".to_string() } else { format!("» {addr} « ") };
             // 下部バーは細く。全操作は Space メニューから選べる
@@ -222,12 +247,9 @@ mod tests {
         radar_idx: usize,
         radar_follow: bool,
         cfg: Config,
-        traffic_points: Vec<TrafficPoint>,
-        traffic_job_active: bool,
-        camera_points: Vec<RoadCamera>,
-        camera_job_active: bool,
-        regulation_events: Vec<ClosureEvent>,
-        regulation_job_active: bool,
+        traffic: PlotStatus,
+        camera: PlotStatus,
+        regulation: PlotStatus,
         addr: String,
         wps: Vec<(f64, f64)>,
         z: u32,
@@ -244,9 +266,8 @@ mod tests {
                 route_note: None, clear_route_confirm: false, jobs_active: false, spin: 0,
                 gps_live: false, web_gps_active: false, play: None, play_speed: 1.0,
                 radar_on: false, radar_tl: radar::Timeline::default(), radar_idx: 0, radar_follow: true,
-                cfg: Config::default(), traffic_points: Vec::new(), traffic_job_active: false,
-                camera_points: Vec::new(), camera_job_active: false,
-                regulation_events: Vec::new(), regulation_job_active: false,
+                cfg: Config::default(),
+                traffic: idle_plot(), camera: idle_plot(), regulation: idle_plot(),
                 addr: String::new(), wps: Vec::new(), z: 14, lat: 35.0, lon: 139.0, next_turn: None,
             }
         }
@@ -262,13 +283,25 @@ mod tests {
                 radar_on: self.radar_on, radar_tl: &self.radar_tl, radar_idx: self.radar_idx,
                 radar_follow: self.radar_follow,
                 loader: shared_loader(), rcx: 0.0, rcy: 0.0, rz: 10, rw: 300, rh: 200,
-                cfg: &self.cfg, traffic_points: &self.traffic_points,
-                traffic_job_active: self.traffic_job_active,
-                camera_points: &self.camera_points, camera_job_active: self.camera_job_active,
-                regulation_events: &self.regulation_events, regulation_job_active: self.regulation_job_active,
+                cfg: &self.cfg,
+                traffic: clone_plot(&self.traffic),
+                camera: clone_plot(&self.camera),
+                regulation: clone_plot(&self.regulation),
                 addr: &self.addr, wps: &self.wps, z: self.z, lat: self.lat, lon: self.lon,
                 next_turn: &self.next_turn,
             })
+        }
+    }
+
+    fn idle_plot() -> PlotStatus {
+        PlotStatus { count: 0, job_active: false, stale_age_secs: None, wide_area: false }
+    }
+    fn clone_plot(p: &PlotStatus) -> PlotStatus {
+        PlotStatus {
+            count: p.count,
+            job_active: p.job_active,
+            stale_age_secs: p.stale_age_secs,
+            wide_area: p.wide_area,
         }
     }
 
@@ -425,16 +458,13 @@ mod tests {
         let mut f = Fixture::new(Focus::Map);
         assert!(!f.line().contains('🚗'), "OFFのときは出さない");
         f.cfg.traffic_enabled = true;
-        f.traffic_job_active = true;
+        f.traffic.job_active = true;
         assert!(f.line().contains("🚗取得中… "));
-        f.traffic_job_active = false;
+        f.traffic.job_active = false;
         assert!(f.line().contains("🚗観測点無し "));
-        f.traffic_points = vec![
-            TrafficPoint { lat: 35.0, lon: 139.0, volume: 10 },
-            TrafficPoint { lat: 35.1, lon: 139.1, volume: 200 },
-        ];
+        f.traffic.count = 2;
         assert!(f.line().contains("🚗2地点 "));
-        f.traffic_job_active = true; // 取得済みなら取得中でも件数を優先する
+        f.traffic.job_active = true; // 取得済みなら取得中でも件数を優先する
         assert!(f.line().contains("🚗2地点 "));
     }
 
@@ -443,16 +473,13 @@ mod tests {
         let mut f = Fixture::new(Focus::Map);
         assert!(!f.line().contains('📷'), "OFFのときは出さない");
         f.cfg.camera_enabled = true;
-        f.camera_job_active = true;
+        f.camera.job_active = true;
         assert!(f.line().contains("📷取得中… "));
-        f.camera_job_active = false;
+        f.camera.job_active = false;
         assert!(f.line().contains("📷カメラ無し "));
-        f.camera_points = vec![RoadCamera {
-            id: "X".to_string(), lat: 35.0, lon: 139.0, name: "テスト地点".to_string(),
-            thumb_url: None, full_url: None, taken_at: String::new(),
-        }];
+        f.camera.count = 1;
         assert!(f.line().contains("📷1台(N) "));
-        f.camera_job_active = true; // 取得済みなら取得中でも件数を優先する
+        f.camera.job_active = true; // 取得済みなら取得中でも件数を優先する
         assert!(f.line().contains("📷1台(N) "));
     }
 
@@ -461,17 +488,69 @@ mod tests {
         let mut f = Fixture::new(Focus::Map);
         assert!(!f.line().contains('⚠'), "OFFのときは出さない");
         f.cfg.regulation_enabled = true;
-        f.regulation_job_active = true;
+        f.regulation.job_active = true;
         assert!(f.line().contains("⚠取得中… "));
-        f.regulation_job_active = false;
+        f.regulation.job_active = false;
         assert!(f.line().contains("⚠規制無し "));
-        f.regulation_events = vec![ClosureEvent {
-            line: vec![(35.0, 139.0), (35.1, 139.1)],
-            kind: crate::regulation::RegulationKind::Closed,
-        }];
+        f.regulation.count = 1;
         assert!(f.line().contains("⚠1件 "));
-        f.regulation_job_active = true; // 取得済みなら取得中でも件数を優先する
+        f.regulation.job_active = true; // 取得済みなら取得中でも件数を優先する
         assert!(f.line().contains("⚠1件 "));
+    }
+
+    // fresh を過ぎた値を出している間だけ経過時間を添える(今の状態とは限らないことを示す)。
+    #[test]
+    fn a_stale_layer_shows_how_old_the_data_is() {
+        let mut f = Fixture::new(Focus::Map);
+        f.cfg.traffic_enabled = true;
+        f.traffic.count = 12;
+        assert!(f.line().contains("🚗12地点 "), "freshなら経過時間は出さない");
+        f.traffic.stale_age_secs = Some(32 * 60);
+        assert!(f.line().contains("🚗12地点(32分前) "));
+        f.traffic.job_active = true;
+        assert!(f.line().contains("🚗12地点(32分前)… "), "裏で取り直し中は続きを示す");
+    }
+
+    #[test]
+    fn a_stale_camera_keeps_the_photo_key_hint_after_the_age() {
+        let mut f = Fixture::new(Focus::Map);
+        f.cfg.camera_enabled = true;
+        f.camera.count = 3;
+        f.camera.stale_age_secs = Some(9 * 24 * 3600);
+        assert!(f.line().contains("📷3台(9日前)(N) "));
+    }
+
+    // ズーム下限より広域では取りに行かないので「無し」とは言えない。
+    #[test]
+    fn a_wide_area_view_says_the_layer_is_not_shown_rather_than_empty() {
+        let mut f = Fixture::new(Focus::Map);
+        f.cfg.regulation_enabled = true;
+        f.regulation.wide_area = true;
+        assert!(f.line().contains("⚠広域では非表示 "));
+        // 既に持っているぶんが表示されているなら、件数の方を出す。
+        f.regulation.count = 4;
+        assert!(f.line().contains("⚠4件 "));
+    }
+
+    #[test]
+    fn a_wide_area_view_still_reports_an_in_flight_job_first() {
+        let mut f = Fixture::new(Focus::Map);
+        f.cfg.traffic_enabled = true;
+        f.traffic.wide_area = true;
+        f.traffic.job_active = true;
+        assert!(f.line().contains("🚗取得中… "));
+    }
+
+    #[test]
+    fn age_is_rendered_with_a_single_unit() {
+        assert_eq!(format_age(0), "0秒前");
+        assert_eq!(format_age(59), "59秒前");
+        assert_eq!(format_age(60), "1分前");
+        assert_eq!(format_age(3599), "59分前");
+        assert_eq!(format_age(3600), "1時間前");
+        assert_eq!(format_age(24 * 3600 - 1), "23時間前");
+        assert_eq!(format_age(24 * 3600), "1日前");
+        assert_eq!(format_age(30 * 24 * 3600), "30日前");
     }
 
     #[test]

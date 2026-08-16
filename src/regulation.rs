@@ -10,9 +10,12 @@
 //     まずpcTukokisei_81_1.htmlを取得してパスを都度発見する必要がある(2段階フェッチ)。
 //   - 1次メッシュコード(JIS X 0410、約80km四方)単位でファイルが分かれているため、
 //     表示範囲を覆う全メッシュコードを列挙して個別に取得する。
+//     bbox→メッシュコードの割り出しは mesh.rs が持ち、ここはメッシュ1枚を取る役に徹する
+//     (呼び出し側がセル単位でキャッシュするため、配信元パスの発見とメッシュ取得を分けてある)。
 // gpslive.rs/radar.rs/traffic.rsと同じ方針でstd+ureq+serde_jsonのみに依存し、
 // crate::を参照しない。
 
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 const BASE: &str = "https://www.road-info-prvs.mlit.go.jp/roadinfo";
@@ -20,7 +23,9 @@ const TUKOKISEI_PAGE: &str = "https://www.road-info-prvs.mlit.go.jp/roadinfo/pc/
 const USER_AGENT: &str = "termmap/0.1 (personal experiment)";
 const HTTP_TIMEOUT_SECS: u64 = 20;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+// serdeのユニットバリアントは既定でバリアント名の文字列になる("Closed" 等)。ディスクへ
+// 保存するときはこの名前で持つ(元の kisei_naiyo_cd は ClosureEvent に残っていないため)。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum RegulationKind {
     Closed,              // 通行止め(冬期含む)
     LaneRestriction,     // 車線規制
@@ -70,31 +75,10 @@ impl RegulationKind {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ClosureEvent {
     pub line: Vec<(f64, f64)>, // (lat, lon)の順(termmapの座標順に合わせる。ソースはlon,lat順なので変換する)
     pub kind: RegulationKind,
-}
-
-// bbox(south,west,north,east)を覆う1次メッシュコード(JIS X 0410)を全て列挙する。
-// p = floor(lat*1.5), u = floor(lon)-100, code = p*100+u。
-fn primary_mesh_codes(lat_min: f64, lon_min: f64, lat_max: f64, lon_max: f64) -> Vec<u32> {
-    let p0 = (lat_min * 1.5).floor() as i64;
-    let p1 = (lat_max * 1.5).floor() as i64;
-    let u0 = lon_min.floor() as i64 - 100;
-    let u1 = lon_max.floor() as i64 - 100;
-    let mut out = Vec::new();
-    if p0 > p1 || u0 > u1 {
-        return out;
-    }
-    for p in p0..=p1 {
-        for u in u0..=u1 {
-            if p >= 0 && u >= 0 {
-                out.push((p * 100 + u) as u32);
-            }
-        }
-    }
-    out
 }
 
 // pcTukokisei_81_1.html本文から、その時点のJSON配信元ベースURLを取り出す。
@@ -112,43 +96,32 @@ fn extract_json_base(html: &str) -> Option<String> {
     Some(format!("{BASE}/backup/{dir}"))
 }
 
-// 失敗しても呼び出し側は「規制情報なし」に静かにフォールバックできるよう常にVecを返す
-// (地図表示自体はこの機能の失敗で壊さない)。
-pub fn fetch_closures(lat_min: f64, lon_min: f64, lat_max: f64, lon_max: f64) -> Vec<ClosureEvent> {
-    let meshes = primary_mesh_codes(lat_min, lon_min, lat_max, lon_max);
-    if meshes.is_empty() {
-        return Vec::new();
-    }
-    let html = match ureq::get(TUKOKISEI_PAGE)
+// その時点のJSON配信元ベースURLを発見する(1段目)。パスは更新のたびに変わるので保存できず、
+// 取得のたびに引き直す必要がある。複数メッシュを取るときは1回だけ呼んで使い回す。
+pub fn discover_json_base() -> Result<String, String> {
+    let html = ureq::get(TUKOKISEI_PAGE)
         .set("User-Agent", USER_AGENT)
         .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
         .call()
-    {
-        Ok(r) => match r.into_string() {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        },
-        Err(_) => return Vec::new(),
-    };
-    let Some(json_base) = extract_json_base(&html) else { return Vec::new() };
+        .map_err(|e| format!("通行規制の配信元: {e}"))?
+        .into_string()
+        .map_err(|e| format!("通行規制の配信元の読み取り: {e}"))?;
+    extract_json_base(&html).ok_or_else(|| "通行規制の配信元パスが見つからない".to_string())
+}
 
-    let mut out = Vec::new();
-    for mesh in meshes {
-        let url = format!("{json_base}TukoKisei/{mesh}.json");
-        let body = match ureq::get(&url)
-            .set("User-Agent", USER_AGENT)
-            .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
-            .call()
-        {
-            Ok(r) => match r.into_string() {
-                Ok(s) => s,
-                Err(_) => continue, // このメッシュだけ諦めて次へ(全滅させない)
-            },
-            Err(_) => continue,
-        };
-        out.extend(parse_closures(&body));
-    }
-    out
+// 1次メッシュ1枚ぶんの規制情報を取る(2段目)。base は discover_json_base() の戻り値。
+// 失敗と0件を区別できるよう Result を返す。以前は両方 Vec::new() だったため、圏外に入った
+// 瞬間に呼び出し側が「規制0件」で上書きし、直前まで見えていた通行止めが消えていた。
+pub fn fetch_mesh(base: &str, mesh: u32) -> Result<Vec<ClosureEvent>, String> {
+    let url = format!("{base}TukoKisei/{mesh}.json");
+    let body = ureq::get(&url)
+        .set("User-Agent", USER_AGENT)
+        .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
+        .call()
+        .map_err(|e| format!("通行規制(メッシュ{mesh}): {e}"))?
+        .into_string()
+        .map_err(|e| format!("通行規制(メッシュ{mesh})の読み取り: {e}"))?;
+    Ok(parse_closures(&body))
 }
 
 // TukoKisei/{mesh}.json 本文 → Vec<ClosureEvent>。ネットワークに触れない純関数。
@@ -182,24 +155,9 @@ pub fn parse_closures(body: &str) -> Vec<ClosureEvent> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn primary_mesh_codes_single_point() {
-        // 東京(35.68, 139.77)は実測で5339
-        assert_eq!(primary_mesh_codes(35.68, 139.77, 35.68, 139.77), vec![5339]);
-    }
-
-    #[test]
-    fn primary_mesh_codes_spans_multiple_cells() {
-        // 緯度経度をまたぐ範囲なら複数コードを返す
-        let codes = primary_mesh_codes(35.0, 139.0, 36.5, 141.0);
-        assert!(codes.len() > 1);
-        assert!(codes.contains(&5339));
-    }
-
-    #[test]
-    fn primary_mesh_codes_empty_on_invalid_range() {
-        assert!(primary_mesh_codes(36.0, 139.0, 35.0, 140.0).is_empty()); // lat_min > lat_max
-    }
+    // bbox→1次メッシュコードの計算はこのモジュールから mesh.rs へ移した
+    // (呼び出し側がセル単位でキャッシュするようになり、ここでbboxを割る必要がなくなったため)。
+    // 当時ここで固定していた既知値は mesh.rs のテストが引き継いでいる。
 
     #[test]
     fn extract_json_base_finds_backup_path() {
@@ -259,11 +217,42 @@ mod tests {
         assert!(parse_closures(r#"[{"kisei_naiyo_cd":"01"}]"#).is_empty()); // geo_json欠如
     }
 
+    // ディスクへ保存する形(設計 §5.3)。kind はバリアント名の文字列で持つ。
+    #[test]
+    fn closure_events_round_trip_through_json_as_line_and_kind_name() {
+        let ev = ClosureEvent {
+            line: vec![(35.64085, 139.733125), (35.64044, 139.732903)],
+            kind: RegulationKind::Closed,
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert_eq!(
+            json,
+            r#"{"line":[[35.64085,139.733125],[35.64044,139.732903]],"kind":"Closed"}"#
+        );
+        assert_eq!(serde_json::from_str::<ClosureEvent>(&json).unwrap(), ev);
+    }
+
+    #[test]
+    fn every_regulation_kind_survives_a_json_round_trip() {
+        for k in [
+            RegulationKind::Closed,
+            RegulationKind::LaneRestriction,
+            RegulationKind::AlternatingOneLane,
+            RegulationKind::ChainRequired,
+            RegulationKind::MovementRestriction,
+            RegulationKind::Other,
+        ] {
+            let json = serde_json::to_string(&k).unwrap();
+            assert_eq!(serde_json::from_str::<RegulationKind>(&json).unwrap(), k, "{json}");
+        }
+    }
+
     // 実ネットワークを叩く手動確認用(CIでは走らない)。`cargo test --release -- --ignored`で実行。
     #[test]
     #[ignore]
     fn live_fetch_real_regulation_data() {
-        let events = fetch_closures(35.3, 139.0, 36.0, 140.3);
+        let base = discover_json_base().expect("配信元パスの発見");
+        let events = fetch_mesh(&base, 5339).expect("メッシュ取得");
         println!("events: {}", events.len());
         for e in events.iter().take(5) {
             println!("{:?} pts={} color={:?}", e.kind, e.line.len(), e.kind.color());

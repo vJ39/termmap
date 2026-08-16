@@ -46,8 +46,9 @@ u = floor(lon) - 100
 code = p * 100 + u
 ```
 
-`primary_mesh_codes(lat_min, lon_min, lat_max, lon_max)` が bbox を覆う全コードを返す。
-`lat_min > lat_max` のような不正な範囲では空 Vec を返し、1回も通信しない。
+bbox からコードを割り出すのは `src/mesh.rs` の `primary_codes(lat_min, lon_min, lat_max, lon_max)`
+(交通量と共通)。`lat_min > lat_max` のような不正な範囲や日本のメッシュ空間の外では空 Vec を返し、
+1回も通信しない。`regulation.rs` 自身はメッシュコード1件ぶんを取る役に徹する。
 
 ## 2. データ層 (`src/regulation.rs`)
 
@@ -59,9 +60,15 @@ pub struct ClosureEvent {
     pub kind: RegulationKind,
 }
 
-pub fn fetch_closures(lat_min, lon_min, lat_max, lon_max) -> Vec<ClosureEvent>
+pub fn discover_json_base() -> Result<String, String>                    // 1段目: 配信元パスの発見
+pub fn fetch_mesh(base: &str, mesh: u32) -> Result<Vec<ClosureEvent>, String>  // 2段目: メッシュ1枚
 pub fn parse_closures(body: &str) -> Vec<ClosureEvent>   // ネットワークに触れない純関数
 ```
+
+2段に分けてあるのは、呼び出し側がメッシュ(セル)単位でキャッシュするため。1ジョブの中で
+`discover_json_base()` を1回だけ呼び、不足しているメッシュに使い回す。配信元パスは更新のたびに
+変わるので永続化しない(保存すると次回404になる)。`ClosureEvent` / `RegulationKind` は
+serde の derive を持ち、そのままディスクキャッシュへ保存できる(`kind` はバリアント名の文字列)。
 
 ### 2.1 種別の判定と配色
 
@@ -90,43 +97,47 @@ pub fn parse_closures(body: &str) -> Vec<ClosureEvent>   // ネットワーク�
 
 ### 2.3 失敗時のフォールバック
 
-`fetch_closures` は**常に `Vec` を返す**(`Result` にしていない)。
+失敗と0件を区別できるよう、通信する関数はどちらも `Result` を返す。
 
 | 失敗箇所 | 挙動 |
 |---|---|
-| メッシュコードが0件 | 空 Vec(通信しない) |
-| HTML の取得・本文化に失敗 | 空 Vec |
-| `extract_json_base` が見つけられない | 空 Vec |
-| 個別メッシュの取得に失敗 | **そのメッシュだけ諦めて次へ**(全体を巻き添えにしない) |
+| メッシュコードが0件 | 通信しない(呼び出し側がセルを1枚も要求しない) |
+| HTML の取得・本文化に失敗 | `Err`(配信元パス不明。そのジョブのメッシュは全部取れない) |
+| `extract_json_base` が見つけられない | `Err` |
+| 個別メッシュの取得に失敗 | そのメッシュだけ `Err`(呼び出し側が他のメッシュを巻き添えにしない) |
+
+`Err` を受けた側(`plotlayer`)は、そのセルの手元の値を**消さずに保持する**。ディスクに
+stale上限(24時間)内の控えがあればそれを表示し、ステータス行に経過時間を添える。
 
 ## 3. ui.rs の配線
 
-### 3.1 状態 (`src/ui.rs:151-155`)
+### 3.1 状態
 
 ```rust
-regulation_events: Vec<regulation::ClosureEvent>
-regulation_job: Option<Receiver<Vec<regulation::ClosureEvent>>>
-regulation_last_fetch: Option<Instant>
-regulation_bbox: Option<(lat_min, lon_min, lat_max, lon_max)>
+regulation_layer: PlotLayer<regulation::ClosureEvent>   // plotlayer::regulation()
 ```
 
-### 3.2 取得スケジュール (`src/ui.rs:1042-1070`)
+セル表(メッシュコード→取得結果)・進行中ジョブ・ディスク永続化はすべて `PlotLayer` が持つ。
+以前あった `regulation_events` / `regulation_job` / `regulation_last_fetch` / `regulation_bbox` は
+この1つに畳まれた。
 
-道路交通量・ライブカメラと同じ形の独立ブロック。
+### 3.2 取得スケジュール
+
+道路交通量・ライブカメラ・主要道路と共通の仕組み(`src/plotlayer.rs`)。設計は
+`docs/plot-data-disk-cache-design.md`。
 
 | 項目 | 値 |
 |---|---|
-| 発火条件 | `cfg.regulation_enabled` かつ `regulation_job` が無い |
-| 取得範囲 | 画面中心から `MARGIN_PX = 900` ピクセル分を広げた bbox |
-| 定期更新 | `REFRESH = 90秒` |
-| 即時更新 | 画面中心が `regulation_bbox` の外に出たとき |
-| 実行方法 | `std::thread::spawn` + `mpsc`、毎ループ `try_recv()` |
+| 発火条件 | `cfg.regulation_enabled` かつ、視野を覆うメッシュに fresh でないものがある |
+| 取得単位 | 1次メッシュ1枚(1回の判定で最大9枚まで) |
+| 再取得の抑止 | fresh TTL 10分。この間は通信しない |
+| オフライン表示 | stale上限 24時間。この間はディスクの控えを出し続ける |
+| ズーム下限 | z11(これより広域では取りに行かない) |
+| 実行方法 | `std::thread::spawn` + `mpsc`、毎ループ `tick()` |
 
-`regulation_job` が生きている間はポーリング側に倒す(`src/ui.rs:1253`)。キー入力が無いまま取得が
-完了しても結果が反映される。
+ジョブが生きている間はポーリング側に倒す。キー入力が無いまま取得が完了しても結果が反映される。
 
-受信すると `regulation_events` を丸ごと置き換える。`fetch_closures` は失敗を空 Vec で返すので、
-通信に失敗した回は線が消え、ステータス行が `⚠規制無し` になる(交通量のように前回値を保持しない)。
+成功したメッシュだけが更新され、失敗したメッシュは手元の値を保持する(空で上書きしない)。
 
 ### 3.3 描画 (`src/ui.rs:798-805`)
 
@@ -167,19 +178,21 @@ halfblock / 実画像 / braille / edge のどの描画モードでも出る。
   「事故なのか工事なのか冬期閉鎖なのか」「いつからいつまでか」は画面に出ない。
   原因コードの文言対応表も特定できていない。
 - 線を引くだけで、クリック/選択して詳細を見る導線が無い(`RegulationKind::label()` は未使用)。
-- 取得失敗が空 Vec と区別できないため、通信断と規制0件が同じ表示(`⚠規制無し`)になる。
+- 表示が「今の規制とは限らない」場合がある(オフライン時は最大24時間前の内容を出す)。
+  そのときはステータス行に経過時間が付く(`⚠3件(2時間前)`)。線の色は変えていないので、
+  色だけでは新旧を区別できない。
 - 配信元パス(`backup/{timestamp}/{hash}/`)は更新のたびに変わるため、HTML の構造が変わると
   全件取得できなくなる。影響は `TUKOKISEI_PAGE` と `extract_json_base` に閉じている。
 - 非公式エンドポイントのため、提供そのものが予告なく止まりうる。
 
 ## 6. テスト (`src/regulation.rs` の `mod tests`)
 
-- `primary_mesh_codes`: 東京(35.68, 139.77) → `5339` / 複数セルにまたがる範囲で複数コード /
-  `lat_min > lat_max` の不正範囲で空。
+- 1次メッシュコードの計算(東京 → `5339` 等)は `src/mesh.rs` の `mod tests` へ移した。
 - `extract_json_base`: `../backup/{timestamp}/{hash}/` を切り出す / 無いときは `None`。
 - `RegulationKind::from_code`: 既知コード5種 + `08` + 未知値(`99` → `Other`)。
 - `parse_closures`: 実 JSON の抜粋(2026/08/16 実測)から種別と `(lat, lon)` 順の線を取り出す /
   1点しかない要素を除外する / 壊れた入力・空配列・`geo_json` 欠如で空 Vec。
+- serde: `ClosureEvent` の JSON 往復(`{"line":[[lat,lon],..],"kind":"Closed"}`)/ 全種別の往復。
 - `live_fetch_real_regulation_data` は `#[ignore]`(実ネットワーク・`cargo test --release -- --ignored`)。
 
 ステータス行のラベル分岐は `src/ui_status.rs` 側のテスト

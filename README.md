@@ -293,3 +293,5 @@ ttyd の `-c`(Basic 認証)を使わないのは、iOS Safari が最初のペー
 - お気に入りルート: `~/.config/termmap/routes/<名前>.txt`
 - マイスポット: `~/.config/termmap/spots.txt` / カテゴリ: `~/.config/termmap/spot-categories.txt`
 - 検索キャッシュ: `~/.config/termmap/search-cache.tsv`
+- 地図タイルキャッシュ: `~/.config/termmap/tiles`(30日)
+- 重ねるデータのキャッシュ: `~/.config/termmap/plot-cache`(交通量5分/規制10分/カメラ7日/主要道路30日)

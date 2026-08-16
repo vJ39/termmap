@@ -280,10 +280,12 @@ pub fn nearest_way_segment(ways: &[Vec<(f64, f64)>], point: (f64, f64), radius: 
 
 /// nearest_way_segment に「最寄り頂点までの距離が max_dist_m を超えたら空Vecを返す」制限を
 /// 加えた版。周囲に該当する道路データが無い観測点を、無関係な遠い道へスナップしてしまうのを防ぐ。
-pub fn nearest_way_segment_within(ways: &[Vec<(f64, f64)>], point: (f64, f64), radius: usize, max_dist_m: f64) -> Vec<(f64, f64)> {
+/// ways は点列そのもの(`Vec<(f64,f64)>`)でも、他の構造体が持つ点列への参照(`&[(f64,f64)]`)でも
+/// 渡せる。呼び出し側がキャッシュ上の道路から点列だけを借りて渡せるようにするため。
+pub fn nearest_way_segment_within<W: AsRef<[(f64, f64)]>>(ways: &[W], point: (f64, f64), radius: usize, max_dist_m: f64) -> Vec<(f64, f64)> {
     let mut best: Option<(usize, usize, f64)> = None; // (way_idx, vertex_idx, dist_m)
     for (wi, way) in ways.iter().enumerate() {
-        for (vi, &p) in way.iter().enumerate() {
+        for (vi, &p) in way.as_ref().iter().enumerate() {
             let d = haversine_m(point, p);
             if best.map_or(true, |(_, _, bd)| d < bd) {
                 best = Some((wi, vi, d));
@@ -292,7 +294,7 @@ pub fn nearest_way_segment_within(ways: &[Vec<(f64, f64)>], point: (f64, f64), r
     }
     let Some((wi, vi, dist)) = best else { return Vec::new() };
     if dist > max_dist_m { return Vec::new(); }
-    let way = &ways[wi];
+    let way = ways[wi].as_ref();
     let lo = vi.saturating_sub(radius);
     let hi = (vi + radius).min(way.len() - 1);
     way[lo..=hi].to_vec()
@@ -550,5 +552,20 @@ mod tests {
         let got_unlimited = nearest_way_segment_within(&[way], (35.01, 139.0), 1, f64::INFINITY);
         assert_eq!(got_plain, got_unlimited);
         assert!(!got_plain.is_empty(), "十分遠くても上限なしなら最寄りwayを返す");
+    }
+
+    // 点列を所有する Vec でも、別の構造体が持つ点列への借用でも同じ結果になること
+    // (キャッシュ上の道路から点列だけを借りて渡す呼び出し方を担保する)。
+    #[test]
+    fn nearest_way_segment_within_accepts_borrowed_point_lists() {
+        let ways = vec![
+            vec![(35.0, 139.0), (35.001, 139.0), (35.002, 139.0)],
+            vec![(36.0, 140.0), (36.001, 140.0)],
+        ];
+        let borrowed: Vec<&[(f64, f64)]> = ways.iter().map(|w| w.as_slice()).collect();
+        let owned_result = nearest_way_segment_within(&ways, (35.001, 139.0), 1, 500.0);
+        let borrowed_result = nearest_way_segment_within(&borrowed, (35.001, 139.0), 1, 500.0);
+        assert_eq!(owned_result, borrowed_result);
+        assert_eq!(owned_result.len(), 3);
     }
 }

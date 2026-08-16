@@ -18,6 +18,7 @@
 // gpslive.rs/radar.rs/traffic.rs/regulation.rsと同じ方針でstd+ureq+serde_jsonのみに依存し、
 // crate::を参照しない。
 
+use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::time::Duration;
 
@@ -41,19 +42,26 @@ const BUREAUS: &[(u32, f64, f64)] = &[
     (90, 26.22762325, 127.6909037), // 沖縄総合事務局
 ];
 
-#[derive(Clone, Debug, PartialEq)]
+// ディスクキャッシュ(plotcache)へ保存するのは設置位置(id/lat/lon/name)だけにする。
+// 写真URLは15分ごとの撮影ディレクトリを含む(実測 .../20260816160000/811C200101.jpeg)ので、
+// 1時間後には404になる。保存すると「キャッシュから読んだのに写真が出ない」状態を作るだけなので
+// skip し、読み込み時は None / 空文字になる(必要になった時点で取り直す)。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RoadCamera {
     pub id: String,
     pub lat: f64,
     pub lon: f64,
     pub name: String,
+    #[serde(skip)]
     pub thumb_url: Option<String>, // 直近のサムネイル(一覧用、小さい)
-    pub full_url: Option<String>,  // 直近のフル画像(詳細表示用)
-    pub taken_at: String,          // フル画像の撮影時刻(get_datetime)
+    #[serde(skip)]
+    pub full_url: Option<String>, // 直近のフル画像(詳細表示用)
+    #[serde(skip)]
+    pub taken_at: String, // フル画像の撮影時刻(get_datetime)
 }
 
-// bboxの中心に最も近い地方整備局CDを返す(常にどれか1つは返る)。
-fn nearest_bureau(lat: f64, lon: f64) -> u32 {
+// 指定座標に最も近い地方整備局CDを返す(常にどれか1つは返る)。
+pub fn nearest_bureau(lat: f64, lon: f64) -> u32 {
     BUREAUS
         .iter()
         .min_by(|a, b| {
@@ -77,28 +85,19 @@ fn extract_kokudo_json(html: &str) -> Option<&str> {
     Some(&rest2[..vend])
 }
 
-// 失敗しても呼び出し側は「カメラなし」に静かにフォールバックできるよう常にVecを返す
-// (地図表示自体はこの機能の失敗で壊さない)。
-pub fn fetch_cameras(lat_min: f64, lon_min: f64, lat_max: f64, lon_max: f64) -> Vec<RoadCamera> {
-    let clat = (lat_min + lat_max) / 2.0;
-    let clon = (lon_min + lon_max) / 2.0;
-    let cd = nearest_bureau(clat, clon);
+// 地方整備局1局ぶんのカメラを全件返す(bboxでは絞らない。絞り込みは呼び出し側のメモリ上で行う)。
+// 失敗と0件を区別できるよう Result を返す。以前は両方 Vec::new() だったため、圏外に入った
+// 瞬間に呼び出し側が「カメラ0台」で上書きし、直前まで見えていたカメラが消えていた。
+pub fn fetch_bureau(cd: u32) -> Result<Vec<RoadCamera>, String> {
     let url = format!("{HTML_BASE}{cd}_1.html");
-    let html = match ureq::get(&url)
+    let html = ureq::get(&url)
         .set("User-Agent", USER_AGENT)
         .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
         .call()
-    {
-        Ok(r) => match r.into_string() {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        },
-        Err(_) => return Vec::new(),
-    };
-    parse_cameras(&html)
-        .into_iter()
-        .filter(|c| c.lat >= lat_min && c.lat <= lat_max && c.lon >= lon_min && c.lon <= lon_max)
-        .collect()
+        .map_err(|e| format!("道路カメラ一覧: {e}"))?
+        .into_string()
+        .map_err(|e| format!("道路カメラ一覧の読み取り: {e}"))?;
+    Ok(parse_cameras(&html))
 }
 
 // pcImage_{cd}_1.html 本文 → Vec<RoadCamera>。ネットワークに触れない純関数。
@@ -218,16 +217,34 @@ mod tests {
         assert!(parse_cameras(html).is_empty());
     }
 
+    // 位置だけを保存し、撮影時刻つきURLは保存しない(読み戻すと None / 空文字になる)。
+    #[test]
+    fn serde_keeps_the_position_and_drops_the_expiring_photo_urls() {
+        let c = parse_cameras(SAMPLE_HTML).remove(0);
+        assert!(c.full_url.is_some(), "取得直後はURLを持っている");
+        let json = serde_json::to_string(&c).unwrap();
+        assert!(!json.contains("full_url"), "URLは保存しない: {json}");
+        assert!(!json.contains("20260816160000"), "撮影ディレクトリを持ち越さない: {json}");
+        let back: RoadCamera = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.id, c.id);
+        assert_eq!(back.lat, c.lat);
+        assert_eq!(back.lon, c.lon);
+        assert_eq!(back.name, c.name);
+        assert_eq!(back.full_url, None);
+        assert_eq!(back.thumb_url, None);
+        assert_eq!(back.taken_at, "");
+    }
+
     // 実ネットワークを叩く手動確認用(CIでは走らない)。`cargo test --release -- --ignored`で実行。
     #[test]
     #[ignore]
     fn live_fetch_real_camera_data() {
-        // 関東広域(東京周辺)。実際に何件かカメラがあるはず。
-        let cams = fetch_cameras(35.3, 139.0, 36.0, 140.3);
+        // 関東地方整備局(東京周辺)。実際に何件かカメラがあるはず。
+        let cams = fetch_bureau(nearest_bureau(35.68, 139.77)).expect("live fetch should succeed");
         println!("cameras: {}", cams.len());
         for c in cams.iter().take(5) {
             println!("{} {} {:.4},{:.4} full={:?}", c.id, c.name, c.lat, c.lon, c.full_url);
         }
-        assert!(!cams.is_empty(), "実際に関東広域で0件は考えにくい");
+        assert!(!cams.is_empty(), "実際に関東で0件は考えにくい");
     }
 }

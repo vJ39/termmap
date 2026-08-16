@@ -1,0 +1,856 @@
+// 地図に重ねるプロットデータ(道路交通量・主要道路・道路ライブカメラ・通行規制)の取得段取り。
+// ui.rs にほぼ同一の取得ブロックが4つ並んでいたものを1つにまとめたもの。
+// 設計は docs/plot-data-disk-cache-design.md §6.3/§7。
+//
+// 旧実装との違いは3点。
+//   1. 取得単位が「視野中心±900pxのbbox」から「取得元が持つ自然な単位のセル」
+//      (1次/2次メッシュ・地方整備局)に変わった。bboxを生でキーにすると1pxパンで別キーになり
+//      ディスクキャッシュがヒットしないため。
+//   2. 再取得の判定が「90秒経過 or 中心がbboxの外」から「そのセルが fresh TTL 以内か」に変わった。
+//   3. ディスクの読み書きを全部ワーカースレッド側に置いた。UIスレッドは mpsc から受け取るだけで、
+//      受信コードの形(try_recv + Disconnected で畳む)は旧実装と同じ。
+
+use crate::plotcache::{self, Cached, Layer};
+use crate::{camera, mesh, regulation, roadsearch, traffic};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::mpsc::{Receiver, TryRecvError};
+
+/// (lat_min, lon_min, lat_max, lon_max)。geo.rs の pixel_to_deg と同じ緯度経度。
+pub type Bbox = (f64, f64, f64, f64);
+
+/// 視野bbox → 覆うセルキー列。
+type CellsFn = fn(Bbox) -> Vec<String>;
+/// セルキー → 取得結果。第2引数は1ジョブ内だけ生きるスクラッチ領域で、
+/// 通行規制が配信元パスの発見(毎回変わるので保存できない)を1ジョブ1回で済ませるために使う。
+/// 他のレイヤは触らない。
+type FetchFn<T> = fn(&str, &mut Option<String>) -> Result<Vec<T>, String>;
+
+// セル被覆を計算するときの視野の半径(px)。旧実装の MARGIN_PX と同じ値だが役割が違う。
+// 旧実装では「中心1点しか見ない再取得判定」を埋めるための余白だったのに対し、ここでは
+// 「覆うべき視野そのもの」の見積り(実際の地図領域は端末サイズによるが、セル1枚(2次で約10km・
+// 1次で約80km)が視野より十分大きいので、余白は構造的に確保される)。
+const VIEW_HALF_PX: f64 = 900.0;
+// 1回の判定で必要なセルがこれを超えたら取得しない。セルに分割すると「1回のbbox取得」が
+// 「N回のセル取得」に化けるため、広域では今より通信が増えてしまう。その安全弁。
+const MAX_CELLS_PER_JOB: usize = 9;
+// メモリ上に保持するセル数の上限。視野外のセルもしばらく残して往復(行って戻る)を速くするが、
+// 長距離を走り続けたときに無制限へ増えないよう、視野に入っていないものから古い順に捨てる。
+const MAX_CELLS_IN_MEMORY: usize = 32;
+// 取得に失敗した(または取得しても値が更新されなかった)セルを、次に試すまでの間隔。
+// これが無いと圏外で毎フレーム新しいジョブを起こし続ける(旧実装は REFRESH=90秒がこの役をしていた)。
+const RETRY_BACKOFF_SECS: u64 = 60;
+
+/// 視野の中心(グローバル画素)とズームから、覆うべき緯度経度bboxを作る。
+pub fn view_bbox(cx: f64, cy: f64, z: u32) -> Bbox {
+    let (lat_max, lon_min) = crate::geo::pixel_to_deg(cx - VIEW_HALF_PX, cy - VIEW_HALF_PX, z);
+    let (lat_min, lon_max) = crate::geo::pixel_to_deg(cx + VIEW_HALF_PX, cy + VIEW_HALF_PX, z);
+    (lat_min, lon_min, lat_max, lon_max)
+}
+
+fn intersects(a: Bbox, b: Bbox) -> bool {
+    a.0 <= b.2 && a.2 >= b.0 && a.1 <= b.3 && a.3 >= b.1
+}
+
+/// 表示範囲で絞り込むために、各アイテムが自分の占める矩形を答える。
+/// 点(交通量・カメラ)は面積ゼロの矩形、線(規制・道路)はその外接矩形になる。
+pub trait PlotItem {
+    fn bounds(&self) -> Bbox;
+}
+
+fn line_bounds(pts: &[(f64, f64)]) -> Bbox {
+    let mut b = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+    for &(lat, lon) in pts {
+        b.0 = b.0.min(lat);
+        b.1 = b.1.min(lon);
+        b.2 = b.2.max(lat);
+        b.3 = b.3.max(lon);
+    }
+    if pts.is_empty() {
+        // 空の線は「どこにも無い」= どの視野とも交差しない矩形にする。
+        return (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+    }
+    b
+}
+
+impl PlotItem for traffic::TrafficPoint {
+    fn bounds(&self) -> Bbox {
+        (self.lat, self.lon, self.lat, self.lon)
+    }
+}
+impl PlotItem for camera::RoadCamera {
+    fn bounds(&self) -> Bbox {
+        (self.lat, self.lon, self.lat, self.lon)
+    }
+}
+impl PlotItem for regulation::ClosureEvent {
+    fn bounds(&self) -> Bbox {
+        line_bounds(&self.line)
+    }
+}
+
+/// 主要道路1本ぶんの線形。roadsearch::fetch_major_roads の戻り値 (点列, oneway) に対応する。
+/// タプルのままだとJSONが位置配列だけになって読み手に意味が分からないので、名前付きにする。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RoadShape {
+    pub pts: Vec<(f64, f64)>,
+    pub oneway: bool,
+}
+
+impl PlotItem for RoadShape {
+    fn bounds(&self) -> Bbox {
+        line_bounds(&self.pts)
+    }
+}
+
+// ワーカー → UIスレッドへ流すセル1件ぶんの結果。
+enum CellMsg<T> {
+    Loaded(String, Cached<T>),
+    // 取得も出来ずディスクにも無かったセル。手元の値は消さずに次の機会を待つ。
+    Failed(String),
+}
+
+pub struct PlotLayer<T> {
+    layer: Layer,
+    // このズームより広域では取得しない(既に持っているセルは表示し続ける)。
+    min_zoom: u32,
+    // データ自身の時刻を fetched_at からどれだけ遡らせるか。交通量だけ 25分×60秒 で、
+    // 他は0(取得時刻がそのままデータの時刻)。
+    data_lag_secs: u64,
+    cells_for: CellsFn,
+    fetch: FetchFn<T>,
+    cells: HashMap<String, Cached<T>>,
+    // キー → この時刻(epoch秒)までは再取得を試みない。
+    retry_after: HashMap<String, u64>,
+    job: Option<Receiver<CellMsg<T>>>,
+    // 直近の tick で視野を覆うと判定したセル(ステータス表示の経過時間とメモリ退避の判定に使う)。
+    view_keys: Vec<String>,
+    // ズーム下限/セル数上限で取得を止めているか。
+    suppressed: bool,
+    // セル表が変わるたび増える。ui.rs の再描画判定シグネチャに混ぜて、新しく届いたデータが
+    // 次のフレームで必ず描き直されるようにする。
+    generation: u64,
+}
+
+impl<T: Serialize + serde::de::DeserializeOwned + PlotItem + Send + 'static> PlotLayer<T> {
+    fn new(layer: Layer, min_zoom: u32, data_lag_secs: u64, cells_for: CellsFn, fetch: FetchFn<T>) -> Self {
+        PlotLayer {
+            layer,
+            min_zoom,
+            data_lag_secs,
+            cells_for,
+            fetch,
+            cells: HashMap::new(),
+            retry_after: HashMap::new(),
+            job: None,
+            view_keys: Vec::new(),
+            suppressed: false,
+            generation: 0,
+        }
+    }
+
+    /// 1フレーム分の進行: 進行中ジョブの受信 → 必要セルの算出 → 不足ぶんのジョブ起動。
+    /// `enabled` が false でも受信だけは行う(設定でOFFにした瞬間に走っていたジョブを畳むため)。
+    /// 戻り値は「セル表が変わったか」で、true なら呼び出し側は即座に描き直す。
+    pub fn tick(&mut self, cx: f64, cy: f64, z: u32, enabled: bool) -> bool {
+        let now = plotcache::now_secs();
+        let mut changed = false;
+        if let Some(rx) = &self.job {
+            loop {
+                match rx.try_recv() {
+                    Ok(CellMsg::Loaded(key, cached)) => {
+                        // 受け取った値がまだ stale なら(取得に失敗して手元のディスク値が返った
+                        // ケース)、すぐ next tick で同じジョブを起こさないよう間隔を空ける。
+                        if cached.is_fresh(self.layer, now) {
+                            self.retry_after.remove(&key);
+                        } else {
+                            self.retry_after.insert(key.clone(), now + RETRY_BACKOFF_SECS);
+                        }
+                        self.cells.insert(key, cached);
+                        self.generation += 1;
+                        changed = true;
+                    }
+                    Ok(CellMsg::Failed(key)) => {
+                        // 失敗しても手元の値(self.cells)は触らない。空で上書きすると、
+                        // トンネル1本で直前まで見えていた通行止めが消える。
+                        self.retry_after.insert(key, now + RETRY_BACKOFF_SECS);
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        self.job = None;
+                        break;
+                    }
+                }
+            }
+        }
+        if !enabled || z < self.min_zoom {
+            if enabled {
+                self.suppressed = true;
+            }
+            return changed;
+        }
+        let keys = (self.cells_for)(view_bbox(cx, cy, z));
+        if keys.len() > MAX_CELLS_PER_JOB {
+            self.suppressed = true;
+            return changed;
+        }
+        self.suppressed = false;
+        if keys.is_empty() {
+            return changed; // 日本のメッシュ空間の外(取得元にデータが無い)
+        }
+        self.view_keys = keys.clone();
+        self.evict(&keys);
+        if self.job.is_some() {
+            return changed;
+        }
+        let missing: Vec<String> = keys
+            .into_iter()
+            .filter(|k| {
+                if self.retry_after.get(k).is_some_and(|t| now < *t) {
+                    return false;
+                }
+                self.cells.get(k).is_none_or(|c| !c.is_fresh(self.layer, now))
+            })
+            .collect();
+        if missing.is_empty() {
+            return changed;
+        }
+        self.job = Some(spawn_job(self.layer, missing, self.fetch, self.data_lag_secs));
+        changed
+    }
+
+    // 視野に入っていないセルを古い順に捨てて上限内に収める。
+    fn evict(&mut self, keep: &[String]) {
+        if self.cells.len() <= MAX_CELLS_IN_MEMORY {
+            return;
+        }
+        let excess = self.cells.len() - MAX_CELLS_IN_MEMORY;
+        let mut victims: Vec<(String, u64)> = self
+            .cells
+            .iter()
+            .filter(|(k, _)| !keep.contains(k))
+            .map(|(k, c)| (k.clone(), c.fetched_at))
+            .collect();
+        victims.sort_by_key(|(_, t)| *t);
+        for (k, _) in victims.into_iter().take(excess) {
+            self.cells.remove(&k);
+            self.retry_after.remove(&k);
+        }
+    }
+
+    /// 表示範囲に掛かるアイテムだけを返す。カメラは整備局まるごと(数百台)をキャッシュするので、
+    /// bboxでの絞り込みはここ(メモリ上)で行う。
+    pub fn items(&self, view: Bbox) -> Vec<&T> {
+        self.cells
+            .values()
+            .flat_map(|c| c.items.iter())
+            .filter(|it| intersects(it.bounds(), view))
+            .collect()
+    }
+
+    /// fresh を過ぎた値を表示しているときだけ、その経過秒(視野内で最も古いもの)を返す。
+    /// 交通量は data_at 基準なので「観測からの経過」になる。
+    pub fn stale_age_secs(&self, now: u64) -> Option<u64> {
+        let mut worst: Option<u64> = None;
+        for k in &self.view_keys {
+            if let Some(c) = self.cells.get(k) {
+                if !c.is_fresh(self.layer, now) {
+                    let a = c.age_secs(now);
+                    worst = Some(worst.map_or(a, |w: u64| w.max(a)));
+                }
+            }
+        }
+        worst
+    }
+
+    pub fn job_active(&self) -> bool {
+        self.job.is_some()
+    }
+
+    /// ズーム下限/セル数上限で取得を止めているか(ステータスの「広域では非表示」用)。
+    pub fn suppressed(&self) -> bool {
+        self.suppressed
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+// 1本のジョブ。不足セルを直列に回し、1セル取れるたびに送る(部分的に描画が進む)。
+// Overpass 等へ並列には投げない。
+fn spawn_job<T: Serialize + serde::de::DeserializeOwned + Send + 'static>(
+    layer: Layer,
+    keys: Vec<String>,
+    fetch: FetchFn<T>,
+    data_lag_secs: u64,
+) -> Receiver<CellMsg<T>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let root = plotcache::cache_root();
+        let mut scratch: Option<String> = None;
+        for key in keys {
+            let now = plotcache::now_secs();
+            let disk = root.as_ref().and_then(|r| plotcache::load::<T>(r, layer, &key, now));
+            if disk.as_ref().is_some_and(|c| c.is_fresh(layer, now)) {
+                // fresh なディスク値がある = 通信しない。
+                if tx.send(CellMsg::Loaded(key, disk.expect("checked above"))).is_err() {
+                    return;
+                }
+                continue;
+            }
+            let msg = match fetch(&key, &mut scratch) {
+                Ok(items) => {
+                    let fetched_at = plotcache::now_secs();
+                    let data_at = fetched_at.saturating_sub(data_lag_secs);
+                    if let Some(r) = &root {
+                        // 保存はベストエフォート(失敗しても次回また取りに行くだけ)。
+                        let _ = plotcache::store(r, layer, &key, &items, fetched_at, data_at);
+                    }
+                    CellMsg::Loaded(key, Cached { items, fetched_at, data_at })
+                }
+                // 取得できなくても、stale上限内のディスク値があればそれを出す(オフライン継続表示)。
+                Err(_) => match disk {
+                    Some(cached) => CellMsg::Loaded(key, cached),
+                    None => CellMsg::Failed(key),
+                },
+            };
+            if tx.send(msg).is_err() {
+                return; // 受信側が消えた(レイヤOFF・終了)
+            }
+        }
+    });
+    rx
+}
+
+// ---- セル被覆(視野bbox → セルキー) ----
+
+fn primary_cells(b: Bbox) -> Vec<String> {
+    mesh::primary_codes(b.0, b.1, b.2, b.3).iter().map(u32::to_string).collect()
+}
+
+fn secondary_cells(b: Bbox) -> Vec<String> {
+    mesh::secondary_codes(b.0, b.1, b.2, b.3).iter().map(u32::to_string).collect()
+}
+
+// カメラは取得元が地方整備局ごとにページを持つので、視野中心の最寄り局1つだけを見る。
+// 管轄境界のポリゴンを持っていないため、境界付近のカメラを取りこぼす制約は従来と同じ。
+fn bureau_cells(b: Bbox) -> Vec<String> {
+    vec![camera::nearest_bureau((b.0 + b.2) / 2.0, (b.1 + b.3) / 2.0).to_string()]
+}
+
+// ---- セル取得(セルキー → データ) ----
+
+fn parse_code(key: &str) -> Result<u32, String> {
+    key.parse::<u32>().map_err(|_| format!("不正なセルキー: {key}"))
+}
+
+fn fetch_traffic_cell(key: &str, _scratch: &mut Option<String>) -> Result<Vec<traffic::TrafficPoint>, String> {
+    let (s, w, n, e) = mesh::shrink(mesh::primary_bbox(parse_code(key)?));
+    traffic::fetch_traffic(s, w, n, e)
+}
+
+fn fetch_roads_cell(key: &str, _scratch: &mut Option<String>) -> Result<Vec<RoadShape>, String> {
+    let (s, w, n, e) = mesh::shrink(mesh::secondary_bbox(parse_code(key)?));
+    let frags = roadsearch::fetch_major_roads(s, w, n, e)?;
+    Ok(frags
+        .into_iter()
+        .map(|(pts, oneway)| RoadShape {
+            // 座標は小数6桁(約0.1m)へ丸める。z16の1pxが約2.4mなので描画には影響せず、
+            // 保存サイズだけが小さくなる。
+            pts: pts.into_iter().map(|(lat, lon)| (round6(lat), round6(lon))).collect(),
+            oneway,
+        })
+        .collect())
+}
+
+fn round6(v: f64) -> f64 {
+    (v * 1e6).round() / 1e6
+}
+
+fn fetch_camera_cell(key: &str, _scratch: &mut Option<String>) -> Result<Vec<camera::RoadCamera>, String> {
+    camera::fetch_bureau(parse_code(key)?)
+}
+
+fn fetch_regulation_cell(key: &str, scratch: &mut Option<String>) -> Result<Vec<regulation::ClosureEvent>, String> {
+    let mesh_code = parse_code(key)?;
+    if scratch.is_none() {
+        // 配信元パスは更新のたびに変わるので永続化しない。1ジョブに1回だけ発見して使い回す。
+        *scratch = Some(regulation::discover_json_base()?);
+    }
+    let base = scratch.as_deref().unwrap_or_default();
+    regulation::fetch_mesh(base, mesh_code)
+}
+
+// ---- 4レイヤの組み立て ----
+
+/// 道路交通量(JARTIC)。1次メッシュ単位・z11未満では取得しない。
+pub fn traffic() -> PlotLayer<traffic::TrafficPoint> {
+    PlotLayer::new(
+        Layer::Traffic,
+        11,
+        traffic::OBSERVE_LAG_MIN as u64 * 60,
+        primary_cells,
+        fetch_traffic_cell,
+    )
+}
+
+/// 主要道路(OSM trunk/primary)。2次メッシュ単位・z14未満では取得しない。
+/// 1次メッシュだと都心の幾何が重すぎて Overpass の [timeout:25] に収まらない恐れがあるため。
+pub fn roads() -> PlotLayer<RoadShape> {
+    PlotLayer::new(Layer::Roads, 14, 0, secondary_cells, fetch_roads_cell)
+}
+
+/// 道路ライブカメラ。地方整備局単位。局は全国で10しかなく1回のレスポンスで足りるので
+/// ズーム下限は設けない。
+pub fn camera() -> PlotLayer<camera::RoadCamera> {
+    PlotLayer::new(Layer::Camera, 0, 0, bureau_cells, fetch_camera_cell)
+}
+
+/// 通行規制。取得元が1次メッシュ単位でファイルを分けているのでそれに合わせる。z11未満では取得しない。
+pub fn regulation() -> PlotLayer<regulation::ClosureEvent> {
+    PlotLayer::new(Layer::Regulation, 11, 0, primary_cells, fetch_regulation_cell)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::geo::deg_to_pixel;
+    use std::sync::Mutex;
+
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    struct TestItem {
+        lat: f64,
+        lon: f64,
+    }
+    impl PlotItem for TestItem {
+        fn bounds(&self) -> Bbox {
+            (self.lat, self.lon, self.lat, self.lon)
+        }
+    }
+
+    // fn ポインタは環境を捕まえられないので、テスト用の取得関数の振る舞いはこの静的変数で操る。
+    // 同時に走ると混ざるため、この変数を使うテストは TEST_LOCK で直列化する。
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+    static FAIL_KEYS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    static FETCHED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    fn test_fetch(key: &str, _scratch: &mut Option<String>) -> Result<Vec<TestItem>, String> {
+        FETCHED.lock().unwrap().push(key.to_string());
+        if FAIL_KEYS.lock().unwrap().iter().any(|k| k == key) {
+            return Err(format!("テストの取得失敗: {key}"));
+        }
+        // キーごとに1件、識別できる座標を返す(テストの視野中心=東京駅付近のすぐ近く)。
+        let n: f64 = key.parse().unwrap_or(0.0);
+        Ok(vec![test_item(n)])
+    }
+
+    // テストの視野中心(35.68,139.77)のすぐ近くに置く。どのズームでも視野に入る距離。
+    fn test_item(n: f64) -> TestItem {
+        TestItem { lat: 35.68 + n / 10000.0, lon: 139.77 + n / 10000.0 }
+    }
+
+    fn three_cells(_b: Bbox) -> Vec<String> {
+        vec!["1".to_string(), "2".to_string(), "3".to_string()]
+    }
+    fn ten_cells(_b: Bbox) -> Vec<String> {
+        (1..=10).map(|i| i.to_string()).collect()
+    }
+
+    // テスト中はディスクキャッシュを一時ディレクトリへ逃がして実 $HOME を汚さない。
+    struct TestEnv {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        root: std::path::PathBuf,
+    }
+    impl TestEnv {
+        fn new(tag: &str) -> Self {
+            let guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let root = std::env::temp_dir().join(format!("termmap_plotlayer_{}_{}", std::process::id(), tag));
+            let _ = std::fs::remove_dir_all(&root);
+            std::env::set_var("TERMMAP_PLOT_CACHE_DIR", &root);
+            FAIL_KEYS.lock().unwrap().clear();
+            FETCHED.lock().unwrap().clear();
+            TestEnv { _guard: guard, root }
+        }
+    }
+    impl Drop for TestEnv {
+        fn drop(&mut self) {
+            std::env::remove_var("TERMMAP_PLOT_CACHE_DIR");
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn tokyo_center(z: u32) -> (f64, f64) {
+        deg_to_pixel(35.68, 139.77, z)
+    }
+
+    // ジョブが終わる(Disconnected を受け取る)まで tick を回す。
+    fn run_to_idle<T: Serialize + serde::de::DeserializeOwned + PlotItem + Send + 'static>(
+        layer: &mut PlotLayer<T>,
+        z: u32,
+    ) {
+        let (cx, cy) = tokyo_center(z);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            layer.tick(cx, cy, z, true);
+            if !layer.job_active() {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("ジョブが終わらない");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    fn test_layer(cells_for: CellsFn, min_zoom: u32) -> PlotLayer<TestItem> {
+        PlotLayer::new(Layer::Traffic, min_zoom, 0, cells_for, test_fetch)
+    }
+
+    #[test]
+    fn view_bbox_is_ordered_south_west_north_east() {
+        let (cx, cy) = tokyo_center(14);
+        let (s, w, n, e) = view_bbox(cx, cy, 14);
+        assert!(s < n && w < e, "({s},{w},{n},{e})");
+        assert!(s < 35.68 && 35.68 < n);
+        assert!(w < 139.77 && 139.77 < e);
+    }
+
+    #[test]
+    fn view_bbox_shrinks_as_the_zoom_gets_deeper() {
+        let (cx14, cy14) = tokyo_center(14);
+        let b14 = view_bbox(cx14, cy14, 14);
+        let (cx16, cy16) = tokyo_center(16);
+        let b16 = view_bbox(cx16, cy16, 16);
+        assert!((b16.2 - b16.0) < (b14.2 - b14.0));
+    }
+
+    #[test]
+    fn traffic_and_regulation_share_the_primary_mesh_cells() {
+        // 交通量と規制は同じ被覆関数を使うので、両方ONのときにセル境界が揃う。
+        let (cx, cy) = tokyo_center(12);
+        let cells = primary_cells(view_bbox(cx, cy, 12));
+        assert!(cells.contains(&"5339".to_string()), "{cells:?}");
+        assert!(cells.len() <= 4, "z12(約56km)は1〜4枚のはず: {cells:?}");
+    }
+
+    #[test]
+    fn primary_cells_stay_within_the_job_cap_at_the_zoom_floor() {
+        // 交通量/規制の下限 z11 で、1次メッシュが MAX_CELLS_PER_JOB を超えないこと。
+        for (lat, lon) in [(35.68, 139.77), (43.06, 141.35), (26.21, 127.68)] {
+            let (cx, cy) = deg_to_pixel(lat, lon, 11);
+            let n = primary_cells(view_bbox(cx, cy, 11)).len();
+            assert!(n <= MAX_CELLS_PER_JOB, "z11 {lat},{lon} で {n} セル");
+        }
+    }
+
+    #[test]
+    fn secondary_cells_stay_within_the_job_cap_at_the_roads_zoom_floor() {
+        for (lat, lon) in [(35.68, 139.77), (43.06, 141.35), (34.69, 135.52)] {
+            let (cx, cy) = deg_to_pixel(lat, lon, 14);
+            let n = secondary_cells(view_bbox(cx, cy, 14)).len();
+            assert!(n <= MAX_CELLS_PER_JOB, "z14 {lat},{lon} で {n} セル");
+        }
+    }
+
+    #[test]
+    fn bureau_cells_pick_exactly_one_office_for_the_view_centre() {
+        let (cx, cy) = tokyo_center(14);
+        assert_eq!(bureau_cells(view_bbox(cx, cy, 14)), vec!["83".to_string()]); // 関東地方整備局
+        let (cx, cy) = deg_to_pixel(43.06, 141.35, 14);
+        assert_eq!(bureau_cells(view_bbox(cx, cy, 14)), vec!["81".to_string()]); // 北海道開発局
+    }
+
+    #[test]
+    fn cells_outside_japan_produce_no_keys() {
+        let (cx, cy) = deg_to_pixel(48.85, 2.35, 12); // パリ
+        assert!(primary_cells(view_bbox(cx, cy, 12)).is_empty());
+    }
+
+    #[test]
+    fn a_fetched_cell_lands_in_the_view_and_hits_the_disk() {
+        let env = TestEnv::new("fetch");
+        let mut l = test_layer(three_cells, 0);
+        run_to_idle(&mut l, 14);
+        let (cx, cy) = tokyo_center(14);
+        assert_eq!(l.items(view_bbox(cx, cy, 14)).len(), 3);
+        assert_eq!(FETCHED.lock().unwrap().len(), 3, "3セルとも取得した");
+        for k in ["1", "2", "3"] {
+            assert!(env.root.join("v1/traffic").join(format!("{k}.json")).is_file(), "{k} が保存されていない");
+        }
+    }
+
+    #[test]
+    fn a_second_pass_reads_the_disk_instead_of_fetching_again() {
+        let _env = TestEnv::new("fresh");
+        let mut l = test_layer(three_cells, 0);
+        run_to_idle(&mut l, 14);
+        assert_eq!(FETCHED.lock().unwrap().len(), 3);
+        // 別インスタンス(=再起動相当)。fresh TTL 内なのでディスクから読むだけで通信しない。
+        let mut l2 = test_layer(three_cells, 0);
+        run_to_idle(&mut l2, 14);
+        assert_eq!(FETCHED.lock().unwrap().len(), 3, "2周目で取得関数が呼ばれてはいけない");
+        let (cx, cy) = tokyo_center(14);
+        assert_eq!(l2.items(view_bbox(cx, cy, 14)).len(), 3, "ディスクから復元されている");
+    }
+
+    #[test]
+    fn a_failing_cell_never_wipes_the_value_already_on_screen() {
+        let _env = TestEnv::new("keepold");
+        let mut l = test_layer(three_cells, 0);
+        run_to_idle(&mut l, 14);
+        let (cx, cy) = tokyo_center(14);
+        assert_eq!(l.items(view_bbox(cx, cy, 14)).len(), 3);
+
+        // 手元の値を期限切れにし、ディスクの控えも消したうえで全セルの取得を失敗させる。
+        // (圏外に入った直後の状態)
+        for c in l.cells.values_mut() {
+            c.fetched_at = 0;
+        }
+        l.retry_after.clear();
+        let _ = std::fs::remove_dir_all(_env.root.join("v1"));
+        *FAIL_KEYS.lock().unwrap() = vec!["1".into(), "2".into(), "3".into()];
+        run_to_idle(&mut l, 14);
+
+        assert_eq!(l.items(view_bbox(cx, cy, 14)).len(), 3, "失敗で消えてはいけない");
+    }
+
+    #[test]
+    fn a_partial_failure_applies_only_the_cells_that_succeeded() {
+        let _env = TestEnv::new("partial");
+        *FAIL_KEYS.lock().unwrap() = vec!["2".into()];
+        let mut l = test_layer(three_cells, 0);
+        run_to_idle(&mut l, 14);
+        let (cx, cy) = tokyo_center(14);
+        assert_eq!(l.items(view_bbox(cx, cy, 14)).len(), 2, "3セル中2セルだけ入る");
+        assert!(l.cells.contains_key("1") && l.cells.contains_key("3"));
+        assert!(!l.cells.contains_key("2"));
+    }
+
+    #[test]
+    fn a_stale_disk_entry_is_shown_when_the_network_is_down() {
+        let env = TestEnv::new("staleshow");
+        // 55分前に取得した交通量(fresh 5分は過ぎているが stale上限 60分の内側)。
+        let now = plotcache::now_secs();
+        plotcache::store(&env.root, Layer::Traffic, "1", &[test_item(1.0)], now - 55 * 60, now - 55 * 60).unwrap();
+        *FAIL_KEYS.lock().unwrap() = vec!["1".into(), "2".into(), "3".into()];
+        let mut l = test_layer(three_cells, 0);
+        run_to_idle(&mut l, 14);
+        let (cx, cy) = tokyo_center(14);
+        assert_eq!(l.items(view_bbox(cx, cy, 14)).len(), 1, "staleでも出す");
+        let age = l.stale_age_secs(plotcache::now_secs()).expect("stale なら経過時間が出る");
+        assert!((3200..3400).contains(&age), "経過時間が55分前後でない: {age}");
+    }
+
+    #[test]
+    fn a_fresh_cell_reports_no_age() {
+        let _env = TestEnv::new("noage");
+        let mut l = test_layer(three_cells, 0);
+        run_to_idle(&mut l, 14);
+        assert_eq!(l.stale_age_secs(plotcache::now_secs()), None);
+    }
+
+    #[test]
+    fn nothing_is_fetched_below_the_zoom_floor() {
+        let _env = TestEnv::new("minzoom");
+        let mut l = test_layer(three_cells, 11);
+        let (cx, cy) = deg_to_pixel(35.68, 139.77, 10);
+        l.tick(cx, cy, 10, true);
+        assert!(!l.job_active(), "z10ではジョブを起こさない");
+        assert!(l.suppressed());
+        assert!(FETCHED.lock().unwrap().is_empty());
+        // 下限以上なら取りに行く。
+        run_to_idle(&mut l, 11);
+        assert!(!l.suppressed());
+        assert_eq!(FETCHED.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn nothing_is_fetched_when_the_view_needs_too_many_cells() {
+        let _env = TestEnv::new("maxcells");
+        let mut l = test_layer(ten_cells, 0);
+        let (cx, cy) = tokyo_center(14);
+        l.tick(cx, cy, 14, true);
+        assert!(!l.job_active(), "10セル必要なら取得しない");
+        assert!(l.suppressed());
+        assert!(FETCHED.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_disabled_layer_does_not_fetch_but_still_drains_its_job() {
+        let _env = TestEnv::new("disabled");
+        let mut l = test_layer(three_cells, 0);
+        let (cx, cy) = tokyo_center(14);
+        l.tick(cx, cy, 14, false);
+        assert!(!l.job_active());
+        assert!(FETCHED.lock().unwrap().is_empty());
+        // ONにして走らせたジョブは、その後OFFにしても畳まれる(受信は続く)。
+        l.tick(cx, cy, 14, true);
+        assert!(l.job_active());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while l.job_active() {
+            l.tick(cx, cy, 14, false);
+            assert!(std::time::Instant::now() < deadline, "OFFのままジョブが畳まれない");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_failed_cell_is_not_retried_immediately() {
+        let _env = TestEnv::new("backoff");
+        *FAIL_KEYS.lock().unwrap() = vec!["1".into(), "2".into(), "3".into()];
+        let mut l = test_layer(three_cells, 0);
+        run_to_idle(&mut l, 14);
+        assert_eq!(FETCHED.lock().unwrap().len(), 3);
+        // 直後に何度 tick しても新しいジョブは起きない(圏外で叩き続けない)。
+        let (cx, cy) = tokyo_center(14);
+        for _ in 0..50 {
+            l.tick(cx, cy, 14, true);
+        }
+        assert!(!l.job_active());
+        assert_eq!(FETCHED.lock().unwrap().len(), 3, "バックオフ中に再取得してはいけない");
+    }
+
+    #[test]
+    fn only_one_job_runs_per_layer_at_a_time() {
+        let _env = TestEnv::new("onejob");
+        let mut l = test_layer(three_cells, 0);
+        let (cx, cy) = tokyo_center(14);
+        l.tick(cx, cy, 14, true);
+        assert!(l.job_active());
+        for _ in 0..20 {
+            l.tick(cx, cy, 14, true);
+        }
+        // 追加のジョブが立っていなければ、取得は3セルぶんで止まる。
+        run_to_idle(&mut l, 14);
+        assert_eq!(FETCHED.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn items_are_filtered_by_the_view_rectangle() {
+        let _env = TestEnv::new("filter");
+        let mut l = test_layer(three_cells, 0);
+        run_to_idle(&mut l, 14);
+        // アイテムは 35.6801/35.6802/35.6803 にある。1件だけ入る細い矩形で絞る。
+        let narrow = (35.68005, 139.77005, 35.68015, 139.77015);
+        assert_eq!(l.items(narrow).len(), 1);
+        // どれも入らない矩形。
+        assert!(l.items((10.0, 100.0, 11.0, 101.0)).is_empty());
+    }
+
+    #[test]
+    fn line_items_are_kept_when_only_a_part_of_the_line_is_visible() {
+        let shape = RoadShape { pts: vec![(35.0, 139.0), (36.0, 140.0)], oneway: false };
+        // 線の中ほどだけを含む小さな矩形でも、外接矩形が交差するので残る。
+        assert!(intersects(shape.bounds(), (35.4, 139.4, 35.6, 139.6)));
+        assert!(!intersects(shape.bounds(), (37.0, 141.0, 38.0, 142.0)));
+    }
+
+    #[test]
+    fn generation_advances_only_when_cells_change() {
+        let _env = TestEnv::new("gen");
+        let mut l = test_layer(three_cells, 0);
+        assert_eq!(l.generation(), 0);
+        run_to_idle(&mut l, 14);
+        assert_eq!(l.generation(), 3, "3セル受信で3回進む");
+        let (cx, cy) = tokyo_center(14);
+        for _ in 0..10 {
+            l.tick(cx, cy, 14, true);
+        }
+        assert_eq!(l.generation(), 3, "変化が無ければ進まない");
+    }
+
+    #[test]
+    fn cells_outside_the_view_are_dropped_once_memory_fills_up() {
+        let _env = TestEnv::new("evict");
+        let mut l = test_layer(three_cells, 0);
+        // 視野外のセルを上限ぶん詰めてから tick すると、古い順に落ちて上限へ収まる。
+        for i in 0..MAX_CELLS_IN_MEMORY + 5 {
+            l.cells.insert(
+                format!("z{i}"),
+                Cached { items: Vec::<TestItem>::new(), fetched_at: i as u64, data_at: i as u64 },
+            );
+        }
+        let (cx, cy) = tokyo_center(14);
+        l.tick(cx, cy, 14, true);
+        assert!(l.cells.len() <= MAX_CELLS_IN_MEMORY + 3, "退避後: {}", l.cells.len());
+        assert!(!l.cells.contains_key("z0"), "最も古いセルから捨てる");
+        assert!(l.cells.contains_key(&format!("z{}", MAX_CELLS_IN_MEMORY + 4)));
+    }
+
+    #[test]
+    fn road_shapes_round_trip_through_json_with_the_designed_field_names() {
+        let s = RoadShape { pts: vec![(35.123456, 139.654321)], oneway: true };
+        let json = serde_json::to_string(&s).unwrap();
+        assert_eq!(json, r#"{"pts":[[35.123456,139.654321]],"oneway":true}"#);
+        assert_eq!(serde_json::from_str::<RoadShape>(&json).unwrap(), s);
+    }
+
+    #[test]
+    fn round6_trims_to_about_ten_centimetres() {
+        assert_eq!(round6(35.123456789), 35.123457);
+        assert_eq!(round6(-139.0000004), -139.0);
+    }
+
+    #[test]
+    fn parse_code_rejects_a_non_numeric_key() {
+        assert!(parse_code("5339").is_ok());
+        assert!(parse_code("abc").is_err());
+        assert!(parse_code("").is_err());
+    }
+
+    // 4種の実データ型が、実際にディスクへ書いて読み戻せること
+    // (型ごとの serde 単体テストとは別に、plotcache を通した往復を1本で押さえる)。
+    #[test]
+    fn all_four_real_item_types_survive_a_trip_through_the_disk_cache() {
+        let _env = TestEnv::new("realtypes");
+        let root = _env.root.clone();
+        let now = plotcache::now_secs();
+
+        let t = vec![traffic::TrafficPoint { lat: 35.6, lon: 139.7, volume: 135 }];
+        plotcache::store(&root, Layer::Traffic, "5339", &t, now, now - 25 * 60).unwrap();
+        let got = plotcache::load::<traffic::TrafficPoint>(&root, Layer::Traffic, "5339", now).unwrap();
+        assert_eq!(got.items, t);
+        assert_eq!(got.age_secs(now), 25 * 60, "交通量は観測時刻からの経過になる");
+
+        let r = vec![RoadShape { pts: vec![(35.6, 139.7), (35.61, 139.71)], oneway: true }];
+        plotcache::store(&root, Layer::Roads, "533946", &r, now, now).unwrap();
+        assert_eq!(plotcache::load::<RoadShape>(&root, Layer::Roads, "533946", now).unwrap().items, r);
+
+        let c = vec![camera::RoadCamera {
+            id: "811C200101".into(),
+            lat: 42.5,
+            lon: 140.36,
+            name: "長万部町大浜情報板".into(),
+            thumb_url: Some("https://example.invalid/s_x.jpeg".into()),
+            full_url: Some("https://example.invalid/x.jpeg".into()),
+            taken_at: "2026-08-16 16:00:36".into(),
+        }];
+        plotcache::store(&root, Layer::Camera, "81", &c, now, now).unwrap();
+        let back = plotcache::load::<camera::RoadCamera>(&root, Layer::Camera, "81", now).unwrap();
+        assert_eq!(back.items[0].id, c[0].id);
+        assert_eq!(back.items[0].name, c[0].name);
+        assert_eq!(back.items[0].full_url, None, "期限切れになるURLは持ち越さない");
+
+        let g = vec![regulation::ClosureEvent {
+            line: vec![(35.64, 139.73), (35.641, 139.732)],
+            kind: regulation::RegulationKind::Closed,
+        }];
+        plotcache::store(&root, Layer::Regulation, "5339", &g, now, now).unwrap();
+        assert_eq!(
+            plotcache::load::<regulation::ClosureEvent>(&root, Layer::Regulation, "5339", now).unwrap().items,
+            g
+        );
+    }
+
+    #[test]
+    fn the_four_real_layers_use_the_ttls_and_zoom_floors_from_the_design() {
+        assert_eq!(traffic().min_zoom, 11);
+        assert_eq!(traffic().data_lag_secs, 25 * 60);
+        assert_eq!(roads().min_zoom, 14);
+        assert_eq!(camera().min_zoom, 0);
+        assert_eq!(regulation().min_zoom, 11);
+        assert_eq!(traffic().layer.fresh_ttl().as_secs(), 300);
+        assert_eq!(regulation().layer.fresh_ttl().as_secs(), 600);
+    }
+}
