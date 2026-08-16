@@ -1448,6 +1448,10 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                             }
                                         }
                                     }
+                                    22 => { // 道路交通量: ONにした時、次のポーリングで即座に取得されるようbboxをクリア
+                                        cfg.traffic_enabled = !cfg.traffic_enabled;
+                                        if cfg.traffic_enabled { traffic_bbox = None; }
+                                    }
                                     _ => {}
                                 }
                             }
