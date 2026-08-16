@@ -35,7 +35,7 @@ pub(crate) const CHOICES: &[SettingChoice] = &[
 
 // 設定画面の項目行数(アコーディオン未展開時)。ui.rs のカーソル下移動の上限がこれを参照する。
 // settings_rows() が返す行数と必ず一致すること(下の回帰テスト settings_row_count_matches_rows で固定)。
-pub(crate) const SETTINGS_ROW_COUNT: usize = 22;
+pub(crate) const SETTINGS_ROW_COUNT: usize = 23;
 
 fn choice_for(idx: usize) -> Option<&'static SettingChoice> { CHOICES.iter().find(|c| c.idx == idx) }
 
@@ -111,6 +111,7 @@ pub(crate) fn setting_description(idx: usize) -> &'static str {
         19 => "雨雲レーダー: 気象庁ナウキャストの降水を地図に重ねる。ここでのON/OFFは起動時の既定にもなる(Cキーでも切替・< > で表示時刻を過去〜未来(直近60分は5分刻み、それより先は降水短時間予報で最大+15時間まで1時間刻み)に移動)",
         20 => "雨雲の濃さ: 重ねる強さ。Enterで一覧を開いて選択(薄い=地図優先 / 標準 / 濃い=雨優先)",
         21 => "ルート音声案内: 曲がり角の300m手前/直前でmacOSの読み上げ(sayコマンド)またはブラウザの読み上げで案内する。ONにした人だけがBRouterへ追加問い合わせする",
+        22 => "道路交通量: 国道の実測交通量(JARTICオープンデータ)を混雑度の目安として地図に重ねる。事故情報・渋滞度そのものではない。ONにした人だけが外部サービスへ問い合わせる",
         _ => "Google APIキー: 検索(Geocoding)とStreet View共通。Enterで入力欄を開く(Cmd+V貼付も可)。環境変数TERMMAP_GOOGLE_API_KEYでも可",
     }
 }
@@ -152,6 +153,7 @@ pub(crate) fn settings_rows(opts: &Args, cfg: &Config, picking: Option<usize>, o
         format!("雨雲レーダー {}", onoff(cfg.radar_enabled)),
         format!("{} 雨雲の濃さ {}", arrow(20), match cfg.radar_opacity.as_str() { "light" => "薄い", "strong" => "濃い", _ => "標準" }),
         format!("ルート音声案内 {}", onoff(cfg.voice_guide_enabled)),
+        format!("道路交通量 {}", onoff(cfg.traffic_enabled)),
     ];
     debug_assert_eq!(its.len(), SETTINGS_ROW_COUNT, "SETTINGS_ROW_COUNT と行数がずれている");
     // アコーディオン展開: 選択中の項目がpickable(3択以上)ならその直下に候補をインデント挿入し、他行を押し下げる

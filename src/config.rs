@@ -54,6 +54,7 @@ pub struct Config {
     pub radar_enabled: bool,          // 起動時に雨雲レーダー(気象庁ナウキャスト)をONにするか。既定false(ONにした人だけが外部サービスへ問い合わせる)
     pub radar_opacity: String,        // 雨雲の重ね方: "light"(0.35)/"mid"(0.55)/"strong"(0.75)。既定mid
     pub radar_refresh_sec: f64,       // フレーム時刻一覧(targetTimes)の再取得間隔(秒)。既定300。ナウキャスト自体が5分更新なのでこれより短くしても新しい情報は無い(設定画面には出さない)
+    pub traffic_enabled: bool,        // 道路交通量(JARTICオープンデータ)を地図に重ねるか。既定false(ONにした人だけが外部サービスへ問い合わせる)
 }
 
 impl Default for Config {
@@ -83,6 +84,7 @@ impl Default for Config {
             radar_enabled: false,
             radar_opacity: "mid".to_string(),
             radar_refresh_sec: 300.0,
+            traffic_enabled: false,
         }
     }
 }
@@ -226,6 +228,7 @@ pub fn load_config_from(path: &Path) -> Config {
                     if f.is_finite() { cfg.radar_refresh_sec = f.max(60.0); }
                 }
             }
+            ("traffic", "enabled") => { if let Some(b) = parse_bool(value) { cfg.traffic_enabled = b; } }
             // 旧スキーマ後方互換: [streetview] api_key を google_maps_api_key に取り込む(未設定時のみ)
             ("streetview", "api_key") => {
                 if cfg.google_maps_api_key.is_empty() {
@@ -288,7 +291,10 @@ pub fn save_config_to(path: &Path, c: &Config) -> Result<(), String> {
          [radar]\n\
          enabled = {}\n\
          opacity = \"{}\"\n\
-         refresh_sec = {}\n",
+         refresh_sec = {}\n\
+         \n\
+         [traffic]\n\
+         enabled = {}\n",
         c.llm_recommend_enabled,
         c.llm_model,
         c.llm_command,
@@ -313,6 +319,7 @@ pub fn save_config_to(path: &Path, c: &Config) -> Result<(), String> {
         c.radar_enabled,
         c.radar_opacity,
         c.radar_refresh_sec,
+        c.traffic_enabled,
     );
 
     // APIキーを含むので unix では 0600。書込中クラッシュで壊さないよう atomic。
@@ -462,6 +469,7 @@ mod tests {
             radar_enabled: true,
             radar_opacity: "strong".to_string(),
             radar_refresh_sec: 600.0,
+            traffic_enabled: true,
         };
         save_config_to(&path, &original).expect("save should succeed");
         let loaded = load_config_from(&path);
@@ -747,6 +755,7 @@ profile = "custom-profile"
             radar_enabled: false,
             radar_opacity: "light".to_string(),
             radar_refresh_sec: 300.0,
+            traffic_enabled: false,
         };
         save_config_to(&path, &cfg).unwrap();
         let loaded = load_config_from(&path);
