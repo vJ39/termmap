@@ -26,6 +26,9 @@ mod menu;
 mod listview;
 mod roadseg;
 mod ui;
+mod ui_helpers; // interactive() の外にあった小さなヘルパー群
+mod focus;      // 対話UIの画面状態(Focus)
+mod ui_overlay; // 中央パネル/ポップアップ・標高帯の描画
 #[allow(dead_code)]
 mod roadtrace; // point_at/sample等は使用、cut_segment等は将来用
 // 以下は今後の機能用(おすすめ相談)。まだ未wireのため dead_code 許容。
@@ -39,6 +42,9 @@ mod settings;
 #[allow(dead_code)]
 mod radar;
 mod voice; // ルート音声案内(曲がり角の距離ベース読み上げ)
+// 道路交通量(JARTICオープンデータ)。ui.rsへの配線は後続増分のため現時点では未wire。
+#[allow(dead_code)]
+mod traffic;
 
 use image::{RgbImage, RgbaImage, imageops::FilterType};
 
