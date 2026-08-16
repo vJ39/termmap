@@ -14,8 +14,7 @@ use image::{RgbImage, RgbaImage, imageops::FilterType};
 // 単一行テキスト入力欄の共通編集ロジック(char_byte/insert_str_at/form_cur/edit_line/
 // render_with_cursor/draw_input_panel)は textedit.rs へ切り出し済み。
 use crate::textedit::{edit_line, form_cur, insert_str_at};
-// 左袖リストのスクロール追従(ensure_visible)は listview.rs へ切り出し済み。
-use crate::listview::ensure_visible;
+// 左袖リストのスクロール追従(ensure_visible)は listview.rs、行の組み立ては ui_gutter.rs へ切り出し済み。
 
 // PALETTE_NAMES(中心十字の色名。SPOT_PALETTEと同じ並び)・その利用箇所は settings.rs に移設。
 // 緑グラデのワードマーク(LOGO・ヘルプ画面で使用)は keymap.rs へ移設済み。
@@ -24,7 +23,7 @@ use crate::keymap::{HELP, LOGO};
 
 // Space メニュー(MenuAction/MenuItem/MenuCategory/MENU_CATEGORIES/MenuLevel/menu_action_for_key/
 // disp_width/menu_row/ROUTE_ACTS)は menu.rs へ切り出し済み。ここでは crate::menu を参照する。
-use crate::menu::{MenuAction, MENU_CATEGORIES, MenuLevel, menu_action_for_key, menu_row, ROUTE_ACTS};
+use crate::menu::{MenuAction, MENU_CATEGORIES, MenuLevel, menu_action_for_key, ROUTE_ACTS};
 
 // 道路名検索(r)で追加した道路の塊(RoadSeg)・その表示色選択(road_color_for)は roadseg.rs へ切り出し済み。
 use crate::roadseg::{RoadSeg, road_color_for};
@@ -729,101 +728,21 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         };
         force_reemit = false; // 強制再emitは消費済み(image_inlineの被り解消は下でmap_coveredが再設定)
 
-        // 左袖リスト(POI か お気に入り)の各行を組む
-        let glines: Vec<String> = if gut > 0 {
-            let gw = gut as usize;
-            let (header, items, sel): (String, Vec<String>, usize) = if show_menu {
-                match &focus {
-                    // トップ: カテゴリだけ(キー列なし)。文字キー直打ちも効く旨は下部に出す。
-                    Focus::Menu(MenuLevel::Categories) => {
-                        let its = MENU_CATEGORIES.iter().map(|c| format!("  {}", c.label)).collect();
-                        ("メニュー".to_string(), its, menu_cat_sel)
-                    }
-                    // 展開: 選んだカテゴリの項目のみ。ラベル左・キー右端揃え。
-                    Focus::Menu(MenuLevel::Items(ci)) => {
-                        let cat = &MENU_CATEGORIES[*ci];
-                        let its = cat.items.iter().map(|it| menu_row(it.label, it.key, gw.saturating_sub(1))).collect();
-                        (format!("← {}", cat.label), its, menu_item_sel)
-                    }
-                    _ => ("メニュー".to_string(), Vec::new(), 0),
-                }
-            } else if show_route {
-                // Map左袖: 点(#1..#n) + 操作行(保存/GPX/QR/再生/標高/代替/消去)。Tabで縦断・Enterで実行。
-                let n = wps.len();
-                let mut its: Vec<String> = wps.iter().enumerate().map(|(i, (la, lo))| {
-                    let role = if i == 0 { "始点" } else if i + 1 == n { "終点" } else { "経由" };
-                    format!("#{} {} {:.3},{:.3}", i + 1, role, la, lo)
-                }).collect();
-                for (label, _) in ROUTE_ACTS.iter() { its.push((*label).to_string()); }
-                let sel = route_sel.min(its.len().saturating_sub(1));
-                let hdr = if matches!(focus, Focus::RoutePanel) { "ルート ↑↓選択".to_string() } else { "ルート(w/s上下)".to_string() };
-                (hdr, its, sel)
-            } else if show_wps {
-                let n = wps.len();
-                let its = wps.iter().enumerate().map(|(i, (la, lo))| {
-                    let role = if i == 0 { "始点" } else if i + 1 == n { "終点" } else { "経由" };
-                    format!("#{} {} {:.3},{:.3}", i + 1, role, la, lo)
-                }).collect();
-                let hdr = if grab { "並べ替え:掴".to_string() } else { "並べ替え".to_string() };
-                (hdr, its, wp_sel)
-            } else if show_splist {
-                let its = spots.iter().filter(|s| s.cat == cur_cat).map(|s| {
-                    let nm = if s.name.is_empty() { "(無名)" } else { s.name.as_str() };
-                    let d = haversine_km((lat, lon), (s.lat, s.lon)); // 現在地(中心)からの距離
-                    format!("{} {:.1}k", nm, d)
-                }).collect();
-                (format!("{cur_cat}"), its, sp_sel)
-            } else if show_catlist {
-                let its = spot_cats.iter().map(|(n, _, _)| n.clone()).collect(); // 色は c、形は M で選ぶ(番号表示はやめた)
-                ("カテゴリ".to_string(), its, cat_sel)
-            } else if show_settings {
-                // 項目一覧(its)の組み立ては settings.rs::settings_rows へ切り出し済み(opts/cfg/引数の値だけを
-                // 見る純関数)。onboarded_marker()(ファイルIO)とset_sel/set_pick_sel(ローカル選択状態)は
-                // ここで評価してから渡す。
-                let picking = if let Focus::SettingsPick(idx) = &focus { Some(*idx) } else { None };
-                let onboarded_done = onboarded_marker().map_or(false, |p| p.exists());
-                settings::settings_rows(&opts, &cfg, picking, onboarded_done, set_sel, set_pick_sel)
-            } else if show_poimenu {
-                let mut its: Vec<String> = poi_kinds.iter().map(|k| format!("{} {}", k.key, k.label)).collect();
-                its.push("キーワードで周辺検索".to_string());
-                ("目的地(n新規 x削除 [ ]並替)".to_string(), its, poimenu_sel)
-            } else if show_routes {
-                ("← お気に入りルート".to_string(), route_names.clone(), rn_sel)
-            } else if show_favmenu {
-                let sel = if let Focus::RouteFavMenu { sel } = &focus { *sel } else { 0 };
-                ("お気に入りルート".to_string(), vec!["保存".to_string(), "呼び出し".to_string()], sel)
-            } else if show_roadlist {
-                // 各行を塊マーカー │ + 道路名で。色はマップ側の別色で区別(gutterはfit_cells制約でANSI不可)
-                let its = road_segs.iter().map(|r| format!("│ {}", if r.name.is_empty() { "(無名)" } else { r.name.as_str() })).collect();
-                ("道路".to_string(), its, road_sel)
-            } else {
-                let its = pois.iter().map(|(la, lo, nm, _)| {
-                    // OSMにnameタグが無いPOI(駐車場等に多い)は「(無名)」の連発でなく検索カテゴリ名で埋める
-                    let d = haversine_km((lat, lon), (*la, *lo));
-                    format!("{} {:.1}k", if nm.is_empty() { poi_label.as_str() } else { nm.as_str() }, d)
-                }).collect();
-                (poi_label.clone(), its, poi_sel)
-            };
-            // 見出し1行を除いた表示可能行数ぶんだけ、選択に追従してウィンドウ表示する
-            let sel = sel.min(items.len().saturating_sub(1)); // sel が範囲外でも位置表示/添字を破綻させない
-            let vh = (map_rows as usize).saturating_sub(1).max(1);
-            ensure_visible(&mut list_offset, sel, items.len(), vh);
-            let end = (list_offset + vh).min(items.len());
-            let (more_up, more_dn) = (list_offset > 0, end < items.len());
-            let mut gl = Vec::with_capacity(map_rows as usize);
-            let hdr = if items.len() > vh {
-                // 画面に収まらない時は 位置(sel+1/総数) と上下の続き矢印を出す
-                format!("[{} {}/{}]{}{}", header, sel + 1, items.len(), if more_up { " ↑" } else { "" }, if more_dn { "↓" } else { "" })
-            } else {
-                format!("[{} {}]", header, items.len())
-            };
-            gl.push(fit_cells(&hdr, gw));
-            for idx in list_offset..end {
-                let cell = fit_cells(&format!("{}{}", if idx == sel { ">" } else { " " }, items[idx]), gw);
-                gl.push(if idx == sel { format!("\x1b[7m{cell}\x1b[0m") } else { cell });
-            }
-            gl
-        } else { Vec::new() };
+        // 左袖リスト(POI か お気に入り)の各行を組む。組み立ては ui_gutter.rs へ切り出し済み。
+        let glines: Vec<String> = ui_gutter::build_gutter_lines(&ui_gutter::GutterCtx {
+            gut, map_rows, focus: &focus,
+            show_menu, show_route, show_wps, show_splist, show_catlist, show_settings,
+            show_poimenu, show_routes, show_favmenu, show_roadlist,
+            menu_cat_sel, menu_item_sel,
+            wps: &wps, route_sel, grab, wp_sel,
+            spots: &spots, cur_cat: &cur_cat, sp_sel, lat, lon,
+            spot_cats: &spot_cats, cat_sel,
+            opts: &opts, cfg: &cfg, set_sel, set_pick_sel,
+            poi_kinds: &poi_kinds, poimenu_sel,
+            route_names: &route_names, rn_sel,
+            road_segs: &road_segs, road_sel,
+            pois: &pois, poi_label: &poi_label, poi_sel,
+        }, &mut list_offset);
 
         // 左袖 + 地図 を絶対座標で配置
         let _ = write!(out, "\x1b[H");
@@ -849,102 +768,19 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         if elev_h > 0 { // 標高プロファイル帯(地図の下・ステータスの上)。描画は ui_overlay.rs へ切り出し済み
             ui_overlay::draw_elevation_band(&mut out, cols, map_rows, elev_h, &route_ele, route_ascend, &spec, lat, lon);
         }
-        let status = match &focus {
-            Focus::Search(_) => " 中央フォームに入力中 ".to_string(),
-            Focus::SaveName(_) if save_confirm.is_some() => {
-                let name = save_confirm.as_deref().unwrap_or("");
-                format!(" 「{name}」は既に存在します。上書きしますか？ y=上書き / 他キー=名前を変更(新規登録) ")
-            }
-            Focus::SaveName(_) => " 中央フォームに入力中 ".to_string(),
-            Focus::NearSearch(_) => " 中央フォームに入力中 ".to_string(),
-            Focus::NewCat(_) => " 中央フォームに入力中 ".to_string(),
-            Focus::SpotForm { .. } => " 新規スポット: ↑↓/Tab移動 入力/貼付 Enter=次/送信 Esc=取消 ".to_string(),
-            Focus::PoiKindForm { .. } => " 新規カテゴリ: ↑↓/Tab移動 入力 Enter=次/追加 Esc=取消 ".to_string(),
-            Focus::WanderForm { .. } => " おまかせ周回: ←→距離調整(Shiftで粗く) Enter=検索開始 Esc=取消 ".to_string(),
-            Focus::SpotList if spot_move_confirm.is_some() => {
-                let nm = spot_move_confirm.and_then(|gi| spots.get(gi)).map(|s| if s.name.is_empty() { "(無名)" } else { s.name.as_str() }).unwrap_or("");
-                format!(" 「{nm}」をこの地図中心の位置へ移動する？ y=はい / 他キー=取消 ")
-            }
-            Focus::SpotList => format!(" [{cur_cat}] ↑↓ Enter移動 [ ]並替 n新規 r改名 m中心へ x削除 Esc戻る "),
-            Focus::SpotEditName(_, _) => " 中央フォームに入力中 ".to_string(),
-            Focus::SettingsEdit(..) => " 中央フォームに入力中 ".to_string(),
-            Focus::SpotCatList if pending_spot.is_some() => " 登録先カテゴリを選択: ↑↓ Enter=ここに登録 n新規 Esc取消 ".to_string(),
-            Focus::SpotCatList => " カテゴリ: ↑↓選択 [ ]並替 Enter=中へ n新規 r改名 c色 M形 x削除(空のみ) Esc=閉 ".to_string(),
-            Focus::Settings => {
-                // 各行の説明文は settings.rs::setting_description へ切り出し済み(状態を必要としない純粋部分)。
-                let desc = settings::setting_description(set_sel);
-                format!(" ▶ {desc}   [↑↓選択 Enter切替/一覧選択/編集 Esc閉(自動保存)]")
-            }
-            Focus::RoadSearch(_) => " 中央フォームに入力中 ".to_string(),
-            Focus::Recommend(_) => " 中央フォームに入力中 ".to_string(),
-            Focus::SpotRename(_, _) => " 中央フォームに入力中 ".to_string(),
-            Focus::PoiMenu => " 目的地カテゴリ: ↑↓選択 Enter=検索(キー直打ちも可) n新規 x削除 [ ]並替 / キーワードは最終行 Esc=取消 ".to_string(),
-            Focus::PoiList => format!(" [{}] ↑↓選択(追従) ←→地図 +/-拡縮 v追加 Enter移動 P登録 f再検索 Esc閉 ", poi_label),
-            Focus::RouteList => " お気に入り: ↑↓選択 Enter=読込 Esc=閉 ".to_string(),
-            Focus::RouteFavMenu { .. } => " お気に入りルート: ↑↓/ws選択 Enter=決定 Esc=取消 ".to_string(),
-            Focus::RoutePanel => {
-                let base = " ルート一覧: ↑↓/ws選択 Enter実行 [ ]並替 x削除 v追加 +/-拡縮 Esc/Tabで地図へ ".to_string();
-                match &route_note { Some(rn) => format!("{base}| {rn} "), None => base }
-            }
-            Focus::RoadList => " 道路: ↑↓選択 x削除 Esc戻る ".to_string(),
-            Focus::WaypointList => " 並べ替え: ↑↓/ws選択(地図追従)  Space掴む↔置く(掴み中↑↓/wsで移動)  x削除  +/-拡縮  Esc閉 ".to_string(),
-            Focus::ColorPick { .. } => " 色を選択: ←→ Enter=決定 Esc=取消 ".to_string(),
-            Focus::ShapePick { .. } => " 形を選択: ←→ Enter=決定 Esc=取消 ".to_string(),
-            Focus::SettingsPick(_) => " 候補を選択: ↑↓/ws選択 Enter=決定 Esc=取消(展開を閉じる) ".to_string(),
-            Focus::Menu(MenuLevel::Categories) => " ↑↓カテゴリ Enter展開 / 文字キーで直接実行 Esc閉 ".to_string(),
-            Focus::Menu(MenuLevel::Items(_)) => " ↑↓選択 Enter実行 / 右端キーでも実行 Esc戻る ".to_string(),
-            Focus::Map if clear_route_confirm => " ルートを全消去しますか？ y=はい / 他キー=取消 ".to_string(),
-            Focus::Map => {
-                // 通信中(いずれかのジョブがSome)はスピナー1文字＋案内を先頭に出す
-                let jobs_active = route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some() || wander_job.is_some();
-                let spinner = if jobs_active {
-                    const FR: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-                    format!("{} 通信中…(Escで中断) ", FR[spin % FR.len()])
-                } else { String::new() };
-                let live = if gps_rx.is_some() { "●LIVE(Gで解除) " }
-                    else if web_gps_active { "●LIVE(スマホGPS) " }
-                    else { "" };
-                let playing = if play.is_some() { format!("▶再生{play_speed:.2}x([ ]変速/A停止) ") } else { String::new() };
-                // 雨雲レーダー: 表示中の時刻・種別と、タイルの読込状況。ONのときだけ出す。
-                // 出典表記は幅を食うので毎フレームは出さず、ONにした直後のメッセージ(addr)で1回出す。
-                let radar_txt = if !radar_on {
-                    String::new()
-                } else {
-                    match radar_tl.get(radar_idx) {
-                        // targetTimes がまだ届いていない(ONにした直後・取得失敗中)
-                        None => "☂時刻取得中… ".to_string(),
-                        Some(f) => {
-                            let (got, need) = radar_progress(&loader, rcx, rcy, rz, rw, rh, f);
-                            if need == 0 {
-                                "☂範囲外 ".to_string() // 日本国外を表示中=1枚も取りに行っていない
-                            } else if got < need {
-                                format!("☂{} 読込{got}/{need} ", radar::frame_label(&radar_tl, radar_idx))
-                            } else {
-                                let follow = if radar_follow { "(追従)" } else { "" };
-                                format!("☂{}{follow} ", radar::frame_label(&radar_tl, radar_idx))
-                            }
-                        }
-                    }
-                };
-                // 道路交通量: ONのときだけ、取得地点数(または取得中)を出す。0件は「圏外/観測点無し」
-                // (このデータは直轄国道の観測点のみで、それ以外の道路には点が無い)と区別できるようにする。
-                let traffic_txt = if !cfg.traffic_enabled {
-                    String::new()
-                } else if traffic_points.is_empty() && traffic_job.is_some() {
-                    "🚗取得中… ".to_string()
-                } else if traffic_points.is_empty() {
-                    "🚗観測点無し ".to_string()
-                } else {
-                    format!("🚗{}地点 ", traffic_points.len())
-                };
-                // 一時メッセージが無い時は底面にロゴを常時表示。メッセージ発生時はそちらを優先。
-                let msg = if addr.is_empty() { "◉╌╌╌► termmap · terminal touring map   ".to_string() } else { format!("» {addr} « ") };
-                // 下部バーは細く。全操作は Space メニューから選べる
-                let route_hint = if wps.is_empty() { "v=地点を置く".to_string() } else { format!("{}点 v足す w/s選択(操作行までEnterで実行) Tab=左の一覧へ(並替/操作)", wps.len()) };
-                let base = format!(" {spinner}{msg}{live}{playing}{radar_txt}{traffic_txt}z{z} {lat:.4},{lon:.4} ｜ {route_hint} ｜ Space:メニュー ?ヘルプ q終了");
-                match &route_note { Some(rn) => format!("{base} | {rn} "), None => base }
-            }
-        };
+        // ステータス行の文面組み立ては ui_status.rs へ切り出し済み。通信中スピナーの判定に使う
+        // 各ジョブは有無しか見ないのでここで1つのフラグに畳んでから渡す。
+        let jobs_active = route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some() || wander_job.is_some();
+        let status = ui_status::build_status_line(ui_status::StatusCtx {
+            focus: &focus, save_confirm: &save_confirm, spot_move_confirm, spots: &spots,
+            cur_cat: &cur_cat, pending_spot: pending_spot.is_some(), set_sel, poi_label: &poi_label,
+            route_note: &route_note, clear_route_confirm, jobs_active, spin,
+            gps_live: gps_rx.is_some(), web_gps_active, play, play_speed,
+            radar_on, radar_tl: &radar_tl, radar_idx, radar_follow,
+            loader: &loader, rcx, rcy, rz, rw, rh,
+            cfg: &cfg, traffic_points: &traffic_points, traffic_job_active: traffic_job.is_some(),
+            addr: &addr, wps: &wps, z, lat, lon,
+        });
         let status = fit_cells(&status, cols as usize);
         write!(out, "\x1b[{};1H\x1b[7m{status}\x1b[0m", tr)?;
 

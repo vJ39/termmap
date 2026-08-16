@@ -29,6 +29,8 @@ mod ui;
 mod ui_helpers; // interactive() の外にあった小さなヘルパー群
 mod focus;      // 対話UIの画面状態(Focus)
 mod ui_overlay; // 中央パネル/ポップアップ・標高帯の描画
+mod ui_gutter;  // 左袖リストの行組み立て
+mod ui_status;  // 最下段ステータス行の文面組み立て
 #[allow(dead_code)]
 mod roadtrace; // point_at/sample等は使用、cut_segment等は将来用
 // 以下は今後の機能用(おすすめ相談)。まだ未wireのため dead_code 許容。
