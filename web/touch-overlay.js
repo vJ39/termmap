@@ -55,18 +55,26 @@
 
   if (window.__termmapTouch) { return; } // 二重読み込み防止
 
-  var OVERLAY_VERSION = '1.0.0';
+  var OVERLAY_VERSION = '1.3.0';
 
   // ── 調整パラメータ ───────────────────────────────────────────────
   var TAP_SLOP_PX      = 12;   // 移動量がこれ以下ならタップ(Enter)扱い
   var TAP_MAX_MS       = 400;  // 接触時間がこれより長いものはタップにしない
-  var PX_PER_STEP      = 24;   // パン: 何 px ごとに矢印キー1回か(X/Yそれぞれ独立に判定=斜め対応)。
-                                // 小さいほど同じスワイプ距離で地図がより大きく動く(既定40→24に短縮)
+  // カーソル軸('c')で、何 px ごとに矢印キー1回か。一覧のカーソルが1行動くのに指24pxは
+  // 細かすぎて狙った項目で止められないため、パン用の24より広めにしてある(実機で詰める)。
+  var CURSOR_PX_PER_STEP = 48;
+  // 通路A(パン量マーカー)が使えない場合のフォールバック用。OSC 9997 を1度も受け取って
+  // いない=古い termmap に新しい overlay が当たっている状況で、従来どおりの離散キー変換に
+  // 使う値(従来の PX_PER_STEP と同じ意味・同じ値)。
+  var FALLBACK_PX_PER_STEP = 24;
+  // パン量マーカーの送信レート上限(約30Hz)。間引いた分は捨てずに次回へ繰り越す。
+  var PAN_MIN_INTERVAL_MS = 33;
   var PINCH_PX_PER_STEP = 55;  // ピンチ: 指の間隔が何 px 変わるごとにズーム1段か(誤爆軽減でパンより粗め)
   // touchmove/慣性の1tickで送るキーの上限(暴走防止の保険)。速いスワイプほど1回の
   // touchmoveあたりの移動量(dx/dy)が大きくなるので、ここを大きめにしておかないと
   // 「速く払っても遅く払っても同じ」に頭打ちされ、スピード感が出ない。
-  // PX_PER_STEPを下げた分、同じ物理距離でも要求ステップ数が増えるため、上限も比例して上げておく。
+  // 効くのはキーを送る経路(ピンチ・'c'軸・フォールバック)だけ。'p'軸は通路Aで連続量を
+  // 送るようになったのでこの上限は掛からない(そもそも1回の送信で全量が伝わる)。
   var MAX_STEPS_PER_TICK = 20;
   var STEP_INTERVAL_MS = 16;   // sendKeyBurst(ピンチの多段ジャンプ用)の連続発火間隔。termmap 側は
                                // 同方向220ms以内の連続入力でpan_streakが伸びて加速する(Rust側既存実装)
@@ -75,10 +83,19 @@
   var GLIDE_MIN_SPEED = 0.05;  // px/ms。これ未満まで減衰したら慣性を止める
   var GLIDE_MAX_TICKS = 16;    // 保険の上限(だいたい1秒で必ず止まる)
 
-  // スワイプの向き。true = 地図を指でつかんで動かす向き(Googleマップ等と同じ)。
-  //   指を右へ払う → 地図が右へ動く → 見えるのは西側 → ArrowLeft を送る
-  // false にすると「指の向き = 視点の移動方向」になる(右へ払う → 東へ進む)。
-  var DRAG_MAP = true;
+  // ── ドラッグの軸モード(termmap から OSC 9997 で通知される) ────────────────────
+  // X軸/Y軸それぞれが今どういう意味を持つかを1文字で表す(docs/web-touch-drag-design.md §3.2)。
+  //   'p' … pan。ビューポート(地図)が動く。極性を反転して、指と同じ向きに地図を流す。
+  //         移動量は通路A(パン量マーカー)で連続量として送る=指に1:1で追従する。
+  //   'c' … cursor。カーソル/値が動く。極性はそのままで矢印キーを送る
+  //         (指を下へ動かす→カーソルも下、が直感どおり。地図とは逆の極性になる)。
+  //   'n' … none。その軸の操作は無効。何も送らない。
+  // 初期値は地図(両軸パン)。通知が届く前でも地図では正しく動く。
+  var dragAxes = { x: 'p', y: 'p' };
+  // OSC 9997 を1回でも受け取ったか。受け取るまでは通路A(パン量マーカー)を使わず、
+  // 従来のキー変換方式のまま動く。「新しい overlay + 古い termmap」の組み合わせで、
+  // パン量のペーストが検索欄へ文字として入るような事故を防ぐためのケイパビリティ検出。
+  var dragModeSeen = false;
 
   // ── キー定義 ────────────────────────────────────────────────────
   // keyCode は US 配列の実キーボードが出す値に合わせてある(xterm.js が keyCode を見るため)。
@@ -206,6 +223,37 @@
     }
   }
 
+  // ── ドラッグ軸モードの受信(termmap → ブラウザ・OSC 9997) ──────────────────────
+  // ペイロードは "<version>;<xy>" 形式(例: "1;pp" = 両軸パン / "1;nc" = 横無効・縦カーソル)。
+  // Focus が変わったフレームだけ termmap 側から送られてくる(src/dragmode.rs)。
+  function applyDragModeData(data) {
+    if (typeof data !== 'string') { return false; }
+    var sep = data.indexOf(';');
+    if (sep < 0) { return false; }
+    // 未知の版数は解釈しない(フィールドの並びが変わっている可能性があるため)。
+    // 受け取れないままなら dragModeSeen が false のままで、従来のキー変換方式に留まる。
+    if (data.slice(0, sep) !== '1') { return false; }
+    var xy = data.slice(sep + 1);
+    if (xy.length < 2) { return false; }
+    var x = xy.charAt(0), y = xy.charAt(1);
+    if ('pcn'.indexOf(x) < 0 || 'pcn'.indexOf(y) < 0) { return false; }
+    dragAxes = { x: x, y: y };
+    dragModeSeen = true;
+    return true;
+  }
+
+  function bindDragModeOsc() {
+    [0, 100, 300, 700, 1500].forEach(function (ms) {
+      setTimeout(function () {
+        var t = window.term;
+        if (t && !t.__termmapDragModeBound && typeof t.registerOscHandler === 'function') {
+          t.__termmapDragModeBound = true;
+          t.registerOscHandler(9997, function (data) { applyDragModeData(data); return true; });
+        }
+      }, ms);
+    });
+  }
+
   // termmapの実画像モード(iTerm2インラインイメージ・OSC 1337)をブラウザでも描画する。
   // ttyd同梱のxterm.jsには本家 @xterm/addon-image のコード自体は入っているが、ttyd側の
   // 初期化スクリプトがloadAddon()していないため何もしない状態だった。web/vendor/配下に
@@ -250,7 +298,9 @@
   var GPS_MIN_INTERVAL_MS = 3000; // 送信間隔の下限(pty/描画を圧迫しないよう間引く)
   var gpsLastSentAt = 0;
 
-  function sendGpsPaste(text) {
+  // termmap への専用マーカー送信。先頭に SOH(U+0001) を付けて term.paste() で送る。
+  // ライブ現在地(GPS…)・パン量(PAN…)・軸モードの再送要求(DRAGMODE?…)の3種で共用する。
+  function sendMarkerPaste(text) {
     var t = window.term;
     if (!t || typeof t.paste !== 'function') { return; }
     t.paste('' + text);
@@ -260,7 +310,7 @@
     if (GPS_WATCH_ID !== null) {
       navigator.geolocation.clearWatch(GPS_WATCH_ID);
       GPS_WATCH_ID = null;
-      sendGpsPaste('GPS_STOP');
+      sendMarkerPaste('GPS_STOP');
       return;
     }
     if (!navigator.geolocation) { return; } // 非対応環境は何もしない
@@ -269,11 +319,74 @@
         var now = Date.now();
         if (now - gpsLastSentAt < GPS_MIN_INTERVAL_MS) { return; } // 間引き
         gpsLastSentAt = now;
-        sendGpsPaste('GPS' + pos.coords.latitude + '' + pos.coords.longitude);
+        sendMarkerPaste('GPS' + pos.coords.latitude + '' + pos.coords.longitude);
       },
       function () { GPS_WATCH_ID = null; }, // 権限拒否/取得失敗: 状態を戻すだけ
       { enableHighAccuracy: true, maximumAge: 5000, timeout: 15000 }
     );
+  }
+
+  // ── パン量の転送(通路A: ブラウザ → termmap) ──────────────────────────────────
+  // 'p' 軸のドラッグは矢印キーに量子化せず、指の移動量を「端末ビューポートの幅/高さで
+  // 割った比」として専用マーカーで送る。termmap 側(src/dragmode.rs::pan_ratio_to_px)が
+  // 地図領域の出力ピクセルへ換算するので、指が画面の1/4を横切れば地図も表示範囲の1/4動く。
+  // 比で送るのは、xterm.js の内部APIからセル寸法を取りに行かずに済み、DPR・フォントサイズ・
+  // 画面回転に影響されないため。符号は指の移動方向そのもの(右/下が正)で、反転は termmap 側。
+  var panPending = { x: 0, y: 0 }; // まだ送っていない移動量[CSS px](間引き分・丸めの端数)
+  var panLastSentAt = 0;
+  var panFlushTimer = null;
+
+  // 端末領域の CSS px 寸法。比の分母になる。回転やURLバーの伸縮で変わるので都度読む。
+  function terminalViewportSize() {
+    var el = document.querySelector(TERMINAL_SELECTOR);
+    var r = (el && el.getBoundingClientRect) ? el.getBoundingClientRect() : null;
+    var w = (r && r.width) || window.innerWidth || 0;
+    var h = (r && r.height) || window.innerHeight || 0;
+    return { w: w, h: h };
+  }
+
+  function clampRatio(v) { return v > 1 ? 1 : (v < -1 ? -1 : v); }
+
+  // 溜まっている移動量を送る。30Hz を超える分は送らずに panPending へ残し、次の送信機会を
+  // タイマーで予約する(指が止まって touchmove が来なくなっても最後の1回が必ず届く)。
+  function flushPan() {
+    if (panFlushTimer) { clearTimeout(panFlushTimer); panFlushTimer = null; }
+    if (panPending.x === 0 && panPending.y === 0) { return; }
+    var now = Date.now();
+    var wait = PAN_MIN_INTERVAL_MS - (now - panLastSentAt);
+    if (wait > 0) { panFlushTimer = setTimeout(flushPan, wait); return; }
+    var size = terminalViewportSize();
+    if (!size.w || !size.h) { return; } // 端末がまだ描画されていない
+    // 1マーカーあたりの比は ±1 まで(termmap 側が範囲外を捨てる)。溢れた分は繰り越す。
+    var fx = clampRatio(panPending.x / size.w);
+    var fy = clampRatio(panPending.y / size.h);
+    var sx = fx.toFixed(4), sy = fy.toFixed(4);
+    var vx = parseFloat(sx), vy = parseFloat(sy);
+    if (vx === 0 && vy === 0) { return; } // 丸めて0になる微小移動。溜めたまま次の機会を待つ
+    panLastSentAt = now;
+    panPending.x -= vx * size.w; // 送った分だけ差し引く(丸めの端数は次回へ繰り越す)
+    panPending.y -= vy * size.h;
+    sendMarkerPaste('PAN' + sx + '' + sy + '');
+    if (panPending.x !== 0 || panPending.y !== 0) { panFlushTimer = setTimeout(flushPan, PAN_MIN_INTERVAL_MS); }
+  }
+
+  function queuePan(dx, dy) {
+    panPending.x += dx;
+    panPending.y += dy;
+    flushPan();
+  }
+
+  // 軸モードの再送要求(設計書 §5.3)。ページを再読み込みすると JS 側の状態は消えるが、
+  // termmap 側の Focus は変わらないので OSC 9997 が飛んでこない。初期化時と復帰時に要求する。
+  // 初期化時は window.term や pty がまだ準備できていないことがあるため、受け取れるまで数回試す。
+  function requestDragMode(force) {
+    if (force) { sendMarkerPaste('DRAGMODE?'); return; }
+    [0, 150, 500, 1200, 2500].forEach(function (ms) {
+      setTimeout(function () {
+        if (dragModeSeen) { return; } // 既に受け取っていれば要求しない
+        sendMarkerPaste('DRAGMODE?');
+      }, ms);
+    });
   }
 
   // ── キーイベント合成 ────────────────────────────────────────────
@@ -386,28 +499,51 @@
   }
 
   // X軸/Y軸それぞれ独立に「押すべき矢印キー」を決める(斜めスワイプでは両方使う)。
-  function xKey(dx) { return DRAG_MAP ? (dx > 0 ? 'ArrowLeft' : 'ArrowRight') : (dx > 0 ? 'ArrowRight' : 'ArrowLeft'); }
-  function yKey(dy) { return DRAG_MAP ? (dy > 0 ? 'ArrowUp' : 'ArrowDown') : (dy > 0 ? 'ArrowDown' : 'ArrowUp'); }
+  // mode 'p'(pan) は極性を反転する: 指を右へ払う → 地図が右へ流れる → 見えるのは西側 →
+  //   ArrowLeft(termmap 側で cx -= step)。地図を指でつかんで動かす向き。
+  // mode 'c'(cursor) は極性そのまま: 指を下へ動かす → カーソルも下 → ArrowDown。
+  //   「見た目の追従感を揃える」ためには、地図とは逆のキーを送る必要がある(設計書 §3.1)。
+  function xKey(dx, mode) {
+    return mode === 'p' ? (dx > 0 ? 'ArrowLeft' : 'ArrowRight') : (dx > 0 ? 'ArrowRight' : 'ArrowLeft');
+  }
+  function yKey(dy, mode) {
+    return mode === 'p' ? (dy > 0 ? 'ArrowUp' : 'ArrowDown') : (dy > 0 ? 'ArrowDown' : 'ArrowUp');
+  }
 
-  // dx/dy ぶんの移動をX軸・Y軸それぞれ独立に矢印キーへ変換して送る(=斜め移動に対応)。
-  // 1回で送るのは MAX_STEPS_PER_TICK まで(暴走防止)。端数(PX_PER_STEP未満)を捨てずに
-  // 済むよう、実際に消費した距離(送った分)を返す。呼び出し側はこれを引いた残りを次回へ繰り越す。
+  // 1軸ぶんの移動量を矢印キーへ量子化して送る。1回で送るのは MAX_STEPS_PER_TICK まで(暴走防止)。
+  // 端数(pxPerStep 未満)を捨てずに済むよう、実際に消費した距離を返す。
+  function sendAxisKeys(delta, pxPerStep, keyName) {
+    var steps = Math.trunc(delta / pxPerStep);
+    if (steps === 0) { return 0; }
+    var n = Math.min(Math.abs(steps), MAX_STEPS_PER_TICK);
+    for (var i = 0; i < n; i++) { sendKey(keyName); }
+    return (steps > 0 ? n : -n) * pxPerStep;
+  }
+
+  // dx/dy ぶんの移動を、軸モードに応じた経路で termmap へ送る(X軸・Y軸は独立=斜め移動に対応)。
+  //   'p' … パン量マーカー(通路A)へ積む。量子化も加速も挟まないので指に1:1で追従する。
+  //   'c' … 矢印キーへ量子化して送る(CURSOR_PX_PER_STEP ごとに1回)。
+  //   'n' … 何も送らない(無効な矢印で termmap 側の再描画だけ走る無駄も消える)。
+  // OSC 9997 を1度も受け取っていない間は、従来どおり全軸を矢印キーへ変換する(§5.4)。
+  // 戻り値は実際に消費した px。呼び出し側はこれを引いた残りを次回へ繰り越す。'p'/'n' 軸は
+  // 全量を消費する('p' は端数を panPending 側で繰り越すため。'n' は溜めておくと軸モードが
+  // 変わった瞬間に溜まった分が一気に出てしまうため)。
   function sendPanDelta(dx, dy) {
-    var usedX = 0, usedY = 0;
-    var stepsX = Math.trunc(dx / PX_PER_STEP);
-    if (stepsX !== 0) {
-      var nx = Math.min(Math.abs(stepsX), MAX_STEPS_PER_TICK);
-      var kx = xKey(dx);
-      for (var i = 0; i < nx; i++) { sendKey(kx); }
-      usedX = (stepsX > 0 ? nx : -nx) * PX_PER_STEP;
+    if (!dragModeSeen) {
+      return {
+        usedX: sendAxisKeys(dx, FALLBACK_PX_PER_STEP, xKey(dx, 'p')),
+        usedY: sendAxisKeys(dy, FALLBACK_PX_PER_STEP, yKey(dy, 'p'))
+      };
     }
-    var stepsY = Math.trunc(dy / PX_PER_STEP);
-    if (stepsY !== 0) {
-      var ny = Math.min(Math.abs(stepsY), MAX_STEPS_PER_TICK);
-      var ky = yKey(dy);
-      for (var j = 0; j < ny; j++) { sendKey(ky); }
-      usedY = (stepsY > 0 ? ny : -ny) * PX_PER_STEP;
-    }
+    var usedX, usedY;
+    var panDx = 0, panDy = 0;
+    if (dragAxes.x === 'p') { panDx = dx; usedX = dx; }
+    else if (dragAxes.x === 'c') { usedX = sendAxisKeys(dx, CURSOR_PX_PER_STEP, xKey(dx, 'c')); }
+    else { usedX = dx; }
+    if (dragAxes.y === 'p') { panDy = dy; usedY = dy; }
+    else if (dragAxes.y === 'c') { usedY = sendAxisKeys(dy, CURSOR_PX_PER_STEP, yKey(dy, 'c')); }
+    else { usedY = dy; }
+    if (panDx !== 0 || panDy !== 0) { queuePan(panDx, panDy); }
     return { usedX: usedX, usedY: usedY };
   }
 
@@ -437,6 +573,14 @@
     stopGlide();
     if (!v) { return; }
     var vx = v.vx, vy = v.vy;
+    // 慣性は 'p'(パン)軸だけに効かせる。'c'(カーソル)軸でフリックすると一覧が流れて意図しない
+    // 項目が選ばれるうえ、一覧はカーソル移動のたびに地図が選択地点へ追従して再描画が走るため
+    // 負荷も大きい。'n' 軸はそもそも送るものが無い。指を離したらその場で止める。
+    if (dragModeSeen) {
+      if (dragAxes.x !== 'p') { vx = 0; }
+      if (dragAxes.y !== 'p') { vy = 0; }
+      if (vx === 0 && vy === 0) { return; }
+    }
     if (Math.sqrt(vx * vx + vy * vy) < GLIDE_MIN_SPEED * 2) { return; } // 離す直前がほぼ静止=弾かない
     var carryX = 0, carryY = 0, ticks = 0;
     (function tick() {
@@ -733,7 +877,16 @@
     bindGestures();
     bindSoundOsc();
     bindVoiceGuideOsc();
+    bindDragModeOsc();
     bindImageAddon();
+    // 軸モードを要求する。termmap は最初のフレームでも1回送ってくるが、そのフレームが
+    // OSC ハンドラの登録より前だと取りこぼすため、受け取れるまで数回要求する。
+    requestDragMode(false);
+    // タブを切り替えて戻ってきた/画面ロックから復帰したときも、状態が失われている可能性が
+    // あるので取り直す(復帰時は既に見えている値が古いこともあるため強制で1回)。
+    document.addEventListener('visibilitychange', function () {
+      if (document.visibilityState === 'visible') { requestDragMode(true); }
+    });
     refit();
   }
 
@@ -756,6 +909,17 @@
     bindImageAddon: bindImageAddon,
     speakVoiceGuide: speakVoiceGuide,
     keys: KEYS,
-    findTextarea: findTextarea
+    findTextarea: findTextarea,
+    // ドラッグ軸モードの確認・手動注入(設計書 §11 の実機確認手順で使う)。
+    // 例: __termmapTouch.setDragAxes('nc') で一覧と同じ挙動を強制、
+    //     __termmapTouch.setDragAxes(null) で OSC 9997 未受信の状態(従来方式)へ戻す。
+    getDragAxes: function () { return { x: dragAxes.x, y: dragAxes.y, seen: dragModeSeen }; },
+    setDragAxes: function (xy) {
+      if (xy === null) { dragModeSeen = false; dragAxes = { x: 'p', y: 'p' }; return true; }
+      return applyDragModeData('1;' + xy);
+    },
+    applyDragModeData: applyDragModeData,
+    requestDragMode: requestDragMode,
+    terminalViewportSize: terminalViewportSize
   };
 })();

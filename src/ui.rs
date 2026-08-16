@@ -361,6 +361,11 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     let mut pan_streak: u32 = 0;
     let mut last_pan_dir: Option<KeyCode> = None;
     let mut last_pan_at = std::time::Instant::now();
+    // web版(ブラウザ)のドラッグ軸モード通知(#87)。前回送った値を覚えておき、変わったフレーム
+    // だけ OSC 9997 を送る。req_pending はブラウザからの再送要求(DRAGMODE?)を受けた印で、
+    // 値が変わっていなくても次フレームで1回送らせる。
+    let mut prev_drag_axes: Option<(dragmode::Axis, dragmode::Axis)> = None;
+    let mut drag_mode_req_pending = false;
     let _ = write!(out, "\x1b[2J");
     loop {
         spin = spin.wrapping_add(1); // 通信中スピナーのアニメ用(毎フレーム進める)
@@ -976,6 +981,17 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 | Focus::SpotRename(..) | Focus::SpotEditName(..) | Focus::ColorPick { .. } | Focus::ShapePick { .. } | Focus::SettingsEdit(..) | Focus::PoiKindForm { .. } | Focus::WanderForm { .. });
         if prev_map_covered && !map_covered { force_reemit = true; }
         prev_map_covered = map_covered;
+        // web版(ブラウザ)へ現在のドラッグ軸モードを通知する(#87 設計書 §5.2)。Focus は
+        // interactive() 内の30か所以上で書き換わり、非同期ジョブの完了で勝手に変わる箇所も
+        // ある(例: 周辺検索の結果適用で Map → PoiList)。変更箇所ごとに通知を足すのではなく
+        // フレーム末で前回値と比較する方式にして、呼び出しをこの1か所に閉じている。
+        // 認識しない端末(通常のターミナル)では無視されるだけなので、web以外でも害は無い。
+        let cur_drag_axes = dragmode::axes(&focus);
+        if prev_drag_axes != Some(cur_drag_axes) || drag_mode_req_pending {
+            dragmode::emit_web_drag_mode(cur_drag_axes);
+            prev_drag_axes = Some(cur_drag_axes);
+            drag_mode_req_pending = false;
+        }
         out.flush()?;
 
         // バックグラウンドジョブの結果を毎フレーム取り込む(route/search/near/street/recommend)。
@@ -1246,6 +1262,54 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                         }
                     }
                 }
+            }
+        }
+        // web版(ブラウザ)からのパン量マーカー(#87 設計書 §6.3)。上のキー間引きは「溜まった分を
+        // 最新1個で上書き」=捨てる方式だが、パン量は相対値なので足し合わせれば取りこぼしがゼロに
+        // なる。描画が遅れて数フレーム分溜まっても、指を離した時点の位置に必ず追いつく。
+        // ev を別イベントで上書きしても合算値はこの変数に残るので、途中で別のキーが割り込んでも
+        // 移動分は失われない。Focus::Map 以外(PoiList の横パン等)でも効かせるためキー間引きの
+        // 内側には置かない。
+        let mut pan_fx = 0.0f64;
+        let mut pan_fy = 0.0f64;
+        let mut got_pan = false;
+        if matches!(&ev, Some(Event::Paste(s)) if s.starts_with(dragmode::PAN_MARKER)) {
+            if let Some(Event::Paste(s)) = &ev {
+                if let Some((fx, fy)) = dragmode::parse_pan_marker(s) { pan_fx += fx; pan_fy += fy; }
+            }
+            got_pan = true;
+            ev = None; // このイベントは消費済み。以降の match へ素通しさせない(検索欄への誤入力防止)
+            while let Ok(true) = event::poll(std::time::Duration::from_millis(0)) {
+                match event::read()? {
+                    Event::Paste(s) if s.starts_with(dragmode::PAN_MARKER) => {
+                        if let Some((fx, fy)) = dragmode::parse_pan_marker(&s) { pan_fx += fx; pan_fy += fy; }
+                    }
+                    other => { ev = Some(other); break; }
+                }
+            }
+        }
+        if got_pan {
+            // 適用は該当軸が Pan のときだけ。X/Yは独立に判定する(PoiList は X だけ適用される)。
+            let (ax, ay) = dragmode::axes(&focus);
+            let moved_x = ax == dragmode::Axis::Pan && pan_fx != 0.0;
+            let moved_y = ay == dragmode::Axis::Pan && pan_fy != 0.0;
+            if moved_x || moved_y {
+                let lay = dragmode::Layout { cols, rows: tr as u32, map_cols, map_rows, ow, oh };
+                let (dx_out, dy_out) = dragmode::pan_ratio_to_px(pan_fx, pan_fy, &lay);
+                if moved_x { cx -= dx_out; } // 指と同じ向きに地図が流れる(設計書 §3.1)
+                if moved_y { cy -= dy_out; }
+                // 中心が動いたので、'a'で引いた住所表示は古くなる。矢印キーでのパンと同じく
+                // 地図フォーカスのときだけ消す(PoiListの微パンはキー経路でも消していない)。
+                if matches!(focus, Focus::Map) { addr.clear(); }
+                // キーボードの加速(pan_streak)と混ざらないようリセットする。ドラッグは
+                // 指の移動量そのものが移動量なので、加速を掛けると1:1でなくなる。
+                pan_streak = 0;
+                last_pan_dir = None;
+                // 地図キーのパンと同じ正規化。合算値は1マーカーの上限(±1)を超えうるので、
+                // 1回ぶんの加減算ではなく rem_euclid で確実に範囲へ収める。
+                let n = (TILE as f64) * 2f64.powi(z as i32);
+                cx = cx.rem_euclid(n);
+                cy = cy.clamp(0.0, n - 1.0);
             }
         }
         match ev {
@@ -2284,6 +2348,16 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     }
                 }
             }
+            // 軸モードの再送要求(#87 設計書 §5.3)。ブラウザを再読み込みするとJS側の状態は
+            // 消えるが termmap 側の Focus は変わらないので通知が飛ばない。ここでは印を立てる
+            // だけで、実際の送出は次フレーム末の1か所に任せる。
+            Some(Event::Paste(s)) if s.starts_with(dragmode::DRAG_MODE_REQUEST) => {
+                drag_mode_req_pending = true;
+            }
+            // パン量マーカーは上の合算ブロックで消費済みなので、通常ここへは来ない。念のための
+            // 保険(合算ブロックを通らない経路が将来増えても、マーカーが検索欄へ文字として
+            // 入らないようにする)。
+            Some(Event::Paste(s)) if s.starts_with(dragmode::PAN_MARKER) => {}
             Some(Event::Paste(s)) => { match &mut focus {
                 Focus::Search(buf) | Focus::SaveName(buf) | Focus::NearSearch(buf) | Focus::NewCat(buf) | Focus::RoadSearch(buf) | Focus::Recommend(buf) => insert_str_at(buf, &mut input_cur, &s),
                 Focus::SpotForm { name, url, field } => { if *field == 0 { insert_str_at(name, &mut input_cur, &s); } else if *field == 1 { insert_str_at(url, &mut input_cur, &s); } }

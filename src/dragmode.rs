@@ -10,6 +10,18 @@ use crate::focus::Focus;
 /// OSC 9997 のデータ部先頭に置くフォーマット版数。将来フィールドを足すときに上げる。
 const OSC_VERSION: u32 = 1;
 
+/// ブラウザ → termmap のパン量マーカーの先頭(設計書 §6.1)。
+/// 形式は `\u{1}PAN\u{1}<fx>\u{1}<fy>\u{1}`。fx/fy は指の移動量を端末ビューポートの
+/// 幅/高さで割った比で、符号は指の移動方向そのもの(右/下が正)。ライブ現在地の
+/// `\u{1}GPS\u{1}...` と同じ SOH 区切りの専用マーカーにしてあり、通常のペースト
+/// (検索欄への貼り付け等)とは衝突しない。
+pub(crate) const PAN_MARKER: &str = "\u{1}PAN\u{1}";
+
+/// ブラウザが軸モードの再送を要求するマーカー(設計書 §5.3)。ページを再読み込みすると
+/// JS 側の状態は消えるが termmap 側の Focus は変わらないため、OSC 9997 が飛ばない。
+/// JS の初期化時と visibilitychange での復帰時にこれを送ってもらい、次フレームで送り直す。
+pub(crate) const DRAG_MODE_REQUEST: &str = "\u{1}DRAGMODE?\u{1}";
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Axis {
     /// ビューポート(地図)が動く軸。ブラウザ側は極性を反転して送る(指と同じ向きに地図が流れる)。
@@ -87,6 +99,65 @@ pub(crate) fn emit_web_drag_mode(axes: (Axis, Axis)) {
     use std::io::Write;
     print!("{}", drag_mode_seq(axes));
     let _ = std::io::stdout().flush();
+}
+
+/// パン量マーカー(`\u{1}PAN\u{1}<fx>\u{1}<fy>\u{1}`)を (fx, fy) に解く。
+///
+/// 壊れた入力は「無視」する(None を返す)方針で、GPS マーカーの受け口
+/// (`src/ui.rs` の `\u{1}GPS\u{1}` 分岐)が `is_finite()` と範囲チェックで弾いているのと
+/// 同じ扱い。範囲外(|比| > 1)は、指が1回の touchmove で端末1画面分を超えて動いたことに
+/// なり実機ではありえないため、クランプして一部を活かすのではなくマーカーごと捨てる
+/// (壊れた値を丸めて画面が飛ぶより、その1回分を落とす方が被害が小さい)。
+pub(crate) fn parse_pan_marker(s: &str) -> Option<(f64, f64)> {
+    let rest = s.strip_prefix(PAN_MARKER)?;
+    let mut parts = rest.split('\u{1}');
+    let fx: f64 = parts.next()?.trim().parse().ok()?;
+    let fy: f64 = parts.next()?.trim().parse().ok()?;
+    if !fx.is_finite() || !fy.is_finite() {
+        return None;
+    }
+    if !(-1.0..=1.0).contains(&fx) || !(-1.0..=1.0).contains(&fy) {
+        return None;
+    }
+    Some((fx, fy))
+}
+
+/// 指の移動比 → 地図の移動量[出力ピクセル]の換算(設計書 §6.2)。
+///
+/// 「指が端末の1/4を横切ったら地図も表示範囲の1/4動く」を式で保証する。
+/// 端末の桁数/行数(`cols`/`rows`)と地図領域(`map_cols`/`map_rows` と出力ピクセル `ow`/`oh`)の
+/// 両方を Rust が持っているので、左袖やステータス行のぶんもここで正確に吸収される
+/// (JS 側にゲイン調整の定数を置かなくて済む)。
+///
+/// 返すのは符号を反転していない生の移動量。指と同じ向きに地図を流すための反転
+/// (`cx -= dx`)は呼び出し側で行う。
+pub(crate) fn pan_ratio_to_px(fx: f64, fy: f64, lay: &Layout) -> (f64, f64) {
+    // 地図領域が0セルなら換算不能。実際の呼び出し元では下限が効いている(map_cols>=10 /
+    // map_rows>=3)が、純関数として0除算でNaNを返さないようにしておく。
+    if lay.map_cols == 0 || lay.map_rows == 0 {
+        return (0.0, 0.0);
+    }
+    let dx = fx * lay.cols as f64 * (lay.ow as f64 / lay.map_cols as f64);
+    let dy = fy * lay.rows as f64 * (lay.oh as f64 / lay.map_rows as f64);
+    (dx, dy)
+}
+
+/// pan_ratio_to_px() に渡す画面レイアウトの寸法。同じ型(u32)の値が6つ並ぶので、
+/// 位置引数で渡すと cols と rows、ow と oh の取り違えが静かに通ってしまう。
+/// 名前付きで束ねて取り違えを防ぐ。
+pub(crate) struct Layout {
+    /// 端末の桁数
+    pub cols: u32,
+    /// 端末の行数(ステータス行を含む)
+    pub rows: u32,
+    /// 地図領域の桁数(左袖を除いた分)
+    pub map_cols: u32,
+    /// 地図領域の行数(標高帯・ステータス行を除いた分)
+    pub map_rows: u32,
+    /// 地図領域の出力ピクセル幅(braille なら map_cols*2)
+    pub ow: u32,
+    /// 地図領域の出力ピクセル高(braille なら map_rows*4)
+    pub oh: u32,
 }
 
 #[cfg(test)]
@@ -253,5 +324,144 @@ mod tests {
         // 標準出力へ書くだけ。sound.rs の play() テストと同じく panic しないことだけ確認する。
         emit_web_drag_mode((Pan, Pan));
         emit_web_drag_mode((Nothing, Nothing));
+    }
+
+    // ── パン量マーカーのパース(設計書 §11) ────────────────────────────
+
+    /// テスト用にマーカー文字列を組み立てる。JS 側(sendPanPaste)が送る形と同じ。
+    fn pan_marker(fx: &str, fy: &str) -> String {
+        format!("{PAN_MARKER}{fx}\u{1}{fy}\u{1}")
+    }
+
+    #[test]
+    fn parse_pan_marker_accepts_normal_values() {
+        let got = parse_pan_marker(&pan_marker("0.0132", "-0.0041")).expect("正常値はパースできる");
+        assert!((got.0 - 0.0132).abs() < 1e-12);
+        assert!((got.1 + 0.0041).abs() < 1e-12);
+    }
+
+    #[test]
+    fn parse_pan_marker_accepts_range_boundaries() {
+        // ±1(端末1画面ぶん)はちょうど許容範囲の端なので通す。
+        assert_eq!(parse_pan_marker(&pan_marker("1", "-1")), Some((1.0, -1.0)));
+        assert_eq!(parse_pan_marker(&pan_marker("0", "0")), Some((0.0, 0.0)));
+    }
+
+    #[test]
+    fn parse_pan_marker_works_without_trailing_separator() {
+        // 末尾の区切りが無い形(GPSマーカーと同じ形)でも読めること。JS 側の実装が変わっても
+        // 受け口が壊れないようにしておく。
+        assert_eq!(parse_pan_marker("\u{1}PAN\u{1}0.5\u{1}0.25"), Some((0.5, 0.25)));
+    }
+
+    #[test]
+    fn parse_pan_marker_rejects_out_of_range() {
+        // |比| > 1 は1回の touchmove で端末1画面分を超えた計算になる。実機ではありえないので捨てる。
+        assert_eq!(parse_pan_marker(&pan_marker("1.5", "0.1")), None);
+        assert_eq!(parse_pan_marker(&pan_marker("0.1", "-1.5")), None);
+        assert_eq!(parse_pan_marker(&pan_marker("1e9", "0")), None);
+    }
+
+    #[test]
+    fn parse_pan_marker_rejects_nan_and_infinity() {
+        assert_eq!(parse_pan_marker(&pan_marker("NaN", "0.1")), None);
+        assert_eq!(parse_pan_marker(&pan_marker("0.1", "NaN")), None);
+        assert_eq!(parse_pan_marker(&pan_marker("inf", "0.1")), None);
+        assert_eq!(parse_pan_marker(&pan_marker("-inf", "0.1")), None);
+    }
+
+    #[test]
+    fn parse_pan_marker_rejects_non_numeric() {
+        assert_eq!(parse_pan_marker(&pan_marker("abc", "0.1")), None);
+        assert_eq!(parse_pan_marker(&pan_marker("0.1", "")), None);
+        assert_eq!(parse_pan_marker(&pan_marker("0.1,0.2", "0.3")), None);
+    }
+
+    #[test]
+    fn parse_pan_marker_rejects_missing_fields() {
+        assert_eq!(parse_pan_marker("\u{1}PAN\u{1}0.5"), None); // fy が無い
+        assert_eq!(parse_pan_marker("\u{1}PAN\u{1}"), None); // マーカーだけ
+        assert_eq!(parse_pan_marker("\u{1}PAN\u{1}\u{1}"), None); // 区切りだけで中身が無い
+    }
+
+    #[test]
+    fn parse_pan_marker_rejects_other_pastes() {
+        // 通常のペーストや他のマーカーを取り違えない(検索欄への貼り付けを食わない)。
+        assert_eq!(parse_pan_marker("\u{1}GPS\u{1}35.0\u{1}139.0"), None);
+        assert_eq!(parse_pan_marker("PAN\u{1}0.1\u{1}0.1\u{1}"), None);
+        assert_eq!(parse_pan_marker("https://example.com/"), None);
+        assert_eq!(parse_pan_marker(""), None);
+    }
+
+    #[test]
+    fn parse_pan_marker_reads_what_the_overlay_actually_sends() {
+        // web/touch-overlay.js の flushPan() が組み立てる文字列そのもの
+        // (`sendMarkerPaste('PAN' + sx + '' + sy + '')` = 先頭SOH + 小数4桁)。
+        // JS 側の組み立てと Rust 側の受け口がズレると、パンが全く効かない/検索欄へ
+        // マーカーが文字として入る、という形で壊れるのでここで固定しておく。
+        assert_eq!(parse_pan_marker("\u{1}PAN\u{1}0.3000\u{1}0.0000\u{1}"), Some((0.3, 0.0)));
+        assert_eq!(parse_pan_marker("\u{1}PAN\u{1}0.2500\u{1}-0.1000\u{1}"), Some((0.25, -0.1)));
+        // 軸モードの再送要求も同様(JS: sendMarkerPaste('DRAGMODE?'))。
+        assert!("\u{1}DRAGMODE?\u{1}".starts_with(DRAG_MODE_REQUEST));
+        // 2つのマーカーは互いに取り違えない。
+        assert!(!DRAG_MODE_REQUEST.starts_with(PAN_MARKER));
+        assert!(!PAN_MARKER.starts_with(DRAG_MODE_REQUEST));
+    }
+
+    // ── 比 → 出力ピクセルの換算(設計書 §6.2・§11) ────────────────────
+
+    /// テスト用にレイアウトを組み立てる(引数順は Layout の宣言順と同じ)。
+    fn lay(cols: u32, rows: u32, map_cols: u32, map_rows: u32, ow: u32, oh: u32) -> Layout {
+        Layout { cols, rows, map_cols, map_rows, ow, oh }
+    }
+
+    #[test]
+    fn pan_ratio_to_px_is_one_to_one_without_gutter() {
+        // 左袖なし(map_cols == cols)・ステータス行1行ぶんだけ地図より小さい端末。
+        // 指が端末幅の1/4を横切ったら、地図も出力幅 ow の1/4動く。
+        let (dx, dy) = pan_ratio_to_px(0.25, 0.0, &lay(100, 40, 100, 39, 200, 156));
+        assert!((dx - 50.0).abs() < 1e-9, "ow=200 の1/4=50 になること (got {dx})");
+        assert_eq!(dy, 0.0);
+    }
+
+    #[test]
+    fn pan_ratio_to_px_compensates_gutter_and_status_row() {
+        // 左袖28桁ぶんは地図ではないので、指が端末幅の1/4動いても地図が動くのは
+        // 「端末幅の1/4に相当するセル数 × 1セルあたりの出力px」= 25 * (144/72) = 50 出力px。
+        let (dx, _) = pan_ratio_to_px(0.25, 0.0, &lay(100, 40, 72, 39, 144, 156));
+        assert!((dx - 50.0).abs() < 1e-9, "got {dx}");
+        // 縦も同じ考え方。ステータス行1行ぶんは地図でないので、端末高の1/2 = 20行 ×
+        // 1行あたり4出力px(braille) = 80 出力px。
+        let (_, dy) = pan_ratio_to_px(0.0, 0.5, &lay(100, 40, 72, 39, 144, 156));
+        assert!((dy - 80.0).abs() < 1e-9, "got {dy}");
+    }
+
+    #[test]
+    fn pan_ratio_to_px_keeps_sign_and_is_linear() {
+        let (dx1, dy1) = pan_ratio_to_px(0.1, -0.2, &lay(100, 40, 72, 39, 144, 156));
+        let (dx2, dy2) = pan_ratio_to_px(0.2, -0.4, &lay(100, 40, 72, 39, 144, 156));
+        assert!(dx1 > 0.0 && dy1 < 0.0, "符号は指の移動方向のまま(反転は呼び出し側)");
+        assert!((dx2 - dx1 * 2.0).abs() < 1e-9);
+        assert!((dy2 - dy1 * 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pan_ratio_to_px_zero_ratio_is_zero() {
+        assert_eq!(pan_ratio_to_px(0.0, 0.0, &lay(100, 40, 72, 39, 144, 156)), (0.0, 0.0));
+    }
+
+    #[test]
+    fn pan_ratio_to_px_guards_zero_sized_map() {
+        // 0除算でNaNを返さない(NaNがcx/cyへ入ると以降の描画が全部壊れる)。
+        assert_eq!(pan_ratio_to_px(0.5, 0.5, &lay(100, 40, 0, 39, 144, 156)), (0.0, 0.0));
+        assert_eq!(pan_ratio_to_px(0.5, 0.5, &lay(100, 40, 72, 0, 144, 156)), (0.0, 0.0));
+    }
+
+    #[test]
+    fn pan_ratio_to_px_output_stays_finite_at_limits() {
+        // パース側が通す最大値(±1)でも有限で、地図の出力寸法をそれほど超えない。
+        let (dx, dy) = pan_ratio_to_px(1.0, 1.0, &lay(100, 40, 72, 39, 144, 156));
+        assert!(dx.is_finite() && dy.is_finite());
+        assert!(dx > 0.0 && dy > 0.0);
     }
 }
