@@ -186,7 +186,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     let mut poi_kinds: Vec<PoiKind> = load_poi_kinds(); // 目的地カテゴリ(並べ替え/追加/削除可・~/.config/termmap/poi-kinds.txt)
     let mut spots = load_spots();          // マイスポット
     let mut spot_cats = load_spot_cats();
-    let mut show_spots = true;
+    let mut show_spots = cfg.show_spots; // 前回終了時の表示/非表示を引き継ぐ
     let mut sp_sel: usize = 0;
     let mut cat_sel: usize = 0;
     let mut cur_cat = String::new(); // スポット一覧で表示中のカテゴリ
@@ -2543,6 +2543,12 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     if let Some(rc) = radar_clock.take() { std::thread::spawn(move || drop(rc)); }
     let (lat, lon) = pixel_to_deg(cx, cy, z);
     save_state(lat, lon, z, &opts.style, &wps, &mode); // 終了時の位置とルートを --resume 用に保存
+    // 直接キー(Cキー・Vキー等)で変えた項目は設定画面を経由しないと即保存されないため、
+    // 終了時にまとめて cfg へ反映して保存する(次回起動が「終了時と全く同じ状態」になるように)。
+    cfg.braille = opts.braille; cfg.classify = opts.classify; cfg.edge = opts.edge; cfg.mono = opts.mono; cfg.style = opts.style.clone();
+    cfg.radar_enabled = radar_on;
+    cfg.show_spots = show_spots;
+    let _ = config::save_config(&cfg);
     Ok(())
 }
 
