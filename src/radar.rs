@@ -375,7 +375,15 @@ pub fn frame_label(tl: &Timeline, idx: usize) -> String {
         .filter(|d| *d != 0)
         .map(|d| format!(" {}{}", if d > 0 { "+" } else { "-" }, format_offset_minutes(d.abs())))
         .unwrap_or_default();
-    format!("{hhmm} {kind}{rel}")
+    // ナウキャスト(hrpns)は5分刻みで+60分までしか無く、それより先は降水短時間予報(rasrf・
+    // 1時間刻み)に切り替わる。両者の基準時刻更新頻度が違うため継ぎ目の間隔は毎回変動し、
+    // 「なぜかここだけ時間が飛ぶ」ように見える。バグではなくデータの境目であることが
+    // 分かるよう明示する。
+    let src = match f.product {
+        RadarProduct::Nowcast => "",
+        RadarProduct::ShortTerm => "(短時間予報)",
+    };
+    format!("{hhmm} {kind}{rel}{src}")
 }
 
 // 相対時刻の表示整形。降水短時間予報(延長分)は+60分を超えうるため、60分以上は「H時間M分」
@@ -541,6 +549,10 @@ mod tests {
         // frame_label は分刻みの差分表示のままでも正しく計算できる(60分超は分表記のまま出るが壊れない)。
         let idx = tl.frames.len() - 1;
         assert!(frame_label(&tl, idx).contains("予報"));
+        // ナウキャストとの継ぎ目で時間が飛んでいても、それが降水短時間予報由来だと分かるタグが付く。
+        assert!(frame_label(&tl, idx).contains("(短時間予報)"));
+        let hrpns_idx = tl.frames.iter().position(|f| f.product == RadarProduct::Nowcast && f.kind == FrameKind::Forecast).unwrap();
+        assert!(!frame_label(&tl, hrpns_idx).contains("短時間予報"), "ナウキャスト側にはタグを付けない");
     }
 
     #[test]
