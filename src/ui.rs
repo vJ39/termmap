@@ -366,7 +366,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 }
                 let hd = ((heading % 360) + 360) % 360;
                 let arrow = heading_arrow(hd as f64);
-                let st = fit_cells(&format!(" 実写 {arrow} h{hd}° fov{sv_fov:.0}°  ←→向き ↑↓移動(地図も追従) +/-ズーム (Shiftで微調整)  Esc/q戻る  {slat:.4},{slon:.4} "), cols as usize);
+                let st = fit_cells_scroll(&format!(" 実写 {arrow} h{hd}° fov{sv_fov:.0}°  ←→向き ↑↓移動(地図も追従) +/-ズーム (Shiftで微調整)  Esc/q戻る  {slat:.4},{slon:.4} "), cols as usize, spin);
                 let _ = write!(out, "\x1b[{};1H\x1b[7m{st}\x1b[0m\x1b[K", tr);
                 let _ = out.flush();
             }
@@ -788,7 +788,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             cfg: &cfg, traffic_points: &traffic_points, traffic_job_active: traffic_job.is_some(),
             addr: &addr, wps: &wps, z, lat, lon, next_turn: &next_turn,
         });
-        let status = fit_cells(&status, cols as usize);
+        let status = fit_cells_scroll(&status, cols as usize, spin);
         write!(out, "\x1b[{};1H\x1b[7m{status}\x1b[0m", tr)?;
 
         // 中央に重ねるパネル/ポップアップ類の描画は ui_overlay.rs へ切り出し済み。

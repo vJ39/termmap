@@ -155,7 +155,7 @@ pub(crate) fn settings_rows(opts: &Args, cfg: &Config, picking: Option<usize>, o
         format!("{} 雨雲の濃さ {}", arrow(20), match cfg.radar_opacity.as_str() { "light" => "薄い", "strong" => "濃い", _ => "標準" }),
         format!("ルート音声案内 {}", onoff(cfg.voice_guide_enabled)),
         format!("道路交通量 {}", onoff(cfg.traffic_enabled)),
-        format!("音声案内をこの端末でも再生 {}", onoff(cfg.voice_speak_local)),
+        format!("音声をこの端末でも再生 {}", onoff(cfg.voice_speak_local)),
     ];
     debug_assert_eq!(its.len(), SETTINGS_ROW_COUNT, "SETTINGS_ROW_COUNT と行数がずれている");
     // アコーディオン展開: 選択中の項目がpickable(3択以上)ならその直下に候補をインデント挿入し、他行を押し下げる

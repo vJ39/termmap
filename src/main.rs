@@ -397,6 +397,39 @@ fn fit_cells(s: &str, cells: usize) -> String {
     o
 }
 
+// fit_cellsのスクロール版。収まる時は今まで通り(パディングのみ・スクロールしない)。
+// 収まらない時は tick(毎フレーム+1の値。呼び出し側の spin をそのまま渡す想定)に応じて
+// 表示位置を左へ流し、末尾の後に隙間を挟んでループする(マーキー表示)。
+fn fit_cells_scroll(s: &str, cells: usize, tick: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let total_w: usize = chars.iter().map(|&c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0)).sum();
+    if total_w <= cells {
+        return fit_cells(s, cells);
+    }
+    const GAP: &str = "    "; // 継ぎ目(1周した後、また先頭から始まるとわかるように空ける)
+    let looped: Vec<char> = chars.iter().copied().chain(GAP.chars()).collect();
+    let loop_w: usize = looped.iter().map(|&c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0)).sum();
+    // tickを1/4に落として流れる速さを読める速度にする(毎フレーム1セルだと速すぎて読めない)。
+    let offset = (tick / 4) % loop_w;
+    let mut start = 0usize;
+    let mut acc = 0usize;
+    for (i, &ch) in looped.iter().enumerate() {
+        if acc >= offset { start = i; break; }
+        acc += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        start = i + 1;
+    }
+    let (mut w, mut o) = (0usize, String::new());
+    let mut i = start;
+    while w < cells {
+        let ch = looped[i % looped.len()];
+        let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if w + cw > cells { break; }
+        o.push(ch); w += cw; i += 1;
+    }
+    while w < cells { o.push(' '); w += 1; }
+    o
+}
+
 fn oneshot(src: RgbImage, a: &Args, ctx: Option<(f64, f64, u32, &OverlaySpec)>) {
     if let Some(path) = &a.png {
         let mut rc = recolor(&src);
@@ -542,6 +575,43 @@ mod tests {
         assert_eq!(sanitize_name("a/b:c"), "a_b_c");
         assert_eq!(fit_cells("ab", 5), "ab   ");
         assert!(fit_cells("あ", 4).starts_with("あ"));
+    }
+
+    #[test]
+    fn fit_cells_scroll_matches_fit_cells_when_it_fits() {
+        // 収まる時はtickに関わらずfit_cellsと同じ(スクロールしない)。
+        for tick in [0, 1, 100] {
+            assert_eq!(fit_cells_scroll("ab", 5, tick), fit_cells("ab", 5));
+        }
+    }
+
+    #[test]
+    fn fit_cells_scroll_shifts_window_as_tick_advances() {
+        let s = "0123456789";
+        let a = fit_cells_scroll(s, 4, 0);
+        assert_eq!(a, "0123"); // tick=0は先頭から
+        let b = fit_cells_scroll(s, 4, 4); // offset = (4/4)%loop_w = 1
+        assert_ne!(a, b, "tickが進むと表示が変わること");
+    }
+
+    #[test]
+    fn fit_cells_scroll_loops_back_to_the_start() {
+        // ループ幅(文字数+GAP)ぶんtickが進むと、同じ表示に戻る。
+        let s = "0123456789";
+        let a = fit_cells_scroll(s, 4, 0);
+        let loop_w = s.chars().count() + 4; // GAPは4文字固定
+        let b = fit_cells_scroll(s, 4, loop_w * 4); // tick/4 = loop_w分進める
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn fit_cells_scroll_always_returns_requested_width() {
+        let s = "とても長い日本語のステータス文言をここに書いてみるテスト";
+        for tick in [0, 3, 17, 999] {
+            let got = fit_cells_scroll(s, 10, tick);
+            let w: usize = got.chars().map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0)).sum();
+            assert_eq!(w, 10, "tick={tick}: {got:?}");
+        }
     }
 
     // 描画モードだけを変えた Args(他は parse_args の既定値と同じ)。
