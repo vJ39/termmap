@@ -475,7 +475,10 @@ mod tests {
     }
     impl Drop for TestEnv {
         fn drop(&mut self) {
-            std::env::remove_var("TERMMAP_PLOT_CACHE_DIR");
+            // 環境変数は**戻さない**。ワーカースレッドは自分が起きたタイミングで cache_root() を
+            // 読むため、ここで消すと「テストは終わったがまだ生きているワーカー」が実 $HOME 側へ
+            // 書いてしまう(実際に ~/.config/termmap/plot-cache へテストデータが漏れた)。
+            // 次の TestEnv が上書きするので、残しておいても他のテストには影響しない。
             let _ = std::fs::remove_dir_all(&self.root);
         }
     }
@@ -764,6 +767,14 @@ mod tests {
     fn cells_outside_the_view_are_dropped_once_memory_fills_up() {
         let _env = TestEnv::new("evict");
         let mut l = test_layer(three_cells, 0);
+        let now = plotcache::now_secs();
+        // 視野内の3セルは fresh にしておく(この tick でジョブを起こさせないため)。
+        for k in ["1", "2", "3"] {
+            l.cells.insert(
+                k.to_string(),
+                Cached { items: vec![test_item(1.0)], fetched_at: now, data_at: now },
+            );
+        }
         // 視野外のセルを上限ぶん詰めてから tick すると、古い順に落ちて上限へ収まる。
         for i in 0..MAX_CELLS_IN_MEMORY + 5 {
             l.cells.insert(
@@ -773,9 +784,13 @@ mod tests {
         }
         let (cx, cy) = tokyo_center(14);
         l.tick(cx, cy, 14, true);
-        assert!(l.cells.len() <= MAX_CELLS_IN_MEMORY + 3, "退避後: {}", l.cells.len());
+        assert!(!l.job_active(), "視野内が fresh ならジョブは起きない");
+        assert_eq!(l.cells.len(), MAX_CELLS_IN_MEMORY, "退避後: {}", l.cells.len());
         assert!(!l.cells.contains_key("z0"), "最も古いセルから捨てる");
         assert!(l.cells.contains_key(&format!("z{}", MAX_CELLS_IN_MEMORY + 4)));
+        for k in ["1", "2", "3"] {
+            assert!(l.cells.contains_key(k), "視野内のセルは捨てない({k})");
+        }
     }
 
     #[test]
