@@ -128,6 +128,12 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     let mut turn_points: Vec<route::TurnPoint> = Vec::new();
     let mut turn_job: Option<route::TurnRx> = None;
     let mut voice_guide: Option<voice::VoiceGuide> = None;
+    // 道路交通量(cfg.traffic_enabled時のみ使う)。表示中の視野を覆う範囲を、動きすぎない程度に
+    // 間引いて背景取得する(TRAFFIC_REFRESH間隔・視野が大きく動いた時のみ再取得)。
+    let mut traffic_points: Vec<traffic::TrafficPoint> = Vec::new();
+    let mut traffic_job: Option<std::sync::mpsc::Receiver<Result<Vec<traffic::TrafficPoint>, String>>> = None;
+    let mut traffic_last_fetch: Option<std::time::Instant> = None;
+    let mut traffic_bbox: Option<(f64, f64, f64, f64)> = None; // 直近フェッチ範囲(lat_min,lon_min,lat_max,lon_max)
     // ルート計算と同じ非同期パターンで、検索/周辺/実写/おすすめの通信もバックグラウンド化する。
     // 新規spawn時に古いrxはdropされる=最新のみ採用(generation ID不要)。
     let mut search_job: Option<std::sync::mpsc::Receiver<(String, String, Result<Vec<(f64, f64, String)>, String>)>> = None; // (ckey, query, geocode結果)
@@ -688,6 +694,19 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                         let iy = (gy - (rcy - rh as f64 / 2.0)).floor() as i32;
                         draw_ring(&mut ov, ix, iy, 3, [255, 255, 255], 1);
                     }
+                    if cfg.traffic_enabled { // 道路交通量(混雑度の目安。事故情報・渋滞度そのものではない)
+                        for p in &traffic_points {
+                            let color = match traffic::classify(p.volume) {
+                                traffic::CongestionLevel::Light => [80, 200, 90],
+                                traffic::CongestionLevel::Moderate => [230, 200, 40],
+                                traffic::CongestionLevel::Heavy => [220, 50, 40],
+                            };
+                            let (gx, gy) = deg_to_pixel(p.lat, p.lon, rz);
+                            let ix = (gx - (rcx - rw as f64 / 2.0)).floor() as i32;
+                            let iy = (gy - (rcy - rh as f64 / 2.0)).floor() as i32;
+                            draw_ring(&mut ov, ix, iy, 2, color, 2);
+                        }
+                    }
                     last_map_sig = map_sig; // このsigで描いた内容がこのフレームでemitされる
                     if img_inline {
                         // 実画像モード: 取得画像に overlay を焼き込んで保持し、AA文字列は空にする。
@@ -974,6 +993,37 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 Ok(v) => { turn_points = v; voice_guide = Some(voice::VoiceGuide::new(&turn_points)); turn_job = None; }
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => { turn_job = None; }
+            }
+        }
+        // 道路交通量: 視野を覆う範囲を一定間隔で背景取得する。視野が前回フェッチ範囲の外に
+        // 出たら間隔を待たず即座に再取得し、そうでなければ90秒ごとに更新する。
+        if cfg.traffic_enabled && traffic_job.is_none() {
+            const MARGIN_PX: f64 = 900.0;
+            const REFRESH: std::time::Duration = std::time::Duration::from_secs(90);
+            let (lat_max, lon_min) = pixel_to_deg(cx - MARGIN_PX, cy - MARGIN_PX, z);
+            let (lat_min, lon_max) = pixel_to_deg(cx + MARGIN_PX, cy + MARGIN_PX, z);
+            let out_of_bbox = match traffic_bbox {
+                Some((blat_min, blon_min, blat_max, blon_max)) => {
+                    let (clat, clon) = pixel_to_deg(cx, cy, z);
+                    clat < blat_min || clat > blat_max || clon < blon_min || clon > blon_max
+                }
+                None => true,
+            };
+            let stale = traffic_last_fetch.map_or(true, |t| t.elapsed() >= REFRESH);
+            if out_of_bbox || stale {
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || { let _ = tx.send(traffic::fetch_traffic(lat_min, lon_min, lat_max, lon_max)); });
+                traffic_job = Some(rx);
+                traffic_bbox = Some((lat_min, lon_min, lat_max, lon_max));
+                traffic_last_fetch = Some(std::time::Instant::now());
+            }
+        }
+        if let Some(job) = &traffic_job {
+            match job.try_recv() {
+                Ok(Ok(pts)) => { traffic_points = pts; traffic_job = None; }
+                Ok(Err(_e)) => { traffic_job = None; } // 失敗時は前回の点をそのまま表示継続
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => { traffic_job = None; }
             }
         }
         if search_job.is_some() {
