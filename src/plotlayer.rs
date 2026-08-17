@@ -1104,6 +1104,22 @@ mod tests {
         assert_eq!(l.view_keys.len(), n);
     }
 
+    // z9だけでなくz10〜z13(塗りが出る全ズーム帯)でも同じ仕組みが効くこと。修正自体が
+    // 「上限を外す」というズーム非依存の変更なので、特定のズームだけ効くような分岐は無い
+    // はずだが、それを実際に確認しておく(設計 §3.2は全ズーム帯が対象)。
+    #[test]
+    fn disaster_layer_stays_unsuppressed_across_every_fill_zoom() {
+        let _env = TestEnv::new("uncapped_all_zooms");
+        for z in [9u32, 10, 11, 12, 13] {
+            let (cx, cy) = tokyo_center(z);
+            let n = disaster_cells(view_bbox(cx, cy, z)).len();
+            let mut l = test_layer_uncapped(disaster_cells, 0);
+            l.tick(cx, cy, z, true);
+            assert!(!l.suppressed(), "z{z} 東京で{n}セル要求でもsuppressedになってはいけない");
+            assert_eq!(l.view_keys.len(), n, "z{z}");
+        }
+    }
+
     // 中心から近いセルほど先に来る(取得の優先度)。既知の並びで固定する:
     // 東京中心の視野では、東京駅を含むメッシュ(5339)が最初に来るはず。
     #[test]
