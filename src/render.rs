@@ -40,11 +40,25 @@ pub fn render_halfblock(img: &RgbImage, truecolor: bool) -> String {
     let mut out = String::with_capacity(w as usize * h as usize * 20);
     let mut y = 0;
     while y + 1 < h {
+        // SGR は端末側の「状態」なので、直前のセルと同じ色なら発行しなくても同じ絵になる
+        // (設計 docs/web-pan-smoothness-design.md §5.3 対策C-1)。地図は同色の面が広いので、
+        // 見た目を1ドットも変えずに1フレームのバイト数が減り、そのぶんコマ数が増える。
+        // 行末で \x1b[0m を出しているため、状態は行内に閉じる(行頭で必ず None から始める)。
+        let mut last_fg: Option<(u8, u8, u8)> = None;
+        let mut last_bg: Option<(u8, u8, u8)> = None;
         for x in 0..w {
             let t = img.get_pixel(x, y);
             let b = img.get_pixel(x, y + 1);
-            out.push_str(&sgr_fg(t[0], t[1], t[2], truecolor));
-            out.push_str(&sgr_bg(b[0], b[1], b[2], truecolor));
+            let fg = (t[0], t[1], t[2]);
+            let bg = (b[0], b[1], b[2]);
+            if last_fg != Some(fg) {
+                out.push_str(&sgr_fg(fg.0, fg.1, fg.2, truecolor));
+                last_fg = Some(fg);
+            }
+            if last_bg != Some(bg) {
+                out.push_str(&sgr_bg(bg.0, bg.1, bg.2, truecolor));
+                last_bg = Some(bg);
+            }
             out.push('\u{2580}');
         }
         out.push_str("\x1b[0m\r\n");
@@ -67,6 +81,10 @@ pub fn render_braille(img: &RgbImage, mono: bool, classify_on: bool, threshold: 
     };
     let mut out = String::with_capacity(cols as usize * rows as usize * 6);
     for cy in 0..rows {
+        // halfblock と同じ SGR 重複除去(設計 §5.3 対策C-1)。braille は背景を使わないので前景だけ。
+        // インクの無いセルは空白1バイトを置くだけで前景色の状態を変えないため、空白を挟んで
+        // 同じ色が続く場合も発行を省ける。行末の \x1b[0m にあわせて行頭で状態をリセットする。
+        let mut last_fg: Option<(u8, u8, u8)> = None;
         for cx in 0..cols {
             let mut bits: u8 = 0;
             let (mut sr, mut sg, mut sb, mut n) = (0u32, 0u32, 0u32, 0u32);
@@ -94,15 +112,24 @@ pub fn render_braille(img: &RgbImage, mono: bool, classify_on: bool, threshold: 
             let ch = char::from_u32(0x2800 + bits as u32).unwrap();
             if bits == 0 { out.push(' '); }
             else if mono { out.push(ch); }
-            else if ovn > 0 { out.push_str(&sgr_fg((ovr / ovn) as u8, (ovg / ovn) as u8, (ovb / ovn) as u8, truecolor)); out.push(ch); }
-            else if classify_on {
-                let bi = (0..6).max_by_key(|&i| cc[i]).unwrap();
-                let (r, g, b) = cat_color([Cat::Water, Cat::Park, Cat::RoadMajor, Cat::Rail, Cat::Building, Cat::Other][bi]);
-                out.push_str(&sgr_fg(r, g, b, truecolor)); out.push(ch);
-            } else {
-                // braille はインク=暗い画素の平均色になりがちで沈むので輝度を持ち上げる
-                let br = |s: u32| ((s as f64 / n as f64) * 1.6).min(255.0) as u8;
-                out.push_str(&sgr_fg(br(sr), br(sg), br(sb), truecolor)); out.push(ch);
+            else {
+                // 色の決め方は従来どおり(オーバーレイ > classify > 平均色)。SGR を出すかどうかだけを
+                // 直前のセルとの比較で決めるため、まず色を確定させてから発行を判断する。
+                let (r, g, b) = if ovn > 0 {
+                    ((ovr / ovn) as u8, (ovg / ovn) as u8, (ovb / ovn) as u8)
+                } else if classify_on {
+                    let bi = (0..6).max_by_key(|&i| cc[i]).unwrap();
+                    cat_color([Cat::Water, Cat::Park, Cat::RoadMajor, Cat::Rail, Cat::Building, Cat::Other][bi])
+                } else {
+                    // braille はインク=暗い画素の平均色になりがちで沈むので輝度を持ち上げる
+                    let br = |s: u32| ((s as f64 / n as f64) * 1.6).min(255.0) as u8;
+                    (br(sr), br(sg), br(sb))
+                };
+                if last_fg != Some((r, g, b)) {
+                    out.push_str(&sgr_fg(r, g, b, truecolor));
+                    last_fg = Some((r, g, b));
+                }
+                out.push(ch);
             }
         }
         if !mono { out.push_str("\x1b[0m"); }
@@ -818,5 +845,228 @@ mod tests {
         assert_eq!(decoded.dimensions(), (3, 2));
         assert_eq!(decoded.get_pixel(0, 0), &image::Rgb([255, 0, 0]));
         assert_eq!(decoded.get_pixel(2, 1), &image::Rgb([0, 128, 255]));
+    }
+
+    // ---- SGR 重複除去 (docs/web-pan-smoothness-design.md §5.3 対策C-1) ----
+
+    /// ANSI を解釈した結果の1セル。SGR は「状態」なので、重複を省いても復号結果が同じなら
+    /// 端末に見える絵は変わっていない。
+    #[derive(Clone, PartialEq, Debug)]
+    struct Cell {
+        fg: Option<String>,
+        bg: Option<String>,
+        ch: char,
+    }
+
+    /// 描画結果を行ごとのセル列へ復号する。想定外のエスケープが混ざったら panic して気づけるようにする。
+    fn decode_cells(s: &str) -> Vec<Vec<Cell>> {
+        let mut rows: Vec<Vec<Cell>> = Vec::new();
+        let mut row: Vec<Cell> = Vec::new();
+        let (mut fg, mut bg): (Option<String>, Option<String>) = (None, None);
+        let mut it = s.chars();
+        while let Some(c) = it.next() {
+            match c {
+                '\x1b' => {
+                    assert_eq!(it.next(), Some('['), "CSI 以外のエスケープは出さない");
+                    let mut params = String::new();
+                    for d in it.by_ref() {
+                        if d == 'm' {
+                            break;
+                        }
+                        params.push(d);
+                    }
+                    if params == "0" {
+                        fg = None;
+                        bg = None;
+                    } else if params.starts_with("38;") {
+                        fg = Some(params);
+                    } else if params.starts_with("48;") {
+                        bg = Some(params);
+                    } else {
+                        panic!("想定外のSGR: {params:?}");
+                    }
+                }
+                '\r' => {
+                    assert_eq!(it.next(), Some('\n'), "改行は CRLF");
+                    rows.push(std::mem::take(&mut row));
+                }
+                _ => row.push(Cell { fg: fg.clone(), bg: bg.clone(), ch: c }),
+            }
+        }
+        if !row.is_empty() {
+            rows.push(row);
+        }
+        rows
+    }
+
+    /// 復号したセル列から「除去前」の出力を組み直す。全セルで無条件に SGR を発行していた
+    /// 従来の形に戻したもので、削減バイト数を測る基準にする。braille の色決定ロジックを
+    /// テストへ写して二重管理にしないよう、実出力の復号結果から作る。
+    /// インクの無いセル(空白)は従来も SGR を出していないので、そこは発行しない。
+    fn reencode_without_dedup(rows: &[Vec<Cell>]) -> String {
+        let mut out = String::new();
+        for row in rows {
+            for c in row {
+                if c.ch != ' ' {
+                    if let Some(fg) = &c.fg {
+                        out.push_str("\x1b[");
+                        out.push_str(fg);
+                        out.push('m');
+                    }
+                    if let Some(bg) = &c.bg {
+                        out.push_str("\x1b[");
+                        out.push_str(bg);
+                        out.push('m');
+                    }
+                }
+                out.push(c.ch);
+            }
+            out.push_str("\x1b[0m\r\n");
+        }
+        out
+    }
+
+    /// 地図らしい画像(広い同色の面 + 少しの模様)。実地図に近い形で削減量を測る。
+    fn maplike_image(w: u32, h: u32) -> RgbImage {
+        let mut img = RgbImage::from_pixel(w, h, image::Rgb([242, 239, 233])); // 下地
+        for y in 0..h {
+            for x in 0..w {
+                if y == h / 3 || y == h / 3 + 1 {
+                    img.put_pixel(x, y, image::Rgb([240, 200, 70])); // 横に走る道路
+                }
+                if x == w / 2 {
+                    img.put_pixel(x, y, image::Rgb([240, 200, 70])); // 縦に走る道路
+                }
+                if x < w / 5 && y > h * 2 / 3 {
+                    img.put_pixel(x, y, image::Rgb([86, 170, 222])); // 水域
+                }
+            }
+        }
+        img
+    }
+
+    // 重複を省いても、復号したセル色列は元画像から直接決まる色と完全に一致する(見た目が変わらない)。
+    #[test]
+    fn halfblock_dedup_keeps_the_same_visible_cells() {
+        let img = maplike_image(40, 20);
+        let rows = decode_cells(&render_halfblock(&img, true));
+        assert_eq!(rows.len(), 10, "1セル=2画素なので10行");
+        for (ry, row) in rows.iter().enumerate() {
+            assert_eq!(row.len(), 40);
+            for (x, cell) in row.iter().enumerate() {
+                let t = img.get_pixel(x as u32, ry as u32 * 2);
+                let b = img.get_pixel(x as u32, ry as u32 * 2 + 1);
+                let want_fg = format!("38;2;{};{};{}", t[0], t[1], t[2]);
+                let want_bg = format!("48;2;{};{};{}", b[0], b[1], b[2]);
+                assert_eq!(cell.ch, '\u{2580}');
+                assert_eq!(cell.fg.as_deref(), Some(want_fg.as_str()), "({x},{ry}) の前景");
+                assert_eq!(cell.bg.as_deref(), Some(want_bg.as_str()), "({x},{ry}) の背景");
+            }
+        }
+    }
+
+    // 前景と背景は独立に追跡する。前景が同じでも背景が変われば背景だけ再発行される。
+    #[test]
+    fn halfblock_dedup_tracks_foreground_and_background_independently() {
+        let mut img = RgbImage::new(2, 2);
+        img.put_pixel(0, 0, image::Rgb([10, 10, 10]));
+        img.put_pixel(1, 0, image::Rgb([10, 10, 10])); // 上半分は同色
+        img.put_pixel(0, 1, image::Rgb([20, 20, 20]));
+        img.put_pixel(1, 1, image::Rgb([30, 30, 30])); // 下半分だけ変わる
+        let out = render_halfblock(&img, true);
+        assert_eq!(out.matches("\x1b[38;2;10;10;10m").count(), 1, "前景は同色なので1回: {out:?}");
+        assert_eq!(out.matches("\x1b[48;2;20;20;20m").count(), 1);
+        assert_eq!(out.matches("\x1b[48;2;30;30;30m").count(), 1);
+    }
+
+    // 行末で \x1b[0m を出しているので、状態は行内に閉じる。次の行は同じ色でも必ず再発行する。
+    #[test]
+    fn halfblock_resets_sgr_state_at_every_row() {
+        let img = RgbImage::from_pixel(1, 4, image::Rgb([1, 2, 3])); // 1桁×2行すべて同色
+        let out = render_halfblock(&img, true);
+        assert_eq!(out.matches("\x1b[38;2;1;2;3m").count(), 2, "行またぎでは再発行: {out:?}");
+        assert_eq!(out.matches("\x1b[48;2;1;2;3m").count(), 2);
+    }
+
+    #[test]
+    fn halfblock_dedup_shortens_output() {
+        let img = maplike_image(94, 44); // §2.2 の計測と同じ 94桁×22行ぶん
+        let out = render_halfblock(&img, true);
+        let naive = reencode_without_dedup(&decode_cells(&out));
+        let cut = 100.0 * (naive.len() - out.len()) as f64 / naive.len() as f64;
+        println!("halfblock: 除去前 {} B → 除去後 {} B ({cut:.1}% 削減)", naive.len(), out.len());
+        assert!(out.len() < naive.len(), "除去後 {} / 除去前 {}", out.len(), naive.len());
+    }
+
+    // インクのあるセルで同じ色が続くなら前景SGRは1回。色が変われば都度発行する。
+    #[test]
+    fn braille_dedup_emits_one_sgr_per_color_run() {
+        let mut img = RgbImage::from_pixel(4, 4, image::Rgb([0, 0, 0])); // 2セル分・全ドットON
+        let same = render_braille(&img, false, false, 250, false, None, true);
+        assert_eq!(same.matches("\x1b[38;2;").count(), 1, "同色の2セルは1回: {same:?}");
+        for y in 0..4 {
+            for x in 2..4 {
+                img.put_pixel(x, y, image::Rgb([0, 0, 40])); // 右のセルだけ色を変える
+            }
+        }
+        let diff = render_braille(&img, false, false, 250, false, None, true);
+        assert_eq!(diff.matches("\x1b[38;2;").count(), 2, "色が変われば2回: {diff:?}");
+    }
+
+    // インクの無いセルは空白1バイトで前景色の状態を変えない。空白を挟んでも同色なら1回でよい。
+    #[test]
+    fn braille_blank_cells_do_not_break_dedup() {
+        let mut img = RgbImage::from_pixel(6, 4, image::Rgb([255, 255, 255])); // 明るい = インク無し
+        for y in 0..4 {
+            img.put_pixel(0, y, image::Rgb([0, 0, 0])); // 1セル目にインク
+            img.put_pixel(4, y, image::Rgb([0, 0, 0])); // 3セル目に同じ色のインク
+        }
+        let out = render_braille(&img, false, false, 128, false, None, true);
+        assert_eq!(out.matches(' ').count(), 1, "中央はインク無しの空白1セル: {out:?}");
+        assert_eq!(out.matches("\x1b[38;2;").count(), 1, "空白を挟んでも同色なら1回: {out:?}");
+    }
+
+    #[test]
+    fn braille_resets_sgr_state_at_every_row() {
+        let img = RgbImage::from_pixel(2, 8, image::Rgb([0, 0, 0])); // 1桁×2行すべて同色
+        let out = render_braille(&img, false, false, 250, false, None, true);
+        assert_eq!(out.matches("\x1b[38;2;0;0;0m").count(), 2, "行またぎでは再発行: {out:?}");
+    }
+
+    // mono は SGR を一切出さない経路。重複除去を入れても出力は変わらない。
+    #[test]
+    fn braille_mono_emits_no_sgr() {
+        let img = maplike_image(20, 8);
+        let out = render_braille(&img, true, false, 128, false, None, true);
+        assert!(!out.contains('\x1b'), "mono ではエスケープを出さない: {out:?}");
+    }
+
+    #[test]
+    fn braille_dedup_shortens_output() {
+        let img = maplike_image(94, 44);
+        // 閾値220: 下地(輝度239)はインク無し、道路(197)と水域(151)がインクになる。
+        // 既定の128だとこの画像は全セルがインク無し=空白だけになり、何も測れない。
+        let out = render_braille(&img, false, false, 220, false, None, true);
+        let naive = reencode_without_dedup(&decode_cells(&out));
+        let cut = 100.0 * (naive.len() - out.len()) as f64 / naive.len() as f64;
+        println!("braille: 除去前 {} B → 除去後 {} B ({cut:.1}% 削減)", naive.len(), out.len());
+        assert!(out.len() < naive.len(), "除去後 {} / 除去前 {}", out.len(), naive.len());
+    }
+
+    // truecolor 非対応端末(256色)でも、量子化後の色列は変わらない。
+    #[test]
+    fn dedup_keeps_visible_cells_in_256_color_mode() {
+        let img = maplike_image(40, 20);
+        let rows = decode_cells(&render_halfblock(&img, false));
+        for (ry, row) in rows.iter().enumerate() {
+            for (x, cell) in row.iter().enumerate() {
+                let t = img.get_pixel(x as u32, ry as u32 * 2);
+                let b = img.get_pixel(x as u32, ry as u32 * 2 + 1);
+                let want_fg = format!("38;5;{}", rgb_to_ansi256(t[0], t[1], t[2]));
+                let want_bg = format!("48;5;{}", rgb_to_ansi256(b[0], b[1], b[2]));
+                assert_eq!(cell.fg.as_deref(), Some(want_fg.as_str()), "({x},{ry}) の前景");
+                assert_eq!(cell.bg.as_deref(), Some(want_bg.as_str()), "({x},{ry}) の背景");
+            }
+        }
     }
 }

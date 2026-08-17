@@ -754,7 +754,13 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         let map_sig: Option<u64> = {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
-            rcx.to_bits().hash(&mut h); rcy.to_bits().hash(&mut h);
+            // 中心座標は生の f64 ではなく、実際に描画へ効く粒度(整数出力ピクセル)へ丸めて混ぜる
+            // (設計 §5.2 対策B)。build_window_nowait の切り出しが整数化されるため、これより
+            // 細かい差はどうせ同じ絵になる。描画へ渡す rcx/rcy は連続値のままにしてあるので、
+            // 同じキー内での再構築が省かれた場合、オーバーレイの位置が最大1出力ピクセル分だけ
+            // 前フレームの値で据え置かれる。地図本体の量子化幅と同じなのでズレとして見えず、
+            // 逆に地図が止まっている間オーバーレイだけが揺れるちらつきを防げる。
+            map_center_sig_key(rcx, rcy, rw, rh).hash(&mut h);
             rz.hash(&mut h); rw.hash(&mut h); rh.hash(&mut h);
             gut.hash(&mut h); map_cols.hash(&mut h); map_rows.hash(&mut h);
             opts.style.hash(&mut h);
@@ -1449,7 +1455,13 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         if got_pan {
             // 軸ゲート・向きの反転・座標の正規化は dragmode::apply_pan に閉じてある
             // (ここに直書きするとテストが書けないため。設計書 §6.2 の適用条件)。
-            let lay = dragmode::Layout { cols, rows: tr as u32, map_cols, map_rows, ow, oh };
+            // 実画像モードでは実際に描かれる解像度は ow/oh ではなく rw/rh(zoom rz のピクセル)。
+            // 表示している地理範囲は zoom z 換算で常に横 map_cols・縦 map_rows*2 ピクセルなので、
+            // rw/scale・rh/scale へ戻して渡す(設計 §5.5 対策E)。AA 用に計算された ow/oh を
+            // そのまま渡すと、braille(または --edge)と実画像を同時に有効にしたときだけ
+            // ow=map_cols*2 / oh=map_rows*4 となり、両軸とも指の2倍地図が動く(§2.5 の実測)。
+            let (pan_ow, pan_oh) = if img_inline { (rw / scale, rh / scale) } else { (ow, oh) };
+            let lay = dragmode::Layout { cols, rows: tr as u32, map_cols, map_rows, ow: pan_ow, oh: pan_oh };
             let (ncx, ncy, moved) = dragmode::apply_pan(cx, cy, z, dragmode::axes(&focus), pan_fx, pan_fy, &lay);
             if moved {
                 cx = ncx;
