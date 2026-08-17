@@ -860,9 +860,10 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             // グレーのプレースホルダーが実タイルへ順次置き換わる。
             loader_gen_snapshot.hash(&mut h);
             spec.routes.len().hash(&mut h);
+            spec.expressway_segments.len().hash(&mut h);
             spec.roads.len().hash(&mut h);
             spec.traffic_segments.len().hash(&mut h);
-            for rt in spec.routes.iter().chain(spec.roads.iter()).chain(spec.traffic_segments.iter()) {
+            for rt in spec.routes.iter().chain(spec.expressway_segments.iter()).chain(spec.roads.iter()).chain(spec.traffic_segments.iter()) {
                 rt.color.hash(&mut h); rt.thickness.hash(&mut h);
                 for &(a2, b2) in &rt.pts { a2.to_bits().hash(&mut h); b2.to_bits().hash(&mut h); }
             }
@@ -1273,6 +1274,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 Ok(Ok(r)) => {
                     spec.routes.clear();
                     spec.traffic_segments.clear(); // 古いルートの色分けを引き継がない
+                    spec.expressway_segments.clear(); // 古いルートの高速区間も同様
                     route_note = Some(route_summary(&mode, &r));
                     // 通行止め回避が件数上限で一部反映できなかった場合、黙って進めると
                     // 「回避できた」と誤解されるのでひとこと添える。
@@ -1296,6 +1298,12 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     if cfg.voice_guide_enabled {
                         turn_job = Some(trigger_turn_points(&wps, &mode, 0, &r.pts, &route_nogos));
                     }
+                    // 高速区間(#高速区間)の点列は r.pts をムーブする前に作る。ルート結果と
+                    // 同時に確定するので、渋滞の色分けのような非同期の受け取り口は要らない。
+                    spec.expressway_segments = route::expressway_polylines(&r.pts, &r.hw_segments)
+                        .into_iter()
+                        .map(|pts| Route { pts, color: route::EXPRESSWAY_COLOR, thickness: 2 })
+                        .collect();
                     spec.routes.push(Route { pts: r.pts, color: [0, 220, 255], thickness: 2 });
                     route_job = None; got_result = true;
                 }
