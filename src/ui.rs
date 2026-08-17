@@ -54,6 +54,9 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     opts.edge = opts.edge || cfg.edge;
     opts.mono = opts.mono || cfg.mono;
     if opts.style == "osm" { opts.style = cfg.style.clone(); }
+    // サブピクセル切り出しの上書き(設計 §5.1 のリスク項目)。起動時に1回だけ読む
+    // (毎フレーム std::env::var を呼ぶ必要は無い)。未設定なら use_subpixel_window の既定。
+    let subpixel_env: Option<String> = std::env::var("TERMMAP_SUBPIXEL").ok();
     let mut set_sel: usize = 0;            // 設定画面の選択行
     let mut input_cur: usize = 0;          // テキスト入力欄のカーソル位置(文字単位)。テキストFocus開始時に該当バッファ末尾へ
     let mut menu_cat_sel: usize = 0;       // Space メニュー: トップのカテゴリ選択
@@ -776,13 +779,27 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         // 解像度になる。設定(image_res)で上限を選べる: high=+2(横4/縦8px per cell) / mid=+1 / low=+0。
         // rz>z のときグローバル画素座標は 2^Δ 倍になるので中心 cx/cy も scale 倍する。
         let base_delta: u32 = match cfg.image_res.as_str() { "high" => 2, "low" => 0, _ => 1 };
-        let delta = if !img_inline { 0 } else if settling { 0 } else { base_delta.min(18u32.saturating_sub(z)) };
+        // 移動中に落とす先は config::IMAGE_SETTLE_DELTA_CAP(設計 §5.3 C-3 の見直し。
+        // 判断の根拠は定数側のコメントに書いてある)。
+        let delta = if !img_inline { 0 }
+            else if settling { base_delta.min(config::IMAGE_SETTLE_DELTA_CAP).min(18u32.saturating_sub(z)) }
+            else { base_delta.min(18u32.saturating_sub(z)) };
         let scale = 1u32 << delta;
         let (rw, rh, rz, rcx, rcy) = if img_inline {
             (map_cols * scale, map_rows * 2 * scale, z + delta, cx * scale as f64, cy * scale as f64)
         } else {
             (ow, oh, z, cx, cy)
         };
+        // サブピクセル描画(設計 §5.1 対策A)。窓の切り出しで left/top の小数部を捨てないので、
+        // 1出力ピクセル未満の動きも色の遷移として見え、斜めドラッグの階段が消える。
+        // braille/edge は閾値でドットの on/off が決まるためちらつく可能性があり、
+        // use_subpixel_window() で切り替えられるようにしてある。
+        let subpixel = use_subpixel_window(opts.braille, opts.edge, subpixel_env.as_deref());
+        let sub_steps = if subpixel { SUBPIXEL_STEPS } else { 1.0 };
+        // 描画へ渡す中心は格子へ吸着させる。再描画判定(map_sig)と描画で同じ値を使わないと、
+        // 絵が変わったのにシグネチャが変わらない取りこぼしが起きる(設計 §5.2)。
+        // 論理座標 cx/cy は連続のまま保持してあるので、指の移動量は 1:1 のまま失われない。
+        let (rcx, rcy) = snap_center_to_grid(rcx, rcy, sub_steps);
         // ローダーへ今の表示位置(実描画のズーム/中心)を毎フレーム渡す。need_buildがfalseで再構築を
         // 省くフレームでも、裏取得の近傍優先が最新の現在地を使えるよう常に更新しておく。
         loader.set_view(rcx, rcy, rz, &opts.style);
@@ -846,13 +863,14 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         let map_sig: Option<u64> = {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
-            // 中心座標は生の f64 ではなく、実際に描画へ効く粒度(整数出力ピクセル)へ丸めて混ぜる
-            // (設計 §5.2 対策B)。build_window_nowait の切り出しが整数化されるため、これより
-            // 細かい差はどうせ同じ絵になる。描画へ渡す rcx/rcy は連続値のままにしてあるので、
-            // 同じキー内での再構築が省かれた場合、オーバーレイの位置が最大1出力ピクセル分だけ
-            // 前フレームの値で据え置かれる。地図本体の量子化幅と同じなのでズレとして見えず、
-            // 逆に地図が止まっている間オーバーレイだけが揺れるちらつきを防げる。
-            map_center_sig_key(rcx, rcy, rw, rh).hash(&mut h);
+            // 中心座標は生の f64 ではなく、実際に描画へ効く粒度へ丸めて混ぜる(設計 §5.2 対策B)。
+            // これより細かい差はどうせ同じ絵になる。粒度は描画側と揃える必要があるので、
+            // rcx/rcy を吸着させたときと同じ sub_steps を渡す(サブピクセル切り出しなら
+            // 1/SUBPIXEL_STEPS ピクセル・従来の整数切り出しなら1ピクセル)。
+            // rcx/rcy は既に同じ格子へ吸着済みなので、描画とシグネチャの位置は必ず一致する。
+            map_center_sig_key(rcx, rcy, rw, rh, sub_steps).hash(&mut h);
+            // 切り出し方が変わると同じ中心でも絵が変わるので、モードそのものも混ぜる。
+            subpixel.hash(&mut h);
             rz.hash(&mut h); rw.hash(&mut h); rh.hash(&mut h);
             gut.hash(&mut h); map_cols.hash(&mut h); map_rows.hash(&mut h);
             opts.style.hash(&mut h);
@@ -928,7 +946,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             let built = match prefetched {
                 Some(img) => Ok(img),
                 // 非ブロッキング版: 未取得タイルはグレーで即返し、取得はローダーが裏で進める。
-                None => build_window_nowait(rcx, rcy, rz, rw, rh, &opts.style, &loader),
+                None => build_window_nowait(rcx, rcy, rz, rw, rh, &opts.style, subpixel, &loader),
             };
             match built {
                 Ok(mut img) => {

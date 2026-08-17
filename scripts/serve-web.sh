@@ -63,6 +63,25 @@ echo "公開する場合は別ターミナルで: cloudflared tunnel --url http:
 # 実際に実画像を使うかは cfg.image_mode(既定OFF・`I`キーか設定画面で切替)の方で決まる。
 CHILD_ENV=(env -u LC_TERMINAL -u ITERM_SESSION_ID TERM_PROGRAM=iTerm.app)
 
+# web 版の既定描画モードは braille にする(docs/web-pan-smoothness-design.md §5.3 C-2)。
+# 1フレームの出力が halfblock の約3分の1(94×23 の実測で 24KB 対 75KB)で、地図が動ける
+# 最小単位も半分(横1/2セル・縦1/4セル)。ブラウザで見えるコマ数は「処理できるバイト数 ÷
+# 1フレームのバイト数」で決まる(同 §2.4)ので、バイトが安い braille は同じ回線・同じ端末で
+# コマ数が増える。失うのは色の階調(前景色のみ・背景なし)だけ。
+#
+# halfblock で使いたいときは TERMMAP_WEB_BRAILLE=0 を付けて起動する。
+#   TERMMAP_WEB_BRAILLE=0 scripts/serve-web.sh
+#
+# 注意: termmap は終了時に描画設定を ~/.config/termmap の config へ書き戻す(braille は
+# CLI フラグと config の OR で決まる)。ここで --braille を渡すと、その後に手元のターミナルで
+# termmap を起動したときも braille で始まる。戻したいときは termmap 上で B キー(または設定画面)
+# で halfblock へ切り替えて終了する。
+TERMMAP_ARGS=()
+case "${TERMMAP_WEB_BRAILLE:-1}" in
+  0|false|off|no) echo "描画モード: halfblock (TERMMAP_WEB_BRAILLE で無効化されている)" ;;
+  *) TERMMAP_ARGS+=(--braille); echo "描画モード: braille (halfblock で使うなら TERMMAP_WEB_BRAILLE=0)" ;;
+esac
+
 TTYD_PID=""
 PROXY_PID=""
 # ttyd とプロキシの2プロセス構成なので、どちらが落ちても/どう止められても
@@ -83,13 +102,15 @@ trap cleanup EXIT INT TERM
 # -W  書き込み可(既定は読み取り専用なので、これが無いと操作できない)
 # -i  127.0.0.1 に限定(直接インターネットへ晒さない)
 # -t  ブラウザ側 xterm.js のオプション
+# TERMMAP_ARGS の展開が "${arr[@]+"${arr[@]}"}" の形なのは、macOS 標準の bash 3.2 が set -u 下で
+# 空配列の "${arr[@]}" を unbound variable として落とすため(TERMMAP_WEB_BRAILLE=0 で空になる)。
 "${CHILD_ENV[@]}" ttyd \
   -i 127.0.0.1 \
   -p "$TTYD_PORT" \
   -W \
   -I "$INDEX" \
   -t 'disableLeaveAlert=true' \
-  "$BIN" "$@" &
+  "$BIN" "${TERMMAP_ARGS[@]+"${TERMMAP_ARGS[@]}"}" "$@" &
 TTYD_PID=$!
 
 sleep 0.3

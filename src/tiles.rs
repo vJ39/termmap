@@ -231,6 +231,61 @@ fn window_tile_range(cx: f64, cy: f64, win_w: u32, win_h: u32) -> (i64, i64, i64
     (tx_min, tx_max, ty_min, ty_max, left, top)
 }
 
+// 窓の切り出し(docs/web-pan-smoothness-design.md §5.1 対策A)。
+//
+// 従来は left/top を整数へ切り捨てて切り出していた。X と Y が独立に切り捨てられるため、
+// 描かれる位置の誤差は X 成分と Y 成分が無関係に ±1ピクセル未満で揺れる。真横のドラッグでは
+// 進行方向と平行な速度のむらにしか見えないが、斜めのドラッグでは誤差に進行方向と直交する
+// 成分が乗り、地図が左右へ振れて軌跡が階段状に見える(設計 §3.1)。
+//
+// ここでは canvas 上の窓左上 (ox, oy) の小数部を捨てず、右下方向の隣接ピクセルとの
+// 2×2 バイリニアで win_w×win_h を作る。出力セルの色が連続的に変化するので、1セル未満の
+// 動きも色の遷移として見え、X と Y が同時に連続になって直交方向のブレが消える。
+//
+// 参照先は canvas の範囲内へクランプする。呼び出し側はバイリニアが右下へ1ピクセル余分に
+// 参照するぶんタイル範囲を広げてあるので通常はクランプに掛からないが、世界の端や壊れた値でも
+// 範囲外参照しないようにしてある。
+fn crop_window_subpixel(canvas: &RgbImage, ox: f64, oy: f64, win_w: u32, win_h: u32) -> RgbImage {
+    let (cw, ch) = canvas.dimensions();
+    let mut out = RgbImage::new(win_w, win_h);
+    if cw == 0 || ch == 0 { return out; }
+    // NaN 等が来ても 0 へ落として必ず描く(地図が消えるより端がずれる方がまし)。
+    let ox = if ox.is_finite() { ox.max(0.0) } else { 0.0 };
+    let oy = if oy.is_finite() { oy.max(0.0) } else { 0.0 };
+    let (bx, by) = (ox.floor(), oy.floor());
+    let (fx, fy) = (ox - bx, oy - by);
+    let (bxi, byi) = (bx as i64, by as i64);
+    // 2×2 の重み。fx=fy=0 のときは w00=1・他0 になり、従来の整数切り出しと完全に一致する。
+    let w00 = (1.0 - fx) * (1.0 - fy);
+    let w10 = fx * (1.0 - fy);
+    let w01 = (1.0 - fx) * fy;
+    let w11 = fx * fy;
+    let cx_max = cw as i64 - 1;
+    let cy_max = ch as i64 - 1;
+    for j in 0..win_h {
+        let sy = byi + j as i64;
+        let y0 = sy.clamp(0, cy_max) as u32;
+        let y1 = (sy + 1).clamp(0, cy_max) as u32;
+        for i in 0..win_w {
+            let sx = bxi + i as i64;
+            let x0 = sx.clamp(0, cx_max) as u32;
+            let x1 = (sx + 1).clamp(0, cx_max) as u32;
+            let p00 = canvas.get_pixel(x0, y0).0;
+            let p10 = canvas.get_pixel(x1, y0).0;
+            let p01 = canvas.get_pixel(x0, y1).0;
+            let p11 = canvas.get_pixel(x1, y1).0;
+            let mut px = [0u8; 3];
+            for c in 0..3 {
+                let v = p00[c] as f64 * w00 + p10[c] as f64 * w10
+                      + p01[c] as f64 * w01 + p11[c] as f64 * w11;
+                px[c] = v.round().clamp(0.0, 255.0) as u8;
+            }
+            out.put_pixel(i, j, image::Rgb(px));
+        }
+    }
+    out
+}
+
 // 中心(cx,cy グローバルpx)から win_w×win_h の矩形窓を組み立てる。タイルは cache 経由。
 pub fn build_window(cx: f64, cy: f64, z: u32, win_w: u32, win_h: u32, style: &str, cache: &mut Cache) -> Result<RgbImage, String> {
     if style == "topo" && z > TOPO_MAX_Z {
@@ -530,19 +585,30 @@ fn draw_loading_watermark(canvas: &mut RgbImage, ox: u32, oy: u32, ink: image::R
 
 // build_window の非ブロッキング版。未取得タイルはネットワークを待たずグレーのプレースホルダーで埋め、
 // ローダーへ取得依頼だけ出して即座に返す。届いたタイルは次フレームで cache から拾われ自動的に地図へ反映される。
-pub fn build_window_nowait(cx: f64, cy: f64, z: u32, win_w: u32, win_h: u32, style: &str, loader: &TileLoader) -> Result<RgbImage, String> {
+//
+// subpixel=true のとき、窓の切り出しに cx/cy の小数部を使う(crop_window_subpixel・設計 §5.1 対策A)。
+// false のときは従来どおり整数位置で切り出す。呼び出し側が描画モードで選ぶ。
+pub fn build_window_nowait(cx: f64, cy: f64, z: u32, win_w: u32, win_h: u32, style: &str, subpixel: bool, loader: &TileLoader) -> Result<RgbImage, String> {
     if style == "topo" && z > TOPO_MAX_Z {
         // 同期版と同じオーバーズーム。z17相当のサブ窓を非ブロッキングで組み(未取得はグレー)、拡大→中央クロップ。
         // z17タイルはローダーへ登録され順次埋まっていく。
         let shift = z - TOPO_MAX_Z;
         let scale = (1u32 << shift) as f64;
         let (base_w, base_h, scaled_w, scaled_h, crop_x, crop_y) = overzoom_geometry(win_w, win_h, shift);
-        let base_img = build_window_nowait(cx / scale, cy / scale, TOPO_MAX_Z, base_w, base_h, style, loader)?;
+        let base_img = build_window_nowait(cx / scale, cy / scale, TOPO_MAX_Z, base_w, base_h, style, subpixel, loader)?;
         let resized = image::imageops::resize(&base_img, scaled_w, scaled_h, image::imageops::FilterType::Nearest);
         return Ok(image::imageops::crop_imm(&resized, crop_x, crop_y, win_w, win_h).to_image());
     }
     let tf = TILE as f64;
-    let (tx_min, tx_max, ty_min, ty_max, left, top) = window_tile_range(cx, cy, win_w, win_h);
+    let (tx_min, mut tx_max, ty_min, mut ty_max, left, top) = window_tile_range(cx, cy, win_w, win_h);
+    if subpixel {
+        // バイリニアは右下方向へ1ピクセル余分に参照する。その1ピクセルが隣のタイルへ掛かる
+        // ときだけ列/行を1つ広げる(窓の右端がちょうどタイル境界に載ったときにだけ起きる)。
+        // 広げないとその1列/1行だけクランプで隣と混ざらず、パン中に端が固まって見える。
+        // 同じズームのタイルなので取得の枠組みは変わらない(設計 §5.1)。
+        tx_max = tx_max.max(((left.floor() + win_w as f64) / tf).floor() as i64);
+        ty_max = ty_max.max(((top.floor() + win_h as f64) / tf).floor() as i64);
+    }
     let max_t = 2i64.pow(z);
     let cols = (tx_max - tx_min + 1) as u32;
     let rows = (ty_max - ty_min + 1) as u32;
@@ -586,9 +652,14 @@ pub fn build_window_nowait(cx: f64, cy: f64, z: u32, win_w: u32, win_h: u32, sty
     // 取得依頼はcacheロック解放後にまとめて登録(二重登録はローダー側で弾く)。
     if !missing.is_empty() { loader.request_tiles(missing); }
 
-    let crop_x = (left - tx_min as f64 * tf).max(0.0) as u32;
-    let crop_y = (top - ty_min as f64 * tf).max(0.0) as u32;
-    Ok(image::imageops::crop_imm(&canvas, crop_x, crop_y, win_w, win_h).to_image())
+    // canvas 上での窓左上。window_tile_range の定義から常に 0 以上だが、念のため抑える。
+    let ox = (left - tx_min as f64 * tf).max(0.0);
+    let oy = (top - ty_min as f64 * tf).max(0.0);
+    if subpixel {
+        Ok(crop_window_subpixel(&canvas, ox, oy, win_w, win_h))
+    } else {
+        Ok(image::imageops::crop_imm(&canvas, ox as u32, oy as u32, win_w, win_h).to_image())
+    }
 }
 
 // ---- 雨雲レーダー(気象庁ナウキャスト)レイヤ ----
@@ -1274,9 +1345,139 @@ mod tests {
         let loader = TileLoader::start(Arc::clone(&cache));
         let cx = (tx as f64 + 0.5) * TILE as f64;
         let cy = (ty as f64 + 0.5) * TILE as f64;
-        let img = build_window_nowait(cx, cy, z, 64, 64, "osm", &loader).unwrap();
+        let img = build_window_nowait(cx, cy, z, 64, 64, "osm", false, &loader).unwrap();
         assert_eq!(img.dimensions(), (64, 64));
         for p in img.pixels() { assert_eq!(*p, image::Rgb([7, 8, 9])); }
+    }
+
+    // ---- サブピクセル切り出し(docs/web-pan-smoothness-design.md §5.1 対策A) ----
+
+    // 横方向にグラデーションを持つ canvas(x がそのまま R 成分)。バイリニアの重みが
+    // どう効いたかを画素値から直接読めるようにするための下地。
+    fn ramp_canvas(w: u32, h: u32) -> RgbImage {
+        RgbImage::from_fn(w, h, |x, y| image::Rgb([x as u8, y as u8, 0]))
+    }
+
+    // 小数部 0.0 なら従来の整数切り出しと完全に一致する(見た目を変えずに入れられることの確認)。
+    #[test]
+    fn crop_window_subpixel_matches_the_integer_crop_at_zero_fraction() {
+        let canvas = ramp_canvas(64, 64);
+        for &(ox, oy) in &[(0.0, 0.0), (5.0, 7.0), (13.0, 2.0)] {
+            let sub = crop_window_subpixel(&canvas, ox, oy, 16, 16);
+            let int = image::imageops::crop_imm(&canvas, ox as u32, oy as u32, 16, 16).to_image();
+            assert_eq!(sub, int, "ox={ox} oy={oy}");
+        }
+    }
+
+    // 小数部 0.5 で隣接ピクセルの中間色になる。
+    #[test]
+    fn crop_window_subpixel_blends_half_way_between_neighbours() {
+        let canvas = ramp_canvas(64, 64);
+        // 横だけ 0.5 ずらす: 出力(i,j) = (canvas[10+i] + canvas[11+i]) / 2 = 10+i+0.5 → 四捨五入で 11+i
+        let img = crop_window_subpixel(&canvas, 10.5, 4.0, 8, 8);
+        for i in 0..8u32 {
+            assert_eq!(img.get_pixel(i, 0).0[0], 11 + i as u8, "x={i}");
+            assert_eq!(img.get_pixel(i, 0).0[1], 4, "y stays put at fy=0");
+        }
+        // 縦だけ 0.5 ずらす。
+        let img = crop_window_subpixel(&canvas, 4.0, 10.5, 8, 8);
+        for j in 0..8u32 {
+            assert_eq!(img.get_pixel(0, j).0[1], 11 + j as u8, "y={j}");
+            assert_eq!(img.get_pixel(0, j).0[0], 4, "x stays put at fx=0");
+        }
+    }
+
+    // 2色の境目が、小数部に応じて連続的に遷移する(階段ではなく色の遷移として見える)。
+    #[test]
+    fn crop_window_subpixel_moves_an_edge_continuously() {
+        // x=0 が黒 / x=1 が白の縦エッジ。
+        let canvas = RgbImage::from_fn(4, 4, |x, _| if x == 0 { image::Rgb([0, 0, 0]) } else { image::Rgb([255, 255, 255]) });
+        let at = |f: f64| crop_window_subpixel(&canvas, f, 0.0, 1, 1).get_pixel(0, 0).0[0];
+        assert_eq!(at(0.0), 0);
+        assert_eq!(at(0.25), 64);  // 255*0.25 = 63.75 → 64
+        assert_eq!(at(0.5), 128);  // 255*0.5  = 127.5 → 128
+        assert_eq!(at(0.75), 191); // 255*0.75 = 191.25 → 191
+        assert_eq!(at(1.0), 255);
+        // 単調に増える = 進行方向と直交する揺り戻しが無い。
+        let seq: Vec<u8> = (0..=8).map(|k| at(k as f64 / 8.0)).collect();
+        assert!(seq.windows(2).all(|w| w[0] <= w[1]), "{seq:?}");
+    }
+
+    // 端(canvas の右下)で範囲外参照しない。クランプされて panic しない。
+    #[test]
+    fn crop_window_subpixel_clamps_at_the_canvas_edge() {
+        let canvas = ramp_canvas(8, 8);
+        // 窓が canvas の右下いっぱいに載っており、隣接ピクセルが存在しない位置。
+        let img = crop_window_subpixel(&canvas, 7.5, 7.5, 1, 1);
+        assert_eq!(img.dimensions(), (1, 1));
+        assert_eq!(img.get_pixel(0, 0).0, [7, 7, 0]); // 4点とも (7,7) へクランプされる
+        // 窓が canvas をはみ出すサイズでも panic しない。
+        let img = crop_window_subpixel(&canvas, 6.3, 6.7, 4, 4);
+        assert_eq!(img.dimensions(), (4, 4));
+    }
+
+    // 壊れた値でも panic せず、必ず窓サイズの画像を返す。
+    #[test]
+    fn crop_window_subpixel_survives_broken_offsets() {
+        let canvas = ramp_canvas(8, 8);
+        for &(ox, oy) in &[(f64::NAN, 0.0), (0.0, f64::INFINITY), (-3.0, -3.0)] {
+            let img = crop_window_subpixel(&canvas, ox, oy, 4, 4);
+            assert_eq!(img.dimensions(), (4, 4));
+        }
+        // 空の canvas でも窓サイズは守る。
+        assert_eq!(crop_window_subpixel(&RgbImage::new(0, 0), 0.0, 0.0, 3, 2).dimensions(), (3, 2));
+    }
+
+    // build_window_nowait: subpixel=false は従来どおり。subpixel=true では中心の小数部が絵に効く。
+    #[test]
+    fn build_window_nowait_uses_the_fractional_centre_only_when_asked() {
+        let z = 3u32;
+        let (tx, ty) = (4i64, 4i64);
+        let cache = Arc::new(Mutex::new(Cache::new()));
+        // タイル内に横グラデーションを入れて、1px 未満のずれが画素値に出るようにする。
+        cache.lock().unwrap().insert(
+            TileKey { src: TileSource::Base("osm".to_string()), z, x: tx, y: ty },
+            RgbaImage::from_fn(TILE, TILE, |x, _| image::Rgba([(x % 256) as u8, 0, 0, 255])),
+        );
+        let loader = TileLoader::start(Arc::clone(&cache));
+        let cx = (tx as f64 + 0.5) * TILE as f64;
+        let cy = (ty as f64 + 0.5) * TILE as f64;
+        let base_int = build_window_nowait(cx, cy, z, 32, 32, "osm", false, &loader).unwrap();
+        let moved_int = build_window_nowait(cx + 0.5, cy, z, 32, 32, "osm", false, &loader).unwrap();
+        assert_eq!(base_int, moved_int, "整数切り出しでは 0.5px の移動は捨てられる");
+
+        let base_sub = build_window_nowait(cx, cy, z, 32, 32, "osm", true, &loader).unwrap();
+        let moved_sub = build_window_nowait(cx + 0.5, cy, z, 32, 32, "osm", true, &loader).unwrap();
+        assert_eq!(base_sub, base_int, "小数部 0 なら両者は一致する");
+        assert_ne!(base_sub, moved_sub, "サブピクセルでは 0.5px の移動が絵に出る");
+        // 中間色になっている(隣の値との平均)。
+        assert_eq!(moved_sub.get_pixel(0, 0).0[0], base_int.get_pixel(0, 0).0[0] + 1);
+    }
+
+    // 窓の右端がちょうどタイル境界に載るとき、バイリニアが参照する隣のタイルまで
+    // 列を広げる(広げないとその1列だけ混ざらず、パン中に端が固まって見える)。
+    #[test]
+    fn build_window_nowait_widens_the_tile_range_for_the_bilinear_neighbour() {
+        let z = 3u32;
+        let (tx, ty) = (4i64, 4i64);
+        let cache = Arc::new(Mutex::new(Cache::new()));
+        {
+            let mut c = cache.lock().unwrap();
+            // 左のタイルは黒、右隣は白。境界をまたぐ位置で切り出す。
+            c.insert(TileKey { src: TileSource::Base("osm".to_string()), z, x: tx, y: ty },
+                     RgbaImage::from_pixel(TILE, TILE, image::Rgba([0, 0, 0, 255])));
+            c.insert(TileKey { src: TileSource::Base("osm".to_string()), z, x: tx + 1, y: ty },
+                     RgbaImage::from_pixel(TILE, TILE, image::Rgba([255, 255, 255, 255])));
+        }
+        let loader = TileLoader::start(Arc::clone(&cache));
+        // 窓の右端(left + win_w)がちょうどタイル境界(tx+1 の先頭)に来るように置く。
+        let win_w = 16u32;
+        let left = (tx + 1) as f64 * TILE as f64 - win_w as f64;
+        let cx = left + win_w as f64 / 2.0 + 0.5; // 右へ 0.5px ずらす
+        let cy = (ty as f64 + 0.5) * TILE as f64;
+        let img = build_window_nowait(cx, cy, z, win_w, 16, "osm", true, &loader).unwrap();
+        // 一番右の列は、黒(0)と隣タイルの白(255)の中間になる。範囲を広げていないと 0 のまま。
+        assert_eq!(img.get_pixel(win_w - 1, 0).0[0], 128);
     }
 
     // draw_loading_watermark: 描画後、ink色のピクセルが1つ以上存在する(=実際に何か描かれている)。
