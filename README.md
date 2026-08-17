@@ -130,6 +130,9 @@ termmap 本体はそのままで、[ttyd](https://github.com/tsl0922/ttyd) の�
 用意していない(環境変数が未設定なら起動せずに終了する)。
 `serve-web.sh` は ttyd(認証なし・`127.0.0.1:17681` の内部ポート)と、その手前の
 `webauth-proxy`(公開ポート 7681)の2プロセスを起こす。Ctrl-C で両方止まる。
+描画は braille で始まる(1フレームが halfblock の約3分の1で、回線が細くてもスワイプが
+滑らかになるため)。halfblock で使いたいときは `TERMMAP_WEB_BRAILLE=0 scripts/serve-web.sh`。
+詳細は `docs/MANUAL.md` の「web 版の描画モード」を参照。
 
 **3. 外から繋ぐ**(使う時だけ手で立ち上げる)
 
