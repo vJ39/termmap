@@ -460,7 +460,11 @@ fn boundary_cells(b: Bbox) -> Vec<String> {
 // 1個ずつ順に取っていく間、常に「今見ている場所の近く」から埋まるようにする(同 §3.3)。
 fn disaster_cells(b: Bbox) -> Vec<String> {
     let since = disaster_since().max(0);
-    let mut codes = mesh::primary_codes(b.0, b.1, b.2, b.3);
+    // primary_codes(通常版)のMAX_CODES安全弁に当たると、この関数だけが空を返し
+    // 「上限を外したのに何も表示されない」という別種の無表示になる(実機で発生・確認済み)。
+    // disaster/boundaryはPlotLayer側で1ジョブのセル数上限を既に外しているので、
+    // 列挙側もunbounded版を使う。
+    let mut codes = mesh::primary_codes_unbounded(b.0, b.1, b.2, b.3);
     sort_codes_by_distance_from_center(&mut codes, mesh::primary_bbox, b);
     codes.iter().map(|c| format!("{c}_{since}")).collect()
 }
@@ -1122,6 +1126,19 @@ mod tests {
 
     // 中心から近いセルほど先に来る(取得の優先度)。既知の並びで固定する:
     // 東京中心の視野では、東京駅を含むメッシュ(5339)が最初に来るはず。
+    #[test]
+    // primary_codes(通常版)はMAX_CODES=256の安全弁でz7以下では空を返すが、disaster_cellsは
+    // primary_codes_unboundedを使うため、同じズームでも0件にならない(設計 unlimited-zoom §3.1)。
+    #[test]
+    fn disaster_cells_are_not_empty_at_extremely_wide_zoom() {
+        for z in [7u32, 6, 5] {
+            let (cx, cy) = tokyo_center(z);
+            let b = view_bbox(cx, cy, z);
+            assert!(mesh::primary_codes(b.0, b.1, b.2, b.3).is_empty(), "前提: z{z}は通常版が空になるはず");
+            assert!(!disaster_cells(b).is_empty(), "z{z}: disaster_cellsが0件になっている");
+        }
+    }
+
     #[test]
     fn disaster_cells_are_ordered_nearest_to_center_first() {
         let (cx, cy) = tokyo_center(9);

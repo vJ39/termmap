@@ -17,7 +17,22 @@ const MAX_CODES: usize = 256;
 
 /// bbox(lat_min, lon_min, lat_max, lon_max)を覆う1次メッシュコードを全て列挙する。
 /// 範囲が逆転している/日本のメッシュ空間(p,u が 0..=99)から外れる場合は空を返す。
+/// 必要セル数が MAX_CODES を超える場合も空を返す(交通量・規制・道路の安全弁。
+/// 過去災害/境界はこの安全弁を持たない `primary_codes_unbounded` を使う)。
 pub fn primary_codes(lat_min: f64, lon_min: f64, lat_max: f64, lon_max: f64) -> Vec<u32> {
+    primary_codes_impl(lat_min, lon_min, lat_max, lon_max, Some(MAX_CODES))
+}
+
+/// primary_codes と同じ列挙だが、MAX_CODES の安全弁を持たない。過去災害/境界は
+/// plotlayer::PlotLayer 側で1回のジョブのセル数上限を外しているため(設計
+/// docs/disaster-choropleth-unlimited-zoom-design.md §3.1)、こちら側の列挙でも
+/// 安全弁に当たって黙って0件を返す状態を作らない。日本のメッシュ空間(p,uが0..=99)の
+/// 外は変わらず除外するので、実際に返る件数は最大10,000(100×100)に収まる。
+pub fn primary_codes_unbounded(lat_min: f64, lon_min: f64, lat_max: f64, lon_max: f64) -> Vec<u32> {
+    primary_codes_impl(lat_min, lon_min, lat_max, lon_max, None)
+}
+
+fn primary_codes_impl(lat_min: f64, lon_min: f64, lat_max: f64, lon_max: f64, max_codes: Option<usize>) -> Vec<u32> {
     if !(lat_min <= lat_max && lon_min <= lon_max) {
         return Vec::new();
     }
@@ -25,8 +40,10 @@ pub fn primary_codes(lat_min: f64, lon_min: f64, lat_max: f64, lon_max: f64) -> 
     let p1 = (lat_max * 1.5).floor() as i64;
     let u0 = lon_min.floor() as i64 - 100;
     let u1 = lon_max.floor() as i64 - 100;
-    if (p1 - p0 + 1).saturating_mul(u1 - u0 + 1) > MAX_CODES as i64 {
-        return Vec::new();
+    if let Some(cap) = max_codes {
+        if (p1 - p0 + 1).saturating_mul(u1 - u0 + 1) > cap as i64 {
+            return Vec::new();
+        }
     }
     let mut out = Vec::new();
     for p in p0..=p1 {
@@ -181,6 +198,39 @@ mod tests {
     fn primary_codes_returns_empty_when_the_area_is_absurdly_wide() {
         // 世界全体。列挙すると数万件になるので空(=取得しない)を返す。
         assert!(primary_codes(-85.0, -180.0, 85.0, 180.0).is_empty());
+    }
+
+    // primary_codes_unbounded は MAX_CODES の安全弁を持たない(過去災害/境界だけが使う。
+    // 設計 docs/disaster-choropleth-unlimited-zoom-design.md)。同じ入力で通常版と結果が
+    // 一致することを、安全弁に当たらない範囲でまず確認する。
+    #[test]
+    fn primary_codes_unbounded_matches_primary_codes_when_under_the_cap() {
+        let cases = [
+            (35.68, 139.77, 35.68, 139.77),
+            (35.0, 136.5, 36.0, 141.0),
+            (36.0, 139.0, 35.0, 140.0), // 範囲逆転(空になるはず)
+            (-10.0, 139.0, -9.0, 140.0), // メッシュ空間の外
+        ];
+        for (a, b, c, d) in cases {
+            assert_eq!(primary_codes_unbounded(a, b, c, d), primary_codes(a, b, c, d), "({a},{b},{c},{d})");
+        }
+    }
+
+    // 通常版が安全弁で空を返す(=256セル超)入力でも、unbounded版はセルを返す。
+    #[test]
+    fn primary_codes_unbounded_does_not_give_up_on_absurdly_wide_areas() {
+        assert!(primary_codes(-85.0, -180.0, 85.0, 180.0).is_empty(), "前提: 通常版は空");
+        // 世界全体は日本のメッシュ空間(p,u が 0..=99)の外がほとんどなので、実際に返る件数は
+        // 上限10,000(100×100)以下に収まる。0件ではなく、かつ現実的な件数であることを見る。
+        let n = primary_codes_unbounded(-85.0, -180.0, 85.0, 180.0).len();
+        assert!(n > 0, "unbounded版は空を返してはいけない");
+        assert!(n <= 10_000, "日本のメッシュ空間(100×100)を超えるのはおかしい: {n}");
+    }
+
+    #[test]
+    fn primary_codes_unbounded_still_rejects_inverted_ranges() {
+        assert!(primary_codes_unbounded(36.0, 139.0, 35.0, 140.0).is_empty());
+        assert!(primary_codes_unbounded(35.0, 140.0, 36.0, 139.0).is_empty());
     }
 
     #[test]

@@ -140,15 +140,22 @@ pub fn build_layer(
     Some(img)
 }
 
+/// このズームで塗り(コロプレス)を出すか。z14以上は画面幅が1km前後になり「全面が同じ色」に
+/// 退化するので、そこは従来の代表点マーカーへ譲る(呼び出し側がdisaster_markers等で判定)。
+/// 下限は無い(無制限ズーム対応。設計 docs/disaster-choropleth-unlimited-zoom-design.md)。
+/// 以前はz9未満を除外していたが、それは取得側(mesh::primary_codes)のMAX_CODES安全弁に
+/// 当たって黙って0件になっていたための暫定処置で、primary_codes_unboundedへ切り替えた
+/// 現在は不要(実機で「広域にしても表示されない」という形で発覚・修正した)。
+pub fn fill_visible_at_zoom(z: u32) -> bool {
+    z <= 13
+}
+
 /// ズームに応じたブラー半径(px)。広域ほど区域が小さく縁が荒れて見えるため強めに掛ける。
-/// z9未満・fill無効時は呼び出し側で使わない想定なので、範囲外のズームは0(ブラー無し)。
+/// z12以上(区域が十分大きい)は0(ブラー無し)。z9より広域(z8以下)はさらに強くするが、
+/// 計算コスト(O(w*h*radius))が際限なく増えないよう6で打ち止める(無制限ズーム対応。
+/// 設計 docs/disaster-choropleth-unlimited-zoom-design.md §4.2)。
 pub fn blur_radius_for_zoom(z: u32) -> u32 {
-    match z {
-        9 => 3,
-        10 => 2,
-        11 => 1,
-        _ => 0,
-    }
+    12i32.saturating_sub(z as i32).clamp(0, 6) as u32
 }
 
 /// RGBA画像に軽いボックスブラーを掛ける(radius=0はimgをそのまま返す)。事前乗算アルファ
@@ -289,13 +296,34 @@ mod tests {
     }
 
     #[test]
+    fn fill_visible_at_zoom_has_no_lower_bound_but_stops_at_z14() {
+        for z in [1u32, 3, 5, 7, 8, 9, 10, 13] {
+            assert!(fill_visible_at_zoom(z), "z{z}で塗りが出ないのはおかしい");
+        }
+        for z in [14u32, 15, 20] {
+            assert!(!fill_visible_at_zoom(z), "z{z}では塗りでなくマーカーへ譲るはず");
+        }
+    }
+
+    #[test]
     fn blur_radius_for_zoom_gets_weaker_as_zoom_increases_then_zero() {
         assert_eq!(blur_radius_for_zoom(9), 3);
         assert_eq!(blur_radius_for_zoom(10), 2);
         assert_eq!(blur_radius_for_zoom(11), 1);
         assert_eq!(blur_radius_for_zoom(12), 0);
         assert_eq!(blur_radius_for_zoom(13), 0);
-        assert_eq!(blur_radius_for_zoom(8), 0, "z8はfillの対象外なので値は使われないが0で安全側");
+    }
+
+    // z9より広域(z8以下)では、区域がさらに小さく見えるのでブラーはむしろ強めていく
+    // (無制限ズーム対応。設計 unlimited-zoom-design.md §4.2)。上限6は
+    // O(w*h*radius)の計算コストが極端に増えないようにする安全弁。
+    #[test]
+    fn blur_radius_for_zoom_gets_stronger_below_z9_then_caps() {
+        assert_eq!(blur_radius_for_zoom(8), 4);
+        assert_eq!(blur_radius_for_zoom(7), 5);
+        assert_eq!(blur_radius_for_zoom(6), 6);
+        assert_eq!(blur_radius_for_zoom(5), 6, "上限6でキャップされる");
+        assert_eq!(blur_radius_for_zoom(1), 6, "極端なズームでも上限6でキャップされる");
     }
 
     fn painted(img: &RgbaImage) -> usize {
@@ -589,5 +617,32 @@ mod tests {
         let blurred_sh = Shading { opacity: DEFAULT_OPACITY, fill: true, blur_radius: 2 };
         let blurred = build_layer(&site_refs, &area_refs, cx, cy, z, w, h, blurred_sh).expect("岐阜北部 z9 で1区域も塗れない");
         assert!(painted(&blurred) >= painted(&img), "ブラー後に不透明画素が減るのはおかしい");
+    }
+
+    // z9より広域(z6)でも実際に何か塗られること。実機で「広域にしても表示されない」
+    // と報告された症状の再現+修正確認(mesh::primary_codesのMAX_CODES安全弁と
+    // choropleth_fillのz9下限、両方を修正した後の状態を固定する)。
+    #[test]
+    #[ignore]
+    fn live_paint_a_screen_wider_than_z9() {
+        let z = 6u32;
+        let (cx, cy) = deg_to_pixel(35.681236, 139.767125, z);
+        let cell = crate::mesh::shrink(crate::plotlayer::view_bbox(cx, cy, z));
+        assert!(fill_visible_at_zoom(z), "z{z}は塗りの対象のはず");
+        let sites = crate::disaster::fetch_sites(cell.0, cell.1, cell.2, cell.3, disaster::DEFAULT_SINCE_YEAR)
+            .expect("live fetch should succeed");
+        println!("z{z}の視野: 地点 {} 件", sites.len());
+        let mut areas: Vec<MuniArea> = Vec::new();
+        for i in crate::muni::relm_indices(cell) {
+            areas.extend(crate::muni::fetch_relm(i).expect("live fetch should succeed"));
+        }
+        let site_refs: Vec<&DisasterSite> = sites.iter().collect();
+        let area_refs: Vec<&MuniArea> = areas.iter().collect();
+        let (w, h) = (320u32, 200u32);
+        let sh = Shading { opacity: DEFAULT_OPACITY, fill: true, blur_radius: blur_radius_for_zoom(z) };
+        let img = build_layer(&site_refs, &area_refs, cx, cy, z, w, h, sh).expect(&format!("z{z}で1区域も塗れない"));
+        let coverage = painted(&img) as f64 / (w * h) as f64;
+        println!("z{z}の塗られた画素 {}/{} ({:.1}%)", painted(&img), w * h, coverage * 100.0);
+        assert!(coverage > 0.0, "z{z}で1画素も塗られていない");
     }
 }

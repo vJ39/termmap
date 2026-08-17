@@ -338,14 +338,13 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
         }
         let disaster_sites = st.disaster_layer.items(plot_view);
         let muni_areas = st.boundary_layer.items(plot_view);
-        // 過去災害の見せ方をズームで切り替える(設計 §3.4 / 広域版 §3.1)。塗りは画面に複数の
-        // 市区町村が入るズーム帯でだけ意味を持つ。z14以上は画面幅が1km前後になり「全面が同じ色」に
-        // 退化するので、そこは従来の代表点マーカーへ譲る。判定に使うのは実描画ズーム(rz)では
-        // なく地図ズーム(z): 実画像モードは rz>z でも写る地理範囲は同じため。
-        // 下限が z9 なのは、z8 では取得側(広域セル20枚・集計2,000行の打ち切り)と描画側
-        // (1区域19px)の両方が成立しないため(広域版 §2.5)。
+        // 過去災害の見せ方をズームで切り替える(設計 §3.4 / 無制限ズーム版 §4.1)。塗りは画面に
+        // 複数の市区町村が入るズーム帯でだけ意味を持つ。z14以上は画面幅が1km前後になり
+        // 「全面が同じ色」に退化するので、そこは従来の代表点マーカーへ譲る。判定に使うのは
+        // 実描画ズーム(rz)ではなく地図ズーム(z): 実画像モードは rz>z でも写る地理範囲は同じため。
+        // 下限は無い(choropleth::fill_visible_at_zoom参照)。
         let fill_on = st.cfg.disaster_enabled && st.cfg.disaster_fill;
-        let choropleth_fill = fill_on && (9..=13).contains(&st.z);
+        let choropleth_fill = fill_on && choropleth::fill_visible_at_zoom(st.z);
         // 件数リングは塗りが件数を担っている間は出さない(中心の小さな塊は常に残すので、
         // B キーが何を指しているかは画面から分かる)。
         let disaster_rings = !choropleth_fill;
