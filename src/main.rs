@@ -26,6 +26,7 @@ mod menu;
 mod listview;
 mod roadseg;
 mod ui;
+mod uistate;    // 対話ループの状態(UiState)
 mod ui_helpers; // interactive() の外にあった小さなヘルパー群
 mod focus;      // 対話UIの画面状態(Focus)
 #[allow(dead_code)] // ui.rs への配線(OSC 9997 送出)はこれから
