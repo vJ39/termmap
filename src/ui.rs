@@ -338,16 +338,25 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
         }
         let disaster_sites = st.disaster_layer.items(plot_view);
         let muni_areas = st.boundary_layer.items(plot_view);
-        // 過去災害の見せ方をズームで切り替える(設計 §3.4)。塗りは画面に複数の市区町村が
-        // 入るズーム帯でだけ意味を持つ。z14以上は画面幅が1km前後になり「全面が同じ色」に
+        // 過去災害の見せ方をズームで切り替える(設計 §3.4 / 広域版 §3.1)。塗りは画面に複数の
+        // 市区町村が入るズーム帯でだけ意味を持つ。z14以上は画面幅が1km前後になり「全面が同じ色」に
         // 退化するので、そこは従来の代表点マーカーへ譲る。判定に使うのは実描画ズーム(rz)では
         // なく地図ズーム(z): 実画像モードは rz>z でも写る地理範囲は同じため。
+        // 下限が z9 なのは、z8 では取得側(広域セル20枚・集計2,000行の打ち切り)と描画側
+        // (1区域19px)の両方が成立しないため(広域版 §2.5)。
         let fill_on = st.cfg.disaster_enabled && st.cfg.disaster_fill;
-        let choropleth_fill = fill_on && (11..=13).contains(&st.z);
-        let choropleth_outline = fill_on && (11..=14).contains(&st.z);
+        let choropleth_fill = fill_on && (9..=13).contains(&st.z);
+        let choropleth_outline = fill_on && (9..=14).contains(&st.z);
         // 件数リングは塗りが件数を担っている間は出さない(中心の小さな塊は常に残すので、
         // B キーが何を指しているかは画面から分かる)。
         let disaster_rings = !choropleth_fill;
+        // 代表点マーカーは z11 以上だけ。市区町村あたり1点なので、z9 の braille では画面に
+        // 最大96個が撒かれて塗りの上のノイズになる(広域版 §3.3)。広域で読みたいのは面の模様。
+        // B キー(中心に最も近い地点の事例一覧)はマーカーが無くても従来どおり動く。
+        let disaster_markers = z >= 11;
+        // 塗りが出るときだけ z9 まで取りに行く。塗りOFFならマーカーの下限(z11)に据え置く
+        // (塗りを使わない人に広域セルの通信をさせない)。
+        let disaster_wanted = st.cfg.disaster_enabled && (z >= 11 || st.cfg.disaster_fill);
         let population_meshes =
             if st.cfg.population_enabled { st.population_layer.items(plot_view) } else { Vec::new() };
         // 表示する年次(設定)。configを手書きで壊されても必ず描ける索引へ落とす。
@@ -541,6 +550,7 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
             st.boundary_layer.generation().hash(&mut h);
             choropleth_fill.hash(&mut h);
             choropleth_outline.hash(&mut h);
+            disaster_markers.hash(&mut h); // 代表点マーカーの出し分け(z11未満では出さない)
             st.population_layer.generation().hash(&mut h);
             // 人口メッシュ: ON/OFF・年次・濃さを変えたら描き直す(セル表は動かないため generation
             // だけでは変化を拾えない)。
@@ -708,7 +718,7 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
                             }
                         }
                     }
-                    if st.cfg.disaster_enabled { // 過去災害(Bでその地点の事例一覧)
+                    if st.cfg.disaster_enabled && disaster_markers { // 過去災害(Bでその地点の事例一覧)
                         // 座標が市区町村の代表点で1点に何十件も重なるため、事例1件=1マーカーには
                         // しない。1座標=1マーカーにして、件数を外周リングの半径、最も多い種別を
                         // 色で表す。外周を細くするのは地図と他レイヤを覆い隠さないため
@@ -851,7 +861,10 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
                 count: disaster_sites.len(),
                 job_active: st.disaster_layer.job_active() || st.disaster_job.is_some() || st.boundary_layer.job_active(),
                 stale_age_secs: st.disaster_layer.stale_age_secs(plot_now),
-                wide_area: st.disaster_layer.suppressed(),
+                // 塗りOFF・z9〜z10 では enabled を落として取りに行かないので suppressed が
+                // 立たない。それだと「なぜ何も出ないのか」が画面から分からなくなるため、
+                // こちらの条件でも「広域では非表示」を出す(広域版 §3.1)。
+                wide_area: st.disaster_layer.suppressed() || (st.cfg.disaster_enabled && !disaster_wanted),
                 // 塗りが出ているときだけ「いまいる市区町村と、その町の記録件数」を出す
                 // (凡例を置く幅が無いので、代わりに読み手が知りたいことへ直接答える)。
                 area: choropleth_fill

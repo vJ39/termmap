@@ -462,4 +462,44 @@ mod tests {
         // 海の上はどの市区町村にも入らない。
         assert_eq!(area_summary(&site_refs, &area_refs, 35.0, 140.5), None, "海上で市区町村が引けている");
     }
+
+    // 広域ズーム(z9)の裏取り。実ネットワークを叩く手動確認用。
+    // 「広域なら地方でも見比べられる」(広域版 §0.7)という主張が実データで成り立つかを見る。
+    #[test]
+    #[ignore]
+    fn live_paint_a_wide_zoom_screen_at_z9() {
+        // 最も混む広域セル1309(緯度34.67〜37.33度・経度136〜140度)。東京も岐阜北部もこの中。
+        let cell = crate::mesh::shrink(crate::mesh::wide_bbox(1309));
+        let sites = crate::disaster::fetch_sites(cell.0, cell.1, cell.2, cell.3, disaster::DEFAULT_SINCE_YEAR)
+            .expect("live fetch should succeed");
+        println!("広域セル1309: 地点 {} 件", sites.len());
+        assert!(
+            !crate::disaster::truncation_seen(),
+            "2,000行の打ち切りに当たっている(市区町村がまるごと塗られなくなる)"
+        );
+        let mut areas: Vec<MuniArea> = Vec::new();
+        for i in crate::muni::relm_indices(cell) {
+            areas.extend(crate::muni::fetch_relm(i).expect("live fetch should succeed"));
+        }
+        let site_refs: Vec<&DisasterSite> = sites.iter().collect();
+        let area_refs: Vec<&MuniArea> = areas.iter().collect();
+
+        let (z, w, h) = (9u32, 320u32, 200u32);
+        // 都心: 画面のほとんどが塗られる。
+        let (cx, cy) = deg_to_pixel(35.681236, 139.767125, z);
+        let img = build_layer(&site_refs, &area_refs, cx, cy, z, w, h, shading()).expect("東京 z9 で1区域も塗れない");
+        let coverage = painted(&img) as f64 / (w * h) as f64;
+        println!("東京 z9 の塗られた画素 {}/{} ({:.1}%)", painted(&img), w * h, coverage * 100.0);
+        assert!(coverage > 0.5, "都心の z9 画面がほとんど塗られていない: {coverage:.3}");
+
+        // 地方(岐阜北部): z11 では画面が1区域=全画面1色になるが、z9 なら複数区域が
+        // 別の色/濃さで並ぶ。縁取りを消して、塗りの値だけで数える。
+        let (cx, cy) = deg_to_pixel(36.24, 137.25, z);
+        let fill_only = Shading { opacity: DEFAULT_OPACITY, fill: true, outline: false };
+        let img = build_layer(&site_refs, &area_refs, cx, cy, z, w, h, fill_only).expect("岐阜北部 z9 で1区域も塗れない");
+        let shades: std::collections::HashSet<[u8; 4]> =
+            img.pixels().filter(|p| p[3] > 0).map(|p| [p[0], p[1], p[2], p[3]]).collect();
+        println!("岐阜北部 z9 の塗り分け {} 種類: {shades:?}", shades.len());
+        assert!(shades.len() >= 2, "地方の z9 が1色に潰れている: {shades:?}");
+    }
 }

@@ -564,14 +564,14 @@ pub fn regulation() -> PlotLayer<regulation::ClosureEvent> {
 /// 複合キー単位。取得元が広いbboxの集計を1リクエストで返すので、他レイヤより粗い刻みにしてある
 /// (設計 §2.2)。z11以上でも最大4枚・典型1枚で済み、パンによる再取得も減る。
 pub fn disaster() -> PlotLayer<disaster::DisasterSite> {
-    PlotLayer::new(Layer::Disaster, 11, 0, disaster_cells, fetch_disaster_cell)
+    PlotLayer::new(Layer::Disaster, 9, 0, disaster_cells, fetch_disaster_cell)
 }
 
 /// 市区町村境界(気象庁 class20s)。過去災害の塗り(コロプレス)にだけ使うので、ズーム下限は
 /// 過去災害と揃える(片方だけ取れていて塗れない、という状態を作らない)。
-/// 領域は全国で10しかなく、視野に掛かるのは実測で1〜2枚。
+/// 領域は全国で10しかなく、視野に掛かるのは z11 で1〜2枚・z9 でも最大5枚(設計 §0.2)。
 pub fn boundary() -> PlotLayer<muni::MuniArea> {
-    PlotLayer::new(Layer::Boundary, 11, 0, boundary_cells, fetch_boundary_cell)
+    PlotLayer::new(Layer::Boundary, 9, 0, boundary_cells, fetch_boundary_cell)
 }
 
 /// 500mメッシュ別推計人口(国土数値情報)。都道府県単位・z11未満では取得しない。
@@ -1168,7 +1168,9 @@ mod tests {
         assert_eq!(roads().min_zoom, 14);
         assert_eq!(camera().min_zoom, 0);
         assert_eq!(regulation().min_zoom, 11);
-        assert_eq!(disaster().min_zoom, 11);
+        // 過去災害と境界だけは z9(コロプレスを広域で出すため。設計 §1-1/§2.5)。
+        // z8 は広域セルが20枚要り、かつ取得元の集計が2,000行で打ち切られるので下限にしない。
+        assert_eq!(disaster().min_zoom, 9);
         assert_eq!(traffic().layer.fresh_ttl().as_secs(), 300);
         assert_eq!(regulation().layer.fresh_ttl().as_secs(), 600);
         assert_eq!(disaster().layer.fresh_ttl().as_secs(), 30 * 24 * 3600, "過去災害は30日");
@@ -1176,6 +1178,7 @@ mod tests {
         assert_eq!(disaster().data_lag_secs, 0);
         // 市区町村境界は過去災害の塗りにだけ使うので、ズーム下限を過去災害と揃える。
         assert_eq!(boundary().min_zoom, disaster().min_zoom, "塗りだけ端が欠ける状態を作らない");
+        assert_eq!(boundary().min_zoom, 9);
         assert_eq!(boundary().layer.fresh_ttl().as_secs(), 180 * 24 * 3600, "境界は180日");
         assert_eq!(boundary().layer.stale_limit(), None, "古くても境界が誤りになることはない");
         assert_eq!(boundary().data_lag_secs, 0);

@@ -117,7 +117,10 @@ pub(crate) fn poll(st: &mut UiState, loader: &TileLoader, lat: f64, lon: f64, no
     got_result |= st.roads_layer.tick(st.cx, st.cy, st.z, st.cfg.traffic_enabled);
     got_result |= st.camera_layer.tick(st.cx, st.cy, st.z, st.cfg.camera_enabled);
     got_result |= st.regulation_layer.tick(st.cx, st.cy, st.z, st.cfg.regulation_enabled);
-    got_result |= st.disaster_layer.tick(st.cx, st.cy, st.z, st.cfg.disaster_enabled);
+    // 塗りが出るときだけ z9 まで取りに行く。塗りOFFならマーカーの下限(z11)に据え置く
+    // (塗りを使わない人に広域セルの通信をさせない。設計 広域版 §2.5)。
+    let disaster_wanted = st.cfg.disaster_enabled && (st.z >= 11 || st.cfg.disaster_fill);
+    got_result |= st.disaster_layer.tick(st.cx, st.cy, st.z, disaster_wanted);
     // 境界は塗りに使うときだけ取りに行く(塗りをOFFにしている人に通信させない)。
     got_result |= st.boundary_layer.tick(st.cx, st.cy, st.z, st.cfg.disaster_enabled && st.cfg.disaster_fill);
     got_result |= st.population_layer.tick(st.cx, st.cy, st.z, st.cfg.population_enabled);
