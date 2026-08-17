@@ -50,6 +50,8 @@ mod camera; // 道路ライブカメラ(road-info-prvs.mlit.go.jp)。Nキーで�
 mod disaster; // 過去災害の発生履歴(NIED 災害事例データベース)。Bキーで中心近くの地点の事例一覧を表示
 mod geopoly; // 多角形の純粋な幾何(even-odd の内外判定・外接矩形)
 mod muni; // 市区町村の境界(気象庁 class20s)。過去災害の塗り分けの下地
+mod geoarea; // 一次細分区域(気象庁 class10s)の境界データと点-in-領域判定。気象警報(#79)の下地
+mod warning; // 気象警報・注意報(気象庁防災情報API)(#79)
 mod choropleth; // 過去災害のコロプレス(市区町村を記録の多さで塗り分ける層の組み立て)
 mod mesh; // JIS X 0410 地域メッシュ(プロットデータのキャッシュ単位)
 mod population; // 500mメッシュ別推計人口(国土数値情報)。都道府県単位の静的ファイル
@@ -216,7 +218,7 @@ fn build_spec(a: &Args, center_lat: f64, center_lon: f64) -> OverlaySpec {
         let (rl, ro) = a.home.unwrap_or((center_lat, center_lon));
         rings.push(Ring { lat: rl, lon: ro, radii_km: a.range.clone(), color: [255, 90, 90], thickness: 2 });
     }
-    OverlaySpec { pois: Vec::new(), routes: Vec::new(), expressway_segments: Vec::new(), roads: Vec::new(), traffic_segments: Vec::new(), rings, spots: Vec::new() }
+    OverlaySpec { pois: Vec::new(), routes: Vec::new(), expressway_segments: Vec::new(), roads: Vec::new(), traffic_segments: Vec::new(), warning_segments: Vec::new(), rings, spots: Vec::new() }
 }
 // --route があれば BRouter で取得して spec に追加し、要約(距離/時間)を返す。--gpx 指定時は書き出し。
 fn attach_route(spec: &mut OverlaySpec, a: &Args) -> Result<Option<String>, String> {

@@ -37,7 +37,7 @@ pub(crate) const CHOICES: &[SettingChoice] = &[
 
 // 設定画面の項目行数(アコーディオン未展開時)。ui.rs のカーソル下移動の上限がこれを参照する。
 // settings_rows() が返す行数と必ず一致すること(下の回帰テスト settings_row_count_matches_rows で固定)。
-pub(crate) const SETTINGS_ROW_COUNT: usize = 33;
+pub(crate) const SETTINGS_ROW_COUNT: usize = 34;
 
 fn choice_for(idx: usize) -> Option<&'static SettingChoice> { CHOICES.iter().find(|c| c.idx == idx) }
 
@@ -170,6 +170,7 @@ pub(crate) fn setting_description(idx: usize) -> &'static str {
         31 => "人口の濃さ: 重ねる強さ。Enterで一覧を開いて選択(薄い=地図優先 / 標準 / 濃い=人口優先)。人口の少ない土地は元から薄く塗るので、濃くしても地図は残る",
         32 => "人口の年次: 表示する年。Enterで一覧を開いて選択。2020年は国勢調査に基づく実績、2025年以降は推計値。年を変えても取り直しは起きない(全年次をまとめて保存している)",
         28 => "渋滞状況の色分け: ルート確定後、Google Directionsで区間ごとの渋滞状況を追加確認し、混雑している区間だけルート線を黄(やや混雑)/赤(混雑)で上塗りする(順調な区間は基調色の青のまま)。道路網全体ではなく表示中のルートのみ。要Google APIキー。区間数に応じて1回のAdvanced課金対象リクエストを送る(無料枠超過分は1000件$8、個人利用なら通常は無料枠内)",
+        33 => "ルート沿い気象警報: ルート確定後、その先が通る気象庁の一次細分区域を判定し、警報・注意報が出ている区間だけルート線を特別警報(紫)/警報(赤)/注意報(黄)で上塗りする。表示中のルートのみ。ONにした人だけがルート確定のたびに気象庁へ問い合わせる",
         _ => "Google APIキー: 検索(Geocoding)とStreet View共通。Enterで入力欄を開く(Cmd+V貼付も可)。環境変数TERMMAP_GOOGLE_API_KEYでも可",
     }
 }
@@ -222,6 +223,7 @@ pub(crate) fn settings_rows(opts: &Args, cfg: &Config, picking: Option<usize>, o
         format!("人口メッシュ {}", onoff(cfg.population_enabled)),
         format!("{} 人口の濃さ {}", arrow(31), match cfg.population_opacity.as_str() { "light" => "薄い", "strong" => "濃い", _ => "標準" }),
         format!("{} 人口の年次 {}年", arrow(32), cfg.population_year),
+        format!("ルート沿い気象警報 {}", onoff(cfg.weather_warning_enabled)),
     ];
     debug_assert_eq!(its.len(), SETTINGS_ROW_COUNT, "SETTINGS_ROW_COUNT と行数がずれている");
     // アコーディオン展開: 選択中の項目がpickable(3択以上)ならその直下に候補をインデント挿入し、他行を押し下げる
@@ -445,10 +447,10 @@ mod tests {
 
     #[test]
     fn setting_description_covers_every_known_row_distinctly() {
-        // 0〜16,18〜32 は個別の説明文を持つ(idx=11/27は端末対応有無で文言が変わるが、いずれにせよ
+        // 0〜16,18〜33 は個別の説明文を持つ(idx=11/27は端末対応有無で文言が変わるが、いずれにせよ
         // 空でない。17=Google APIキーはフォールバック経由で別テストで確認するためここでは含めない)。
         let mut seen = Vec::new();
-        for idx in (0usize..=16).chain(18..=32) {
+        for idx in (0usize..=16).chain(18..=33) {
             let d = setting_description(idx);
             assert!(!d.is_empty(), "idx {idx} should have a description");
             if idx != 11 && idx != 27 { seen.push(d); } // 11/27は環境依存で文言が2通りあるため一意性判定から除外
@@ -527,6 +529,18 @@ mod tests {
         assert_eq!(its[24], "道路ライブカメラ OFF");
         assert_eq!(its[25], "通行規制 OFF");
         assert_eq!(its[26], "過去災害 ON");
+    }
+
+    #[test]
+    fn settings_rows_row33_shows_the_weather_warning_row_after_population_year() {
+        let mut cfg = Config::default();
+        cfg.weather_warning_enabled = true;
+        let (_, its, _) = settings_rows(&test_args(), &cfg, None, false, 33, 0);
+        assert_eq!(its.len(), SETTINGS_ROW_COUNT);
+        assert_eq!(its[33], "ルート沿い気象警報 ON");
+        // 既存項目(28〜32)の並びが動いていないことの回帰確認
+        assert!(its[28].starts_with("渋滞状況の色分け"));
+        assert!(its[32].contains("人口の年次"));
     }
 
     #[test]

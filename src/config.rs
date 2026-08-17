@@ -88,6 +88,7 @@ pub struct Config {
     pub population_opacity: String,   // 人口メッシュの重ね方: "light"(0.35)/"mid"(0.55)/"strong"(0.75)。既定mid(雨雲と同じ3択)
     pub population_year: u16,         // 表示する年次。2020〜2070の5年刻み。既定2025(2020は実績・以降は推計値)
     pub route_traffic_enabled: bool,  // ルート確定後、Google Directions(departure_time=now)で区間ごとの渋滞状況を追加確認しルート線を色分けするか。既定false(ONにした人だけがGoogle APIへ追加問い合わせする。要Google APIキー・Advanced課金対象)
+    pub weather_warning_enabled: bool, // ルート沿いの気象警報・注意報(気象庁防災情報API)を表示するか。既定false。ルート確定時だけ気象庁へ問い合わせる
 }
 
 impl Default for Config {
@@ -128,6 +129,7 @@ impl Default for Config {
             population_opacity: "mid".to_string(),
             population_year: DEFAULT_POPULATION_YEAR,
             route_traffic_enabled: false,
+            weather_warning_enabled: false,
         }
     }
 }
@@ -292,6 +294,7 @@ pub fn load_config_from(path: &Path) -> Config {
                 }
             }
             ("route_traffic", "enabled") => { if let Some(b) = parse_bool(value) { cfg.route_traffic_enabled = b; } }
+            ("weather_warning", "enabled") => { if let Some(b) = parse_bool(value) { cfg.weather_warning_enabled = b; } }
             // 旧スキーマ後方互換: [streetview] api_key を google_maps_api_key に取り込む(未設定時のみ)
             ("streetview", "api_key") => {
                 if cfg.google_maps_api_key.is_empty() {
@@ -377,6 +380,9 @@ pub fn save_config_to(path: &Path, c: &Config) -> Result<(), String> {
          year = {}\n\
          \n\
          [route_traffic]\n\
+         enabled = {}\n\
+         \n\
+         [weather_warning]\n\
          enabled = {}\n",
         c.llm_recommend_enabled,
         c.llm_model,
@@ -413,6 +419,7 @@ pub fn save_config_to(path: &Path, c: &Config) -> Result<(), String> {
         c.population_opacity,
         c.population_year,
         c.route_traffic_enabled,
+        c.weather_warning_enabled,
     );
 
     // APIキーを含むので unix では 0600。書込中クラッシュで壊さないよう atomic。
@@ -582,6 +589,7 @@ mod tests {
             population_opacity: "light".to_string(),
             population_year: 2050,
             route_traffic_enabled: true,
+            weather_warning_enabled: true,
         };
         save_config_to(&path, &original).expect("save should succeed");
         let loaded = load_config_from(&path);
@@ -730,6 +738,17 @@ show_spots = maybe
         let cfg = load_config_from(&path);
         assert!(cfg.route_traffic_enabled);
         assert!(!cfg.disaster_enabled);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn weather_warning_defaults_to_off_and_is_read_from_its_own_section() {
+        assert!(!Config::default().weather_warning_enabled);
+        let path = unique_temp_path("weather_warning_section");
+        std::fs::write(&path, "[weather_warning]\nenabled = true\n").unwrap();
+        let cfg = load_config_from(&path);
+        assert!(cfg.weather_warning_enabled);
+        assert!(!cfg.route_traffic_enabled);
         cleanup(&path);
     }
 
@@ -1024,6 +1043,7 @@ profile = "custom-profile"
             population_opacity: "mid".to_string(),
             population_year: DEFAULT_POPULATION_YEAR,
             route_traffic_enabled: false,
+            weather_warning_enabled: false,
         };
         save_config_to(&path, &cfg).unwrap();
         let loaded = load_config_from(&path);

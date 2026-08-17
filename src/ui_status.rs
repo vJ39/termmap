@@ -76,6 +76,11 @@ pub(crate) struct StatusCtx<'a> {
     pub regulation: PlotStatus,
     pub disaster: PlotStatus,
     pub population: PopulationStatus,
+    /// ルート沿い気象警報(#79)。件数と、最初の1件の表示名(例:"濃霧注意報")だけを持つ
+    /// (件数だけでは「何に注意すべきか」が分からず、他レイヤと違い名称そのものに価値があるため)。
+    pub weather_warning_count: usize,
+    pub weather_warning_top_name: Option<&'a str>,
+    pub weather_warning_job_active: bool,
     pub addr: &'a str,
     pub wps: &'a [(f64, f64)],
     pub z: u32,
@@ -181,6 +186,7 @@ pub(crate) fn build_status_line(c: StatusCtx) -> String {
         route_note, clear_route_confirm, jobs_active, spin, gps_live, web_gps_active, play,
         play_speed, radar_on, radar_tl, radar_idx, radar_follow, loader, rcx, rcy, rz, rw, rh,
         cfg, traffic, camera, regulation, disaster, population,
+        weather_warning_count, weather_warning_top_name, weather_warning_job_active,
         addr, wps, z, lat, lon, next_turn,
     } = c;
     match focus {
@@ -272,13 +278,28 @@ pub(crate) fn build_status_line(c: StatusCtx) -> String {
             let disaster_txt = plot_label(cfg.disaster_enabled, "🌊", "地点", "(B)", "記録無し", &disaster);
             // 500mメッシュ人口: 件数ではなく中心のメッシュの人口密度(人/km²)を出す。
             let population_txt = population_label(cfg.population_enabled, &population);
+            // ルート沿い気象警報(#79): ルート未確定なら何も出さない(判定対象が無いため)。
+            // 件数でなく最初の1件の名称を出す(「何に注意すべきか」が本文)。
+            let weather_warning_txt = if !cfg.weather_warning_enabled || wps.is_empty() {
+                String::new()
+            } else if weather_warning_job_active && weather_warning_count == 0 {
+                "🌂取得中… ".to_string()
+            } else if weather_warning_count == 0 {
+                "🌂警報無し ".to_string()
+            } else {
+                match weather_warning_top_name {
+                    Some(name) if weather_warning_count > 1 => format!("🌂{name}ほか{weather_warning_count}件 "),
+                    Some(name) => format!("🌂{name} "),
+                    None => format!("🌂{weather_warning_count}件 "),
+                }
+            };
             // 一時メッセージが無い時は底面にロゴを常時表示。メッセージ発生時はそちらを優先。
             let msg = if addr.is_empty() { "◉╌╌╌► termmap · terminal touring map   ".to_string() } else { format!("» {addr} « ") };
             // 下部バーは細く。全操作は Space メニューから選べる
             let route_hint = if wps.is_empty() { "v=地点を置く".to_string() } else { format!("{}点 v足す w/s選択(操作行までEnterで実行) Tab=左の一覧へ(並替/操作)", wps.len()) };
             // 次の曲がり角(音声案内と同じデータソース。ONでルート走行中のみ出る)。
             let turn_txt = next_turn.as_deref().unwrap_or("");
-            let base = format!(" {spinner}{msg}{live}{playing}{radar_txt}{traffic_txt}{camera_txt}{regulation_txt}{disaster_txt}{population_txt}{turn_txt}z{z} {lat:.4},{lon:.4} ｜ {route_hint} ｜ Space:メニュー ?ヘルプ q終了");
+            let base = format!(" {spinner}{msg}{live}{playing}{radar_txt}{traffic_txt}{camera_txt}{regulation_txt}{disaster_txt}{population_txt}{weather_warning_txt}{turn_txt}z{z} {lat:.4},{lon:.4} ｜ {route_hint} ｜ Space:メニュー ?ヘルプ q終了");
             match route_note { Some(rn) => format!("{base} | {rn} "), None => base }
         }
     }
@@ -326,6 +347,9 @@ mod tests {
         regulation: PlotStatus,
         disaster: PlotStatus,
         population: PopulationStatus,
+        weather_warning_count: usize,
+        weather_warning_top_name: Option<String>,
+        weather_warning_job_active: bool,
         addr: String,
         wps: Vec<(f64, f64)>,
         z: u32,
@@ -345,6 +369,7 @@ mod tests {
                 cfg: Config::default(),
                 traffic: idle_plot(), camera: idle_plot(), regulation: idle_plot(), disaster: idle_plot(),
                 population: idle_population(),
+                weather_warning_count: 0, weather_warning_top_name: None, weather_warning_job_active: false,
                 addr: String::new(), wps: Vec::new(), z: 14, lat: 35.0, lon: 139.0, next_turn: None,
             }
         }
@@ -371,6 +396,9 @@ mod tests {
                     wide_area: self.population.wide_area,
                     density: self.population.density,
                 },
+                weather_warning_count: self.weather_warning_count,
+                weather_warning_top_name: self.weather_warning_top_name.as_deref(),
+                weather_warning_job_active: self.weather_warning_job_active,
                 addr: &self.addr, wps: &self.wps, z: self.z, lat: self.lat, lon: self.lon,
                 next_turn: &self.next_turn,
             })
@@ -584,6 +612,30 @@ mod tests {
         assert!(f.line().contains("⚠1件 "));
         f.regulation.job_active = true; // 取得済みなら取得中でも件数を優先する
         assert!(f.line().contains("⚠1件 "));
+    }
+
+    #[test]
+    fn weather_warning_label_hidden_when_off_or_route_unconfirmed() {
+        let mut f = Fixture::new(Focus::Map);
+        assert!(!f.line().contains('🌂'), "OFFのときは出さない");
+        f.cfg.weather_warning_enabled = true;
+        assert!(!f.line().contains('🌂'), "ONでもルート未確定なら出さない(判定対象が無い)");
+    }
+
+    #[test]
+    fn weather_warning_label_shows_loading_then_none_then_top_name() {
+        let mut f = Fixture::new(Focus::Map);
+        f.cfg.weather_warning_enabled = true;
+        f.wps = vec![(35.0, 139.0), (35.1, 139.1)]; // ルート確定済み扱い
+        f.weather_warning_job_active = true;
+        assert!(f.line().contains("🌂取得中… "));
+        f.weather_warning_job_active = false;
+        assert!(f.line().contains("🌂警報無し "));
+        f.weather_warning_count = 1;
+        f.weather_warning_top_name = Some("濃霧注意報".to_string());
+        assert!(f.line().contains("🌂濃霧注意報 "));
+        f.weather_warning_count = 3;
+        assert!(f.line().contains("🌂濃霧注意報ほか3件 "));
     }
 
     #[test]

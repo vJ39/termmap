@@ -187,9 +187,12 @@ pub struct Ring { pub lat: f64, pub lon: f64, pub radii_km: Vec<f64>, pub color:
 // 独立フィールドにしている。
 // expressway_segments は高速道路を通る区間(#高速区間)用の別レイヤ。routes[0]と同じ経路のうち
 // 高速の部分だけを緑で上塗りする。traffic_segments と同じ理由で独立フィールドにしている。
-pub struct OverlaySpec { pub pois: Vec<Poi>, pub routes: Vec<Route>, pub expressway_segments: Vec<Route>, pub roads: Vec<Route>, pub traffic_segments: Vec<Route>, pub rings: Vec<Ring>, pub spots: Vec<(f64, f64, [u8; 3], u8)> }
+// warning_segments は気象警報(#79・ルートベース)用の別レイヤ。ルートのうち、警報が
+// 有効なclass10s領域を通る区間だけをseverityの色で上塗りする。他の*_segmentsと同じ理由で
+// 独立フィールドにしている。
+pub struct OverlaySpec { pub pois: Vec<Poi>, pub routes: Vec<Route>, pub expressway_segments: Vec<Route>, pub roads: Vec<Route>, pub traffic_segments: Vec<Route>, pub warning_segments: Vec<Route>, pub rings: Vec<Ring>, pub spots: Vec<(f64, f64, [u8; 3], u8)> }
 impl OverlaySpec {
-    pub fn is_empty(&self) -> bool { self.pois.is_empty() && self.routes.is_empty() && self.expressway_segments.is_empty() && self.roads.is_empty() && self.traffic_segments.is_empty() && self.rings.is_empty() && self.spots.is_empty() }
+    pub fn is_empty(&self) -> bool { self.pois.is_empty() && self.routes.is_empty() && self.expressway_segments.is_empty() && self.roads.is_empty() && self.traffic_segments.is_empty() && self.warning_segments.is_empty() && self.rings.is_empty() && self.spots.is_empty() }
 }
 
 // インクマスク層。描画は最終出力寸法(resize後)で構築する。
@@ -301,6 +304,10 @@ pub fn build_overlay(spec: &OverlaySpec, cx: f64, cy: f64, z: u32, win_w: u32, w
     for tr in &spec.traffic_segments { // 渋滞状況の色分け(BRouterルートと同じ経路を上塗り)
         let pts: Vec<(i32, i32)> = tr.pts.iter().map(|&(la, lo)| to_img(la, lo)).collect();
         draw_polyline(&mut ov, &pts, tr.color, tr.thickness);
+    }
+    for wr in &spec.warning_segments { // 気象警報(#79・最前面。ルート上の全上塗りより優先して目立たせる)
+        let pts: Vec<(i32, i32)> = wr.pts.iter().map(|&(la, lo)| to_img(la, lo)).collect();
+        draw_polyline(&mut ov, &pts, wr.color, wr.thickness);
     }
     for p in &spec.pois { // マーカー(最前面)
         let (ix, iy) = to_img(p.lat, p.lon);
@@ -869,13 +876,18 @@ mod tests {
         let red = [220, 40, 40];
 
         let mut spec = OverlaySpec { pois: Vec::new(), routes: vec![route(cyan)], expressway_segments: vec![route(green)],
-                                     roads: Vec::new(), traffic_segments: Vec::new(), rings: Vec::new(), spots: Vec::new() };
+                                     roads: Vec::new(), traffic_segments: Vec::new(), warning_segments: Vec::new(), rings: Vec::new(), spots: Vec::new() };
         let ov = build_overlay(&spec, cx, cy, z, 8, 8, 1.0, 1.0, 8, 8, &[]);
         assert_eq!(ov.get(4, 4), Some(green), "高速区間はルート本体(シアン)を上塗りする");
 
         spec.traffic_segments = vec![route(red)];
         let ov2 = build_overlay(&spec, cx, cy, z, 8, 8, 1.0, 1.0, 8, 8, &[]);
         assert_eq!(ov2.get(4, 4), Some(red), "渋滞の色分けは高速区間より前面に出る");
+
+        let purple = [230, 30, 200];
+        spec.warning_segments = vec![route(purple)];
+        let ov3 = build_overlay(&spec, cx, cy, z, 8, 8, 1.0, 1.0, 8, 8, &[]);
+        assert_eq!(ov3.get(4, 4), Some(purple), "気象警報(#79)は渋滞の色分けより最前面に出る");
     }
 
     // build_overlay に雨雲を渡すと最背面に入る = 経路/マーカーは必ず雨雲より前面に残る。
@@ -884,7 +896,7 @@ mod tests {
         let (lat, lon, z) = (35.0, 139.0, 10u32);
         let (cx, cy) = deg_to_pixel(lat, lon, z);
         let spec = OverlaySpec { pois: Vec::new(), routes: Vec::new(), expressway_segments: Vec::new(), roads: Vec::new(),
-                                 traffic_segments: Vec::new(), rings: Vec::new(), spots: vec![(lat, lon, [1, 2, 3], 0)] };
+                                 traffic_segments: Vec::new(), warning_segments: Vec::new(), rings: Vec::new(), spots: vec![(lat, lon, [1, 2, 3], 0)] };
         let layer = RgbaImage::from_pixel(8, 8, image::Rgba([200, 0, 0, 255]));
         let ink = InkLayer::Dither { layer: &layer, density: 1.0 };
         let ov = build_overlay(&spec, cx, cy, z, 8, 8, 1.0, 1.0, 8, 8, &[ink]);
@@ -904,7 +916,7 @@ mod tests {
         let (lat, lon, z) = (35.0, 139.0, 10u32);
         let (cx, cy) = deg_to_pixel(lat, lon, z);
         let spec = OverlaySpec { pois: Vec::new(), routes: Vec::new(), expressway_segments: Vec::new(), roads: Vec::new(), traffic_segments: Vec::new(),
-                                 rings: Vec::new(), spots: Vec::new() };
+                                 warning_segments: Vec::new(), rings: Vec::new(), spots: Vec::new() };
         let back = RgbaImage::from_pixel(8, 8, image::Rgba([10, 20, 30, 255]));  // コロプレス
         let front = RgbaImage::from_pixel(8, 8, image::Rgba([200, 0, 0, 255]));  // 雨雲
         let ov = build_overlay(&spec, cx, cy, z, 8, 8, 1.0, 1.0, 8, 8, &[
@@ -1693,7 +1705,7 @@ mod tests {
         let (lat, lon, z) = (35.0, 139.0, 10u32);
         let (cx, cy) = deg_to_pixel(lat, lon, z);
         let spec = OverlaySpec { pois: Vec::new(), routes: Vec::new(), expressway_segments: Vec::new(), roads: Vec::new(), traffic_segments: Vec::new(),
-                                 rings: Vec::new(), spots: Vec::new() };
+                                 warning_segments: Vec::new(), rings: Vec::new(), spots: Vec::new() };
         let pop = RgbaImage::from_pixel(8, 8, image::Rgba([100, 20, 110, 255]));
         let rain = RgbaImage::from_pixel(8, 8, image::Rgba([0, 65, 255, 255]));
         let ov = build_overlay(&spec, cx, cy, z, 8, 8, 1.0, 1.0, 8, 8,

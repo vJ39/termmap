@@ -69,6 +69,74 @@ pub(crate) fn maybe_speak_turn(cfg: &config::Config, spec: &render::OverlaySpec,
     }
 }
 
+// 気象警報(#79・ルートベース)。ルートのポリラインを2km間隔でサンプリングし、通過する
+// class10s領域(geoarea.rs)の気象台コードを重複無しで列挙する。2kmはclass10s領域が概ね
+// 数十km規模のため、粒度を上げても得られる精度は限定的という判断(粗くても良い)。
+pub(crate) fn route_warning_office_codes(pts: &[(f64, f64)]) -> Vec<String> {
+    let sampled = roadtrace::sample_every(pts, 2000.0);
+    let mut codes: Vec<String> = Vec::new();
+    for &p in &sampled {
+        if let Some(region) = geoarea::region_at(p) {
+            if !codes.iter().any(|c| c == &region.office_code) {
+                codes.push(region.office_code.clone());
+            }
+        }
+    }
+    codes
+}
+
+// ルートのポリラインを、警報の有無/severityで塗り分けたRoute群へ変換する。警報が無い
+// 区間はRouteを作らない(既存のroutes/traffic_segments等の下地色がそのまま見える)。
+// 連続する点が同じ判定(同じseverityの色、または「警報なし」)である間は1本のRouteへまとめる。
+pub(crate) fn build_warning_segments(pts: &[(f64, f64)], warnings: &[warning::ActiveWarning]) -> Vec<render::Route> {
+    let color_at = |p: (f64, f64)| -> Option<[u8; 3]> {
+        let region = geoarea::region_at(p)?;
+        warnings
+            .iter()
+            .filter(|w| w.area_code == region.code)
+            .map(|w| w.severity)
+            .max_by_key(severity_rank)
+            .map(|s| s.color())
+    };
+    if pts.len() < 2 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut cur: Vec<(f64, f64)> = vec![pts[0]];
+    let mut cur_color = color_at(pts[0]);
+    for &p in &pts[1..] {
+        let color = color_at(p);
+        if color == cur_color {
+            cur.push(p);
+        } else {
+            if let Some(c) = cur_color {
+                if cur.len() >= 2 {
+                    out.push(render::Route { pts: cur, color: c, thickness: 3 });
+                }
+            }
+            cur = vec![p];
+            cur_color = color;
+        }
+    }
+    if let Some(c) = cur_color {
+        if cur.len() >= 2 {
+            out.push(render::Route { pts: cur, color: c, thickness: 3 });
+        }
+    }
+    out
+}
+
+// severityの深刻度を大小比較できる数値へ(max_by_keyで最も深刻なものを選ぶため)。
+// 特別警報 > 警報 > 注意報 > その他、の順。
+fn severity_rank(s: &warning::Severity) -> u8 {
+    match s {
+        warning::Severity::Special => 3,
+        warning::Severity::Warning => 2,
+        warning::Severity::Advisory => 1,
+        warning::Severity::Other => 0,
+    }
+}
+
 // 位置/ルート(last.txt)と直接キーで変えたcfg項目をまとめて保存。終了時とアイドル時の両方から呼ぶ。
 pub(crate) fn persist_full_state(cx: f64, cy: f64, z: u32, opts: &Args, wps: &[(f64, f64)], mode: &str, cfg: &mut config::Config, radar_on: bool, show_spots: bool) {
     let (lat, lon) = pixel_to_deg(cx, cy, z);
@@ -220,6 +288,71 @@ mod tests {
         let pos = closure_icon_position(&[(35.0, 139.0), (35.02, 139.0)]).unwrap();
         assert!((pos.0 - 35.01).abs() < 1e-3, "{pos:?}");
         assert!((pos.1 - 139.0).abs() < 1e-6, "{pos:?}");
+    }
+
+    // 新宿駅付近(東京地方=130010・気象台コード130000)を通る短い直線ルート。geoarea.rsの
+    // 実データ(assets/jma-class10s.json)を使うテストなので、座標は実在の地点にしている。
+    fn tokyo_route() -> Vec<(f64, f64)> {
+        vec![(35.6896, 139.7006), (35.69, 139.701), (35.6905, 139.7015)]
+    }
+
+    #[test]
+    fn route_warning_office_codes_resolves_tokyo() {
+        let codes = route_warning_office_codes(&tokyo_route());
+        assert_eq!(codes, vec!["130000".to_string()]);
+    }
+
+    #[test]
+    fn route_warning_office_codes_empty_route_is_empty() {
+        assert!(route_warning_office_codes(&[]).is_empty());
+    }
+
+    #[test]
+    fn build_warning_segments_colors_the_route_when_area_has_an_active_warning() {
+        let pts = tokyo_route();
+        let warnings = vec![warning::ActiveWarning {
+            area_code: "130010".to_string(),
+            name: "濃霧注意報".to_string(),
+            severity: warning::Severity::Advisory,
+        }];
+        let segs = build_warning_segments(&pts, &warnings);
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].color, warning::Severity::Advisory.color());
+        assert_eq!(segs[0].pts, pts);
+    }
+
+    #[test]
+    fn build_warning_segments_empty_when_no_warning_matches_the_area() {
+        let pts = tokyo_route();
+        let warnings = vec![warning::ActiveWarning {
+            area_code: "999999".to_string(), // どこにも該当しないコード
+            name: "大雨警報".to_string(),
+            severity: warning::Severity::Warning,
+        }];
+        assert!(build_warning_segments(&pts, &warnings).is_empty());
+    }
+
+    #[test]
+    fn build_warning_segments_empty_when_no_warnings_at_all() {
+        assert!(build_warning_segments(&tokyo_route(), &[]).is_empty());
+    }
+
+    #[test]
+    fn build_warning_segments_picks_the_most_severe_when_multiple_warnings_overlap() {
+        let pts = tokyo_route();
+        let warnings = vec![
+            warning::ActiveWarning { area_code: "130010".to_string(), name: "大雨注意報".to_string(), severity: warning::Severity::Advisory },
+            warning::ActiveWarning { area_code: "130010".to_string(), name: "大雨特別警報".to_string(), severity: warning::Severity::Special },
+        ];
+        let segs = build_warning_segments(&pts, &warnings);
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].color, warning::Severity::Special.color());
+    }
+
+    #[test]
+    fn build_warning_segments_handles_short_routes_without_panicking() {
+        assert!(build_warning_segments(&[], &[]).is_empty());
+        assert!(build_warning_segments(&[(35.0, 139.0)], &[]).is_empty());
     }
 
     fn ev(id: &str) -> ClosureEvent {

@@ -131,6 +131,9 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     let mut turn_points: Vec<route::TurnPoint> = Vec::new();
     let mut turn_job: Option<route::TurnRx> = None;
     let mut voice_guide: Option<voice::VoiceGuide> = None;
+    // 気象警報(#79・ルートベース)。turn_jobと同じ「ルート確定時」フックで作り直す。
+    let mut route_warnings: Vec<warning::ActiveWarning> = Vec::new();
+    let mut route_warning_job: Option<std::sync::mpsc::Receiver<Vec<warning::ActiveWarning>>> = None;
     // 地図に重ねる7種のプロットデータ。取得単位(メッシュ/整備局/都道府県)・TTL・ズーム下限・
     // ディスク永続化はすべて plotlayer/plotcache 側が持つ。ここは毎フレーム tick して結果を読むだけ。
     // 道路交通量は cfg.traffic_enabled、カメラは camera_enabled、規制は regulation_enabled、
@@ -881,7 +884,8 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             spec.expressway_segments.len().hash(&mut h);
             spec.roads.len().hash(&mut h);
             spec.traffic_segments.len().hash(&mut h);
-            for rt in spec.routes.iter().chain(spec.expressway_segments.iter()).chain(spec.roads.iter()).chain(spec.traffic_segments.iter()) {
+            spec.warning_segments.len().hash(&mut h);
+            for rt in spec.routes.iter().chain(spec.expressway_segments.iter()).chain(spec.roads.iter()).chain(spec.traffic_segments.iter()).chain(spec.warning_segments.iter()) {
                 rt.color.hash(&mut h); rt.thickness.hash(&mut h);
                 for &(a2, b2) in &rt.pts { a2.to_bits().hash(&mut h); b2.to_bits().hash(&mut h); }
             }
@@ -1238,6 +1242,9 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     .then(|| choropleth::area_summary(&disaster_sites, &muni_areas, lat, lon))
                     .flatten(),
             },
+            weather_warning_count: route_warnings.len(),
+            weather_warning_top_name: route_warnings.first().map(|w| w.name.as_str()),
+            weather_warning_job_active: route_warning_job.is_some(),
             addr: &addr, wps: &wps, z, lat, lon, next_turn: &next_turn,
         });
         let status = fit_cells_scroll(&status, cols as usize, spin);
@@ -1293,6 +1300,8 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     spec.routes.clear();
                     spec.traffic_segments.clear(); // 古いルートの色分けを引き継がない
                     spec.expressway_segments.clear(); // 古いルートの高速区間も同様
+                    spec.warning_segments.clear(); // 古いルートの気象警報も同様
+                    route_warnings.clear(); route_warning_job = None; // 新ルート確定でturn_jobを待ち直すため一旦クリア
                     route_note = Some(route_summary(&mode, &r));
                     // 通行止め回避が件数上限で一部反映できなかった場合、黙って進めると
                     // 「回避できた」と誤解されるのでひとこと添える。
@@ -1332,9 +1341,42 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         }
         if turn_job.is_some() {
             match turn_job.as_ref().unwrap().try_recv() {
-                Ok(v) => { turn_points = v; voice_guide = Some(voice::VoiceGuide::new(&turn_points)); turn_job = None; }
+                Ok(v) => {
+                    turn_points = v; voice_guide = Some(voice::VoiceGuide::new(&turn_points)); turn_job = None;
+                    // 気象警報(#79・ルートベース)。voice_guide作り直しと同じ「ルート確定時」フックで
+                    // ルート沿いの気象台コードを列挙し、まとめて背景取得する。
+                    if cfg.weather_warning_enabled {
+                        if let Some(pts) = spec.routes.last().map(|rt| rt.pts.clone()) {
+                            let office_codes = ui_helpers::route_warning_office_codes(&pts);
+                            if !office_codes.is_empty() {
+                                let (tx, rx) = std::sync::mpsc::channel();
+                                std::thread::spawn(move || {
+                                    let mut all = Vec::new();
+                                    for code in office_codes {
+                                        if let Ok(ws) = warning::fetch_warnings(&code) { all.extend(ws); }
+                                    }
+                                    let _ = tx.send(all);
+                                });
+                                route_warning_job = Some(rx);
+                            }
+                        }
+                    }
+                }
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => { turn_job = None; }
+            }
+        }
+        if let Some(job) = &route_warning_job {
+            match job.try_recv() {
+                Ok(ws) => {
+                    route_warnings = ws;
+                    if let Some(pts) = spec.routes.last().map(|rt| rt.pts.clone()) {
+                        spec.warning_segments = ui_helpers::build_warning_segments(&pts, &route_warnings);
+                    }
+                    route_warning_job = None;
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => { route_warning_job = None; }
             }
         }
         // プロットデータ4種の取得。各レイヤが「視野を覆うセルのうち、fresh なものが手元に
@@ -1590,7 +1632,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             || traffic_layer.job_active() || roads_layer.job_active()
             || camera_layer.job_active() || regulation_layer.job_active() || disaster_layer.job_active()
             || boundary_layer.job_active() || population_layer.job_active()
-            || disaster_job.is_some() || voice_preview_job.is_some() || regulation_detail_job.is_some() || traffic_color_job.is_some() || cause_job.is_some();
+            || disaster_job.is_some() || voice_preview_job.is_some() || regulation_detail_job.is_some() || traffic_color_job.is_some() || cause_job.is_some() || route_warning_job.is_some();
         let mut ev: Option<Event> = if got_result {
             None
         } else if polling {
@@ -1908,6 +1950,12 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                     }
                                     29 => { disaster_fill_toggle!(); } // 過去災害の塗り: Fキー・Spaceメニューと共通処理
                                     30 => { population_toggle!(); } // 人口メッシュ: Uキー・Spaceメニューと共通処理
+                                    33 => { // ルート沿い気象警報: 次にルートが確定したタイミングで初めて問い合わせる
+                                        cfg.weather_warning_enabled = !cfg.weather_warning_enabled;
+                                        if cfg.weather_warning_enabled && spec.routes.is_empty() {
+                                            addr = "ルート沿い気象警報: ルート未確定".into();
+                                        }
+                                    }
                                     _ => {}
                                 }
                             }
