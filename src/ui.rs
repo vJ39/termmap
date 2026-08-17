@@ -454,7 +454,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 // 端末全体のセル矩形へそのまま強制フィットすると、iPhone 縦持ちのような縦長端末
                 // では縦に約2.6倍伸びる(設計書 §4.1)。写真の縦横比を保ったまま黒帯付きの1枚へ
                 // 合成してから出す(設計書 §7.6)。実画像モードもAAフォールバックも同じ考え方。
-                let shown = cellratio::letterbox_photo(img, cols.max(10), map_rows, cell_ratio);
+                let shown = cellratio::crop_photo(img, cols.max(10), map_rows, cell_ratio);
                 if cfg.image_mode && image_capable() {
                     // 実画像モード: 実写を全幅×map_rows のインライン画像で表示
                     let _ = write!(out, "\x1b[H");
@@ -550,7 +550,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 let (img, cam) = cam_view.as_ref().unwrap();
                 // 実写と同じく、写真の縦横比を保ったまま黒帯付きの1枚へ合成してから出す
                 // (設計書 §7.6)。カメラ画像は提供元により縦横比が違うので 4:3 決め打ちにしない。
-                let shown = cellratio::letterbox_photo(img, cols.max(10), map_rows, cell_ratio);
+                let shown = cellratio::crop_photo(img, cols.max(10), map_rows, cell_ratio);
                 if cfg.image_mode && image_capable() {
                     let _ = write!(out, "\x1b[H");
                     let _ = emit_iterm2_image(&mut out, &shown, cols, map_rows);
