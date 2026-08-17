@@ -52,6 +52,7 @@ mod geopoly; // 多角形の純粋な幾何(even-odd の内外判定・外接矩
 mod muni; // 市区町村の境界(気象庁 class20s)。過去災害の塗り分けの下地
 mod choropleth; // 過去災害のコロプレス(市区町村を記録の多さで塗り分ける層の組み立て)
 mod mesh; // JIS X 0410 地域メッシュ(プロットデータのキャッシュ単位)
+mod population; // 500mメッシュ別推計人口(国土数値情報)。都道府県単位の静的ファイル
 mod plotcache; // プロットデータのディスク層(TTL付き・種別ごとに1キー1ファイル)
 mod plotlayer; // 上の2つを束ねた6レイヤ共通の取得段取り
 
@@ -227,24 +228,25 @@ fn attach_route(spec: &mut OverlaySpec, a: &Args) -> Result<Option<String>, Stri
     Ok(Some(summary))
 }
 
-// layers は地図の上へ半透明合成するレイヤ群 (層, 不透明度) で、**配列の順序がそのまま重ね順**
-// (先頭が最背面)。呼び出し側は [コロプレス, 雨雲] を渡す(雨は今の話・災害履歴は土地の話なので、
-// 今の情報が上に来る)。braille/edge では使わない(呼び出し側が OverlayLayer へインクとして
-// 焼いている)。classify では recolor() の「後」に合成する: 先に混ぜると classify() が
-// 淡い青の降水を Cat::Water(湖)と誤判定して雨が湖に化ける。
-fn render(img: &RgbImage, a: &Args, ov: Option<&OverlayLayer>, layers: &[(&RgbaImage, f64)]) -> String {
+// blends は地図の上へアルファ合成する半透明レイヤ群 (層, 濃さ) で、**配列の順序がそのまま
+// 重ね順**(先頭が最背面)。呼び出し側は [コロプレス, 人口, 雨雲] を渡す(雨は今の話・災害履歴と
+// 人口は土地の話なので、今の情報が上に来る)。
+// braille/edge はドットしか無くアルファ合成では読めないので使わない(呼び出し側が OverlayLayer
+// へインクとして焼いてから ov に入れて渡す)。classify では recolor() の「後」に合成する:
+// 先に混ぜると classify() が淡い青の降水を Cat::Water(湖)と誤判定して雨が湖に化ける。
+fn render(img: &RgbImage, a: &Args, ov: Option<&OverlayLayer>, blends: &[(&RgbaImage, f64)]) -> String {
     let th = a.threshold.unwrap_or(if a.edge { 45 } else { 195 });
     let truecolor = truecolor_safe();
     if a.edge { render_braille(img, a.mono, false, th, true, ov, truecolor) }
     else if a.braille { render_braille(img, a.mono, a.classify, th, false, ov, truecolor) }
     else if a.classify {
         let mut rc = recolor(img);
-        for &(l, op) in layers { blend_rgba_over(&mut rc, l, op); }
+        for &(l, op) in blends { blend_rgba_over(&mut rc, l, op); }
         if let Some(o) = ov { composite(&mut rc, o); }
         render_halfblock(&rc, truecolor)
-    } else if ov.is_some() || !layers.is_empty() {
+    } else if ov.is_some() || !blends.is_empty() {
         let mut c = img.clone();
-        for &(l, op) in layers { blend_rgba_over(&mut c, l, op); }
+        for &(l, op) in blends { blend_rgba_over(&mut c, l, op); }
         if let Some(o) = ov { composite(&mut c, o); }
         render_halfblock(&c, truecolor)
     } else {
@@ -463,7 +465,7 @@ fn oneshot(src: RgbImage, a: &Args, ctx: Option<(f64, f64, u32, &OverlaySpec)>) 
         if spec.is_empty() { None }
         else { Some(build_overlay(spec, cx, cy, z, sw, sh, out_w as f64 / sw as f64, out_h as f64 / sh as f64, out_w, out_h, &[])) }
     });
-    // CLI一発描画は雨雲レーダー/過去災害の塗り 非対応(対話モード限定・設計 §5.4)。
+    // CLI一発描画は雨雲レーダー/過去災害の塗り/人口メッシュ 非対応(いずれも対話モード限定・設計 §5.4)。
     print!("{}", render(&resized, a, ov.as_ref(), &[]).replace("\r\n", "\n"));
 }
 
@@ -673,6 +675,34 @@ mod tests {
         for a in [args_for(true, false, false), args_for(false, false, true)] {
             assert_eq!(render(&img, &a, None, &[(&rain, 1.0)]), render(&img, &a, None, &[]));
         }
+    }
+
+    // 複数の半透明レイヤは渡した順に重なる(人口メッシュ → 雨雲)。人口は数年変わらない下地、
+    // 雨雲は現況なので、人口を最背面に置く(設計 §7.1)。
+    #[test]
+    fn render_halfblock_stacks_blends_in_order() {
+        let img = RgbImage::from_pixel(4, 4, image::Rgb([200, 200, 200]));
+        let pop = RgbaImage::from_pixel(4, 4, image::Rgba([96, 20, 110, 230]));
+        let rain = RgbaImage::from_pixel(4, 4, image::Rgba([0, 65, 255, 255]));
+        let got = render(&img, &args_for(false, false, false), None, &[(&pop, 0.55), (&rain, 0.55)]);
+
+        let mut want = img.clone();
+        blend_rgba_over(&mut want, &pop, 0.55);
+        blend_rgba_over(&mut want, &rain, 0.55);
+        assert_eq!(got, render_halfblock(&want, truecolor_safe()));
+
+        // 順序が逆だと結果が変わる(=順序が意味を持っている)。
+        let flipped = render(&img, &args_for(false, false, false), None, &[(&rain, 0.55), (&pop, 0.55)]);
+        assert_ne!(got, flipped);
+    }
+
+    // 人口メッシュだけを重ねる場合も halfblock/classify の経路は同じ。
+    #[test]
+    fn render_blends_the_population_layer_on_its_own() {
+        let img = RgbImage::from_pixel(4, 4, image::Rgb([245, 245, 245]));
+        let pop = RgbaImage::from_pixel(4, 4, image::Rgba([96, 20, 110, 230]));
+        let got = render(&img, &args_for(false, false, false), None, &[(&pop, 0.55)]);
+        assert_ne!(got, render(&img, &args_for(false, false, false), None, &[]));
     }
 
     #[test]

@@ -28,6 +28,13 @@
 
 use std::path::{Path, PathBuf};
 
+/// 人口メッシュの既定年次。2020年は令和2年国勢調査に基づく実績、2025年以降は推計値。
+/// 「いまどこに人がいるか」を見たい用途なので、実績ではなく直近の推計を既定にする。
+pub const DEFAULT_POPULATION_YEAR: u16 = 2025;
+/// 選べる年次(population.rs の YEARS と同じ並び)。config を手書きで壊されたときの検査に使う。
+pub const POPULATION_YEARS: [u16; 11] =
+    [2020, 2025, 2030, 2035, 2040, 2045, 2050, 2055, 2060, 2065, 2070];
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub llm_recommend_enabled: bool,
@@ -61,6 +68,9 @@ pub struct Config {
     pub regulation_enabled: bool,     // 通行規制(通行止め・車線規制等、road-info-prvs.mlit.go.jp)を地図に重ねるか。既定false(ONにした人だけが外部サービスへ問い合わせる)
     pub disaster_enabled: bool,       // 過去災害の発生履歴(NIED 災害事例データベース)を地図に重ねるか。既定false(ONにした人だけが外部サービスへ問い合わせる)
     pub disaster_fill: bool,          // 過去災害を市区町村の塗り(コロプレス)で出すか。既定true。OFFなら従来の代表点マーカーだけになる。disaster_enabled がOFFならこの値に関わらず何も出ない
+    pub population_enabled: bool,     // 500mメッシュ別推計人口(国土数値情報)を地図に重ねるか。既定false(1都道府県が最大31MBあるので、ONにした人だけが取得する)
+    pub population_opacity: String,   // 人口メッシュの重ね方: "light"(0.35)/"mid"(0.55)/"strong"(0.75)。既定mid(雨雲と同じ3択)
+    pub population_year: u16,         // 表示する年次。2020〜2070の5年刻み。既定2025(2020は実績・以降は推計値)
     pub route_traffic_enabled: bool,  // ルート確定後、Google Directions(departure_time=now)で区間ごとの渋滞状況を追加確認しルート線を色分けするか。既定false(ONにした人だけがGoogle APIへ追加問い合わせする。要Google APIキー・Advanced課金対象)
 }
 
@@ -98,6 +108,9 @@ impl Default for Config {
             regulation_enabled: false,
             disaster_enabled: false,
             disaster_fill: true,
+            population_enabled: false,
+            population_opacity: "mid".to_string(),
+            population_year: DEFAULT_POPULATION_YEAR,
             route_traffic_enabled: false,
         }
     }
@@ -249,6 +262,19 @@ pub fn load_config_from(path: &Path) -> Config {
             ("regulation", "enabled") => { if let Some(b) = parse_bool(value) { cfg.regulation_enabled = b; } }
             ("disaster", "enabled") => { if let Some(b) = parse_bool(value) { cfg.disaster_enabled = b; } }
             ("disaster", "fill") => { if let Some(b) = parse_bool(value) { cfg.disaster_fill = b; } }
+            ("population", "enabled") => { if let Some(b) = parse_bool(value) { cfg.population_enabled = b; } }
+            ("population", "opacity") => {
+                if let Some(s) = parse_string(value) {
+                    if matches!(s.as_str(), "light" | "mid" | "strong") { cfg.population_opacity = s; }
+                }
+            }
+            ("population", "year") => {
+                // 5年刻みの一覧に無い年は既定へ落とす(その年のデータは存在しないため)。
+                if let Some(n) = parse_number(value) {
+                    let y = n as u16;
+                    if POPULATION_YEARS.contains(&y) { cfg.population_year = y; }
+                }
+            }
             ("route_traffic", "enabled") => { if let Some(b) = parse_bool(value) { cfg.route_traffic_enabled = b; } }
             // 旧スキーマ後方互換: [streetview] api_key を google_maps_api_key に取り込む(未設定時のみ)
             ("streetview", "api_key") => {
@@ -329,6 +355,11 @@ pub fn save_config_to(path: &Path, c: &Config) -> Result<(), String> {
          enabled = {}\n\
          fill = {}\n\
          \n\
+         [population]\n\
+         enabled = {}\n\
+         opacity = \"{}\"\n\
+         year = {}\n\
+         \n\
          [route_traffic]\n\
          enabled = {}\n",
         c.llm_recommend_enabled,
@@ -362,6 +393,9 @@ pub fn save_config_to(path: &Path, c: &Config) -> Result<(), String> {
         c.regulation_enabled,
         c.disaster_enabled,
         c.disaster_fill,
+        c.population_enabled,
+        c.population_opacity,
+        c.population_year,
         c.route_traffic_enabled,
     );
 
@@ -528,6 +562,9 @@ mod tests {
             regulation_enabled: true,
             disaster_enabled: true,
             disaster_fill: false,
+            population_enabled: true,
+            population_opacity: "light".to_string(),
+            population_year: 2050,
             route_traffic_enabled: true,
         };
         save_config_to(&path, &original).expect("save should succeed");
@@ -678,6 +715,64 @@ show_spots = maybe
         assert!(cfg.route_traffic_enabled);
         assert!(!cfg.disaster_enabled);
         cleanup(&path);
+    }
+
+    #[test]
+    fn population_defaults_are_off_mid_and_2025() {
+        let c = Config::default();
+        assert!(!c.population_enabled, "既定OFF(1都道府県が最大31MBあるため)");
+        assert_eq!(c.population_opacity, "mid");
+        assert_eq!(c.population_year, 2025);
+        assert_eq!(c.population_year, DEFAULT_POPULATION_YEAR);
+    }
+
+    #[test]
+    fn population_section_is_read() {
+        let path = unique_temp_path("population_section");
+        std::fs::write(&path, "[population]\nenabled = true\nopacity = \"strong\"\nyear = 2050\n").unwrap();
+        let cfg = load_config_from(&path);
+        assert!(cfg.population_enabled);
+        assert_eq!(cfg.population_opacity, "strong");
+        assert_eq!(cfg.population_year, 2050);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn population_opacity_only_accepts_known_values() {
+        let path = unique_temp_path("population_opacity_unknown");
+        std::fs::write(&path, "[population]\nopacity = \"bogus\"\n").unwrap();
+        assert_eq!(load_config_from(&path).population_opacity, Config::default().population_opacity);
+        cleanup(&path);
+    }
+
+    // 5年刻みの一覧に無い年はデータ自体が存在しないので、既定へ落とす。
+    #[test]
+    fn population_year_falls_back_to_the_default_when_it_is_not_a_five_year_step() {
+        for bad in ["2021", "2019", "2071", "0", "-5"] {
+            let path = unique_temp_path(&format!("population_year_{}", bad.replace('-', "m")));
+            std::fs::write(&path, format!("[population]\nyear = {bad}\n")).unwrap();
+            assert_eq!(
+                load_config_from(&path).population_year,
+                DEFAULT_POPULATION_YEAR,
+                "year = {bad} を受け付けてはいけない"
+            );
+            cleanup(&path);
+        }
+        // 一覧にある年は全部通る。
+        for good in POPULATION_YEARS {
+            let path = unique_temp_path(&format!("population_year_ok_{good}"));
+            std::fs::write(&path, format!("[population]\nyear = {good}\n")).unwrap();
+            assert_eq!(load_config_from(&path).population_year, good);
+            cleanup(&path);
+        }
+    }
+
+    // config.rs 側の年次一覧が population.rs の YEARS とずれていないこと
+    // (ずれると設定画面に存在しない年が並ぶ)。
+    #[test]
+    fn the_population_year_list_matches_the_data_module() {
+        assert_eq!(POPULATION_YEARS, crate::population::YEARS);
+        assert!(POPULATION_YEARS.contains(&DEFAULT_POPULATION_YEAR));
     }
 
     #[test]
@@ -909,6 +1004,9 @@ profile = "custom-profile"
             regulation_enabled: false,
             disaster_enabled: false,
             disaster_fill: true,
+            population_enabled: false,
+            population_opacity: "mid".to_string(),
+            population_year: DEFAULT_POPULATION_YEAR,
             route_traffic_enabled: false,
         };
         save_config_to(&path, &cfg).unwrap();
