@@ -55,6 +55,11 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
         let (tc, tr) = crossterm::terminal::size().unwrap_or((100, 40));
         let cols = tc.max(20) as u32;
         let map_rows = (tr.max(3) - 1) as u32;
+        // このフレームで使う端末セル比。ネイティブ端末(window_size)→ブラウザ通知(CELLマーカー)→
+        // 既定 2.0 の順(設計書 §7.2)。フォントサイズ変更や画面回転に毎フレーム追随させたいので
+        // キャッシュせず都度引く(window_size は terminal::size と同じ ioctl 1回で、上の size()
+        // 呼び出しと同程度のコスト)。
+        let cell_ratio = cellratio::resolve_ratio(cellratio::detect_native_ratio(), st.cell_ratio_web);
         if st.help { // ヘルプ全画面。画面高に収まらなければページ送り(最終ページで任意キー→閉じる)
             let _ = write!(out, "\x1b[2J\x1b[H");
             for (i, (bold, (r, g, b), ln)) in LOGO.iter().enumerate() { // 先頭に緑ワードマーク
@@ -86,12 +91,17 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
         if st.street.is_some() { // 実写(Street View)全画面。←→で向き、Esc/qで戻る
             { // 描画(不変借用のスコープ)
                 let (img, heading, slat, slon) = st.street.as_ref().unwrap();
+                // 実写は 640x480(4:3)の写真で、地図と違って端末の形に合わせて生成していない。
+                // 端末全体のセル矩形へそのまま強制フィットすると、iPhone 縦持ちのような縦長端末
+                // では縦に約2.6倍伸びる(設計書 §4.1)。写真の縦横比を保ったまま黒帯付きの1枚へ
+                // 合成してから出す(設計書 §7.6)。実画像モードもAAフォールバックも同じ考え方。
+                let shown = cellratio::crop_photo(img, cols.max(10), map_rows, cell_ratio);
                 if st.cfg.image_mode && image_capable() {
                     // 実画像モード: 実写を全幅×map_rows のインライン画像で表示
                     let _ = write!(out, "\x1b[H");
-                    let _ = emit_iterm2_image(&mut out, img, cols, map_rows);
+                    let _ = emit_iterm2_image(&mut out, &shown, cols, map_rows);
                 } else {
-                    let rs = image::imageops::resize(img, cols.max(10), map_rows * 2, FilterType::Triangle);
+                    let rs = image::imageops::resize(&shown, cols.max(10), map_rows * 2, FilterType::Triangle);
                     let art = render_halfblock(&rs, truecolor_safe());
                     let sv_lines: Vec<&str> = art.split("\r\n").collect();
                     let _ = write!(out, "\x1b[H");
@@ -120,6 +130,12 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
                         }
                     }
                 }
+            }
+            // この画面は下の match まで進まず continue するので、セル比の通知はここで取り込む。
+            // 取りこぼすと、写真を開いたまま文字サイズを変えたときだけ古い比のまま固定される
+            // (JS 側は同じ値を再送しないため、地図へ戻っても直らない)。
+            if let Event::Paste(s) = &ev {
+                if let Some(r) = cellratio::parse_cell_marker(s) { st.cell_ratio_web = Some(r); }
             }
             if let Event::Key(k) = ev {
                 match k.code {
@@ -173,11 +189,14 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
             // 道路カメラは固定視点の1枚画像なのでstreetと違いパン/ズームは無い(Esc/qで戻るのみ)。
             { // 描画(不変借用のスコープ)
                 let (img, cam) = st.cam_view.as_ref().unwrap();
+                // 実写と同じく、写真の縦横比を保ったまま黒帯付きの1枚へ合成してから出す
+                // (設計書 §7.6)。カメラ画像は提供元により縦横比が違うので 4:3 決め打ちにしない。
+                let shown = cellratio::crop_photo(img, cols.max(10), map_rows, cell_ratio);
                 if st.cfg.image_mode && image_capable() {
                     let _ = write!(out, "\x1b[H");
-                    let _ = emit_iterm2_image(&mut out, img, cols, map_rows);
+                    let _ = emit_iterm2_image(&mut out, &shown, cols, map_rows);
                 } else {
-                    let rs = image::imageops::resize(img, cols.max(10), map_rows * 2, FilterType::Triangle);
+                    let rs = image::imageops::resize(&shown, cols.max(10), map_rows * 2, FilterType::Triangle);
                     let art = render_halfblock(&rs, truecolor_safe());
                     let cam_lines: Vec<&str> = art.split("\r\n").collect();
                     let _ = write!(out, "\x1b[H");
@@ -190,7 +209,12 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
                 let _ = write!(out, "\x1b[{};1H\x1b[7m{bar}\x1b[0m\x1b[K", tr);
                 let _ = out.flush();
             }
-            if let Event::Key(k) = event::read()? {
+            let ev = event::read()?;
+            // 実写画面と同じ理由でセル比の通知をここで取り込む(下の match まで進まないため)。
+            if let Event::Paste(s) = &ev {
+                if let Some(r) = cellratio::parse_cell_marker(s) { st.cell_ratio_web = Some(r); }
+            }
+            if let Event::Key(k) = ev {
                 match k.code {
                     KeyCode::Esc | KeyCode::Char('q') => st.cam_view = None,
                     KeyCode::Char('I') => { // 表示中も画像モードON/OFFを切替できるように(Map focusと同じキー)
@@ -313,6 +337,32 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
             }
         }
         let disaster_sites = st.disaster_layer.items(plot_view);
+        let muni_areas = st.boundary_layer.items(plot_view);
+        // 過去災害の見せ方をズームで切り替える(設計 §3.4)。塗りは画面に複数の市区町村が
+        // 入るズーム帯でだけ意味を持つ。z14以上は画面幅が1km前後になり「全面が同じ色」に
+        // 退化するので、そこは従来の代表点マーカーへ譲る。判定に使うのは実描画ズーム(rz)では
+        // なく地図ズーム(z): 実画像モードは rz>z でも写る地理範囲は同じため。
+        let fill_on = st.cfg.disaster_enabled && st.cfg.disaster_fill;
+        let choropleth_fill = fill_on && (11..=13).contains(&st.z);
+        let choropleth_outline = fill_on && (11..=14).contains(&st.z);
+        // 件数リングは塗りが件数を担っている間は出さない(中心の小さな塊は常に残すので、
+        // B キーが何を指しているかは画面から分かる)。
+        let disaster_rings = !choropleth_fill;
+        let population_meshes =
+            if st.cfg.population_enabled { st.population_layer.items(plot_view) } else { Vec::new() };
+        // 表示する年次(設定)。configを手書きで壊されても必ず描ける索引へ落とす。
+        let population_year_idx = population::year_index(st.cfg.population_year)
+            .unwrap_or_else(|| population::year_index(config::DEFAULT_POPULATION_YEAR).unwrap_or(1));
+        // 中心のクロスヘアが指すメッシュの人口密度(ステータス行に実数値で出す・設計 §7.6)。
+        // 階級の幅(1,000〜4,000等)しか読めない色分けを、1つの数字で補う。
+        // 中心は必ず視野の中にあるので、切り出し済みの population_meshes から拾う
+        // (layer.items() をもう一度呼ぶと全セル(最大16万件)をもう1周することになる)。
+        let population_here = mesh::half_mesh_code(lat, lon).and_then(|code| {
+            population_meshes
+                .iter()
+                .find(|m| m.mesh == code)
+                .and_then(|m| population::density(m, population_year_idx))
+        });
 
         // 通行止めルート回避(#通行止めを推奨しない)。表示中の視野(plot_view)ではなく、
         // 経由地全体を覆うbboxで実施中の通行止めを見て、BRouterのnogosへ変換する。
@@ -348,13 +398,27 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
         // 解像度になる。設定(image_res)で上限を選べる: high=+2(横4/縦8px per cell) / mid=+1 / low=+0。
         // rz>z のときグローバル画素座標は 2^Δ 倍になるので中心 cx/cy も scale 倍する。
         let base_delta: u32 = match st.cfg.image_res.as_str() { "high" => 2, "low" => 0, _ => 1 };
-        let delta = if !img_inline { 0 } else if settling { 0 } else { base_delta.min(18u32.saturating_sub(st.z)) };
+        // 移動中に落とす先は config::IMAGE_SETTLE_DELTA_CAP(設計 §5.3 C-3 の見直し。
+        // 判断の根拠は定数側のコメントに書いてある)。
+        let delta = if !img_inline { 0 }
+            else if settling { base_delta.min(config::IMAGE_SETTLE_DELTA_CAP).min(18u32.saturating_sub(st.z)) }
+            else { base_delta.min(18u32.saturating_sub(st.z)) };
         let scale = 1u32 << delta;
         let (rw, rh, rz, rcx, rcy) = if img_inline {
             (map_cols * scale, map_rows * 2 * scale, st.z + delta, st.cx * scale as f64, st.cy * scale as f64)
         } else {
             (ow, oh, st.z, st.cx, st.cy)
         };
+        // サブピクセル描画(設計 §5.1 対策A)。窓の切り出しで left/top の小数部を捨てないので、
+        // 1出力ピクセル未満の動きも色の遷移として見え、斜めドラッグの階段が消える。
+        // braille/edge は閾値でドットの on/off が決まるためちらつく可能性があり、
+        // use_subpixel_window() で切り替えられるようにしてある。
+        let subpixel = use_subpixel_window(st.opts.braille, st.opts.edge, st.subpixel_env.as_deref());
+        let sub_steps = if subpixel { SUBPIXEL_STEPS } else { 1.0 };
+        // 描画へ渡す中心は格子へ吸着させる。再描画判定(map_sig)と描画で同じ値を使わないと、
+        // 絵が変わったのにシグネチャが変わらない取りこぼしが起きる(設計 §5.2)。
+        // 論理座標 cx/cy は連続のまま保持してあるので、指の移動量は 1:1 のまま失われない。
+        let (rcx, rcy) = snap_center_to_grid(rcx, rcy, sub_steps);
         // ローダーへ今の表示位置(実描画のズーム/中心)を毎フレーム渡す。need_buildがfalseで再構築を
         // 省くフレームでも、裏取得の近傍優先が最新の現在地を使えるよう常に更新しておく。
         loader.set_view(rcx, rcy, rz, &st.opts.style);
@@ -418,7 +482,14 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
         let map_sig: Option<u64> = {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
-            rcx.to_bits().hash(&mut h); rcy.to_bits().hash(&mut h);
+            // 中心座標は生の f64 ではなく、実際に描画へ効く粒度へ丸めて混ぜる(設計 §5.2 対策B)。
+            // これより細かい差はどうせ同じ絵になる。粒度は描画側と揃える必要があるので、
+            // rcx/rcy を吸着させたときと同じ sub_steps を渡す(サブピクセル切り出しなら
+            // 1/SUBPIXEL_STEPS ピクセル・従来の整数切り出しなら1ピクセル)。
+            // rcx/rcy は既に同じ格子へ吸着済みなので、描画とシグネチャの位置は必ず一致する。
+            map_center_sig_key(rcx, rcy, rw, rh, sub_steps).hash(&mut h);
+            // 切り出し方が変わると同じ中心でも絵が変わるので、モードそのものも混ぜる。
+            subpixel.hash(&mut h);
             rz.hash(&mut h); rw.hash(&mut h); rh.hash(&mut h);
             gut.hash(&mut h); map_cols.hash(&mut h); map_rows.hash(&mut h);
             st.opts.style.hash(&mut h);
@@ -426,9 +497,11 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
             // グレーのプレースホルダーが実タイルへ順次置き換わる。
             loader_gen_snapshot.hash(&mut h);
             st.spec.routes.len().hash(&mut h);
+            st.spec.expressway_segments.len().hash(&mut h);
             st.spec.roads.len().hash(&mut h);
             st.spec.traffic_segments.len().hash(&mut h);
-            for rt in st.spec.routes.iter().chain(st.spec.roads.iter()).chain(st.spec.traffic_segments.iter()) {
+            st.spec.warning_segments.len().hash(&mut h);
+            for rt in st.spec.routes.iter().chain(st.spec.expressway_segments.iter()).chain(st.spec.roads.iter()).chain(st.spec.traffic_segments.iter()).chain(st.spec.warning_segments.iter()) {
                 rt.color.hash(&mut h); rt.thickness.hash(&mut h);
                 for &(a2, b2) in &rt.pts { a2.to_bits().hash(&mut h); b2.to_bits().hash(&mut h); }
             }
@@ -463,6 +536,19 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
             st.camera_layer.generation().hash(&mut h);
             st.regulation_layer.generation().hash(&mut h);
             st.disaster_layer.generation().hash(&mut h);
+            // 過去災害の塗り: 境界セルが届くたび、また塗り/縁取りの出し分けが変わるたびに
+            // ラスタライズし直す(逆に、パンもズームもしていないフレームでは1回も走らない)。
+            st.boundary_layer.generation().hash(&mut h);
+            choropleth_fill.hash(&mut h);
+            choropleth_outline.hash(&mut h);
+            st.population_layer.generation().hash(&mut h);
+            // 人口メッシュ: ON/OFF・年次・濃さを変えたら描き直す(セル表は動かないため generation
+            // だけでは変化を拾えない)。
+            st.cfg.population_enabled.hash(&mut h);
+            if st.cfg.population_enabled {
+                population_year_idx.hash(&mut h);
+                population_opacity_value(&st.cfg).to_bits().hash(&mut h);
+            }
             Some(h.finish())
         };
 
@@ -480,7 +566,7 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
             let built = match prefetched {
                 Some(img) => Ok(img),
                 // 非ブロッキング版: 未取得タイルはグレーで即返し、取得はローダーが裏で進める。
-                None => build_window_nowait(rcx, rcy, rz, rw, rh, &st.opts.style, &loader),
+                None => build_window_nowait(rcx, rcy, rz, rw, rh, &st.opts.style, subpixel, &loader),
             };
             match built {
                 Ok(mut img) => {
@@ -490,16 +576,51 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
                         st.radar_tl.get(st.radar_idx)
                             .and_then(|f| build_radar_window_nowait(rcx, rcy, rz, rw, rh, f, &loader))
                     } else { None };
+                    // 過去災害のコロプレス層(市区町村を記録の多さで塗り分けたRGBA)。
+                    // 雨雲と同じ合成経路に「雨雲より後ろ」として乗せる(雨は今の話・災害履歴は
+                    // 土地の話なので、今の情報が上に来るのが正しい)。
+                    let choro_shading = choropleth::Shading {
+                        // 濃さは層の中身に影響しない(合成時に掛ける)ので、ここで控えておいて
+                        // 3経路それぞれへ同じ値を渡す。設定行にするのは Stage2。
+                        opacity: choropleth::DEFAULT_OPACITY,
+                        fill: choropleth_fill,
+                        outline: choropleth_outline,
+                    };
+                    let choro_opacity = choro_shading.opacity;
+                    let choro_layer: Option<RgbaImage> = if choropleth_fill || choropleth_outline {
+                        choropleth::build_layer(&disaster_sites, &muni_areas, rcx, rcy, rz, rw, rh, choro_shading)
+                    } else { None };
+                    // 500mメッシュ人口。人口なし=透明の面レイヤを作る(設計 §7.1)。
+                    // 雨雲より背面に置く(人口は数年変わらない下地・雨雲は現況)。
+                    let pop_layer: Option<RgbaImage> = if st.cfg.population_enabled && !population_meshes.is_empty() {
+                        Some(build_population_layer(&population_meshes, population_year_idx,
+                                                    population::Metric::Density, rcx, rcy, rz, rw, rh))
+                    } else { None };
                     // 実画像モードはここで地図へ直接アルファ合成する(オーバーレイはこの後に焼くので
-                    // 経路/POI/中心十字は常に雨雲より前面に残る)。
+                    // 経路/POI/中心十字は常に雨雲・人口より前面に残る)。
+                    // 下から コロプレス → 人口 → 雨雲 の順で重ねる(土地の話が下・今の話が上)。
                     if img_inline {
+                        if let Some(l) = &choro_layer { blend_rgba_over(&mut img, l, choro_opacity); }
+                        if let Some(l) = &pop_layer { blend_rgba_over(&mut img, l, population_opacity_value(&st.cfg)); }
                         if let Some(l) = &radar_layer { blend_rgba_over(&mut img, l, radar_opacity_value(&st.cfg)); }
                     }
                     // braille/edge は OverlayLayer へインクとして焼く(build_overlay の先頭で最背面に入る)。
-                    let ink = if radar_ink {
-                        radar_layer.as_ref().map(|l| RadarInk { layer: l, density: radar_opacity_value(&st.cfg) })
-                    } else { None };
-                    let mut ov = build_overlay(&st.spec, rcx, rcy, rz, rw, rh, 1.0, 1.0, rw, rh, ink);
+                    // 配列の順序がそのまま重ね順(先頭が最背面)なので、上と同じ順で積む。
+                    // コロプレスの面塗りだけは雨雲・人口のディザではなく疎な点描で間引く
+                    // (Bayerだと braille のセルが全部塗り色に化けるため)。
+                    let mut inks: Vec<InkLayer> = Vec::new();
+                    if radar_ink {
+                        if let Some(l) = &choro_layer {
+                            inks.push(InkLayer::Stipple { layer: l, spacing: choropleth::STIPPLE_SPACING });
+                        }
+                        if let Some(l) = &pop_layer {
+                            inks.push(InkLayer::Dither { layer: l, density: population_opacity_value(&st.cfg) });
+                        }
+                        if let Some(l) = &radar_layer {
+                            inks.push(InkLayer::Dither { layer: l, density: radar_opacity_value(&st.cfg) });
+                        }
+                    }
+                    let mut ov = build_overlay(&st.spec, rcx, rcy, rz, rw, rh, 1.0, 1.0, rw, rh, &inks);
                     let (mx, my) = (rw as i32 / 2, rh as i32 / 2); // 中心クロスヘア(色は設定で選択可)
                     let cross = SPOT_PALETTE[st.cfg.cross_color_idx as usize % SPOT_PALETTE.len()];
                     draw_line(&mut ov, mx - 6, my, mx + 6, my, cross, 1);
@@ -592,13 +713,17 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
                         // しない。1座標=1マーカーにして、件数を外周リングの半径、最も多い種別を
                         // 色で表す。外周を細くするのは地図と他レイヤを覆い隠さないため
                         // (中心の塊があるので細くても位置は読める)。
+                        // 塗り(コロプレス)が出ているズーム帯では件数の役目が塗りへ移るので、
+                        // 外周リングは出さず中心の小さな塊だけを残す(Bキーの対象を示すため)。
                         for s in &disaster_sites {
                             let (gx, gy) = deg_to_pixel(s.lat, s.lon, rz);
                             let ix = (gx - (rcx - rw as f64 / 2.0)).floor() as i32;
                             let iy = (gy - (rcy - rh as f64 / 2.0)).floor() as i32;
                             let color = s.dominant().color();
                             draw_ring(&mut ov, ix, iy, 1, color, 2);
-                            draw_ring(&mut ov, ix, iy, disaster::marker_radius(s.total()), color, 1);
+                            if disaster_rings {
+                                draw_ring(&mut ov, ix, iy, disaster::marker_radius(s.total()), color, 1);
+                            }
                         }
                     }
                     st.last_map_sig = map_sig; // このsigで描いた内容がこのフレームでemitされる
@@ -611,8 +736,15 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
                     } else {
                         // インク経路(braille/edge)は ov に入れ済みなので render 側では合成しない。
                         // halfblock/classify はここで渡し、classify は recolor 後に混ざる。
-                        let rd = if radar_ink { None } else { radar_layer.as_ref().map(|l| (l, radar_opacity_value(&st.cfg))) };
-                        render(&img, &st.opts, Some(&ov), rd)
+                        // 配列の順序がそのまま重ね順。コロプレス → 人口 → 雨雲 の順で地図へ
+                        // アルファ合成する(braille/edge は上で ov のインクに入れ済みなので渡さない)。
+                        let mut blends: Vec<(&RgbaImage, f64)> = Vec::new();
+                        if !radar_ink {
+                            if let Some(l) = &choro_layer { blends.push((l, choro_opacity)); }
+                            if let Some(l) = &pop_layer { blends.push((l, population_opacity_value(&st.cfg))); }
+                            if let Some(l) = &radar_layer { blends.push((l, radar_opacity_value(&st.cfg))); }
+                        }
+                        render(&img, &st.opts, Some(&ov), &blends)
                     }
                 }
                 Err(e) => {
@@ -682,18 +814,21 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
             cfg: &st.cfg,
             // 主要道路は交通量のスナップ下地で、それ自体はステータスに出さない(描画も未実装)。
             traffic: ui_status::PlotStatus {
+                area: None,
                 count: traffic_points.len(),
                 job_active: st.traffic_layer.job_active() || st.roads_layer.job_active(),
                 stale_age_secs: st.traffic_layer.stale_age_secs(plot_now),
                 wide_area: st.traffic_layer.suppressed(),
             },
             camera: ui_status::PlotStatus {
+                area: None,
                 count: camera_points.len(),
                 job_active: st.camera_layer.job_active(),
                 stale_age_secs: st.camera_layer.stale_age_secs(plot_now),
                 wide_area: st.camera_layer.suppressed(),
             },
             regulation: ui_status::PlotStatus {
+                area: None,
                 count: regulation_events.len(),
                 job_active: st.regulation_layer.job_active(),
                 stale_age_secs: st.regulation_layer.stale_age_secs(plot_now),
@@ -701,12 +836,31 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
             },
             // 過去災害は事例数でなく地点数を出す(1地点に最大166件が重なるため)。
             // 事例一覧(Bキー)の取得中もスピナーではなくこのレイヤの表示で分かるようにする。
+            population: ui_status::PopulationStatus {
+                job_active: st.population_layer.job_active(),
+                // 取得中のセルキーは都道府県コード2桁。名前に直して「北海道を取得中…」と出す。
+                fetching: st.population_layer
+                    .fetching_key()
+                    .and_then(|k| k.parse::<u8>().ok())
+                    .map(|p| population::pref_name(p).to_string())
+                    .filter(|n| !n.is_empty()),
+                wide_area: st.population_layer.suppressed(),
+                density: population_here,
+            },
             disaster: ui_status::PlotStatus {
                 count: disaster_sites.len(),
-                job_active: st.disaster_layer.job_active() || st.disaster_job.is_some(),
+                job_active: st.disaster_layer.job_active() || st.disaster_job.is_some() || st.boundary_layer.job_active(),
                 stale_age_secs: st.disaster_layer.stale_age_secs(plot_now),
                 wide_area: st.disaster_layer.suppressed(),
+                // 塗りが出ているときだけ「いまいる市区町村と、その町の記録件数」を出す
+                // (凡例を置く幅が無いので、代わりに読み手が知りたいことへ直接答える)。
+                area: choropleth_fill
+                    .then(|| choropleth::area_summary(&disaster_sites, &muni_areas, lat, lon))
+                    .flatten(),
             },
+            weather_warning_count: st.route_warnings.len(),
+            weather_warning_top_name: st.route_warnings.first().map(|w| w.name.as_str()),
+            weather_warning_job_active: st.route_warning_job.is_some(),
             addr: &st.addr, wps: &st.wps, z: st.z, lat, lon, next_turn: &next_turn,
         });
         let status = fit_cells_scroll(&status, cols as usize, st.spin);
@@ -769,8 +923,12 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
             // 道路交通量/主要道路/ライブカメラ/通行規制の背景取得完了を、キー入力無しでも
             // 取りこぼさない(結果が最大60秒(IDLE_SAVE_INTERVAL)反映されない事故を防ぐ)。
             // 主要道路は以前この条件から漏れていたが、4レイヤとも同じ扱いにする。
+            // 人口メッシュは1セルの取得に数十秒かかるため、ここから漏れると
+            // 「取得中…」の表示すら出ないまま画面が固まって見える(PTY実機で確認済み)。
             || st.traffic_layer.job_active() || st.roads_layer.job_active()
-            || st.camera_layer.job_active() || st.regulation_layer.job_active() || st.disaster_layer.job_active();
+            || st.camera_layer.job_active() || st.regulation_layer.job_active() || st.disaster_layer.job_active()
+            || st.boundary_layer.job_active() || st.population_layer.job_active()
+            || st.route_warning_job.is_some();
         let mut ev: Option<Event> = if got_result {
             None
         } else if polling {
@@ -837,7 +995,13 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
         if got_pan {
             // 軸ゲート・向きの反転・座標の正規化は dragmode::apply_pan に閉じてある
             // (ここに直書きするとテストが書けないため。設計書 §6.2 の適用条件)。
-            let lay = dragmode::Layout { cols, rows: tr as u32, map_cols, map_rows, ow, oh };
+            // 実画像モードでは実際に描かれる解像度は ow/oh ではなく rw/rh(zoom rz のピクセル)。
+            // 表示している地理範囲は zoom z 換算で常に横 map_cols・縦 map_rows*2 ピクセルなので、
+            // rw/scale・rh/scale へ戻して渡す(設計 §5.5 対策E)。AA 用に計算された ow/oh を
+            // そのまま渡すと、braille(または --edge)と実画像を同時に有効にしたときだけ
+            // ow=map_cols*2 / oh=map_rows*4 となり、両軸とも指の2倍地図が動く(§2.5 の実測)。
+            let (pan_ow, pan_oh) = if img_inline { (rw / scale, rh / scale) } else { (ow, oh) };
+            let lay = dragmode::Layout { cols, rows: tr as u32, map_cols, map_rows, ow: pan_ow, oh: pan_oh };
             let (ncx, ncy, moved) = dragmode::apply_pan(st.cx, st.cy, st.z, dragmode::axes(&st.focus), pan_fx, pan_fy, &lay);
             if moved {
                 st.cx = ncx;
@@ -921,6 +1085,20 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
                 st.web_gps_active = false;
                 st.addr = "ライブ現在地(スマホ): OFF".into();
             }
+            // スマホ側のGeolocation APIが失敗した時の理由(web/touch-overlay.js::gpsErrorReason)。
+            // 「ボタンを押しても権限ダイアログすら出ない」といった切り分けをステータス行で
+            // できるようにする診断用。成功時は既存のGPSマーカー分岐がaddrを上書きする。
+            Some(Event::Paste(s)) if s.starts_with("\u{1}GPS_ERR\u{1}") => {
+                let reason = &s["\u{1}GPS_ERR\u{1}".len()..];
+                let msg = match reason {
+                    "denied" => "権限拒否(Safariのサイト設定/位置情報サービスを確認)",
+                    "unavailable" => "位置情報を取得できません",
+                    "timeout" => "取得がタイムアウトしました",
+                    "unsupported" => "この接続では使えません(HTTPS化を確認)",
+                    _ => "原因不明のエラー",
+                };
+                st.addr = format!("ライブ現在地(スマホ): 失敗 - {msg}");
+            }
             Some(Event::Paste(s)) if s.starts_with("\u{1}GPS\u{1}") => {
                 let rest = &s["\u{1}GPS\u{1}".len()..];
                 let mut parts = rest.splitn(2, '\u{1}');
@@ -942,6 +1120,19 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
             // だけで、実際の送出は次フレーム末の1か所に任せる。
             Some(Event::Paste(s)) if s.starts_with(dragmode::DRAG_MODE_REQUEST) => {
                 st.drag_mode_req_pending = true;
+            }
+            // ブラウザが実測したセル寸法(設計書 §7.2 の経路2)。ttyd は pty の ws_xpixel/ws_ypixel
+            // を埋めないため、web版ではここが唯一のセル比の入手経路になる。壊れた値・非現実的な
+            // 比は parse 側が捨て、その場合は既定値 2.0 のまま(=修正前と同じ)動く。
+            Some(Event::Paste(s)) if s.starts_with(cellratio::CELL_MARKER) => {
+                if let Some(r) = cellratio::parse_cell_marker(&s) {
+                    if st.cell_ratio_web != Some(r) {
+                        st.cell_ratio_web = Some(r);
+                        // 比が変わった=いま出ている画像の形が古い。次フレームで1枚描き直す。
+                        st.force_reemit = true;
+                        st.last_map_sig = None; // sig一致による再構築スキップに巻き込まれないように
+                    }
+                }
             }
             // パン量マーカーは上の合算ブロックで消費済みなので、通常ここへは来ない。念のための
             // 保険(合算ブロックを通らない経路が将来増えても、マーカーが検索欄へ文字として

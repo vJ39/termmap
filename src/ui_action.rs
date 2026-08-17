@@ -84,6 +84,8 @@ pub(crate) fn run_action(st: &mut UiState, a: &Args, act: MenuAction, lat: f64, 
             }
         }
         MenuAction::ToggleRadar => { st.radar_toggle(); } // 雨雲レーダー(地図の C キーと同じ)
+        MenuAction::TogglePopulation => { st.population_toggle(); } // 500mメッシュ人口(地図の U キーと同じ)
+        MenuAction::ToggleDisasterFill => { st.disaster_fill_toggle(); } // 過去災害の塗り(地図の F キーと同じ)
         MenuAction::ViewCamera => { // 道路ライブカメラ(地図の N キーと同じ)
             if !st.cfg.camera_enabled { st.snd.play("error"); st.addr = "道路ライブカメラ: OFF(設定で有効化)".into(); }
             else {

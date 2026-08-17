@@ -32,6 +32,13 @@ pub(crate) fn build_qr_view(c: &qrcode::QrCode, style: &str) -> QrView {
 pub(crate) fn radar_opacity_value(cfg: &config::Config) -> f64 {
     match cfg.radar_opacity.as_str() { "light" => 0.35, "strong" => 0.75, _ => 0.55 }
 }
+// 人口メッシュの不透明度(0.0..=1.0)。雨雲と同じ3択・同じ値。面を塗る唯一のレイヤなので、
+// ここを1.0にすると道路も経路も完全に消えて地図が読めなくなる。
+// 実際に塗られる濃さは、この値に階級ごとのアルファ(薄い階級=40 / 都心=230)が掛かる。
+pub(crate) fn population_opacity_value(cfg: &config::Config) -> f64 {
+    match cfg.population_opacity.as_str() { "light" => 0.35, "strong" => 0.75, _ => 0.55 }
+}
+
 // targetTimes(フレーム時刻一覧)の再取得間隔(秒)の既定。ナウキャスト自体が5分更新なので、
 // これより短くしても新しい情報は無い。設定 [radar] refresh_sec で変えられる。
 pub(crate) const RADAR_REFRESH_SECS: u64 = 300;
@@ -62,6 +69,74 @@ pub(crate) fn maybe_speak_turn(cfg: &config::Config, spec: &render::OverlaySpec,
     }
 }
 
+// 気象警報(#79・ルートベース)。ルートのポリラインを2km間隔でサンプリングし、通過する
+// class10s領域(geoarea.rs)の気象台コードを重複無しで列挙する。2kmはclass10s領域が概ね
+// 数十km規模のため、粒度を上げても得られる精度は限定的という判断(粗くても良い)。
+pub(crate) fn route_warning_office_codes(pts: &[(f64, f64)]) -> Vec<String> {
+    let sampled = roadtrace::sample_every(pts, 2000.0);
+    let mut codes: Vec<String> = Vec::new();
+    for &p in &sampled {
+        if let Some(region) = geoarea::region_at(p) {
+            if !codes.iter().any(|c| c == &region.office_code) {
+                codes.push(region.office_code.clone());
+            }
+        }
+    }
+    codes
+}
+
+// ルートのポリラインを、警報の有無/severityで塗り分けたRoute群へ変換する。警報が無い
+// 区間はRouteを作らない(既存のroutes/traffic_segments等の下地色がそのまま見える)。
+// 連続する点が同じ判定(同じseverityの色、または「警報なし」)である間は1本のRouteへまとめる。
+pub(crate) fn build_warning_segments(pts: &[(f64, f64)], warnings: &[warning::ActiveWarning]) -> Vec<render::Route> {
+    let color_at = |p: (f64, f64)| -> Option<[u8; 3]> {
+        let region = geoarea::region_at(p)?;
+        warnings
+            .iter()
+            .filter(|w| w.area_code == region.code)
+            .map(|w| w.severity)
+            .max_by_key(severity_rank)
+            .map(|s| s.color())
+    };
+    if pts.len() < 2 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut cur: Vec<(f64, f64)> = vec![pts[0]];
+    let mut cur_color = color_at(pts[0]);
+    for &p in &pts[1..] {
+        let color = color_at(p);
+        if color == cur_color {
+            cur.push(p);
+        } else {
+            if let Some(c) = cur_color {
+                if cur.len() >= 2 {
+                    out.push(render::Route { pts: cur, color: c, thickness: 3 });
+                }
+            }
+            cur = vec![p];
+            cur_color = color;
+        }
+    }
+    if let Some(c) = cur_color {
+        if cur.len() >= 2 {
+            out.push(render::Route { pts: cur, color: c, thickness: 3 });
+        }
+    }
+    out
+}
+
+// severityの深刻度を大小比較できる数値へ(max_by_keyで最も深刻なものを選ぶため)。
+// 特別警報 > 警報 > 注意報 > その他、の順。
+fn severity_rank(s: &warning::Severity) -> u8 {
+    match s {
+        warning::Severity::Special => 3,
+        warning::Severity::Warning => 2,
+        warning::Severity::Advisory => 1,
+        warning::Severity::Other => 0,
+    }
+}
+
 // 位置/ルート(last.txt)と直接キーで変えたcfg項目をまとめて保存。終了時とアイドル時の両方から呼ぶ。
 pub(crate) fn persist_full_state(cx: f64, cy: f64, z: u32, opts: &Args, wps: &[(f64, f64)], mode: &str, cfg: &mut config::Config, radar_on: bool, show_spots: bool) {
     let (lat, lon) = pixel_to_deg(cx, cy, z);
@@ -70,6 +145,85 @@ pub(crate) fn persist_full_state(cx: f64, cy: f64, z: u32, opts: &Args, wps: &[(
     cfg.radar_enabled = radar_on;
     cfg.show_spots = show_spots;
     let _ = config::save_config(cfg);
+}
+
+// ---- サブピクセル描画と再描画判定(docs/web-pan-smoothness-design.md §5.1/§5.2 対策A・B) ----
+
+// 1出力ピクセルを何段に割るか(設計 §5.1 対策A・§5.2)。
+// 対策A で切り出しが小数位置になったため、描画に効く粒度が「整数ピクセル」から
+// 「1/SUBPIXEL_STEPS ピクセル」へ細かくなった。設計は 8 か 16 を想定と書いている。
+// 8 を選んだのは、halfblock の横1出力ピクセル(=1文字セル・iPhone の xterm.js でおおむね
+// 9 CSS px)を約1.1 CSS px 刻みで動かせて、指の動きの粒度としてはこれで十分細かい一方、
+// 16 にすると同じ絵に見える差でも再構築が走る回数が倍になり、対策B(同じ絵なら送らない)で
+// 削ったバイト数を食い潰すため。偶数なので、窓の左上(中心 - rw/2.0)も必ず同じ格子に載る。
+pub(crate) const SUBPIXEL_STEPS: f64 = 8.0;
+
+// 描画へ渡す中心座標をサブピクセル格子へ吸着させる。
+//
+// 描画に使う位置と map_sig の位置がずれていると、絵が変わったのにシグネチャが変わらない
+// 取りこぼし(=地図が止まって見える)が起きる。両者を必ず同じ値から導くため、丸めは
+// ここ1箇所に閉じてある(設計 §5.2)。論理座標 cx/cy は連続のまま保持し、丸めるのは
+// 描画へ渡す直前だけにする。
+//
+// steps=1.0 なら整数ピクセルへの吸着になり、対策A を使わない描画モード(braille/edge)で
+// そのまま使える。
+pub(crate) fn snap_center_to_grid(rcx: f64, rcy: f64, steps: f64) -> (f64, f64) {
+    let snap = |v: f64| if v.is_finite() { (v * steps).round() / steps } else { v };
+    (snap(rcx), snap(rcy))
+}
+
+// サブピクセル切り出しを使うか(設計 §5.1 の注意・§11 のリスク)。
+//
+// braille / edge は輝度の閾値でドットの on/off を決める(render.rs)ので、バイリニアで作った
+// 中間色が閾値をまたぐ瞬間にドットが入れ替わる。実質ディザになるため、階段は消える代わりに
+// ちらつきが増える可能性がある。halfblock と実画像では素直に効く。
+//
+// 設計は「braille は実機で確認して、悪ければ braille だけ従来の整数切り出しに戻せるように
+// しておく」としている。既定は全モードで有効にし、環境変数 TERMMAP_SUBPIXEL で上書きできる。
+//   0 / false / off / no        … 全モードで従来の整数切り出し
+//   1 / true / on / yes         … 全モードで対策A を使う
+//   halfblock / no-braille      … braille/edge だけ従来の整数切り出し(halfblock と実画像は対策A)
+// 実機で braille のちらつきが問題だと分かったら、環境変数を毎回付けずに済むよう
+// SUBPIXEL_EXCEPT_BRAILLE を true にする。
+pub(crate) fn use_subpixel_window(braille: bool, edge: bool, env: Option<&str>) -> bool {
+    let dots = braille || edge; // 輝度の閾値でドットの on/off を決めるモード
+    match env.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("0") | Some("false") | Some("off") | Some("no") => false,
+        Some("1") | Some("true") | Some("on") | Some("yes") => true,
+        Some("halfblock") | Some("no-braille") | Some("nobraille") => !dots,
+        _ => !(SUBPIXEL_EXCEPT_BRAILLE && dots),
+    }
+}
+
+// 既定で braille/edge を対策A から外すか。実機で braille のちらつきが許容できないと
+// 分かったら、ここを true にするだけで既定が「braille/edge は従来の整数切り出し」になる
+// (halfblock と実画像は対策A のまま)。
+//
+// 手元の PTY 実測では、braille のインク量のコマ間の揺れは対策A で 0.39% → 0.50% と
+// 1.28 倍になるものの絶対量は小さく(約1400セル中1コマ7セル)、1コマのバイト数はむしろ
+// 14% 減った。数字の上では有効のままでよさそうだが、ちらつきの見え方は実機でしか
+// 判断できないので false のままにしてある。
+pub(crate) const SUBPIXEL_EXCEPT_BRAILLE: bool = false;
+
+// map_sig に混ぜる中心座標の値。実際に描画へ効く粒度へ丸める。
+//
+// 生の f64(to_bits)を混ぜると、1出力ピクセルの1/100しか動かないパンでもシグネチャが変わり、
+// 絵が1ピクセルも変わらないのに全画面(halfblock 94x23 で 85.6KB)を再送してしまう
+// (設計 §2.3 の実測)。ゆっくり指を動かしているときほどこの無駄の割合が上がる。
+//
+// 丸めの基準は中心そのものではなく「窓の左上」にしてある。切り出しは tiles.rs で
+// left = rcx - rw/2.0 を基準に行われ、rw が奇数(左袖なし・halfblock で端末幅が奇数のとき等)
+// だと rcx の丸めが同じでも left の丸めが変わる = 実際の絵が変わる。設計と依頼は rcx を
+// 直接丸めると書いているが、それだとこの場合に再構築を取りこぼして地図が動かなくなる。
+// rw/rh 自体は map_sig 側で別途ハッシュしているので、中心の代わりに左上を混ぜても情報は落ちない。
+//
+// steps は描画側の粒度と必ず揃える。対策A(サブピクセル切り出し)を使う描画モードでは
+// SUBPIXEL_STEPS、従来の整数切り出しでは 1.0 を渡す(設計 §5.2 の「対策A を入れる場合」)。
+pub(crate) fn map_center_sig_key(rcx: f64, rcy: f64, rw: u32, rh: u32, steps: f64) -> (i64, i64) {
+    (
+        ((rcx - rw as f64 / 2.0) * steps).floor() as i64,
+        ((rcy - rh as f64 / 2.0) * steps).floor() as i64,
+    )
 }
 
 // ---- 規制原因アイコン(#規制原因アイコン、docs/regulation-cause-icons-design.md) ----
@@ -136,6 +290,71 @@ mod tests {
         assert!((pos.1 - 139.0).abs() < 1e-6, "{pos:?}");
     }
 
+    // 新宿駅付近(東京地方=130010・気象台コード130000)を通る短い直線ルート。geoarea.rsの
+    // 実データ(assets/jma-class10s.json)を使うテストなので、座標は実在の地点にしている。
+    fn tokyo_route() -> Vec<(f64, f64)> {
+        vec![(35.6896, 139.7006), (35.69, 139.701), (35.6905, 139.7015)]
+    }
+
+    #[test]
+    fn route_warning_office_codes_resolves_tokyo() {
+        let codes = route_warning_office_codes(&tokyo_route());
+        assert_eq!(codes, vec!["130000".to_string()]);
+    }
+
+    #[test]
+    fn route_warning_office_codes_empty_route_is_empty() {
+        assert!(route_warning_office_codes(&[]).is_empty());
+    }
+
+    #[test]
+    fn build_warning_segments_colors_the_route_when_area_has_an_active_warning() {
+        let pts = tokyo_route();
+        let warnings = vec![warning::ActiveWarning {
+            area_code: "130010".to_string(),
+            name: "濃霧注意報".to_string(),
+            severity: warning::Severity::Advisory,
+        }];
+        let segs = build_warning_segments(&pts, &warnings);
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].color, warning::Severity::Advisory.color());
+        assert_eq!(segs[0].pts, pts);
+    }
+
+    #[test]
+    fn build_warning_segments_empty_when_no_warning_matches_the_area() {
+        let pts = tokyo_route();
+        let warnings = vec![warning::ActiveWarning {
+            area_code: "999999".to_string(), // どこにも該当しないコード
+            name: "大雨警報".to_string(),
+            severity: warning::Severity::Warning,
+        }];
+        assert!(build_warning_segments(&pts, &warnings).is_empty());
+    }
+
+    #[test]
+    fn build_warning_segments_empty_when_no_warnings_at_all() {
+        assert!(build_warning_segments(&tokyo_route(), &[]).is_empty());
+    }
+
+    #[test]
+    fn build_warning_segments_picks_the_most_severe_when_multiple_warnings_overlap() {
+        let pts = tokyo_route();
+        let warnings = vec![
+            warning::ActiveWarning { area_code: "130010".to_string(), name: "大雨注意報".to_string(), severity: warning::Severity::Advisory },
+            warning::ActiveWarning { area_code: "130010".to_string(), name: "大雨特別警報".to_string(), severity: warning::Severity::Special },
+        ];
+        let segs = build_warning_segments(&pts, &warnings);
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].color, warning::Severity::Special.color());
+    }
+
+    #[test]
+    fn build_warning_segments_handles_short_routes_without_panicking() {
+        assert!(build_warning_segments(&[], &[]).is_empty());
+        assert!(build_warning_segments(&[(35.0, 139.0)], &[]).is_empty());
+    }
+
     fn ev(id: &str) -> ClosureEvent {
         ClosureEvent { line: vec![(35.0, 139.0), (35.01, 139.0)], kind: RegulationKind::Closed, detail_id: id.to_string(), active: true }
     }
@@ -172,5 +391,181 @@ mod tests {
         let visible = vec![&a, &b];
         let cached = std::collections::HashMap::new();
         assert_eq!(next_closure_to_categorize(&visible, &cached), Some("a"));
+    }
+
+    // ---- map_center_sig_key(再描画判定の中心座標項・設計 §5.2 対策B) ----
+
+    // map_sig と同じ形でキーをハッシュしたもの。値が変わらない = need_build が立たない。
+    // 従来の整数切り出し(対策A なし)相当の粒度。
+    fn center_sig(rcx: f64, rcy: f64, rw: u32, rh: u32) -> u64 {
+        center_sig_steps(rcx, rcy, rw, rh, 1.0)
+    }
+    fn center_sig_steps(rcx: f64, rcy: f64, rw: u32, rh: u32, steps: f64) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        map_center_sig_key(rcx, rcy, rw, rh, steps).hash(&mut h);
+        h.finish()
+    }
+    // ui.rs と同じ手順(格子へ吸着 → キー化)。描画とシグネチャで同じ値を使う経路の検証。
+    fn snapped_sig(rcx: f64, rcy: f64, rw: u32, rh: u32, steps: f64) -> u64 {
+        let (sx, sy) = snap_center_to_grid(rcx, rcy, steps);
+        center_sig_steps(sx, sy, rw, rh, steps)
+    }
+
+    // 同じ丸め値になる2つの中心座標では need_build が立たない(全画面の無駄な再送が消える)。
+    #[test]
+    fn map_center_sig_key_ignores_subpixel_moves() {
+        let (rw, rh) = (94u32, 44u32);
+        // 1出力ピクセルの1/100しか動かないパン(設計 §2.3 の再現条件)。
+        assert_eq!(center_sig(1000.0, 500.0, rw, rh), center_sig(1000.0001, 500.0001, rw, rh));
+        // 同じ整数ピクセル内であれば、小数部がどれだけ違っても同じ。
+        assert_eq!(center_sig(1000.2, 500.9, rw, rh), center_sig(1000.8, 500.1, rw, rh));
+    }
+
+    // 丸め値が1段変われば need_build が立つ(動くべきときに動かなくなる退行を防ぐ)。
+    #[test]
+    fn map_center_sig_key_changes_when_the_drawn_pixel_changes() {
+        let (rw, rh) = (94u32, 44u32);
+        assert_ne!(center_sig(1000.0, 500.0, rw, rh), center_sig(1001.0, 500.0, rw, rh));
+        assert_ne!(center_sig(1000.0, 500.0, rw, rh), center_sig(1000.0, 501.0, rw, rh));
+        // 整数の境界をまたぐケース(0.9 → 1.1)。
+        assert_ne!(center_sig(1000.9, 500.0, rw, rh), center_sig(1001.1, 500.0, rw, rh));
+    }
+
+    // 出力幅が奇数のときは left = rcx - rw/2.0 に .5 が乗る。中心を floor する実装だと
+    // この2つが同じキーになり、実際には1px違う絵なのに再構築されず地図が止まって見える。
+    #[test]
+    fn map_center_sig_key_follows_the_window_origin_for_odd_widths() {
+        let (rw, rh) = (93u32, 44u32); // 左袖なし・halfblock で端末幅が奇数のとき
+        assert_eq!(map_center_sig_key(1000.2, 500.0, rw, rh, 1.0).0, 953); // 1000.2 - 46.5 = 953.7
+        assert_eq!(map_center_sig_key(1000.8, 500.0, rw, rh, 1.0).0, 954); // 1000.8 - 46.5 = 954.3
+        assert_ne!(center_sig(1000.2, 500.0, rw, rh), center_sig(1000.8, 500.0, rw, rh));
+    }
+
+    // 出力寸法が変われば当然キーも変わる(map_sig 側でも rw/rh を混ぜているが二重に効かせる)。
+    #[test]
+    fn map_center_sig_key_depends_on_the_output_size() {
+        assert_ne!(map_center_sig_key(1000.0, 500.0, 94, 44, 1.0), map_center_sig_key(1000.0, 500.0, 96, 44, 1.0));
+        assert_ne!(map_center_sig_key(1000.0, 500.0, 94, 44, 1.0), map_center_sig_key(1000.0, 500.0, 94, 48, 1.0));
+    }
+
+    #[test]
+    fn map_center_sig_key_handles_negative_origin_and_broken_values() {
+        // 世界の西端付近では窓の左上が負になる。floor は負側でも下方向へ丸まる。
+        assert_eq!(map_center_sig_key(10.0, 500.0, 94, 44, 1.0).0, -37);
+        assert_eq!(map_center_sig_key(-0.5, 500.0, 94, 44, 1.0).0, -48);
+        // 壊れた値が来ても panic しない(as キャストは飽和し、NaN は 0 になる)。
+        let (kx, ky) = map_center_sig_key(f64::NAN, f64::INFINITY, 94, 44, 1.0);
+        assert_eq!(kx, 0);
+        assert_eq!(ky, i64::MAX);
+    }
+
+    // ---- サブピクセル刻みの丸め(設計 §5.2 の「対策A を入れる場合」) ----
+
+    // 同じ刻みに入る2つの中心では need_build が立たない。対策A で粒度は細かくなるが、
+    // 「同じ絵なら送らない」は 1/SUBPIXEL_STEPS 単位で引き続き効く。
+    #[test]
+    fn subpixel_sig_ignores_moves_inside_one_step() {
+        let (rw, rh) = (94u32, 44u32);
+        let step = 1.0 / SUBPIXEL_STEPS; // 0.125
+        // 1出力ピクセルの1/100しか動かないパン(設計 §2.3 の再現条件)は刻みの中に収まる。
+        assert_eq!(snapped_sig(1000.0, 500.0, rw, rh, SUBPIXEL_STEPS),
+                   snapped_sig(1000.0001, 500.0001, rw, rh, SUBPIXEL_STEPS));
+        // 刻みの 1/10 ずつずらしても同じキーのまま。
+        assert_eq!(snapped_sig(1000.0, 500.0, rw, rh, SUBPIXEL_STEPS),
+                   snapped_sig(1000.0 + step * 0.1, 500.0 + step * 0.1, rw, rh, SUBPIXEL_STEPS));
+    }
+
+    // 刻みが1段変われば need_build が立つ(サブピクセルの動きが描画へ反映される)。
+    #[test]
+    fn subpixel_sig_changes_when_the_step_changes() {
+        let (rw, rh) = (94u32, 44u32);
+        let step = 1.0 / SUBPIXEL_STEPS;
+        assert_ne!(snapped_sig(1000.0, 500.0, rw, rh, SUBPIXEL_STEPS),
+                   snapped_sig(1000.0 + step, 500.0, rw, rh, SUBPIXEL_STEPS));
+        assert_ne!(snapped_sig(1000.0, 500.0, rw, rh, SUBPIXEL_STEPS),
+                   snapped_sig(1000.0, 500.0 + step, rw, rh, SUBPIXEL_STEPS));
+    }
+
+    // 整数切り出しでは捨てられていた 1/8 ピクセルの動きが、対策A では別フレームになる。
+    // (これが「ゆっくり動かすと 9px 飛ぶ」が消える理由。設計 §3.1)
+    #[test]
+    fn subpixel_sig_is_finer_than_the_integer_one() {
+        let (rw, rh) = (94u32, 44u32);
+        let step = 1.0 / SUBPIXEL_STEPS;
+        assert_eq!(snapped_sig(1000.0, 500.0, rw, rh, 1.0),
+                   snapped_sig(1000.0 + step, 500.0, rw, rh, 1.0)); // 従来は同じ絵
+        assert_ne!(snapped_sig(1000.0, 500.0, rw, rh, SUBPIXEL_STEPS),
+                   snapped_sig(1000.0 + step, 500.0, rw, rh, SUBPIXEL_STEPS)); // 対策A では変わる
+    }
+
+    // 吸着後の中心から作ったキーは、境界上でも揺れない(1/8 は2進で正確に表せるので、
+    // floor が期待どおりの整数になる)。描画とシグネチャがずれない前提そのものの検証。
+    #[test]
+    fn snap_center_to_grid_lands_exactly_on_the_grid() {
+        let (sx, sy) = snap_center_to_grid(1000.06, 500.19, SUBPIXEL_STEPS);
+        assert_eq!(sx, 1000.0 + 0.0 / 8.0); // 0.06 → 0/8(最寄りは 0.0)
+        assert_eq!(sy, 500.0 + 2.0 / 8.0);  // 0.19 → 2/8 = 0.25
+        // 奇数幅でも左上は格子に載る(rw/2.0 の .5 は 1/8 の倍数)。
+        assert_eq!(map_center_sig_key(sx, sy, 93, 44, SUBPIXEL_STEPS).0,
+                   ((1000.0 - 46.5) * 8.0) as i64);
+    }
+
+    #[test]
+    fn snap_center_to_grid_passes_broken_values_through() {
+        let (sx, sy) = snap_center_to_grid(f64::NAN, f64::INFINITY, SUBPIXEL_STEPS);
+        assert!(sx.is_nan());
+        assert!(sy.is_infinite());
+    }
+
+    // ---- use_subpixel_window(braille/edge を従来方式へ戻せる逃げ道・設計 §5.1 の注意) ----
+
+    #[test]
+    fn use_subpixel_window_defaults_to_on_for_every_mode() {
+        assert!(use_subpixel_window(false, false, None)); // halfblock
+        assert!(use_subpixel_window(true, false, None));  // braille
+        assert!(use_subpixel_window(false, true, None));  // edge
+    }
+
+    #[test]
+    fn use_subpixel_window_can_be_turned_off_by_env() {
+        for v in ["0", "false", "off", "no", " OFF "] {
+            assert!(!use_subpixel_window(false, false, Some(v)), "{v}");
+            assert!(!use_subpixel_window(true, false, Some(v)), "{v}");
+        }
+    }
+
+    #[test]
+    fn use_subpixel_window_can_be_forced_on_by_env() {
+        for v in ["1", "true", "on", "yes", " ON "] {
+            assert!(use_subpixel_window(true, true, Some(v)), "{v}");
+        }
+    }
+
+    // 設計 §5.1/§11 が求める「braille だけ従来の整数切り出しへ戻す」逃げ道。
+    // 全モード一括の 0/1 とは別に、モード単位で切り替えられること。
+    #[test]
+    fn use_subpixel_window_can_exclude_only_the_dot_modes() {
+        for v in ["halfblock", "no-braille", "nobraille", " HalfBlock "] {
+            assert!(use_subpixel_window(false, false, Some(v)), "halfblock は対策A のまま: {v}");
+            assert!(!use_subpixel_window(true, false, Some(v)), "braille は整数切り出しへ: {v}");
+            assert!(!use_subpixel_window(false, true, Some(v)), "edge は整数切り出しへ: {v}");
+        }
+    }
+
+    // 既定の分岐は SUBPIXEL_EXCEPT_BRAILLE 1箇所で決まる(実機で braille がちらついたら
+    // ここを true にするだけで既定が変わる)。定数の現在値と挙動が食い違わないことを見る。
+    #[test]
+    fn use_subpixel_window_default_follows_the_except_braille_constant() {
+        assert!(use_subpixel_window(false, false, None), "halfblock は常に対策A");
+        assert_eq!(use_subpixel_window(true, false, None), !SUBPIXEL_EXCEPT_BRAILLE);
+        assert_eq!(use_subpixel_window(false, true, None), !SUBPIXEL_EXCEPT_BRAILLE);
+    }
+
+    // 綴り間違い等の未知の値は既定へ落とす(起動しなくなる/黙って挙動が変わるのを避ける)。
+    #[test]
+    fn use_subpixel_window_ignores_unknown_env_values() {
+        assert!(use_subpixel_window(false, false, Some("maybe")));
+        assert!(use_subpixel_window(false, false, Some("")));
     }
 }

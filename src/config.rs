@@ -28,6 +28,29 @@
 
 use std::path::{Path, PathBuf};
 
+/// 人口メッシュの既定年次。2020年は令和2年国勢調査に基づく実績、2025年以降は推計値。
+/// 「いまどこに人がいるか」を見たい用途なので、実績ではなく直近の推計を既定にする。
+pub const DEFAULT_POPULATION_YEAR: u16 = 2025;
+/// 選べる年次(population.rs の YEARS と同じ並び)。config を手書きで壊されたときの検査に使う。
+pub const POPULATION_YEARS: [u16; 11] =
+    [2020, 2025, 2030, 2035, 2040, 2045, 2050, 2055, 2060, 2065, 2070];
+
+/// `image_settle_low_res` が有効なとき、地図の移動中に許す解像度の上限(zoom の上乗せ段数)。
+/// 0 = scale1(横 map_cols / 縦 map_rows*2 px)まで落とす / 1 = mid 相当で止める。
+///
+/// docs/web-pan-smoothness-design.md §5.3 C-3 の見直し結果。設計は「1段だけ下げる
+/// (high→mid、mid→mid)」つまりここを 1 にする案を挙げているが、0 のままにしてある。
+/// 理由は2つ:
+///   - 実画像モードは PNG エンコードが重く、設計 §2.2 の実測で 30 回のパンに対し 7 コマ程度しか
+///     生成できない。mid は 1 コマ 75,747 B あり、移動中の解像度を上げるとコマ数がさらに落ちる。
+///     既定は mid なので、1 にすると既定の利用者にとって image_settle_low_res が何もしない設定になる。
+///   - 設計 §5.1 の対策A(サブピクセル切り出し)を入れたことで、移動中の scale1 でも 1/8 出力
+///     ピクセル単位で滑らかに動くようになった。§3.4 が問題にしていた「滑らかさが要る瞬間に
+///     一番粗い状態になる」は、解像度ではなく切り出しの側で解けている。
+/// 設計 §5.3 の結び「実画像モードは静止して見る用と位置づけ、ドラッグの滑らかさは AA モード側で
+/// 解くのが素直」に沿う判断。実機で移動中の粗さが気になるようなら 1 へ上げて比べる。
+pub const IMAGE_SETTLE_DELTA_CAP: u32 = 0;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub llm_recommend_enabled: bool,
@@ -47,7 +70,7 @@ pub struct Config {
     pub mono: bool,
     pub image_mode: bool,            // インライン画像(iTerm2 OSC1337)で実画像を描画。既定OFF(AA描画)
     pub image_res: String,           // 実画像モードの解像度: "high"(scale4)/"mid"(scale2)/"low"(scale1)。既定mid
-    pub image_settle_low_res: bool,  // 実画像モードで地図移動中は低解像度に落とすか。既定true(OFFなら常に設定解像度を維持)
+    pub image_settle_low_res: bool,  // 実画像モードで地図移動中は低解像度に落とすか。既定true(OFFなら常に設定解像度を維持。落とす先は IMAGE_SETTLE_DELTA_CAP)
     pub cross_color_idx: u8,         // 中心十字(クロスヘア)の色。spots::SPOT_PALETTEのindex(0..10循環)。既定2(金/従来の黄に近い)
     pub google_maps_api_key: String, // Google Maps系(Geocoding検索/Street View)共通キー。旧streetview_api_keyから改名
     pub streetview_enabled: bool,     // 実写(i)を使うか
@@ -60,7 +83,12 @@ pub struct Config {
     pub camera_enabled: bool,         // 道路ライブカメラ(road-info-prvs.mlit.go.jp)を地図に重ねるか。既定false(ONにした人だけが外部サービスへ問い合わせる)
     pub regulation_enabled: bool,     // 通行規制(通行止め・車線規制等、road-info-prvs.mlit.go.jp)を地図に重ねるか。既定false(ONにした人だけが外部サービスへ問い合わせる)
     pub disaster_enabled: bool,       // 過去災害の発生履歴(NIED 災害事例データベース)を地図に重ねるか。既定false(ONにした人だけが外部サービスへ問い合わせる)
+    pub disaster_fill: bool,          // 過去災害を市区町村の塗り(コロプレス)で出すか。既定true。OFFなら従来の代表点マーカーだけになる。disaster_enabled がOFFならこの値に関わらず何も出ない
+    pub population_enabled: bool,     // 500mメッシュ別推計人口(国土数値情報)を地図に重ねるか。既定false(1都道府県が最大31MBあるので、ONにした人だけが取得する)
+    pub population_opacity: String,   // 人口メッシュの重ね方: "light"(0.35)/"mid"(0.55)/"strong"(0.75)。既定mid(雨雲と同じ3択)
+    pub population_year: u16,         // 表示する年次。2020〜2070の5年刻み。既定2025(2020は実績・以降は推計値)
     pub route_traffic_enabled: bool,  // ルート確定後、Google Directions(departure_time=now)で区間ごとの渋滞状況を追加確認しルート線を色分けするか。既定false(ONにした人だけがGoogle APIへ追加問い合わせする。要Google APIキー・Advanced課金対象)
+    pub weather_warning_enabled: bool, // ルート沿いの気象警報・注意報(気象庁防災情報API)を表示するか。既定false。ルート確定時だけ気象庁へ問い合わせる
 }
 
 impl Default for Config {
@@ -96,7 +124,12 @@ impl Default for Config {
             camera_enabled: false,
             regulation_enabled: false,
             disaster_enabled: false,
+            disaster_fill: true,
+            population_enabled: false,
+            population_opacity: "mid".to_string(),
+            population_year: DEFAULT_POPULATION_YEAR,
             route_traffic_enabled: false,
+            weather_warning_enabled: false,
         }
     }
 }
@@ -246,7 +279,22 @@ pub fn load_config_from(path: &Path) -> Config {
             ("camera", "enabled") => { if let Some(b) = parse_bool(value) { cfg.camera_enabled = b; } }
             ("regulation", "enabled") => { if let Some(b) = parse_bool(value) { cfg.regulation_enabled = b; } }
             ("disaster", "enabled") => { if let Some(b) = parse_bool(value) { cfg.disaster_enabled = b; } }
+            ("disaster", "fill") => { if let Some(b) = parse_bool(value) { cfg.disaster_fill = b; } }
+            ("population", "enabled") => { if let Some(b) = parse_bool(value) { cfg.population_enabled = b; } }
+            ("population", "opacity") => {
+                if let Some(s) = parse_string(value) {
+                    if matches!(s.as_str(), "light" | "mid" | "strong") { cfg.population_opacity = s; }
+                }
+            }
+            ("population", "year") => {
+                // 5年刻みの一覧に無い年は既定へ落とす(その年のデータは存在しないため)。
+                if let Some(n) = parse_number(value) {
+                    let y = n as u16;
+                    if POPULATION_YEARS.contains(&y) { cfg.population_year = y; }
+                }
+            }
             ("route_traffic", "enabled") => { if let Some(b) = parse_bool(value) { cfg.route_traffic_enabled = b; } }
+            ("weather_warning", "enabled") => { if let Some(b) = parse_bool(value) { cfg.weather_warning_enabled = b; } }
             // 旧スキーマ後方互換: [streetview] api_key を google_maps_api_key に取り込む(未設定時のみ)
             ("streetview", "api_key") => {
                 if cfg.google_maps_api_key.is_empty() {
@@ -324,8 +372,17 @@ pub fn save_config_to(path: &Path, c: &Config) -> Result<(), String> {
          \n\
          [disaster]\n\
          enabled = {}\n\
+         fill = {}\n\
+         \n\
+         [population]\n\
+         enabled = {}\n\
+         opacity = \"{}\"\n\
+         year = {}\n\
          \n\
          [route_traffic]\n\
+         enabled = {}\n\
+         \n\
+         [weather_warning]\n\
          enabled = {}\n",
         c.llm_recommend_enabled,
         c.llm_model,
@@ -357,7 +414,12 @@ pub fn save_config_to(path: &Path, c: &Config) -> Result<(), String> {
         c.camera_enabled,
         c.regulation_enabled,
         c.disaster_enabled,
+        c.disaster_fill,
+        c.population_enabled,
+        c.population_opacity,
+        c.population_year,
         c.route_traffic_enabled,
+        c.weather_warning_enabled,
     );
 
     // APIキーを含むので unix では 0600。書込中クラッシュで壊さないよう atomic。
@@ -522,7 +584,12 @@ mod tests {
             camera_enabled: true,
             regulation_enabled: true,
             disaster_enabled: true,
+            disaster_fill: false,
+            population_enabled: true,
+            population_opacity: "light".to_string(),
+            population_year: 2050,
             route_traffic_enabled: true,
+            weather_warning_enabled: true,
         };
         save_config_to(&path, &original).expect("save should succeed");
         let loaded = load_config_from(&path);
@@ -641,6 +708,29 @@ show_spots = maybe
     }
 
     #[test]
+    fn disaster_fill_defaults_to_on_and_is_independent_of_the_layer_switch() {
+        // レイヤをONにする人は「地図で見たい」人で、その主目的が塗りなので既定ON。
+        assert!(Config::default().disaster_fill);
+        // 塗りだけを切ってマーカー表示へ戻せること(レイヤ自体のON/OFFとは別のキー)。
+        let path = unique_temp_path("disaster_fill_off");
+        std::fs::write(&path, "[disaster]\nenabled = true\nfill = false\n").unwrap();
+        let cfg = load_config_from(&path);
+        assert!(cfg.disaster_enabled);
+        assert!(!cfg.disaster_fill);
+        cleanup(&path);
+        // fill を書かない古い config.toml でも既定(ON)のまま読める。
+        let path2 = unique_temp_path("disaster_fill_absent");
+        std::fs::write(&path2, "[disaster]\nenabled = true\n").unwrap();
+        assert!(load_config_from(&path2).disaster_fill);
+        cleanup(&path2);
+        // 値が壊れていれば既定を保つ。
+        let path3 = unique_temp_path("disaster_fill_bogus");
+        std::fs::write(&path3, "[disaster]\nfill = \"maybe\"\n").unwrap();
+        assert!(load_config_from(&path3).disaster_fill);
+        cleanup(&path3);
+    }
+
+    #[test]
     fn route_traffic_defaults_to_off_and_is_read_from_its_own_section() {
         assert!(!Config::default().route_traffic_enabled);
         let path = unique_temp_path("route_traffic_section");
@@ -649,6 +739,75 @@ show_spots = maybe
         assert!(cfg.route_traffic_enabled);
         assert!(!cfg.disaster_enabled);
         cleanup(&path);
+    }
+
+    #[test]
+    fn weather_warning_defaults_to_off_and_is_read_from_its_own_section() {
+        assert!(!Config::default().weather_warning_enabled);
+        let path = unique_temp_path("weather_warning_section");
+        std::fs::write(&path, "[weather_warning]\nenabled = true\n").unwrap();
+        let cfg = load_config_from(&path);
+        assert!(cfg.weather_warning_enabled);
+        assert!(!cfg.route_traffic_enabled);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn population_defaults_are_off_mid_and_2025() {
+        let c = Config::default();
+        assert!(!c.population_enabled, "既定OFF(1都道府県が最大31MBあるため)");
+        assert_eq!(c.population_opacity, "mid");
+        assert_eq!(c.population_year, 2025);
+        assert_eq!(c.population_year, DEFAULT_POPULATION_YEAR);
+    }
+
+    #[test]
+    fn population_section_is_read() {
+        let path = unique_temp_path("population_section");
+        std::fs::write(&path, "[population]\nenabled = true\nopacity = \"strong\"\nyear = 2050\n").unwrap();
+        let cfg = load_config_from(&path);
+        assert!(cfg.population_enabled);
+        assert_eq!(cfg.population_opacity, "strong");
+        assert_eq!(cfg.population_year, 2050);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn population_opacity_only_accepts_known_values() {
+        let path = unique_temp_path("population_opacity_unknown");
+        std::fs::write(&path, "[population]\nopacity = \"bogus\"\n").unwrap();
+        assert_eq!(load_config_from(&path).population_opacity, Config::default().population_opacity);
+        cleanup(&path);
+    }
+
+    // 5年刻みの一覧に無い年はデータ自体が存在しないので、既定へ落とす。
+    #[test]
+    fn population_year_falls_back_to_the_default_when_it_is_not_a_five_year_step() {
+        for bad in ["2021", "2019", "2071", "0", "-5"] {
+            let path = unique_temp_path(&format!("population_year_{}", bad.replace('-', "m")));
+            std::fs::write(&path, format!("[population]\nyear = {bad}\n")).unwrap();
+            assert_eq!(
+                load_config_from(&path).population_year,
+                DEFAULT_POPULATION_YEAR,
+                "year = {bad} を受け付けてはいけない"
+            );
+            cleanup(&path);
+        }
+        // 一覧にある年は全部通る。
+        for good in POPULATION_YEARS {
+            let path = unique_temp_path(&format!("population_year_ok_{good}"));
+            std::fs::write(&path, format!("[population]\nyear = {good}\n")).unwrap();
+            assert_eq!(load_config_from(&path).population_year, good);
+            cleanup(&path);
+        }
+    }
+
+    // config.rs 側の年次一覧が population.rs の YEARS とずれていないこと
+    // (ずれると設定画面に存在しない年が並ぶ)。
+    #[test]
+    fn the_population_year_list_matches_the_data_module() {
+        assert_eq!(POPULATION_YEARS, crate::population::YEARS);
+        assert!(POPULATION_YEARS.contains(&DEFAULT_POPULATION_YEAR));
     }
 
     #[test]
@@ -879,7 +1038,12 @@ profile = "custom-profile"
             camera_enabled: false,
             regulation_enabled: false,
             disaster_enabled: false,
+            disaster_fill: true,
+            population_enabled: false,
+            population_opacity: "mid".to_string(),
+            population_year: DEFAULT_POPULATION_YEAR,
             route_traffic_enabled: false,
+            weather_warning_enabled: false,
         };
         save_config_to(&path, &cfg).unwrap();
         let loaded = load_config_from(&path);

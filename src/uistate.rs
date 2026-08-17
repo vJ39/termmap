@@ -31,6 +31,9 @@ pub(crate) struct UiState {
     pub focus: Focus,
     pub cfg: config::Config,           // 設定(streetview key / 描画既定 等・設定画面で書き換え)
     pub opts: Args,                    // 実行中に変えられる描画設定(Argsのコピー)
+    // サブピクセル切り出しの上書き(設計 §5.1 のリスク項目)。起動時に1回だけ読む
+    // (毎フレーム std::env::var を呼ぶ必要は無い)。未設定なら use_subpixel_window の既定。
+    pub subpixel_env: Option<String>,
     pub set_sel: usize,                // 設定画面の選択行
     pub input_cur: usize,              // テキスト入力欄のカーソル位置(文字単位)。テキストFocus開始時に該当バッファ末尾へ
     pub menu_cat_sel: usize,           // Space メニュー: トップのカテゴリ選択
@@ -110,17 +113,25 @@ pub(crate) struct UiState {
     pub turn_points: Vec<route::TurnPoint>,
     pub turn_job: Option<route::TurnRx>,
     pub voice_guide: Option<voice::VoiceGuide>,
+    // 気象警報(#79・ルートベース)。turn_jobと同じ「ルート確定時」フックで作り直す。
+    pub route_warnings: Vec<warning::ActiveWarning>,
+    pub route_warning_job: Option<std::sync::mpsc::Receiver<Vec<warning::ActiveWarning>>>,
 
-    // ---- 地図に重ねる5種のプロットデータ ----
-    // 取得単位(メッシュ/整備局)・TTL・ズーム下限・ディスク永続化はすべて plotlayer/plotcache 側が
-    // 持つ。ここは毎フレーム tick して結果を読むだけ。道路交通量は cfg.traffic_enabled、
-    // カメラは camera_enabled、規制は regulation_enabled、過去災害は disaster_enabled で ON/OFFする。
+    // ---- 地図に重ねる7種のプロットデータ ----
+    // 取得単位(メッシュ/整備局/都道府県)・TTL・ズーム下限・ディスク永続化はすべて
+    // plotlayer/plotcache 側が持つ。ここは毎フレーム tick して結果を読むだけ。道路交通量は
+    // cfg.traffic_enabled、カメラは camera_enabled、規制は regulation_enabled、
+    // 過去災害は disaster_enabled、500mメッシュ人口は population_enabled で ON/OFFする。
     // 主要道路(#73)は交通量の観測点をラインへスナップする下地なので交通量と連動する。
     pub traffic_layer: plotlayer::PlotLayer<traffic::TrafficPoint>,
     pub roads_layer: plotlayer::PlotLayer<plotlayer::RoadShape>,
     pub camera_layer: plotlayer::PlotLayer<camera::RoadCamera>,
     pub regulation_layer: plotlayer::PlotLayer<regulation::ClosureEvent>,
     pub disaster_layer: plotlayer::PlotLayer<disaster::DisasterSite>,
+    // 市区町村境界(気象庁 class20s)。過去災害を塗り分ける(コロプレス)ためだけの下地なので、
+    // 過去災害がONでかつ塗りがONのときだけ取りに行く。
+    pub boundary_layer: plotlayer::PlotLayer<muni::MuniArea>,
+    pub population_layer: plotlayer::PlotLayer<population::PopMesh>,
     // 期限切れ/上限超過のキャッシュ掃除は1セッション1回、最初のアイドル到達時に別スレッドで走らせる
     // (起動を遅くせず、無操作のたびにディレクトリを走査もしない)。
     pub plot_gc_done: bool,
@@ -204,6 +215,10 @@ pub(crate) struct UiState {
     // 値が変わっていなくても次フレームで1回送らせる。
     pub prev_drag_axes: Option<(dragmode::Axis, dragmode::Axis)>,
     pub drag_mode_req_pending: bool,
+    // 端末1セルの縦横比(セル高/セル幅)。web版(ブラウザ)から CELL マーカーで届いた値を覚えておく
+    // (設計書 docs/web-image-aspect-ratio-design.md §7.2 の経路2)。ネイティブ端末は毎フレーム
+    // window_size() から取れるので保持しない。どちらも無ければ既定値 2.0 へ落ちる。
+    pub cell_ratio_web: Option<f64>,
 }
 
 impl UiState {
@@ -277,11 +292,15 @@ impl UiState {
             turn_points: Vec::new(),
             turn_job: None,
             voice_guide: None,
+            route_warnings: Vec::new(),
+            route_warning_job: None,
             traffic_layer: plotlayer::traffic(),
             roads_layer: plotlayer::roads(),
             camera_layer: plotlayer::camera(),
             regulation_layer: plotlayer::regulation(),
             disaster_layer: plotlayer::disaster(),
+            boundary_layer: plotlayer::boundary(),
+            population_layer: plotlayer::population(),
             plot_gc_done: false,
             cam_view: None,
             cam_job: None,
@@ -332,6 +351,10 @@ impl UiState {
             last_pan_at: std::time::Instant::now(),
             prev_drag_axes: None,
             drag_mode_req_pending: false,
+            cell_ratio_web: None,
+            // 環境変数の読み取りはディスクにもネットワークにも触らないので blank() で行う
+            // (interactive() と同じ「起動時に1回だけ」を保つ)。
+            subpixel_env: std::env::var("TERMMAP_SUBPIXEL").ok(),
             opts,
             cfg,
         }
@@ -414,6 +437,49 @@ impl UiState {
         } else {
             self.radar_turn_on();
         }
+    }
+
+    // 500mメッシュ人口の表示/非表示。雨雲と違い背景ポーラーを持たないので、設定を反転して
+    // 保存するだけでよい(次の tick が cfg.population_enabled を見てセルを取りに行く)。
+    // ONにした直後は出典と、取得が重いことを1回だけ知らせる(31MBが無言で落ちないように)。
+    // 設定の保存と分けてあるのは radar_view_turn_on と同じ理由で、ここをディスクに触らず
+    // テストできるようにするため(保存は cfg を書き換えた後なのでどちらの順でも結果は同じ)。
+    fn population_toggle_view(&mut self) {
+        self.cfg.population_enabled = !self.cfg.population_enabled;
+        self.addr = if self.cfg.population_enabled {
+            format!(
+                "人口メッシュ: ON({}年) {}",
+                self.cfg.population_year,
+                population::ATTRIBUTION
+            )
+        } else {
+            "人口メッシュ: OFF".to_string()
+        };
+        // 再描画は cfg.population_enabled を map_sig に混ぜてあるので自動で起きる(force_reemit不要)。
+    }
+
+    pub(crate) fn population_toggle(&mut self) {
+        self.population_toggle_view();
+        let _ = config::save_config(&self.cfg);
+    }
+
+    // 過去災害の塗り(コロプレス)の ON/OFF を反転する(Spaceメニュー・設定画面・地図での F キーの
+    // 3経路共通処理、population_toggle と同じ構成)。ONにした直後だけ境界データの出典を1回出す。
+    fn disaster_fill_toggle_view(&mut self) {
+        self.cfg.disaster_fill = !self.cfg.disaster_fill;
+        self.force_reemit = true; // 今表示している地図の見た目が変わる
+        self.addr = if self.cfg.disaster_fill && self.cfg.disaster_enabled {
+            "過去災害の塗り: 市区町村境界 気象庁".to_string()
+        } else if self.cfg.disaster_fill {
+            "過去災害の塗り: ON(「過去災害」もONにすると出る)".to_string()
+        } else {
+            "過去災害の塗り: OFF".to_string()
+        };
+    }
+
+    pub(crate) fn disaster_fill_toggle(&mut self) {
+        self.disaster_fill_toggle_view();
+        let _ = config::save_config(&self.cfg);
     }
 
     // 「利用者が結果を待っている」ジョブが1本でも走っているか。ステータス行のスピナー・
@@ -590,6 +656,58 @@ mod tests {
         assert_eq!(st.radar_idx, 3, "OFFではコマ位置を触らない");
     }
 
+    // 人口メッシュ・過去災害の塗りは、設定の保存だけを別関数(population_toggle /
+    // disaster_fill_toggle)へ出してある。ここで呼ぶのは保存しない *_view 側だけなので、
+    // $HOME/.config/termmap/config.toml には一切触らない。
+    #[test]
+    fn population_toggle_view_flips_the_flag_and_names_the_source() {
+        let mut st = test_state();
+        assert!(!st.cfg.population_enabled);
+        st.cfg.population_year = 2020;
+        st.population_toggle_view();
+        assert!(st.cfg.population_enabled);
+        assert!(st.addr.contains("ON(2020年)"), "何年の値を出しているかを言う: {}", st.addr);
+        assert!(st.addr.contains(population::ATTRIBUTION), "出典を1回出す");
+
+        st.population_toggle_view();
+        assert!(!st.cfg.population_enabled);
+        assert_eq!(st.addr, "人口メッシュ: OFF");
+    }
+
+    #[test]
+    fn population_toggle_view_does_not_force_a_reemit() {
+        // 再描画は cfg.population_enabled が map_sig に入っていることで起きる。
+        let mut st = test_state();
+        st.force_reemit = false;
+        st.population_toggle_view();
+        assert!(!st.force_reemit);
+    }
+
+    #[test]
+    fn disaster_fill_toggle_view_tells_whether_the_fill_will_actually_show() {
+        // 既定は塗りON・過去災害本体OFF。まず塗りを消してから、戻したときの文言を見る。
+        let mut st = test_state();
+        assert!(st.cfg.disaster_fill && !st.cfg.disaster_enabled, "既定の組み合わせ");
+        st.disaster_fill_toggle_view();
+        assert!(!st.cfg.disaster_fill);
+        assert_eq!(st.addr, "過去災害の塗り: OFF");
+
+        // 本体がOFFのまま塗りをONへ戻すと、それだけでは出ないことを伝える
+        st.force_reemit = false;
+        st.disaster_fill_toggle_view();
+        assert!(st.cfg.disaster_fill);
+        assert_eq!(st.addr, "過去災害の塗り: ON(「過去災害」もONにすると出る)");
+        assert!(st.force_reemit, "いま出ている地図の見た目が変わるので再emitする");
+
+        // 本体もONなら境界データの出典を出す
+        let mut st = test_state();
+        st.cfg.disaster_enabled = true;
+        st.cfg.disaster_fill = false;
+        st.disaster_fill_toggle_view();
+        assert!(st.cfg.disaster_fill);
+        assert_eq!(st.addr, "過去災害の塗り: 市区町村境界 気象庁");
+    }
+
     #[test]
     fn restart_prefetch_on_zoom_is_noop_while_stopped() {
         let mut st = test_state();
@@ -675,6 +793,18 @@ mod tests {
             set(&mut st);
             assert!(st.jobs_active(), "{i}番目のジョブが一覧から漏れている");
         }
+    }
+
+    #[test]
+    fn jobs_active_ignores_the_background_layers_and_the_weather_warning() {
+        // 背景で取りに行くだけのもの(市区町村境界・人口メッシュ・ルート沿い気象警報)は
+        // 「利用者が結果を待っている」ジョブではないので、スピナーも中断の対象にもしない。
+        // 取りこぼし防止のポーリング判定(ui.rs の polling)にだけ入れてある。
+        let mut st = test_state();
+        st.route_warning_job = Some(std::sync::mpsc::channel().1);
+        assert!(!st.jobs_active());
+        st.cancel_jobs();
+        assert!(st.route_warning_job.is_some(), "気象警報は中断で止めない");
     }
 
     #[test]

@@ -26,6 +26,9 @@ pub(crate) fn poll(st: &mut UiState, loader: &TileLoader, lat: f64, lon: f64, no
             Ok(Ok(r)) => {
                 st.spec.routes.clear();
                 st.spec.traffic_segments.clear(); // 古いルートの色分けを引き継がない
+                st.spec.expressway_segments.clear(); // 古いルートの高速区間も同様
+                st.spec.warning_segments.clear(); // 古いルートの気象警報も同様
+                st.route_warnings.clear(); st.route_warning_job = None; // 新ルート確定でturn_jobを待ち直すため一旦クリア
                 st.route_note = Some(route_summary(&st.mode, &r));
                 // 通行止め回避が件数上限で一部反映できなかった場合、黙って進めると
                 // 「回避できた」と誤解されるのでひとこと添える。
@@ -51,6 +54,12 @@ pub(crate) fn poll(st: &mut UiState, loader: &TileLoader, lat: f64, lon: f64, no
                 if st.cfg.voice_guide_enabled {
                     st.turn_job = Some(trigger_turn_points(&st.wps, &st.mode, 0, &r.pts, &nogos));
                 }
+                // 高速区間(#高速区間)の点列は r.pts をムーブする前に作る。ルート結果と
+                // 同時に確定するので、渋滞の色分けのような非同期の受け取り口は要らない。
+                st.spec.expressway_segments = route::expressway_polylines(&r.pts, &r.hw_segments)
+                    .into_iter()
+                    .map(|pts| Route { pts, color: route::EXPRESSWAY_COLOR, thickness: 2 })
+                    .collect();
                 st.spec.routes.push(Route { pts: r.pts, color: [0, 220, 255], thickness: 2 });
                 st.route_job = None; got_result = true;
             }
@@ -61,9 +70,42 @@ pub(crate) fn poll(st: &mut UiState, loader: &TileLoader, lat: f64, lon: f64, no
     }
     if st.turn_job.is_some() {
         match st.turn_job.as_ref().unwrap().try_recv() {
-            Ok(v) => { st.turn_points = v; st.voice_guide = Some(voice::VoiceGuide::new(&st.turn_points)); st.turn_job = None; }
+            Ok(v) => {
+                st.turn_points = v; st.voice_guide = Some(voice::VoiceGuide::new(&st.turn_points)); st.turn_job = None;
+                // 気象警報(#79・ルートベース)。voice_guide作り直しと同じ「ルート確定時」フックで
+                // ルート沿いの気象台コードを列挙し、まとめて背景取得する。
+                if st.cfg.weather_warning_enabled {
+                    if let Some(pts) = st.spec.routes.last().map(|rt| rt.pts.clone()) {
+                        let office_codes = ui_helpers::route_warning_office_codes(&pts);
+                        if !office_codes.is_empty() {
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            std::thread::spawn(move || {
+                                let mut all = Vec::new();
+                                for code in office_codes {
+                                    if let Ok(ws) = warning::fetch_warnings(&code) { all.extend(ws); }
+                                }
+                                let _ = tx.send(all);
+                            });
+                            st.route_warning_job = Some(rx);
+                        }
+                    }
+                }
+            }
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => { st.turn_job = None; }
+        }
+    }
+    if let Some(job) = &st.route_warning_job {
+        match job.try_recv() {
+            Ok(ws) => {
+                st.route_warnings = ws;
+                if let Some(pts) = st.spec.routes.last().map(|rt| rt.pts.clone()) {
+                    st.spec.warning_segments = ui_helpers::build_warning_segments(&pts, &st.route_warnings);
+                }
+                st.route_warning_job = None;
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => { st.route_warning_job = None; }
         }
     }
     // プロットデータ4種の取得。各レイヤが「視野を覆うセルのうち、fresh なものが手元に
@@ -76,6 +118,9 @@ pub(crate) fn poll(st: &mut UiState, loader: &TileLoader, lat: f64, lon: f64, no
     got_result |= st.camera_layer.tick(st.cx, st.cy, st.z, st.cfg.camera_enabled);
     got_result |= st.regulation_layer.tick(st.cx, st.cy, st.z, st.cfg.regulation_enabled);
     got_result |= st.disaster_layer.tick(st.cx, st.cy, st.z, st.cfg.disaster_enabled);
+    // 境界は塗りに使うときだけ取りに行く(塗りをOFFにしている人に通信させない)。
+    got_result |= st.boundary_layer.tick(st.cx, st.cy, st.z, st.cfg.disaster_enabled && st.cfg.disaster_fill);
+    got_result |= st.population_layer.tick(st.cx, st.cy, st.z, st.cfg.population_enabled);
     if let Some(job) = &st.disaster_job { // Bキーで頼んだ事例一覧(2段目)の到着
         match job.try_recv() {
             Ok(Ok(panel)) => { st.disaster_view = Some(panel); st.disaster_job = None; got_result = true; }
@@ -372,6 +417,138 @@ mod tests {
         assert_eq!(st.turn_points.len(), 1);
         assert!(st.voice_guide.is_some());
         assert!(st.turn_job.is_none());
+    }
+
+    // ---- 気象警報(#79・ルートベース)の配線 ----
+    //
+    // 以下は取得そのもの(warning::fetch_warnings)を走らせない経路だけを通す。
+    // 「設定ON かつ ルートあり かつ 気象台コードが1つ以上」が揃うとスレッドを起こして
+    // 気象庁へ問い合わせるので、その組み合わせは意図的に作らない。
+    // 塗り分けの計算そのもの(build_warning_segments)は ui_helpers.rs 側で試している。
+
+    // 新宿駅付近(東京地方=130010)を通る短いルート。geoarea.rs の実データを引くので実在の座標。
+    fn tokyo_pts() -> Vec<(f64, f64)> {
+        vec![(35.6896, 139.7006), (35.69, 139.701), (35.6905, 139.7015)]
+    }
+
+    fn warned(code: &str, severity: warning::Severity) -> warning::ActiveWarning {
+        warning::ActiveWarning { area_code: code.to_string(), name: "大雨警報".to_string(), severity }
+    }
+
+    #[test]
+    fn route_warnings_arrival_paints_the_route() {
+        let mut st = test_state();
+        let pts = tokyo_pts();
+        st.spec.routes.push(Route { pts: pts.clone(), color: [0, 220, 255], thickness: 2 });
+        st.route_warning_job = Some(sent(vec![warned("130010", warning::Severity::Advisory)]));
+        // 警報はルート線の付随情報なので、届いても即再描画はしない(曲がり角と同じ扱い)。
+        assert!(!poll1(&mut st));
+        assert_eq!(st.route_warnings.len(), 1);
+        assert_eq!(st.spec.warning_segments.len(), 1, "ルートを塗り分ける");
+        assert_eq!(st.spec.warning_segments[0].pts, pts);
+        assert!(st.route_warning_job.is_none());
+    }
+
+    #[test]
+    fn route_warnings_that_match_no_area_leave_the_route_plain() {
+        let mut st = test_state();
+        st.spec.routes.push(Route { pts: tokyo_pts(), color: [0, 220, 255], thickness: 2 });
+        st.route_warning_job = Some(sent(vec![warned("999999", warning::Severity::Warning)]));
+        assert!(!poll1(&mut st));
+        assert_eq!(st.route_warnings.len(), 1, "件数はステータス行に出すので保持する");
+        assert!(st.spec.warning_segments.is_empty());
+    }
+
+    #[test]
+    fn route_warnings_without_a_route_are_kept_but_paint_nothing() {
+        // ルートを消した直後に結果が届く場合。塗る対象が無いだけで、件数は捨てない。
+        let mut st = test_state();
+        st.route_warning_job = Some(sent(vec![warned("130010", warning::Severity::Warning)]));
+        assert!(!poll1(&mut st));
+        assert_eq!(st.route_warnings.len(), 1);
+        assert!(st.spec.warning_segments.is_empty());
+        assert!(st.route_warning_job.is_none());
+    }
+
+    #[test]
+    fn a_dropped_warning_sender_clears_the_job() {
+        let mut st = test_state();
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<warning::ActiveWarning>>();
+        drop(tx);
+        st.route_warning_job = Some(rx);
+        assert!(!poll1(&mut st));
+        assert!(st.route_warning_job.is_none());
+        assert!(st.route_warnings.is_empty());
+    }
+
+    #[test]
+    fn turn_points_do_not_ask_for_warnings_while_the_setting_is_off() {
+        // 既定OFF。ONにした人だけが気象庁へ追加問い合わせする。
+        let mut st = test_state();
+        assert!(!st.cfg.weather_warning_enabled, "既定はOFF");
+        st.spec.routes.push(Route { pts: tokyo_pts(), color: [0, 220, 255], thickness: 2 });
+        st.turn_job = Some(sent(Vec::new()));
+        assert!(!poll1(&mut st));
+        assert!(st.route_warning_job.is_none());
+    }
+
+    #[test]
+    fn turn_points_do_not_ask_for_warnings_without_a_route() {
+        // ONでもルートが無ければ問い合わせ先が決まらない。
+        let mut st = test_state();
+        st.cfg.weather_warning_enabled = true;
+        st.turn_job = Some(sent(Vec::new()));
+        assert!(!poll1(&mut st));
+        assert!(st.route_warning_job.is_none());
+    }
+
+    #[test]
+    fn turn_points_do_not_ask_for_warnings_when_the_route_yields_no_office_code() {
+        // ONでルートもあるが、そのルートから気象台コードが1つも出ない場合は空振りの
+        // 通信をしない(点が無いルートで再現)。
+        let mut st = test_state();
+        st.cfg.weather_warning_enabled = true;
+        st.spec.routes.push(Route { pts: Vec::new(), color: [0, 220, 255], thickness: 2 });
+        st.turn_job = Some(sent(Vec::new()));
+        assert!(!poll1(&mut st));
+        assert!(st.route_warning_job.is_none());
+    }
+
+    #[test]
+    fn a_new_route_clears_what_belonged_to_the_old_one() {
+        // 高速区間(#高速区間)と気象警報(#79)はどちらもルートに紐づく付随情報なので、
+        // 新しいルートが確定した時点で古い分を捨てる(でないと別のルートの上に前の色が残る)。
+        // pts を空にしているのは周辺タイルの先読み(loader経由の通信)を起こさないため。
+        let mut st = test_state();
+        st.spec.expressway_segments = vec![Route { pts: tokyo_pts(), color: [1, 2, 3], thickness: 2 }];
+        st.spec.warning_segments = vec![Route { pts: tokyo_pts(), color: [4, 5, 6], thickness: 3 }];
+        st.route_warnings = vec![warned("130010", warning::Severity::Warning)];
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<warning::ActiveWarning>>();
+        st.route_warning_job = Some(rx);
+        st.route_job = Some(sent(Ok(RouteResult {
+            pts: Vec::new(), ele: Vec::new(), dist_m: 1000.0, time_s: 600.0,
+            hw_m: 0.0, hw_segments: Vec::new(), ascend_m: 0.0, via_google: false,
+        })));
+        assert!(poll1(&mut st));
+        assert!(st.spec.expressway_segments.is_empty());
+        assert!(st.spec.warning_segments.is_empty());
+        assert!(st.route_warnings.is_empty());
+        assert!(st.route_warning_job.is_none(), "turn_job の完了を待って取り直すので一旦畳む");
+        assert!(st.route_job.is_none());
+        drop(tx);
+    }
+
+    #[test]
+    fn the_background_layers_stay_idle_while_their_settings_are_off() {
+        // 市区町村境界は「過去災害ON かつ 塗りON」の両方が揃ったときだけ取りに行く
+        // (既定は disaster_enabled=false / disaster_fill=true なので取りに行かない)。
+        // 人口メッシュも既定OFF(1都道府県が最大31MBあるため)。
+        let mut st = test_state();
+        assert!(!st.cfg.disaster_enabled && st.cfg.disaster_fill, "既定の組み合わせ");
+        assert!(!st.cfg.population_enabled);
+        assert!(!poll1(&mut st));
+        assert!(!st.boundary_layer.job_active());
+        assert!(!st.population_layer.job_active());
     }
 
     #[test]

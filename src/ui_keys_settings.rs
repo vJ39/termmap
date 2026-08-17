@@ -90,6 +90,14 @@ pub(crate) fn settings(st: &mut UiState, k: KeyEvent, route_nogos: &str, out: &m
                             st.addr = "渋滞状況の色分け: Google APIキー未設定".into();
                         }
                     }
+                    29 => { st.disaster_fill_toggle(); } // 過去災害の塗り: Fキー・Spaceメニューと共通処理
+                    30 => { st.population_toggle(); } // 人口メッシュ: Uキー・Spaceメニューと共通処理
+                    33 => { // ルート沿い気象警報: 次にルートが確定したタイミングで初めて問い合わせる
+                        st.cfg.weather_warning_enabled = !st.cfg.weather_warning_enabled;
+                        if st.cfg.weather_warning_enabled && st.spec.routes.is_empty() {
+                            st.addr = "ルート沿い気象警報: ルート未確定".into();
+                        }
+                    }
                     _ => {}
                 }
             }

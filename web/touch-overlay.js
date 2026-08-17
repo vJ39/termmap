@@ -55,7 +55,15 @@
 
   if (window.__termmapTouch) { return; } // 二重読み込み防止
 
-  var OVERLAY_VERSION = '1.4.0';
+  // 1.5.0: 端末セル比(CELL マーカー)の通知を追加。実写/道路カメラ写真が縦長端末で
+  //        歪む件の対策(docs/web-image-aspect-ratio-design.md §7.2 の経路2)。
+  // 1.6.0: パンの滑らかさ対策(docs/web-pan-smoothness-design.md §7 Step2)。
+  //        term.write を包んで未処理バイト数を数え、詰まっている間はパン量を送らない背圧
+  //        (対策D §5.4)。フラッシュと慣性を setTimeout から requestAnimationFrame へ移し、
+  //        慣性の減衰を経過時間ベースにした。ビューポート寸法をキャッシュして touchmove 中の
+  //        同期レイアウトをやめ、ドラッグ開始のスロップ分を送らないようにした(対策F §5.6)。
+  //        実機計測用に __termmapTouch.stats() を追加(§10)。
+  var OVERLAY_VERSION = '1.6.0';
 
   // ── 調整パラメータ ───────────────────────────────────────────────
   var TAP_SLOP_PX      = 12;   // 移動量がこれ以下ならタップ(Enter)扱い
@@ -75,6 +83,10 @@
   // 軸モード要求のリトライ。bracketed paste が有効になる(=termmap起動)まで空振りする前提。
   var DRAG_MODE_PROBE_INTERVAL_MS = 500;
   var DRAG_MODE_PROBE_MAX_TRIES = 40;     // 約20秒
+  // セル寸法通知のリトライ。termmap の起動・OSC 9997 の受信・端末レイアウトの確定を待つ。
+  var CELL_SIZE_PROBE_INTERVAL_MS = 500;
+  var CELL_SIZE_PROBE_MAX_TRIES = 40;     // 約20秒
+  var CELL_SIZE_SETTLE_MS = 250;          // 回転/リサイズ後、fit addon が cols/rows を決め直すのを待つ時間
   var PINCH_PX_PER_STEP = 55;  // ピンチ: 指の間隔が何 px 変わるごとにズーム1段か(誤爆軽減でパンより粗め)
   // touchmove/慣性の1tickで送るキーの上限(暴走防止の保険)。速いスワイプほど1回の
   // touchmoveあたりの移動量(dx/dy)が大きくなるので、ここを大きめにしておかないと
@@ -84,10 +96,36 @@
   var MAX_STEPS_PER_TICK = 20;
   var STEP_INTERVAL_MS = 16;   // sendKeyBurst(ピンチの多段ジャンプ用)の連続発火間隔。termmap 側は
                                // 同方向220ms以内の連続入力でpan_streakが伸びて加速する(Rust側既存実装)
-  var GLIDE_TICK_MS   = 60;    // 指を離した後の慣性スクロールの1tick間隔
-  var GLIDE_DECAY     = 0.75;  // 1tickごとにこの倍率で速度を減衰させる(小さいほど早く止まる)
+  var GLIDE_TICK_MS   = 60;    // requestAnimationFrame が使えない環境でのフォールバック tick 間隔
+  var GLIDE_DECAY     = 0.75;  // GLIDE_DECAY_REF_MS ごとにこの倍率で速度を減衰させる(小さいほど早く止まる)
+  // 減衰率の基準時間。rAF 化(設計 §5.6)で1フレームの長さが端末任せ(60Hz なら 16.7ms・
+  // ProMotion なら 8.3ms・負荷時はもっと長い)になるため、減衰を tick 回数ベースから
+  // 経過時間ベース(v *= pow(GLIDE_DECAY, dt / GLIDE_DECAY_REF_MS))へ変えた。基準を rAF の
+  // 1フレームではなく従来の tick 間隔(60ms)にしてあるのは、減速カーブを従来と同じ体感に
+  // 保つため。ここを 16.7 にすると同じ GLIDE_DECAY でも約3.6倍速く止まる。
+  var GLIDE_DECAY_REF_MS = 60;
   var GLIDE_MIN_SPEED = 0.05;  // px/ms。これ未満まで減衰したら慣性を止める
-  var GLIDE_MAX_TICKS = 16;    // 保険の上限(だいたい1秒で必ず止まる)
+  var GLIDE_MAX_MS    = 960;   // 保険の上限(だいたい1秒で必ず止まる。従来の 60ms×16tick 相当)
+  // 1フレームの間隔がこれを超えたら、そのフレームでは慣性を進めない(タブ復帰・長いGC等)。
+  // 裏に回っていた数秒ぶんが復帰の1フレームで一気に流れて地図が飛ぶのを防ぐ。減衰の方は
+  // 実経過時間で掛けるので、長く空いていれば復帰後すぐ慣性が止まる。
+  var GLIDE_MAX_STEP_MS = 100;
+
+  // ── 出力の背圧(設計 §5.4 対策D)────────────────────────────────────
+  // 1セルあたりの出力バイト数の目安。halfblock は前景SGR+背景SGR+▀ で約41バイト、
+  // 対策C-1(直前と同じSGRを出さない)を通した実測で 94×23 が約65KB = 1セル約30バイト。
+  // braille はこれより安いので、halfblock 基準にしておけば安全側(閾値が大きめ)に倒れる。
+  var BYTES_PER_CELL_ESTIMATE = 30;
+  // 未処理バイト数がこの「フレーム数」ぶんを超えている間はパン量を送らない。
+  // 設計 §5.4 の「1フレーム分の目安バイト数×2程度」。実機の stats() を見て詰める。
+  var BACKPRESSURE_FRAMES = 2;
+  // 背圧が連続してこの時間を超えたら、未処理バイト数の勘定が壊れているとみなして 0 へ戻す。
+  // outstanding は term.write の callback でしか減らないため、xterm.js が何らかの理由で
+  // callback を1回でも返さないと、その分がずっと残って背圧が二度と解けない
+  // (=スワイプしても地図が動かないままリロードするしかない)。実際にその状況を作ると
+  // 復帰しないことを確認したので、時間で必ず抜ける逃げ道を置く。詰まりが本物なら
+  // 次のフレームでまた背圧が掛かるだけなので、通常時の効き方は変わらない。
+  var BACKPRESSURE_STUCK_MS = 1500;
 
   // ── ドラッグの軸モード(termmap から OSC 9997 で通知される) ────────────────────
   // X軸/Y軸それぞれが今どういう意味を持つかを1文字で表す(docs/web-touch-drag-design.md §3.2)。
@@ -148,6 +186,75 @@
     if (!b64) { return; } // 未知の名前は無視(Rust側にSFXが増えてもここが古いだけで済む)
     try { new Audio('data:audio/wav;base64,' + b64).play().catch(function () {}); }
     catch (e) { /* Audio非対応環境は無視 */ }
+  }
+
+  // ── 出力の背圧と計測(設計 §5.4 対策D / §10 の計測窓)──────────────────────
+  // 端末のストリームには「古いフレームを捨てて最新だけ描く」という概念が無いので、
+  // ブラウザが遅れていても termmap が送ったフレームは全部順に描かれる。したがって
+  // 送り続けると「指を離した後も地図が動き続ける」状態になる(設計 §3.2)。
+  // xterm.js が処理し切れていないバイト数を数え、詰まっている間はパン量を送らずに
+  // panPending へ溜めたままにする。溜めた分は失われないので 1:1 は維持され、コマだけが落ちる。
+  //
+  // ttyd 1.7.7 同梱の xterm.js は write(data, callback) の callback を持ち、WriteBuffer が
+  // パース完了時に消化することを実物のバンドルで確認済み(設計 §11 のリスク項目)。
+  // ただし ttyd を更新して callback を持たない版になった場合に備え、callback が1度でも
+  // 呼ばれるまでは背圧を効かせない(writeCbSeen)。呼ばれないままなら outstanding は
+  // 統計値としてしか使われず、送信間隔は従来どおり rAF と最小間隔だけで決まる。
+  var outstanding = 0;      // term.write へ渡したが、まだパースし切れていないバイト数
+  var writeCbSeen = false;  // write の callback が1度でも呼ばれたか(=背圧を信用してよいか)
+  var byteWindow = [];      // 直近1秒に term.write へ来た { t, n }
+  var panWindow = [];       // 直近1秒に PAN マーカーを送った時刻
+
+  function trimWindow(arr, keyIsObject) {
+    var cutoff = Date.now() - 1000;
+    while (arr.length && (keyIsObject ? arr[0].t : arr[0]) < cutoff) { arr.shift(); }
+  }
+  function noteBytes(n) { byteWindow.push({ t: Date.now(), n: n }); trimWindow(byteWindow, true); }
+  function notePanSent() { panWindow.push(Date.now()); trimWindow(panWindow, false); }
+
+  // 未処理バイト数がこれを超えている間は送らない。端末サイズで1フレームの重さが変わるので
+  // cols×rows から見積もる(端末が取れない間は設計 §2.2 の計測に使った 94×23 を仮に使う)。
+  function backpressureLimit() {
+    var t = window.term;
+    var cells = (t && t.cols && t.rows) ? t.cols * t.rows : 94 * 23;
+    return cells * BYTES_PER_CELL_ESTIMATE * BACKPRESSURE_FRAMES;
+  }
+  // 送るのを止めるべきか。callback を確認できていない相手では常に false(=従来どおり送る)。
+  // BACKPRESSURE_STUCK_MS を超えて解けない場合は勘定が壊れているとみなし、outstanding を
+  // 捨てて送信を再開する(理由は定数側のコメント)。
+  var backedUpSince = 0;
+  function writeBackedUp() {
+    if (!writeCbSeen || outstanding <= backpressureLimit()) { backedUpSince = 0; return false; }
+    var now = Date.now();
+    if (backedUpSince === 0) { backedUpSince = now; return true; }
+    if (now - backedUpSince < BACKPRESSURE_STUCK_MS) { return true; }
+    outstanding = 0;
+    backedUpSince = 0;
+    return false;
+  }
+
+  // term.write を包んで未処理バイト数を数える。bindSoundOsc と同じくリトライして粘る
+  // (包めなくても背圧が効かないだけで、他の機能は従来どおり動く)。
+  function bindWriteBackpressure() {
+    [0, 100, 300, 700, 1500].forEach(function (ms) {
+      setTimeout(function () {
+        var t = window.term;
+        if (!t || t.__termmapWriteWrapped || typeof t.write !== 'function') { return; }
+        t.__termmapWriteWrapped = true;
+        var origWrite = t.write.bind(t);
+        t.write = function (data, cb) {
+          var n = (data && data.length) || 0;
+          outstanding += n;
+          noteBytes(n);
+          return origWrite(data, function () {
+            outstanding -= n;
+            if (outstanding < 0) { outstanding = 0; } // 念のため(負に振れたら意味を失う)
+            writeCbSeen = true;
+            if (cb) { cb(); }
+          });
+        };
+      }, ms);
+    });
   }
 
   // window.term(ttyd同梱xterm.jsが公開する実インスタンス)にOSCハンドラを登録する。
@@ -407,6 +514,19 @@
     t.paste('' + text);
   }
 
+  // navigator.geolocation の PositionError.code (1=PERMISSION_DENIED /
+  // 2=POSITION_UNAVAILABLE / 3=TIMEOUT) を診断用の短い理由文字列へ。
+  // 「権限ダイアログが一度も出ない」等の切り分けに、原因をステータス行へ出す。
+  function gpsErrorReason(err) {
+    if (!err) { return 'unknown'; }
+    switch (err.code) {
+      case 1: return 'denied';   // 権限拒否(サイト設定/OS設定で既にブロックされている場合も含む)
+      case 2: return 'unavailable';
+      case 3: return 'timeout';
+      default: return 'unknown';
+    }
+  }
+
   function toggleWebGps() {
     if (GPS_WATCH_ID !== null) {
       navigator.geolocation.clearWatch(GPS_WATCH_ID);
@@ -414,7 +534,12 @@
       sendMarkerPaste('GPS_STOP');
       return;
     }
-    if (!navigator.geolocation) { return; } // 非対応環境は何もしない
+    if (!navigator.geolocation) {
+      // Secure Context でない(HTTP接続)/ブラウザ非対応。watchPositionを呼ぶ前に
+      // 判明する唯一のケースなのでここで理由を確定して送る。
+      sendMarkerPaste('GPS_ERRunsupported');
+      return;
+    }
     GPS_WATCH_ID = navigator.geolocation.watchPosition(
       function (pos) {
         var now = Date.now();
@@ -422,7 +547,10 @@
         gpsLastSentAt = now;
         sendMarkerPaste('GPS' + pos.coords.latitude + '' + pos.coords.longitude);
       },
-      function () { GPS_WATCH_ID = null; }, // 権限拒否/取得失敗: 状態を戻すだけ
+      function (err) { // 権限拒否/取得失敗: 状態を戻し、原因をステータス行へ出す
+        GPS_WATCH_ID = null;
+        sendMarkerPaste('GPS_ERR' + gpsErrorReason(err));
+      },
       { enableHighAccuracy: true, maximumAge: 5000, timeout: 15000 }
     );
   }
@@ -436,48 +564,78 @@
   var panPending = { x: 0, y: 0 }; // まだ送っていない移動量[CSS px](間引き分・丸めの端数)
   var panLastSentAt = 0;
   var panFlushTimer = null;
+  var panFlushRaf = null;
 
-  // 比の分母になる寸法。回転やURLバーの伸縮で変わるので都度読む。
+  // 比の分母になる寸法。回転やURLバーの伸縮で変わるが、フラッシュのたびに
+  // getBoundingClientRect() を呼ぶと touchmove 中に毎回同期レイアウトが走る(設計 §3.5)。
+  // 一度取れた値をキャッシュし、寸法が変わり得るイベント(resize / orientationchange /
+  // タブ復帰)でだけ捨てる。
   // 分母は「実際に cols×rows のセルが占めている矩形」でなければならない。
   // #terminal-container の矩形には、fit addon が切り捨てた1セル未満の余り・padding・
   // スクロールバー幅が含まれるぶん余分があり、そのまま使うと比が小さく出て地図が指より
   // わずかに遅れる。.xterm-screen は幅=cols*cellWidth・高さ=rows*cellHeight に一致するので
   // そちらを優先し、取れない場合だけコンテナへフォールバックする。
+  var viewportCache = null;
   function terminalViewportSize() {
+    if (viewportCache) { return viewportCache; }
     var t = window.term;
-    var el = (t && t.element && t.element.querySelector) ? t.element.querySelector('.xterm-screen') : null;
-    if (!el) { el = document.querySelector(TERMINAL_SELECTOR); }
+    var screen = (t && t.element && t.element.querySelector) ? t.element.querySelector('.xterm-screen') : null;
+    var el = screen || document.querySelector(TERMINAL_SELECTOR);
     var r = (el && el.getBoundingClientRect) ? el.getBoundingClientRect() : null;
     var w = (r && r.width) || window.innerWidth || 0;
     var h = (r && r.height) || window.innerHeight || 0;
-    return { w: w, h: h };
+    var size = { w: w, h: h };
+    // .xterm-screen が取れたときの値だけキャッシュする。端末が描画されるまでの間に
+    // コンテナ側のフォールバック値(padding 込み・比がわずかにずれる)を焼き付けないため。
+    if (screen && w > 0 && h > 0) { viewportCache = size; }
+    return size;
   }
+  function invalidateViewportCache() { viewportCache = null; }
 
   function clampRatio(v) { return v > 1 ? 1 : (v < -1 ? -1 : v); }
 
-  // 溜まっている移動量を送る。30Hz を超える分は送らずに panPending へ残し、次の送信機会を
-  // タイマーで予約する(指が止まって touchmove が来なくなっても最後の1回が必ず届く)。
+  // 次のフラッシュ機会を予約する。requestAnimationFrame にすることで、送信が画面の
+  // リフレッシュと位相が揃い、1フレーム1回に収まる(設計 §5.4)。iOS は負荷時に
+  // setTimeout をまとめて発火させるため、33ms 固定タイマーだと送信間隔が不揃いになる。
+  // rAF が無い環境(古いブラウザ・非表示タブ)ではタイマーへフォールバックする。
+  function schedulePanFlush() {
+    if (panFlushRaf !== null || panFlushTimer !== null) { return; } // 既に予約済み
+    if (typeof window.requestAnimationFrame === 'function') {
+      panFlushRaf = window.requestAnimationFrame(function () { panFlushRaf = null; flushPan(); });
+    } else {
+      panFlushTimer = setTimeout(function () { panFlushTimer = null; flushPan(); }, PAN_MIN_INTERVAL_MS);
+    }
+  }
+
+  // 溜まっている移動量を送る。送れない事情(最小間隔・背圧・端末未描画)があるときは
+  // 送らずに panPending へ残し、次のフレームで出直す(指が止まって touchmove が来なく
+  // なっても最後の1回が必ず届く)。溜めた分は捨てないので指と地図の 1:1 は維持され、
+  // 落ちるのはコマだけになる。
   function flushPan() {
-    if (panFlushTimer) { clearTimeout(panFlushTimer); panFlushTimer = null; }
     if (panPending.x === 0 && panPending.y === 0) { return; }
+    // rAF は端末によって 60Hz にも 120Hz にもなる。送信レートの上限は従来どおり約30Hz に
+    // 保つ(設計 §6 のとおり、送る量を増やしても見えるコマ数は増えない)。
     var now = Date.now();
-    var wait = PAN_MIN_INTERVAL_MS - (now - panLastSentAt);
-    if (wait > 0) { panFlushTimer = setTimeout(flushPan, wait); return; }
+    if (now - panLastSentAt < PAN_MIN_INTERVAL_MS) { schedulePanFlush(); return; }
+    // 背圧: xterm.js が処理し切れていない間は送らない(設計 §5.4 対策D)。
+    if (writeBackedUp()) { schedulePanFlush(); return; }
     var size = terminalViewportSize();
-    if (!size.w || !size.h) { return; } // 端末がまだ描画されていない
+    if (!size.w || !size.h) { schedulePanFlush(); return; } // 端末がまだ描画されていない
     // 1マーカーあたりの比は ±1 まで(termmap 側が範囲外を捨てる)。溢れた分は繰り越す。
     var fx = clampRatio(panPending.x / size.w);
     var fy = clampRatio(panPending.y / size.h);
     var sx = fx.toFixed(4), sy = fy.toFixed(4);
     var vx = parseFloat(sx), vy = parseFloat(sy);
     // 丸めて0になる微小移動。溜めたまま、次に queuePan が呼ばれる機会を待つ
-    // (ここでタイマーを張り直さないのは、0.005%未満の端数のために起き続けるのを避けるため)。
+    // (ここで次フレームを予約しないのは、0.005%未満の端数のために毎フレーム起き続けるのを
+    //  避けるため)。
     if (vx === 0 && vy === 0) { return; }
     panLastSentAt = now;
     panPending.x -= vx * size.w; // 送った分だけ差し引く(丸めの端数は次回へ繰り越す)
     panPending.y -= vy * size.h;
+    notePanSent();
     sendMarkerPaste('PAN' + sx + '' + sy + '');
-    if (panPending.x !== 0 || panPending.y !== 0) { panFlushTimer = setTimeout(flushPan, PAN_MIN_INTERVAL_MS); }
+    if (panPending.x !== 0 || panPending.y !== 0) { schedulePanFlush(); }
   }
 
   function queuePan(dx, dy) {
@@ -493,7 +651,11 @@
   function cancelPendingPan() {
     panPending.x = 0;
     panPending.y = 0;
-    if (panFlushTimer) { clearTimeout(panFlushTimer); panFlushTimer = null; }
+    if (panFlushTimer !== null) { clearTimeout(panFlushTimer); panFlushTimer = null; }
+    if (panFlushRaf !== null && typeof window.cancelAnimationFrame === 'function') {
+      window.cancelAnimationFrame(panFlushRaf);
+    }
+    panFlushRaf = null;
   }
 
   // 軸モードの再送要求(設計書 §5.3)。ページを再読み込みすると JS 側の状態は消えるが、
@@ -524,6 +686,66 @@
       }
       sendMarkerPaste('DRAGMODE?');
     }, DRAG_MODE_PROBE_INTERVAL_MS);
+  }
+
+  // ── 端末セル比の通知(通路A: ブラウザ → termmap) ────────────────────────────
+  // 実画像モードの写真(実写/道路ライブカメラ)は、termmap 側が「1セルの縦横比」を知らないと
+  // 端末の形へ歪めずに収められない(docs/web-image-aspect-ratio-design.md §7.2)。ttyd は pty の
+  // ws_xpixel/ws_ypixel を埋めないため、termmap はネイティブ端末のように window_size() から
+  // 比を取れない。ここで .xterm-screen の実寸を term.cols/term.rows で割ってセル寸法を出し、
+  // 専用マーカー(SOH + "CELL" + SOH + cw + SOH + ch + SOH)で渡す。
+  //
+  // 内部APIの _renderService.dimensions は使わない(公開APIだけで足りる)。CSI 16 t の問い合わせを
+  // 使わないのは、xterm.js の応答が整数 CSS px へ丸められて比が最大7%ずれるため(設計書 §7.2)。
+  var SOH = String.fromCharCode(1); // マーカーの区切り。他のマーカーは同じ文字をリテラルで埋めている
+  var cellSizeLastSent = '';
+  var cellSizeProbeTimer = null;
+  var cellSizeSettleTimer = null;
+
+  // 送れた(または送る必要が無かった)ら true。まだ条件が整っていなければ false を返し、
+  // 呼び出し側のリトライに任せる。
+  function sendCellSize() {
+    // OSC 9997 を1度も受け取っていない相手には送らない。CELL を知らない古い termmap では
+    // 通常のペーストとして扱われ、検索欄への文字入力や設定画面のAPIキー行(貼り付けで即保存)の
+    // 上書きになるため(requestDragMode(force) と同じ理由)。送れないままでも termmap 側は
+    // 既定のセル比 2.0 で動くので、機能が落ちるだけで壊れはしない。
+    if (!dragModeSeen) { return false; }
+    if (!bracketedPasteReady()) { return false; }
+    var t = window.term;
+    if (!t || !t.cols || !t.rows) { return false; }
+    var size = terminalViewportSize();
+    if (!size.w || !size.h) { return false; } // 端末がまだ描画されていない
+    var cw = size.w / t.cols;
+    var ch = size.h / t.rows;
+    if (!(cw > 0) || !(ch > 0)) { return false; }
+    var payload = cw.toFixed(4) + SOH + ch.toFixed(4);
+    if (payload === cellSizeLastSent) { return true; } // 値が同じなら送らない(termmap 側も無視する)
+    cellSizeLastSent = payload;
+    sendMarkerPaste('CELL' + SOH + payload + SOH);
+    return true;
+  }
+
+  // 送れるようになるまで一定間隔で粘る(上限つき)。初期化直後は termmap の起動待ちで空振りする。
+  function probeCellSize() {
+    if (cellSizeProbeTimer) { return; }
+    if (sendCellSize()) { return; }
+    var tries = 0;
+    cellSizeProbeTimer = setInterval(function () {
+      if (sendCellSize() || ++tries > CELL_SIZE_PROBE_MAX_TRIES) {
+        clearInterval(cellSizeProbeTimer);
+        cellSizeProbeTimer = null;
+      }
+    }, CELL_SIZE_PROBE_INTERVAL_MS);
+  }
+
+  // 画面回転・URLバーの伸縮・ソフトキーボードの開閉でセル寸法は変わる。fit addon が
+  // cols/rows を決め直した後の値を読みたいので、少し置いてから送る(連続発火はまとめる)。
+  function scheduleCellSize() {
+    if (cellSizeSettleTimer) { clearTimeout(cellSizeSettleTimer); }
+    cellSizeSettleTimer = setTimeout(function () {
+      cellSizeSettleTimer = null;
+      probeCellSize();
+    }, CELL_SIZE_SETTLE_MS);
   }
 
   // ── キーイベント合成 ────────────────────────────────────────────
@@ -700,9 +922,23 @@
     return { vx: (b.x - a.x) / dt, vy: (b.y - a.y) / dt };
   }
 
+  // 慣性も rAF で回す(設計 §5.6)。従来は 60ms の setTimeout で、指を離した後の動きが
+  // 16 コマ/秒のコマ送りになっていた。
   var glideTimer = null;
+  var glideRaf = null;
   function stopGlide() {
-    if (glideTimer) { clearTimeout(glideTimer); glideTimer = null; }
+    if (glideTimer !== null) { clearTimeout(glideTimer); glideTimer = null; }
+    if (glideRaf !== null && typeof window.cancelAnimationFrame === 'function') {
+      window.cancelAnimationFrame(glideRaf);
+    }
+    glideRaf = null;
+  }
+  function scheduleGlide(fn) {
+    if (typeof window.requestAnimationFrame === 'function') {
+      glideRaf = window.requestAnimationFrame(function () { glideRaf = null; fn(); });
+    } else {
+      glideTimer = setTimeout(function () { glideTimer = null; fn(); }, GLIDE_TICK_MS);
+    }
   }
   // 指を離した瞬間の速度をもとに、減衰させながら動かし続ける慣性スクロール
   // (「しゅーっ」と流れて自然に止まる感じを出す)。新しい操作が始まったら即打ち切る。
@@ -719,18 +955,31 @@
       if (vx === 0 && vy === 0) { return; }
     }
     if (Math.sqrt(vx * vx + vy * vy) < GLIDE_MIN_SPEED * 2) { return; } // 離す直前がほぼ静止=弾かない
-    var carryX = 0, carryY = 0, ticks = 0;
-    (function tick() {
-      ticks++;
-      var dx = vx * GLIDE_TICK_MS + carryX;
-      var dy = vy * GLIDE_TICK_MS + carryY;
+    var carryX = 0, carryY = 0;
+    var startedAt = Date.now();
+    var lastAt = startedAt;
+    var tick = function () {
+      var t = Date.now();
+      var dt = t - lastAt;
+      lastAt = t;
+      if (dt <= 0) { dt = 1; }
+      // タブ復帰・画面ロックからの復帰で数秒空くことがある。その間ぶんを1フレームで
+      // 動かすと地図が飛ぶので、飛びが大きいフレームでは移動を見送って位置だけ合わせ直す
+      // (減衰は下で実経過時間ぶん掛かるため、長く空いていれば次の判定で慣性が止まる)。
+      // 端末が重くて 100ms 程度かかっているだけのフレームは従来どおり動かす。
+      var moveDt = dt > GLIDE_MAX_STEP_MS ? 0 : dt;
+      var dx = vx * moveDt + carryX;
+      var dy = vy * moveDt + carryY;
       var used = sendPanDelta(dx, dy);
       carryX = dx - used.usedX;
       carryY = dy - used.usedY;
-      vx *= GLIDE_DECAY; vy *= GLIDE_DECAY;
-      if (Math.sqrt(vx * vx + vy * vy) < GLIDE_MIN_SPEED || ticks >= GLIDE_MAX_TICKS) { glideTimer = null; return; }
-      glideTimer = setTimeout(tick, GLIDE_TICK_MS);
-    })();
+      // 減衰は経過時間ベース。フレームが落ちても減速カーブが変わらない(設計 §5.6)。
+      var k = Math.pow(GLIDE_DECAY, dt / GLIDE_DECAY_REF_MS);
+      vx *= k; vy *= k;
+      if (Math.sqrt(vx * vx + vy * vy) < GLIDE_MIN_SPEED || t - startedAt >= GLIDE_MAX_MS) { return; }
+      scheduleGlide(tick);
+    };
+    scheduleGlide(tick);
   }
 
   // 2本指ピンチ(拡大/縮小)。指の間隔の変化量をズームキーの回数に変換する。
@@ -763,14 +1012,19 @@
   // タップのブレで地図がずれないようにするデッドゾーン。'p' 軸は量子化をやめたので、
   // これまで PX_PER_STEP(24px)の量子化が吸収していた「タップ時の十数pxのブレ」が
   // そのままパン量として送られ、タップのたびに地図が少しずつずれて戻らなくなる。
-  // ジェスチャー開始点から TAP_SLOP_PX を超えるまでは送らない。panLast を進めないので、
-  // 超えた時点で溜まった分がまとめて流れる(移動量は失われない)。
+  // ジェスチャー開始点から TAP_SLOP_PX を超えるまでは送らない。
   // 閾値はタップ判定(onGestureEnd)と同じものを使う。
+  //
+  // 超えた時点でスロップ分(12px超)は捨てる(設計 §5.6 対策F)。以前は panLast を開始点の
+  // ままにしていたため、超えた瞬間に溜まっていた 12px 超がまとめて1回で送られ、指を動かし
+  // 始めた瞬間に地図が飛んでいた。ここで panLast を今の指の位置まで進めると、指と地図の間に
+  // TAP_SLOP_PX ぶんの固定ずれが残る代わりに開始時の飛びが消える(一般的な地図アプリと同じ挙動)。
   function passedTapSlop(x, y) {
     if (!gesture || gesture.moved) { return true; }
     var ddx = x - gesture.x, ddy = y - gesture.y;
     if (Math.sqrt(ddx * ddx + ddy * ddy) <= TAP_SLOP_PX) { return false; }
     gesture.moved = true;
+    if (panLast) { panLast.x = x; panLast.y = y; }
     return true;
   }
 
@@ -1030,6 +1284,7 @@
     injectStyle();
     buildBar();
     bindGestures();
+    bindWriteBackpressure();
     bindSoundOsc();
     bindVoiceGuideOsc();
     bindVoiceList();
@@ -1038,10 +1293,21 @@
     // 軸モードを要求する。termmap は最初のフレームでも1回送ってくるが、そのフレームが
     // OSC ハンドラの登録より前だと取りこぼすため、受け取れるまで数回要求する。
     requestDragMode(false);
+    // 端末セル比を termmap へ渡す(実写/道路カメラ写真を歪めずに収めるのに要る)。
+    // dragModeSeen が立つまで空振りするので、requestDragMode と同じく粘る作りにしてある。
+    probeCellSize();
+    // 回転・URLバーの伸縮・ソフトキーボードの開閉でセル寸法が変わる。ttyd 側も window の
+    // resize で FitAddon.fit() を呼ぶので、その後の値を読み直して送り直す。
+    // ビューポート寸法のキャッシュ(terminalViewportSize)も同じ理由で捨てる。scheduleCellSize
+    // より先に登録して、セル寸法を測り直すときには必ず新しい矩形が読まれるようにする。
+    window.addEventListener('resize', invalidateViewportCache);
+    window.addEventListener('orientationchange', invalidateViewportCache);
+    window.addEventListener('resize', scheduleCellSize);
+    window.addEventListener('orientationchange', scheduleCellSize);
     // タブを切り替えて戻ってきた/画面ロックから復帰したときも、状態が失われている可能性が
     // あるので取り直す(復帰時は既に見えている値が古いこともあるため強制で1回)。
     document.addEventListener('visibilitychange', function () {
-      if (document.visibilityState === 'visible') { requestDragMode(true); }
+      if (document.visibilityState === 'visible') { invalidateViewportCache(); requestDragMode(true); scheduleCellSize(); }
     });
     refit();
   }
@@ -1080,6 +1346,51 @@
     requestDragMode: requestDragMode,
     terminalViewportSize: terminalViewportSize,
     bracketedPasteReady: bracketedPasteReady,
-    cancelPendingPan: cancelPendingPan
+    cancelPendingPan: cancelPendingPan,
+    // セル比の確認・手動送信(設計書 §9 の実機確認手順で使う)。
+    // 例: __termmapTouch.getCellSize() で cw/ch と比 r を見る、
+    //     __termmapTouch.sendCellSize() で今の値を termmap へ送り直す。
+    getCellSize: function () {
+      var t = window.term;
+      var size = terminalViewportSize();
+      if (!t || !t.cols || !t.rows || !size.w || !size.h) { return null; }
+      var cw = size.w / t.cols;
+      var ch = size.h / t.rows;
+      return { cols: t.cols, rows: t.rows, w: size.w, h: size.h, cw: cw, ch: ch, r: ch / cw, lastSent: cellSizeLastSent };
+    },
+    sendCellSize: sendCellSize,
+    probeCellSize: probeCellSize,
+    // 実機計測窓(設計 §10)。Safari の開発者ツールから __termmapTouch.stats() を叩いて、
+    // スワイプ中の bytesPerSec と outstandingBytes を読む。
+    //   dragModeSeen が false … #87 の追従改善が丸ごと効いていない(従来のキー変換のまま)
+    //   writeCbSeen が false  … term.write の callback が呼ばれておらず背圧が働いていない
+    //   outstandingBytes が backpressureLimit 付近に張り付く … ブラウザ側が詰まっている
+    // 地図フレーム数(framesPerSec)は termmap 側がフレーム末にマーカーを出さないと数えられない
+    // ため、ここでは term.write の呼び出し回数(writesPerSec)で代用している。
+    stats: function () {
+      trimWindow(byteWindow, true);
+      trimWindow(panWindow, false);
+      var bytes = 0;
+      for (var i = 0; i < byteWindow.length; i++) { bytes += byteWindow[i].n; }
+      var cs = window.__termmapTouch.getCellSize();
+      return {
+        version: OVERLAY_VERSION,
+        dragModeSeen: dragModeSeen,
+        dragAxes: { x: dragAxes.x, y: dragAxes.y },
+        writeCbSeen: writeCbSeen,
+        outstandingBytes: outstanding,
+        backpressureLimit: backpressureLimit(),
+        // stats() は診断用なので、ここで詰まり判定の副作用(勘定のリセット)を起こさないよう
+        // 素の条件だけを見る。
+        backedUp: writeCbSeen && outstanding > backpressureLimit(),
+        backedUpForMs: backedUpSince ? Date.now() - backedUpSince : 0,
+        bytesPerSec: bytes,
+        writesPerSec: byteWindow.length,
+        panSentPerSec: panWindow.length,
+        panPending: { x: panPending.x, y: panPending.y },
+        cellSize: cs && { w: cs.cw, h: cs.ch, r: cs.r },
+        viewport: terminalViewportSize()
+      };
+    }
   };
 })();

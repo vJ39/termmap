@@ -21,8 +21,9 @@ pub(crate) struct SettingChoice {
     pub labels: &'static [&'static str],
 }
 
-// idx は Focus::Settings 側の項目行番号と対応(4=地図種別/5=既定ルート/9=提案AIモデル/12=画像解像度/18=QR表示方式/20=雨雲の濃さ)。
+// idx は Focus::Settings 側の項目行番号と対応(4=地図種別/5=既定ルート/9=提案AIモデル/12=画像解像度/18=QR表示方式/20=雨雲の濃さ/31=人口の濃さ)。
 // 中心十字の色(idx=16)は cfg.cross_color_idx が String でなく u8 なので、この表とは別枠(is_pickable等で16を特別扱い)。
+// 人口の年次(idx=32)も cfg.population_year が u16 なので同じく別枠。
 // 項目を増やすときは必ず末尾に足す(既存 idx を動かすと ui.rs の set_sel == 6 / 17 等の生の数値比較と食い違う)。
 pub(crate) const CHOICES: &[SettingChoice] = &[
     SettingChoice { idx: 4, values: &["osm", "voyager", "dark", "light", "topo"], labels: &["osm", "voyager", "dark", "light", "topo"] },
@@ -31,16 +32,26 @@ pub(crate) const CHOICES: &[SettingChoice] = &[
     SettingChoice { idx: 12, values: &["high", "mid", "low"], labels: &["高", "中", "低"] },
     SettingChoice { idx: 18, values: &["dense", "image"], labels: &["標準", "画像(小型)"] },
     SettingChoice { idx: 20, values: &["light", "mid", "strong"], labels: &["薄い", "標準", "濃い"] },
+    SettingChoice { idx: 31, values: &["light", "mid", "strong"], labels: &["薄い", "標準", "濃い"] },
 ];
 
 // 設定画面の項目行数(アコーディオン未展開時)。ui.rs のカーソル下移動の上限がこれを参照する。
 // settings_rows() が返す行数と必ず一致すること(下の回帰テスト settings_row_count_matches_rows で固定)。
-pub(crate) const SETTINGS_ROW_COUNT: usize = 29;
+pub(crate) const SETTINGS_ROW_COUNT: usize = 34;
 
 fn choice_for(idx: usize) -> Option<&'static SettingChoice> { CHOICES.iter().find(|c| c.idx == idx) }
 
 // idx が SettingsPick(一覧選択)の対象か。中心十字の色(16)・読み上げの声(27)も対象に含む。
-pub(crate) fn is_pickable(idx: usize) -> bool { idx == 16 || idx == 27 || choice_for(idx).is_some() }
+pub(crate) fn is_pickable(idx: usize) -> bool { idx == 16 || idx == 27 || idx == 32 || choice_for(idx).is_some() }
+
+// 人口メッシュの年次(idx=32)の候補。2020年は令和2年国勢調査に基づく実績で、それ以降は推計値。
+// 見分けが付かないと誤読されるので、ラベルで実績/推計を明示する。
+pub(crate) fn population_year_labels() -> Vec<String> {
+    crate::config::POPULATION_YEARS
+        .iter()
+        .map(|y| if *y == 2020 { format!("{y}年(実績)") } else { format!("{y}年(推計)") })
+        .collect()
+}
 
 // 読み上げの声(idx=27)の候補一覧。他の項目と違い実行環境と現在値の両方に依存するため
 // CHOICESの静的テーブルには載せず、ここで組み立てる。戻り値は(保存値, 表示名)。
@@ -66,6 +77,8 @@ pub(crate) fn pick_labels(idx: usize, cfg: &Config) -> Vec<String> {
         PALETTE_NAMES.iter().map(|s| s.to_string()).collect()
     } else if idx == 27 {
         voice_choices(cfg).into_iter().map(|(_, label)| label).collect()
+    } else if idx == 32 {
+        population_year_labels()
     } else {
         choice_for(idx).map(|c| c.labels.iter().map(|s| s.to_string()).collect()).unwrap_or_default()
     }
@@ -83,6 +96,8 @@ pub(crate) fn pick_current(idx: usize, cfg: &Config, style: &str) -> usize {
         18 => choice_for(18).and_then(|c| c.values.iter().position(|v| *v == cfg.qr_style)).unwrap_or(0),
         20 => choice_for(20).and_then(|c| c.values.iter().position(|v| *v == cfg.radar_opacity)).unwrap_or(0),
         27 => voice_choices(cfg).iter().position(|(v, _)| *v == cfg.voice_name).unwrap_or(0),
+        31 => choice_for(31).and_then(|c| c.values.iter().position(|v| *v == cfg.population_opacity)).unwrap_or(0),
+        32 => crate::config::POPULATION_YEARS.iter().position(|y| *y == cfg.population_year).unwrap_or(0),
         _ => 0,
     }
 }
@@ -107,6 +122,9 @@ pub(crate) fn apply_pick(idx: usize, sel: usize, cfg: &mut Config, style: &mut S
         // 雨雲の濃さは今表示している地図の見た目が変わるので、確定した時点で描き直す。
         20 => if let Some(v) = choice_for(20).and_then(|c| c.values.get(sel)) { cfg.radar_opacity = v.to_string(); eff.force_reemit = true; }
         27 => if let Some((v, _)) = voice_choices(cfg).get(sel) { cfg.voice_name = v.clone(); }
+        // 人口の濃さ・年次は今表示している地図の見た目が変わるので、確定した時点で描き直す。
+        31 => if let Some(v) = choice_for(31).and_then(|c| c.values.get(sel)) { cfg.population_opacity = v.to_string(); eff.force_reemit = true; }
+        32 => if let Some(y) = crate::config::POPULATION_YEARS.get(sel) { cfg.population_year = *y; eff.force_reemit = true; }
         _ => {}
     }
     eff
@@ -147,7 +165,12 @@ pub(crate) fn setting_description(idx: usize) -> &'static str {
         } else {
             "読み上げの声: この端末(macOS以外)では読み上げ自体が動かないため効果は無い"
         },
+        29 => "過去災害の塗り: 過去災害を市区町村の境界ごとに塗り分けて出す(ハザードマップのような面表示)。色=最も多い災害種別・濃さ=記録の件数。OFFにすると従来の代表点マーカーだけになる。「過去災害」自体がOFFのときは何も出ない",
+        30 => "人口メッシュ: 500mメッシュごとの推計人口(国土数値情報)を人口密度の濃さで地図に重ねる。補給・宿・明かりが期待できる帯と、人がいない帯が読める(Uキーでも切替)。1都道府県が最大31MBあり、取得は都道府県まるごと・数十秒かかる。一度取れば1年は取り直さない。ONにした人だけが外部サービスへ問い合わせる",
+        31 => "人口の濃さ: 重ねる強さ。Enterで一覧を開いて選択(薄い=地図優先 / 標準 / 濃い=人口優先)。人口の少ない土地は元から薄く塗るので、濃くしても地図は残る",
+        32 => "人口の年次: 表示する年。Enterで一覧を開いて選択。2020年は国勢調査に基づく実績、2025年以降は推計値。年を変えても取り直しは起きない(全年次をまとめて保存している)",
         28 => "渋滞状況の色分け: ルート確定後、Google Directionsで区間ごとの渋滞状況を追加確認し、混雑している区間だけルート線を黄(やや混雑)/赤(混雑)で上塗りする(順調な区間は基調色の青のまま)。道路網全体ではなく表示中のルートのみ。要Google APIキー。区間数に応じて1回のAdvanced課金対象リクエストを送る(無料枠超過分は1000件$8、個人利用なら通常は無料枠内)",
+        33 => "ルート沿い気象警報: ルート確定後、その先が通る気象庁の一次細分区域を判定し、警報・注意報が出ている区間だけルート線を特別警報(紫)/警報(赤)/注意報(黄)で上塗りする。表示中のルートのみ。ONにした人だけがルート確定のたびに気象庁へ問い合わせる",
         _ => "Google APIキー: 検索(Geocoding)とStreet View共通。Enterで入力欄を開く(Cmd+V貼付も可)。環境変数TERMMAP_GOOGLE_API_KEYでも可",
     }
 }
@@ -196,6 +219,11 @@ pub(crate) fn settings_rows(opts: &Args, cfg: &Config, picking: Option<usize>, o
         format!("過去災害 {}", onoff(cfg.disaster_enabled)),
         format!("{} 読み上げの声 {}", arrow(27), if cfg.voice_name.is_empty() { "システム既定".to_string() } else { crate::voice::display_voice_name(&cfg.voice_name).to_string() }),
         format!("渋滞状況の色分け {}", onoff(cfg.route_traffic_enabled)),
+        format!("過去災害の塗り {}", onoff(cfg.disaster_fill)),
+        format!("人口メッシュ {}", onoff(cfg.population_enabled)),
+        format!("{} 人口の濃さ {}", arrow(31), match cfg.population_opacity.as_str() { "light" => "薄い", "strong" => "濃い", _ => "標準" }),
+        format!("{} 人口の年次 {}年", arrow(32), cfg.population_year),
+        format!("ルート沿い気象警報 {}", onoff(cfg.weather_warning_enabled)),
     ];
     debug_assert_eq!(its.len(), SETTINGS_ROW_COUNT, "SETTINGS_ROW_COUNT と行数がずれている");
     // アコーディオン展開: 選択中の項目がpickable(3択以上)ならその直下に候補をインデント挿入し、他行を押し下げる
@@ -217,10 +245,10 @@ mod tests {
 
     #[test]
     fn pickable_covers_the_multi_choice_items_and_cross_color() {
-        for idx in [4usize, 5, 9, 12, 16, 18, 20, 27] {
+        for idx in [4usize, 5, 9, 12, 16, 18, 20, 27, 31, 32] {
             assert!(is_pickable(idx), "idx {idx} should be pickable");
         }
-        for idx in [0usize, 1, 2, 3, 6, 7, 8, 10, 11, 13, 14, 15, 17, 19, 28] {
+        for idx in [0usize, 1, 2, 3, 6, 7, 8, 10, 11, 13, 14, 15, 17, 19, 28, 29, 30] {
             assert!(!is_pickable(idx), "idx {idx} should not be pickable");
         }
     }
@@ -283,11 +311,12 @@ mod tests {
     #[test]
     fn pick_labels_len_matches_choice_values_len() {
         let cfg = Config::default();
-        for idx in [4usize, 5, 9, 12, 18, 20] {
+        for idx in [4usize, 5, 9, 12, 18, 20, 31] {
             let c = choice_for(idx).unwrap();
             assert_eq!(pick_labels(idx, &cfg).len(), c.values.len());
         }
         assert_eq!(pick_labels(16, &cfg).len(), PALETTE_NAMES.len());
+        assert_eq!(pick_labels(32, &cfg).len(), crate::config::POPULATION_YEARS.len());
     }
 
     // voice_choices/pick_labels(27,..)は実行環境にインストール済みの音声(say -v '?')に依存する
@@ -365,6 +394,37 @@ mod tests {
     }
 
     #[test]
+    fn settings_rows_shows_the_disaster_fill_row_after_route_traffic() {
+        // 項目は必ず末尾に足す(既存 idx を動かすと ui.rs の生の数値比較と食い違う)。
+        // 過去災害の塗り=29 は固定で、人口メッシュの3行(30〜32)はその後ろに並ぶ。
+        let cfg = Config::default();
+        let (_, its, _) = settings_rows(&test_args(), &cfg, None, false, 29, 0);
+        assert_eq!(its.len(), SETTINGS_ROW_COUNT);
+        assert_eq!(its[29], "過去災害の塗り ON", "既定はON");
+        assert!(its[26].starts_with("過去災害 "), "レイヤ自体のON/OFF(26)は別の行のまま");
+        assert!(its[28].starts_with("渋滞状況の色分け"), "既存項目(28)の並びが動いていない");
+        let mut off = Config::default();
+        off.disaster_fill = false;
+        let (_, its_off, _) = settings_rows(&test_args(), &off, None, false, 29, 0);
+        assert_eq!(its_off[29], "過去災害の塗り OFF");
+    }
+
+    #[test]
+    fn setting_description_for_the_disaster_fill_row_explains_the_two_axes() {
+        let d = setting_description(29);
+        assert!(d.contains("過去災害の塗り"), "{d}");
+        assert!(d.contains("市区町村"), "何を塗るのかに触れる: {d}");
+        assert!(d.contains("種別") && d.contains("件数"), "色と濃さの意味に触れる: {d}");
+        assert_ne!(d, setting_description(26), "レイヤ本体の説明と混ざっていない");
+        assert_ne!(d, setting_description(17), "フォールバック(Google APIキー)と混ざっていない");
+    }
+
+    #[test]
+    fn the_disaster_fill_row_is_a_plain_toggle_not_a_picker() {
+        assert!(!is_pickable(29), "ON/OFF なのでアコーディオンを開かない");
+    }
+
+    #[test]
     fn setting_description_for_route_traffic_row_mentions_google_and_coloring() {
         let d = setting_description(28);
         assert!(d.contains("渋滞状況の色分け"), "{d}");
@@ -387,10 +447,10 @@ mod tests {
 
     #[test]
     fn setting_description_covers_every_known_row_distinctly() {
-        // 0〜16,18〜28 は個別の説明文を持つ(idx=11/27は端末対応有無で文言が変わるが、いずれにせよ
+        // 0〜16,18〜33 は個別の説明文を持つ(idx=11/27は端末対応有無で文言が変わるが、いずれにせよ
         // 空でない。17=Google APIキーはフォールバック経由で別テストで確認するためここでは含めない)。
         let mut seen = Vec::new();
-        for idx in (0usize..=16).chain(18..=28) {
+        for idx in (0usize..=16).chain(18..=33) {
             let d = setting_description(idx);
             assert!(!d.is_empty(), "idx {idx} should have a description");
             if idx != 11 && idx != 27 { seen.push(d); } // 11/27は環境依存で文言が2通りあるため一意性判定から除外
@@ -472,6 +532,18 @@ mod tests {
     }
 
     #[test]
+    fn settings_rows_row33_shows_the_weather_warning_row_after_population_year() {
+        let mut cfg = Config::default();
+        cfg.weather_warning_enabled = true;
+        let (_, its, _) = settings_rows(&test_args(), &cfg, None, false, 33, 0);
+        assert_eq!(its.len(), SETTINGS_ROW_COUNT);
+        assert_eq!(its[33], "ルート沿い気象警報 ON");
+        // 既存項目(28〜32)の並びが動いていないことの回帰確認
+        assert!(its[28].starts_with("渋滞状況の色分け"));
+        assert!(its[32].contains("人口の年次"));
+    }
+
+    #[test]
     fn setting_description_for_the_disaster_row_mentions_its_source_and_key() {
         let d = setting_description(26);
         assert!(d.contains("過去災害"), "{d}");
@@ -512,5 +584,112 @@ mod tests {
         assert_eq!(its[22], "    標準");
         assert_eq!(its[23], "    濃い");
         assert_eq!(sel, 22); // 21(先頭候補) + set_pick_sel(1)
+    }
+
+    // ---- 人口メッシュ(設計 §9) ----
+
+    #[test]
+    fn settings_rows_end_with_the_three_population_rows() {
+        let mut cfg = Config::default();
+        cfg.population_enabled = true;
+        cfg.population_opacity = "strong".to_string();
+        cfg.population_year = 2050;
+        let (_, its, _) = settings_rows(&test_args(), &cfg, None, false, 30, 0);
+        assert_eq!(its.len(), SETTINGS_ROW_COUNT);
+        assert_eq!(its[30], "人口メッシュ ON");
+        assert_eq!(its[31], "▸ 人口の濃さ 濃い");
+        assert_eq!(its[32], "▸ 人口の年次 2050年");
+        // 既存項目の並びが動いていないことの回帰確認。
+        assert_eq!(its[28], "渋滞状況の色分け OFF");
+        assert!(its[29].starts_with("過去災害の塗り"));
+        assert!(its[26].starts_with("過去災害"));
+        assert!(its[19].starts_with("雨雲レーダー"));
+    }
+
+    #[test]
+    fn the_population_rows_default_to_off_mid_and_2025() {
+        let cfg = Config::default();
+        let (_, its, _) = settings_rows(&test_args(), &cfg, None, false, 0, 0);
+        assert_eq!(its[30], "人口メッシュ OFF", "既定OFF(1都道府県が最大31MBあるため)");
+        assert_eq!(its[31], "▸ 人口の濃さ 標準");
+        assert_eq!(its[32], "▸ 人口の年次 2025年");
+    }
+
+    #[test]
+    fn pick_current_and_apply_pick_roundtrip_population_opacity() {
+        let mut cfg = Config::default();
+        let mut style = "osm".to_string();
+        assert_eq!(pick_current(31, &cfg, &style), 1); // 既定 "mid"
+        let eff = apply_pick(31, 2, &mut cfg, &mut style);
+        assert_eq!(cfg.population_opacity, "strong");
+        assert!(eff.force_reemit, "濃さを変えたら即描き直す");
+        assert!(!eff.cache_clear);
+        assert_eq!(pick_current(31, &cfg, &style), 2);
+        // 範囲外の選択は無視する。
+        let before = cfg.population_opacity.clone();
+        let eff2 = apply_pick(31, 99, &mut cfg, &mut style);
+        assert_eq!(cfg.population_opacity, before);
+        assert!(!eff2.force_reemit);
+    }
+
+    #[test]
+    fn pick_current_and_apply_pick_roundtrip_population_year() {
+        let mut cfg = Config::default();
+        let mut style = "osm".to_string();
+        assert_eq!(pick_current(32, &cfg, &style), 1, "既定2025は2番目(先頭は2020)");
+        let eff = apply_pick(32, 0, &mut cfg, &mut style);
+        assert_eq!(cfg.population_year, 2020);
+        assert!(eff.force_reemit);
+        assert_eq!(pick_current(32, &cfg, &style), 0);
+        let eff2 = apply_pick(32, 10, &mut cfg, &mut style);
+        assert_eq!(cfg.population_year, 2070);
+        assert!(eff2.force_reemit);
+        // 範囲外の選択は無視する。
+        let eff3 = apply_pick(32, 99, &mut cfg, &mut style);
+        assert_eq!(cfg.population_year, 2070);
+        assert!(!eff3.force_reemit);
+    }
+
+    #[test]
+    fn pick_current_unknown_population_values_default_to_zero() {
+        let mut cfg = Config::default();
+        cfg.population_opacity = "bogus".to_string(); // configを手書きで壊された場合
+        cfg.population_year = 2021; // 5年刻みに無い年
+        assert_eq!(pick_current(31, &cfg, "osm"), 0);
+        assert_eq!(pick_current(32, &cfg, "osm"), 0);
+    }
+
+    // 2020年は実績・それ以降は推計であることがラベルで分かる(混ぜて読むと誤読される)。
+    #[test]
+    fn the_year_labels_distinguish_the_census_year_from_the_projections() {
+        let labels = population_year_labels();
+        assert_eq!(labels.len(), 11);
+        assert_eq!(labels[0], "2020年(実績)");
+        assert_eq!(labels[1], "2025年(推計)");
+        assert_eq!(labels[10], "2070年(推計)");
+    }
+
+    #[test]
+    fn setting_description_for_the_population_rows_mentions_the_cost_and_the_key() {
+        let d = setting_description(30);
+        assert!(d.contains("人口メッシュ"), "{d}");
+        assert!(d.contains("国土数値情報"), "出典を出す: {d}");
+        assert!(d.contains("31MB"), "通信量が予期できること: {d}");
+        assert!(d.contains("U"), "切替キーに触れる: {d}");
+        assert_ne!(d, setting_description(17), "フォールバック(Google APIキー)と混ざっていない");
+        assert_ne!(d, setting_description(29), "過去災害の塗り(29)の説明と混ざっていない");
+        assert!(setting_description(31).contains("濃さ"));
+        assert!(setting_description(32).contains("実績"), "2020年が実績であることに触れる");
+    }
+
+    #[test]
+    fn settings_rows_expands_the_population_year_accordion_below_its_row() {
+        let cfg = Config::default();
+        let (_, its, sel) = settings_rows(&test_args(), &cfg, Some(32), false, 32, 2);
+        assert_eq!(its.len(), SETTINGS_ROW_COUNT + crate::config::POPULATION_YEARS.len());
+        assert_eq!(its[32], "▾ 人口の年次 2025年");
+        assert_eq!(its[33], "    2020年(実績)");
+        assert_eq!(its[34], "    2025年(推計)");
+        assert_eq!(sel, 35); // 33(先頭候補) + set_pick_sel(2)
     }
 }

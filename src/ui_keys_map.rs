@@ -174,6 +174,12 @@ pub(crate) fn map(st: &mut UiState, k: KeyEvent, kx: &KeyCtx, out: &mut dyn Writ
             if st.show_elev && (st.spec.routes.is_empty() || !st.route_ele.iter().any(|&z| z != 0.0)) { st.addr = "標高: ルート確定後に表示".into(); }
         }
         KeyCode::Char('C') => { st.radar_toggle(); } // 雨雲レーダー(気象庁ナウキャスト)の表示/非表示。Spaceメニュー・設定画面と共通処理
+        // 500mメッシュ人口(国土数値情報)の表示/非表示。Pはマイスポット・Cは雨雲で
+        // 埋まっているため、空いている U を割り当てている。
+        KeyCode::Char('U') => { st.population_toggle(); }
+        // 過去災害の塗り(コロプレス)の表示/非表示。Bは詳細パネル・Uは人口メッシュで
+        // 埋まっているため、空いている F(Fill)を割り当てている。
+        KeyCode::Char('F') => { st.disaster_fill_toggle(); }
         KeyCode::Char('>') => { // 表示時刻を未来へ1コマ(OFFなら発見しやすさのためONにする)
             if !st.radar_on {
                 st.radar_turn_on();
