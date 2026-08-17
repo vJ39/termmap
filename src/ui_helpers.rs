@@ -111,19 +111,31 @@ pub(crate) fn snap_center_to_grid(rcx: f64, rcy: f64, steps: f64) -> (f64, f64) 
 // ちらつきが増える可能性がある。halfblock と実画像では素直に効く。
 //
 // 設計は「braille は実機で確認して、悪ければ braille だけ従来の整数切り出しに戻せるように
-// しておく」としている。既定は全モードで有効にし、環境変数 TERMMAP_SUBPIXEL で上書きできる
-// ようにした(0/false=全モードで従来の整数切り出し、1/true=全モードで有効)。
-// 実機で braille がちらつくと分かったら、ここの既定を「braille/edge では false」へ変える。
+// しておく」としている。既定は全モードで有効にし、環境変数 TERMMAP_SUBPIXEL で上書きできる。
+//   0 / false / off / no        … 全モードで従来の整数切り出し
+//   1 / true / on / yes         … 全モードで対策A を使う
+//   halfblock / no-braille      … braille/edge だけ従来の整数切り出し(halfblock と実画像は対策A)
+// 実機で braille のちらつきが問題だと分かったら、環境変数を毎回付けずに済むよう
+// SUBPIXEL_EXCEPT_BRAILLE を true にする。
 pub(crate) fn use_subpixel_window(braille: bool, edge: bool, env: Option<&str>) -> bool {
-    match env.map(|s| s.trim().to_ascii_lowercase()) {
-        Some(v) if v == "0" || v == "false" || v == "off" || v == "no" => false,
-        Some(v) if v == "1" || v == "true" || v == "on" || v == "yes" => true,
-        _ => {
-            let _ = (braille, edge); // 既定は描画モードによらず有効(上のコメントの判断)
-            true
-        }
+    let dots = braille || edge; // 輝度の閾値でドットの on/off を決めるモード
+    match env.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("0") | Some("false") | Some("off") | Some("no") => false,
+        Some("1") | Some("true") | Some("on") | Some("yes") => true,
+        Some("halfblock") | Some("no-braille") | Some("nobraille") => !dots,
+        _ => !(SUBPIXEL_EXCEPT_BRAILLE && dots),
     }
 }
+
+// 既定で braille/edge を対策A から外すか。実機で braille のちらつきが許容できないと
+// 分かったら、ここを true にするだけで既定が「braille/edge は従来の整数切り出し」になる
+// (halfblock と実画像は対策A のまま)。
+//
+// 手元の PTY 実測では、braille のインク量のコマ間の揺れは対策A で 0.39% → 0.50% と
+// 1.28 倍になるものの絶対量は小さく(約1400セル中1コマ7セル)、1コマのバイト数はむしろ
+// 14% 減った。数字の上では有効のままでよさそうだが、ちらつきの見え方は実機でしか
+// 判断できないので false のままにしてある。
+pub(crate) const SUBPIXEL_EXCEPT_BRAILLE: bool = false;
 
 // map_sig に混ぜる中心座標の値。実際に描画へ効く粒度へ丸める。
 //
@@ -395,6 +407,26 @@ mod tests {
         for v in ["1", "true", "on", "yes", " ON "] {
             assert!(use_subpixel_window(true, true, Some(v)), "{v}");
         }
+    }
+
+    // 設計 §5.1/§11 が求める「braille だけ従来の整数切り出しへ戻す」逃げ道。
+    // 全モード一括の 0/1 とは別に、モード単位で切り替えられること。
+    #[test]
+    fn use_subpixel_window_can_exclude_only_the_dot_modes() {
+        for v in ["halfblock", "no-braille", "nobraille", " HalfBlock "] {
+            assert!(use_subpixel_window(false, false, Some(v)), "halfblock は対策A のまま: {v}");
+            assert!(!use_subpixel_window(true, false, Some(v)), "braille は整数切り出しへ: {v}");
+            assert!(!use_subpixel_window(false, true, Some(v)), "edge は整数切り出しへ: {v}");
+        }
+    }
+
+    // 既定の分岐は SUBPIXEL_EXCEPT_BRAILLE 1箇所で決まる(実機で braille がちらついたら
+    // ここを true にするだけで既定が変わる)。定数の現在値と挙動が食い違わないことを見る。
+    #[test]
+    fn use_subpixel_window_default_follows_the_except_braille_constant() {
+        assert!(use_subpixel_window(false, false, None), "halfblock は常に対策A");
+        assert_eq!(use_subpixel_window(true, false, None), !SUBPIXEL_EXCEPT_BRAILLE);
+        assert_eq!(use_subpixel_window(false, true, None), !SUBPIXEL_EXCEPT_BRAILLE);
     }
 
     // 綴り間違い等の未知の値は既定へ落とす(起動しなくなる/黙って挙動が変わるのを避ける)。

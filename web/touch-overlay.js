@@ -106,8 +106,9 @@
   var GLIDE_DECAY_REF_MS = 60;
   var GLIDE_MIN_SPEED = 0.05;  // px/ms。これ未満まで減衰したら慣性を止める
   var GLIDE_MAX_MS    = 960;   // 保険の上限(だいたい1秒で必ず止まる。従来の 60ms×16tick 相当)
-  // 1フレーム(タブ復帰・長いGC等)で進める時間の上限。dt をそのまま使うと、裏に回っていた
-  // 数秒ぶんが復帰の1フレームで一気に流れて地図が飛ぶ。
+  // 1フレームの間隔がこれを超えたら、そのフレームでは慣性を進めない(タブ復帰・長いGC等)。
+  // 裏に回っていた数秒ぶんが復帰の1フレームで一気に流れて地図が飛ぶのを防ぐ。減衰の方は
+  // 実経過時間で掛けるので、長く空いていれば復帰後すぐ慣性が止まる。
   var GLIDE_MAX_STEP_MS = 100;
 
   // ── 出力の背圧(設計 §5.4 対策D)────────────────────────────────────
@@ -962,9 +963,13 @@
       var dt = t - lastAt;
       lastAt = t;
       if (dt <= 0) { dt = 1; }
-      if (dt > GLIDE_MAX_STEP_MS) { dt = GLIDE_MAX_STEP_MS; } // タブ復帰等の飛びで一気に流さない
-      var dx = vx * dt + carryX;
-      var dy = vy * dt + carryY;
+      // タブ復帰・画面ロックからの復帰で数秒空くことがある。その間ぶんを1フレームで
+      // 動かすと地図が飛ぶので、飛びが大きいフレームでは移動を見送って位置だけ合わせ直す
+      // (減衰は下で実経過時間ぶん掛かるため、長く空いていれば次の判定で慣性が止まる)。
+      // 端末が重くて 100ms 程度かかっているだけのフレームは従来どおり動かす。
+      var moveDt = dt > GLIDE_MAX_STEP_MS ? 0 : dt;
+      var dx = vx * moveDt + carryX;
+      var dy = vy * moveDt + carryY;
       var used = sendPanDelta(dx, dy);
       carryX = dx - used.usedX;
       carryY = dy - used.usedY;
