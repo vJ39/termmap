@@ -15,7 +15,7 @@ pub struct RouteResult { pub pts: Vec<(f64, f64)>, pub ele: Vec<f64>, pub dist_m
 // 対象外、予定段階(まだ始まっていない)の通行止めも対象外にする(過剰回避を避ける)。
 pub const NOGO_RADIUS_M: f64 = 100.0; // 道幅+GPS誤差を吸収しつつ、近くの別の道路まで塞がない程度
 const NOGO_SAMPLE_INTERVAL_M: f64 = 150.0; // 半径100mの円が隣同士で重なるよう、直径200mより狭い間隔でサンプリング
-pub const NOGO_MAX_COUNT: usize = 200; // BRouterへ渡すURLが長大にならないための上限
+pub const NOGO_MAX_COUNT: usize = 50; // BRouter watchdogタイムアウト対策の上限(実測: 60個=13s際どい/100個以上=400で失敗。安全マージンを取って200から引き下げ。2026/08/17)
 
 // 通行止めのラインを円の列へ変換する。center(経由地の中心等)に近い円を優先し、
 // 上限(NOGO_MAX_COUNT)を超えたら遠い分を切り捨てる。戻り値の bool は切り捨てが発生したか。
@@ -219,12 +219,24 @@ pub fn fetch_route(wps: &[(f64, f64)], mode: &str, alt: u32, key: &str, nogos: &
             Err(_) => return Err(e), // Googleも失敗→元のBRouterエラーを返す
         },
     };
-    // 成功時のみ保存(ベストエフォート)
-    if let Some(p) = &cpath {
-        if let Some(d) = p.parent() { let _ = std::fs::create_dir_all(d); }
-        if let Ok(s) = serde_json::to_string(&result) { let _ = std::fs::write(p, s); }
+    // 成功時のみ保存(ベストエフォート)。Googleフォールバック結果はキャッシュしない
+    // (BRouterの一時的失敗(watchdogタイムアウト等)でGoogle経由の下道ルートが一度でも
+    // 生成されると、それがディスクに永続化されBRouter復旧後も古い下道ルートを出し
+    // 続けてしまう事故があったため。[高速]設定なのに[下道 (Google経由)]が固定表示され
+    // 続けた根本原因)。
+    if should_persist_route_cache(&result) {
+        if let Some(p) = &cpath {
+            if let Some(d) = p.parent() { let _ = std::fs::create_dir_all(d); }
+            if let Ok(s) = serde_json::to_string(&result) { let _ = std::fs::write(p, s); }
+        }
     }
     Ok(result)
+}
+
+// Googleフォールバック結果はディスクキャッシュへ保存しない(次回また新規に
+// BRouterへ再挑戦させ、一時的な失敗から自己修復できるようにするため)。
+fn should_persist_route_cache(r: &RouteResult) -> bool {
+    !r.via_google
 }
 
 // 1プロファイル分の取得。target island は sentinel "ISLAND" を返し、呼び出し側でフォールバック判定する。
@@ -714,6 +726,16 @@ mod tests {
     }
 
     #[test]
+    fn should_persist_route_cache_rejects_google_fallback_results() {
+        // Googleフォールバック結果をキャッシュしてしまうと、BRouterの一時的失敗が
+        // 永久に固定表示され続ける事故になる(2026/08/17)。
+        let g = RouteResult { pts: vec![], ele: vec![], dist_m: 1.0, time_s: 1.0, hw_m: 0.0, ascend_m: 0.0, via_google: true };
+        assert!(!should_persist_route_cache(&g));
+        let b = RouteResult { pts: vec![], ele: vec![], dist_m: 1.0, time_s: 1.0, hw_m: 0.0, ascend_m: 0.0, via_google: false };
+        assert!(should_persist_route_cache(&b));
+    }
+
+    #[test]
     fn route_result_serde_back_compat() {
         // via_google が無い旧キャッシュJSONも #[serde(default)] で false として読める
         let old = r#"{"pts":[],"ele":[],"dist_m":0.0,"time_s":0.0,"hw_m":0.0,"ascend_m":0.0}"#;
@@ -820,7 +842,7 @@ mod tests {
 
     #[test]
     fn closures_to_nogos_truncates_to_max_count_keeping_nearest_to_center() {
-        // 経線に沿った約55km分の長い通行止め(150m間隔で刻むと370点前後になり上限200を超える)。
+        // 経線に沿った約55km分の長い通行止め(150m間隔で刻むと370点前後になり上限(NOGO_MAX_COUNT)を超える)。
         let far_line: Vec<(f64, f64)> = (0..5000).map(|i| (35.0 + i as f64 * 0.0001, 139.0)).collect();
         let ev = closure(far_line, RegulationKind::Closed, true);
         let refs = vec![&ev];
@@ -936,5 +958,43 @@ mod tests {
         assert!(!should_show_traffic_delay(59.0));
         assert!(should_show_traffic_delay(60.0));
         assert!(should_show_traffic_delay(480.0));
+    }
+
+    // 実ネットワークを叩く手動確認用(CIでは走らない)。事故調査(新宿→釈迦堂PA、長距離ルートで
+    // nogosが多すぎてBRouterのwatchdogに殺され、通行止め回避が意図せずGoogleフォールバックへ
+    // 落ちた件)の再現・検証用。`cargo test --release -- --ignored --nocapture`で実行。
+    #[test]
+    #[ignore]
+    fn live_probe_real_nogos_count_and_brouter_survival_for_a_long_route() {
+        let wps = vec![(35.690, 139.701), (35.645, 138.714)]; // 新宿 → 釈迦堂PA(甲府方面)相当
+        let bbox = waypoints_bbox_with_margin(&wps, 0.05).unwrap();
+        let base = crate::regulation::discover_json_base().expect("配信元パスの発見");
+        let meshes = crate::mesh::primary_codes(bbox.0, bbox.1, bbox.2, bbox.3);
+        println!("meshes: {:?}", meshes);
+        let mut all: Vec<crate::regulation::ClosureEvent> = Vec::new();
+        for m in &meshes {
+            if let Ok(evs) = crate::regulation::fetch_mesh(&base, *m) {
+                all.extend(evs);
+            }
+        }
+        println!("total closure events: {}", all.len());
+        let refs: Vec<&crate::regulation::ClosureEvent> = all.iter().collect();
+        let center = ((bbox.0 + bbox.2) / 2.0, (bbox.1 + bbox.3) / 2.0);
+        let (circles, truncated) = closures_to_nogos(&refs, center);
+        println!("nogo circles: {} truncated={}", circles.len(), truncated);
+        let nogos = nogos_query_param(&circles);
+        println!("nogos url length: {}", nogos.len());
+
+        let url = format!(
+            "https://brouter.de/brouter?lonlats=139.701,35.690|138.714,35.645&profile=car-fast&alternativeidx=0&format=geojson&nogos={nogos}"
+        );
+        let start = std::time::Instant::now();
+        let result = ureq::get(&url).timeout(std::time::Duration::from_secs(30)).call();
+        println!("BRouter took {:?}, ok={}", start.elapsed(), result.is_ok());
+        let ok = result.is_ok();
+        if let Err(ureq::Error::Status(code, resp)) = result {
+            println!("status={code} body={}", resp.into_string().unwrap_or_default());
+        }
+        assert!(ok, "現状のNOGO_MAX_COUNT({NOGO_MAX_COUNT})でBRouterが失敗するなら要修正");
     }
 }
