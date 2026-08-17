@@ -34,6 +34,7 @@ mod ui_keys_settings; // 設定画面のキー処理
 mod ui_keys_spots;    // マイスポット(カテゴリ/一覧/登録フォーム/ピッカー)のキー処理
 mod ui_keys_poi;      // 探して候補を出す画面(地名/道路名/AIおすすめ/目的地カテゴリ/周辺検索)のキー処理
 mod ui_keys_route;    // ルート(おまかせ周回/お気に入り/道路一覧/経由地の並べ替え/ルートパネル)のキー処理
+mod ui_keys_map;      // 地図そのもの(パン/ズーム/直打ちキー)と Space メニューのキー処理
 mod ui_helpers; // interactive() の外にあった小さなヘルパー群
 mod focus;      // 対話UIの画面状態(Focus)
 #[allow(dead_code)] // ui.rs への配線(OSC 9997 送出)はこれから
