@@ -21,6 +21,10 @@ pub(crate) struct PlotStatus {
     pub stale_age_secs: Option<u64>,
     /// ズーム下限より広域で、取得を止めているか。
     pub wide_area: bool,
+    /// 中心十字がいる区画の名前と件数(過去災害だけが使う。他レイヤは常に None)。
+    /// ステータス行に凡例を置く幅は無いので、代わりに「いまどの町にいて、その町にどれだけ
+    /// 記録があるか」を直接出す。境界は簡略化された形なので、これは目安。
+    pub area: Option<(String, u32)>,
 }
 
 // build_status_line が読むループ状態。Option のうち有無しか見ないもの(通信中ジョブ・GPS)は
@@ -73,6 +77,9 @@ pub(crate) struct StatusCtx<'a> {
 //   0件 + ズーム下限外   → 🚗広域では非表示     ← 取りに行っていないので「無し」とは言えない
 //   0件                  → 🚗観測点無し
 // fresh の間は経過時間を出さない(常時出すと情報量が増えるだけなので)。
+// area が付いているとき(過去災害で中心が塗られた市区町村の中にいるとき)だけは、件数の代わりに
+//   🌊野田市 89件(B)
+// と出す。地点数より「いま見ている土地に何件の記録があるか」の方が読み手の知りたいことに近い。
 fn plot_label(enabled: bool, icon: &str, unit: &str, suffix: &str, none_txt: &str, s: &PlotStatus) -> String {
     if !enabled {
         return String::new();
@@ -92,6 +99,9 @@ fn plot_label(enabled: bool, icon: &str, unit: &str, suffix: &str, none_txt: &st
     };
     // 古い値を出したまま裏で取り直しているときだけ、続きがあることを示す。
     let updating = if s.stale_age_secs.is_some() && s.job_active { "…" } else { "" };
+    if let Some((name, n)) = &s.area {
+        return format!("{icon}{name} {n}件{age}{suffix}{updating} ");
+    }
     format!("{icon}{}{unit}{age}{suffix}{updating} ", s.count)
 }
 
@@ -301,7 +311,7 @@ mod tests {
     }
 
     fn idle_plot() -> PlotStatus {
-        PlotStatus { count: 0, job_active: false, stale_age_secs: None, wide_area: false }
+        PlotStatus { count: 0, job_active: false, stale_age_secs: None, wide_area: false, area: None }
     }
     fn clone_plot(p: &PlotStatus) -> PlotStatus {
         PlotStatus {
@@ -309,6 +319,7 @@ mod tests {
             job_active: p.job_active,
             stale_age_secs: p.stale_age_secs,
             wide_area: p.wide_area,
+            area: p.area.clone(),
         }
     }
 
@@ -528,6 +539,52 @@ mod tests {
         f.disaster.count = 7;
         f.disaster.stale_age_secs = Some(31 * 24 * 3600);
         assert!(f.line().contains("🌊7地点(31日前)(B) "));
+    }
+
+    // 中心十字が塗られた市区町村の中にいるときは、地点数ではなくその市区町村を出す
+    // (ステータス行に凡例を置く幅が無いので、代わりに直接答える)。
+    #[test]
+    fn the_disaster_label_names_the_municipality_under_the_crosshair() {
+        let mut f = Fixture::new(Focus::Map);
+        f.cfg.disaster_enabled = true;
+        f.disaster.count = 12;
+        f.disaster.area = Some(("野田市".to_string(), 89));
+        assert!(f.line().contains("🌊野田市 89件(B) "), "{}", f.line());
+        assert!(!f.line().contains("12地点"), "地点数は出さない");
+    }
+
+    #[test]
+    fn the_disaster_label_falls_back_to_the_site_count_outside_any_municipality() {
+        let mut f = Fixture::new(Focus::Map);
+        f.cfg.disaster_enabled = true;
+        f.disaster.count = 12;
+        f.disaster.area = None; // 海の上・記録の無い市区町村・境界が未取得
+        assert!(f.line().contains("🌊12地点(B) "));
+        // 0件のときは市区町村名より先に「取得中/広域では非表示/記録無し」を出す。
+        f.disaster.count = 0;
+        f.disaster.area = Some(("野田市".to_string(), 89));
+        assert!(f.line().contains("🌊記録無し "), "{}", f.line());
+    }
+
+    #[test]
+    fn a_stale_municipality_label_still_shows_the_age_and_the_detail_key() {
+        let mut f = Fixture::new(Focus::Map);
+        f.cfg.disaster_enabled = true;
+        f.disaster.count = 7;
+        f.disaster.area = Some(("広島市中区".to_string(), 278));
+        f.disaster.stale_age_secs = Some(31 * 24 * 3600);
+        f.disaster.job_active = true;
+        assert!(f.line().contains("🌊広島市中区 278件(31日前)(B)… "), "{}", f.line());
+    }
+
+    // 市区町村名を出すのは過去災害だけ。他レイヤは area を持たない(常に件数表示)。
+    #[test]
+    fn the_other_plot_layers_never_show_an_area_name() {
+        let mut f = Fixture::new(Focus::Map);
+        f.cfg.traffic_enabled = true;
+        f.traffic.count = 5;
+        assert!(f.traffic.area.is_none());
+        assert!(f.line().contains("🚗5地点 "));
     }
 
     #[test]

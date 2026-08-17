@@ -138,6 +138,9 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     let mut camera_layer = plotlayer::camera();
     let mut regulation_layer = plotlayer::regulation();
     let mut disaster_layer = plotlayer::disaster();
+    // 市区町村境界(気象庁 class20s)。過去災害を塗り分ける(コロプレス)ためだけの下地なので、
+    // 過去災害がONでかつ塗りがONのときだけ取りに行く。
+    let mut boundary_layer = plotlayer::boundary();
     // 期限切れ/上限超過のキャッシュ掃除は1セッション1回、最初のアイドル到達時に別スレッドで走らせる
     // (起動を遅くせず、無操作のたびにディレクトリを走査もしない)。
     let mut plot_gc_done = false;
@@ -649,6 +652,17 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             }
         }
         let disaster_sites = disaster_layer.items(plot_view);
+        let muni_areas = boundary_layer.items(plot_view);
+        // 過去災害の見せ方をズームで切り替える(設計 §3.4)。塗りは画面に複数の市区町村が
+        // 入るズーム帯でだけ意味を持つ。z14以上は画面幅が1km前後になり「全面が同じ色」に
+        // 退化するので、そこは従来の代表点マーカーへ譲る。判定に使うのは実描画ズーム(rz)では
+        // なく地図ズーム(z): 実画像モードは rz>z でも写る地理範囲は同じため。
+        let fill_on = cfg.disaster_enabled && cfg.disaster_fill;
+        let choropleth_fill = fill_on && (11..=13).contains(&z);
+        let choropleth_outline = fill_on && (11..=14).contains(&z);
+        // 件数リングは塗りが件数を担っている間は出さない(中心の小さな塊は常に残すので、
+        // B キーが何を指しているかは画面から分かる)。
+        let disaster_rings = !choropleth_fill;
 
         // 通行止めルート回避(#通行止めを推奨しない)。表示中の視野(plot_view)ではなく、
         // 経由地全体を覆うbboxで実施中の通行止めを見て、BRouterのnogosへ変換する。
@@ -799,6 +813,11 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             camera_layer.generation().hash(&mut h);
             regulation_layer.generation().hash(&mut h);
             disaster_layer.generation().hash(&mut h);
+            // 過去災害の塗り: 境界セルが届くたび、また塗り/縁取りの出し分けが変わるたびに
+            // ラスタライズし直す(逆に、パンもズームもしていないフレームでは1回も走らない)。
+            boundary_layer.generation().hash(&mut h);
+            choropleth_fill.hash(&mut h);
+            choropleth_outline.hash(&mut h);
             Some(h.finish())
         };
 
@@ -826,16 +845,39 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                         radar_tl.get(radar_idx)
                             .and_then(|f| build_radar_window_nowait(rcx, rcy, rz, rw, rh, f, &loader))
                     } else { None };
+                    // 過去災害のコロプレス層(市区町村を記録の多さで塗り分けたRGBA)。
+                    // 雨雲と同じ合成経路に「雨雲より1枚後ろ」として乗せる(雨は今の話・災害履歴は
+                    // 土地の話なので、今の情報が上に来るのが正しい)。
+                    let choro_shading = choropleth::Shading {
+                        // 濃さは層の中身に影響しない(合成時に掛ける)ので、ここで控えておいて
+                        // 3経路それぞれへ同じ値を渡す。設定行にするのは Stage2。
+                        opacity: choropleth::DEFAULT_OPACITY,
+                        fill: choropleth_fill,
+                        outline: choropleth_outline,
+                    };
+                    let choro_opacity = choro_shading.opacity;
+                    let choro_layer: Option<RgbaImage> = if choropleth_fill || choropleth_outline {
+                        choropleth::build_layer(&disaster_sites, &muni_areas, rcx, rcy, rz, rw, rh, choro_shading)
+                    } else { None };
                     // 実画像モードはここで地図へ直接アルファ合成する(オーバーレイはこの後に焼くので
                     // 経路/POI/中心十字は常に雨雲より前面に残る)。
                     if img_inline {
+                        if let Some(l) = &choro_layer { blend_rgba_over(&mut img, l, choro_opacity); }
                         if let Some(l) = &radar_layer { blend_rgba_over(&mut img, l, radar_opacity_value(&cfg)); }
                     }
                     // braille/edge は OverlayLayer へインクとして焼く(build_overlay の先頭で最背面に入る)。
-                    let ink = if radar_ink {
-                        radar_layer.as_ref().map(|l| RadarInk { layer: l, density: radar_opacity_value(&cfg) })
-                    } else { None };
-                    let mut ov = build_overlay(&spec, rcx, rcy, rz, rw, rh, 1.0, 1.0, rw, rh, ink);
+                    // 配列の順序がそのまま重ね順(先頭が最背面)。面塗りは雨雲のディザではなく
+                    // 疎な点描で間引く(Bayerだと braille のセルが全部塗り色に化けるため)。
+                    let mut inks: Vec<InkLayer> = Vec::new();
+                    if radar_ink {
+                        if let Some(l) = &choro_layer {
+                            inks.push(InkLayer::Stipple { layer: l, spacing: choropleth::STIPPLE_SPACING });
+                        }
+                        if let Some(l) = &radar_layer {
+                            inks.push(InkLayer::Dither { layer: l, density: radar_opacity_value(&cfg) });
+                        }
+                    }
+                    let mut ov = build_overlay(&spec, rcx, rcy, rz, rw, rh, 1.0, 1.0, rw, rh, &inks);
                     let (mx, my) = (rw as i32 / 2, rh as i32 / 2); // 中心クロスヘア(色は設定で選択可)
                     let cross = SPOT_PALETTE[cfg.cross_color_idx as usize % SPOT_PALETTE.len()];
                     draw_line(&mut ov, mx - 6, my, mx + 6, my, cross, 1);
@@ -928,13 +970,17 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                         // しない。1座標=1マーカーにして、件数を外周リングの半径、最も多い種別を
                         // 色で表す。外周を細くするのは地図と他レイヤを覆い隠さないため
                         // (中心の塊があるので細くても位置は読める)。
+                        // 塗り(コロプレス)が出ているズーム帯では件数の役目が塗りへ移るので、
+                        // 外周リングは出さず中心の小さな塊だけを残す(Bキーの対象を示すため)。
                         for s in &disaster_sites {
                             let (gx, gy) = deg_to_pixel(s.lat, s.lon, rz);
                             let ix = (gx - (rcx - rw as f64 / 2.0)).floor() as i32;
                             let iy = (gy - (rcy - rh as f64 / 2.0)).floor() as i32;
                             let color = s.dominant().color();
                             draw_ring(&mut ov, ix, iy, 1, color, 2);
-                            draw_ring(&mut ov, ix, iy, disaster::marker_radius(s.total()), color, 1);
+                            if disaster_rings {
+                                draw_ring(&mut ov, ix, iy, disaster::marker_radius(s.total()), color, 1);
+                            }
                         }
                     }
                     last_map_sig = map_sig; // このsigで描いた内容がこのフレームでemitされる
@@ -947,8 +993,13 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     } else {
                         // インク経路(braille/edge)は ov に入れ済みなので render 側では合成しない。
                         // halfblock/classify はここで渡し、classify は recolor 後に混ざる。
-                        let rd = if radar_ink { None } else { radar_layer.as_ref().map(|l| (l, radar_opacity_value(&cfg))) };
-                        render(&img, &opts, Some(&ov), rd)
+                        // 配列の順序がそのまま重ね順で、コロプレスが雨雲の下に来る。
+                        let mut layers: Vec<(&RgbaImage, f64)> = Vec::new();
+                        if !radar_ink {
+                            if let Some(l) = &choro_layer { layers.push((l, choro_opacity)); }
+                            if let Some(l) = &radar_layer { layers.push((l, radar_opacity_value(&cfg))); }
+                        }
+                        render(&img, &opts, Some(&ov), &layers)
                     }
                 }
                 Err(e) => {
@@ -1018,18 +1069,21 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             cfg: &cfg,
             // 主要道路は交通量のスナップ下地で、それ自体はステータスに出さない(描画も未実装)。
             traffic: ui_status::PlotStatus {
+                area: None,
                 count: traffic_points.len(),
                 job_active: traffic_layer.job_active() || roads_layer.job_active(),
                 stale_age_secs: traffic_layer.stale_age_secs(plot_now),
                 wide_area: traffic_layer.suppressed(),
             },
             camera: ui_status::PlotStatus {
+                area: None,
                 count: camera_points.len(),
                 job_active: camera_layer.job_active(),
                 stale_age_secs: camera_layer.stale_age_secs(plot_now),
                 wide_area: camera_layer.suppressed(),
             },
             regulation: ui_status::PlotStatus {
+                area: None,
                 count: regulation_events.len(),
                 job_active: regulation_layer.job_active(),
                 stale_age_secs: regulation_layer.stale_age_secs(plot_now),
@@ -1039,9 +1093,14 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             // 事例一覧(Bキー)の取得中もスピナーではなくこのレイヤの表示で分かるようにする。
             disaster: ui_status::PlotStatus {
                 count: disaster_sites.len(),
-                job_active: disaster_layer.job_active() || disaster_job.is_some(),
+                job_active: disaster_layer.job_active() || disaster_job.is_some() || boundary_layer.job_active(),
                 stale_age_secs: disaster_layer.stale_age_secs(plot_now),
                 wide_area: disaster_layer.suppressed(),
+                // 塗りが出ているときだけ「いまいる市区町村と、その町の記録件数」を出す
+                // (凡例を置く幅が無いので、代わりに読み手が知りたいことへ直接答える)。
+                area: choropleth_fill
+                    .then(|| choropleth::area_summary(&disaster_sites, &muni_areas, lat, lon))
+                    .flatten(),
             },
             addr: &addr, wps: &wps, z, lat, lon, next_turn: &next_turn,
         });
@@ -1145,6 +1204,8 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         got_result |= camera_layer.tick(cx, cy, z, cfg.camera_enabled);
         got_result |= regulation_layer.tick(cx, cy, z, cfg.regulation_enabled);
         got_result |= disaster_layer.tick(cx, cy, z, cfg.disaster_enabled);
+        // 境界は塗りに使うときだけ取りに行く(塗りをOFFにしている人に通信させない)。
+        got_result |= boundary_layer.tick(cx, cy, z, cfg.disaster_enabled && cfg.disaster_fill);
         if let Some(job) = &disaster_job { // Bキーで頼んだ事例一覧(2段目)の到着
             match job.try_recv() {
                 Ok(Ok(panel)) => { disaster_view = Some(panel); disaster_job = None; got_result = true; }
@@ -1382,6 +1443,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             // 主要道路は以前この条件から漏れていたが、4レイヤとも同じ扱いにする。
             || traffic_layer.job_active() || roads_layer.job_active()
             || camera_layer.job_active() || regulation_layer.job_active() || disaster_layer.job_active()
+            || boundary_layer.job_active()
             || disaster_job.is_some() || voice_preview_job.is_some() || regulation_detail_job.is_some() || traffic_color_job.is_some() || cause_job.is_some();
         let mut ev: Option<Event> = if got_result {
             None
@@ -1690,6 +1752,15 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                         cfg.route_traffic_enabled = !cfg.route_traffic_enabled;
                                         if cfg.route_traffic_enabled && cfg.google_maps_api_key.trim().is_empty() {
                                             addr = "渋滞状況の色分け: Google APIキー未設定".into();
+                                        }
+                                    }
+                                    29 => { // 過去災害の塗り: ONにした直後だけ境界データの出典を1回出す
+                                        cfg.disaster_fill = !cfg.disaster_fill;
+                                        force_reemit = true; // 今表示している地図の見た目が変わる
+                                        if cfg.disaster_fill && cfg.disaster_enabled {
+                                            addr = "過去災害の塗り: 市区町村境界 気象庁".into();
+                                        } else if cfg.disaster_fill {
+                                            addr = "過去災害の塗り: ON(「過去災害」もONにすると出る)".into();
                                         }
                                     }
                                     _ => {}

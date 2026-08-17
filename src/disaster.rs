@@ -15,6 +15,11 @@
 //     座標は幾何ではなく fX/fY フィールドから取る(GeoJSON経由の再投影で乗る丸めを含まない生値)。
 //   - SAIGAI_SYUBETSU_1 は数値ではなく文字列("3" 等)。値の対応表はレイヤ定義の codedValue から採取。
 //   - 被害統計(SHIBOU_SU 等)と発生月日には、実数と符号付きコードと null が混ざる(DamageValue/format_date)。
+//   - グループ化キーに CHIDAN_CODE(地方公共団体コード)を足しても行数は増えない(2026/08/17 実測で
+//     203行→203行・打ち切り無し・座標と1対1)。市区町村の境界ポリゴンへ件数を割り当てるのに使う
+//     (代表点の内外判定ではなくコードで直接結合する。docs/disaster-choropleth-design.md §1.1)。
+//   - resultOffset は集計クエリでは黙って無視される(offset を変えても同一レスポンスが返る)。
+//     この機能はページングしないので影響しないが、将来足すときは二重計上事故に注意。
 // traffic.rs/regulation.rs/camera.rs と同じ方針で std + ureq + serde_json のみに依存し、
 // crate:: を参照しない(ネットワークに触れない部分だけで単体テストが完結する)。
 
@@ -131,6 +136,15 @@ pub struct KindCount {
 pub struct DisasterSite {
     pub lat: f64,
     pub lon: f64,
+    /// 全国地方公共団体コード5桁(CHIDAN_CODE "JP12208" から "JP" を外したもの)。
+    /// 市区町村の境界ポリゴン(muni.rs)へ件数を割り当てる結合キー。読めなかった行は空文字で、
+    /// その場合は塗られずマーカーだけになる。
+    ///
+    /// **このフィールドを足したことで、既存のディスクキャッシュは1回だけ読めなくなる**
+    /// (plotcache::load の serde_json::from_str が失敗して None になり、全セルが取り直しになる)。
+    /// #[serde(default)] で古いキャッシュを読めるようにはしない。コードが空のセルは塗れず、
+    /// 原因の分からない虫食いになるため、取り直させた方が素直。
+    pub muni_code: String,
     pub kinds: Vec<KindCount>,
 }
 
@@ -175,6 +189,22 @@ pub fn marker_radius(total: u32) -> i32 {
         3
     } else {
         2
+    }
+}
+
+/// コロプレス(市区町村の塗り)のアルファ(件数5段)。実測(1地点あたり中央値18件・最大166件)に
+/// 合わせて刻む。この値にさらに濃さ設定(既定 0.45)が掛かって地図へ合成される。
+///
+/// 段階は固定値で、画面内の分布に合わせた相対配色(分位数)にはしない。相対にすると同じ
+/// 市区町村がパンするたびに色を変え、「濃い=記録が多い」が場所によって別の意味になって
+/// ハザードマップとして読めなくなるため。
+pub fn fill_alpha(total: u32) -> u8 {
+    match total {
+        0..=4 => 70,
+        5..=14 => 120,
+        15..=39 => 170,
+        40..=99 => 215,
+        _ => 255,
     }
 }
 
@@ -396,7 +426,9 @@ fn sites_url(lat_min: f64, lon_min: f64, lat_max: f64, lon_max: f64, since_year:
          &groupByFieldsForStatistics={}&outStatistics={}&returnGeometry=false&f=json",
         urlencode(&where_clause(since_year)),
         urlencode(&geom),
-        urlencode("fX,fY,SAIGAI_SYUBETSU_1"),
+        // CHIDAN_CODE(地方公共団体コード)を足しても行数は増えない(座標と1対1・実測)。
+        // 市区町村の塗り(choropleth.rs)へ件数を割り当てる結合キーになる。
+        urlencode("fX,fY,CHIDAN_CODE,SAIGAI_SYUBETSU_1"),
         urlencode(STATS),
     )
 }
@@ -475,16 +507,37 @@ pub fn parse_sites(body: &str) -> Vec<DisasterSite> {
             year_min: as_i32(a.get("YMIN")),
             year_max: as_i32(a.get("YMAX")),
         };
+        let muni_code = muni_code_from(a.get("CHIDAN_CODE"));
         let key = (lat.to_bits(), lon.to_bits());
         match index.get(&key) {
-            Some(&i) => out[i].kinds.push(kc),
+            Some(&i) => {
+                // 同じ座標の行は同じコードを持つ(実測で座標とコードは1対1)。念のため、
+                // 先に読めた非空の値を採る(欠けている行があってもコードを失わない)。
+                if out[i].muni_code.is_empty() {
+                    out[i].muni_code = muni_code;
+                }
+                out[i].kinds.push(kc);
+            }
             None => {
                 index.insert(key, out.len());
-                out.push(DisasterSite { lat, lon, kinds: vec![kc] });
+                out.push(DisasterSite { lat, lon, muni_code, kinds: vec![kc] });
             }
         }
     }
     out
+}
+
+// CHIDAN_CODE("JP12208")→ 全国地方公共団体コード5桁("12208")。
+// "JP" + 数字5桁の7文字だけを採り、それ以外(null・空・別形式)は空文字にする。
+// [2..] を無条件に切ると、形式が変わったときに意味の無い文字列を結合キーにしてしまう。
+fn muni_code_from(v: Option<&serde_json::Value>) -> String {
+    let s = text(v);
+    let ok = s.len() == 7 && s.starts_with("JP") && s.as_bytes()[2..].iter().all(u8::is_ascii_digit);
+    if ok {
+        s[2..].to_string()
+    } else {
+        String::new()
+    }
 }
 
 /// 事例一覧応答 → Vec<DisasterEvent>。応答の並び(新しい順)をそのまま保つ。
@@ -565,15 +618,16 @@ fn urlencode(s: &str) -> String {
 mod tests {
     use super::*;
 
-    // 実際の集計応答の抜粋(2026/08/16 実測、1次メッシュ5339・1926年以降)。
+    // 実際の集計応答の抜粋(2026/08/16 実測、1次メッシュ5339・1926年以降。CHIDAN_CODE は
+    // 同じ座標について 2026/08/17 に実測した値)。
     // 1行目と4行目は同じ座標で種別だけが違う(=1つの DisasterSite へ畳まれる)。
     const SITES_SAMPLE: &str = r#"{"displayFieldName":"","fieldAliases":{"fX":"経度"},
       "fields":[{"name":"fX","type":"esriFieldTypeDouble"}],
       "features":[
-        {"attributes":{"fX":139.87482800000001,"fY":35.955106000000001,"SAIGAI_SYUBETSU_1":"3","N":60,"YMIN":1926,"YMAX":2019}},
-        {"attributes":{"fX":139.27499399999999,"fY":35.788170999999998,"SAIGAI_SYUBETSU_1":"1","N":33,"YMIN":1926,"YMAX":2011}},
-        {"attributes":{"fX":139.14885200000001,"fY":35.726840000000003,"SAIGAI_SYUBETSU_1":"5","N":20,"YMIN":1927,"YMAX":1974}},
-        {"attributes":{"fX":139.87482800000001,"fY":35.955106000000001,"SAIGAI_SYUBETSU_1":"9","N":10,"YMIN":1929,"YMAX":1996}}
+        {"attributes":{"fX":139.87482800000001,"fY":35.955106000000001,"CHIDAN_CODE":"JP12208","SAIGAI_SYUBETSU_1":"3","N":60,"YMIN":1926,"YMAX":2019}},
+        {"attributes":{"fX":139.27499399999999,"fY":35.788170999999998,"CHIDAN_CODE":"JP13205","SAIGAI_SYUBETSU_1":"1","N":33,"YMIN":1926,"YMAX":2011}},
+        {"attributes":{"fX":139.14885200000001,"fY":35.726840000000003,"CHIDAN_CODE":"JP13307","SAIGAI_SYUBETSU_1":"5","N":20,"YMIN":1927,"YMAX":1974}},
+        {"attributes":{"fX":139.87482800000001,"fY":35.955106000000001,"CHIDAN_CODE":"JP12208","SAIGAI_SYUBETSU_1":"9","N":10,"YMIN":1929,"YMAX":1996}}
       ]}"#;
 
     // 実際の事例一覧応答の抜粋(2026/08/16 実測、千葉県野田市の地点)。
@@ -657,6 +711,53 @@ mod tests {
         assert_eq!(first.dominant(), DisasterKind::Storm);
         assert_eq!(first.year_min(), Some(1926));
         assert_eq!(first.year_max(), Some(2019));
+        assert_eq!(first.muni_code, "12208", "野田市。CHIDAN_CODE の \"JP\" を外した5桁");
+    }
+
+    #[test]
+    fn parse_sites_reads_the_municipality_code_of_every_site() {
+        let got = parse_sites(SITES_SAMPLE);
+        assert_eq!(got[1].muni_code, "13205", "青梅市");
+        assert_eq!(got[2].muni_code, "13307", "奥多摩町");
+    }
+
+    #[test]
+    fn parse_sites_keeps_the_code_when_only_some_rows_of_a_site_carry_it() {
+        // 同じ座標の行はどれも同じコードを持つ実測だが、欠けている行が混ざってもコードを失わない。
+        let body = r#"{"features":[
+            {"attributes":{"fX":139.8,"fY":35.9,"CHIDAN_CODE":null,"SAIGAI_SYUBETSU_1":"3","N":5}},
+            {"attributes":{"fX":139.8,"fY":35.9,"CHIDAN_CODE":"JP12208","SAIGAI_SYUBETSU_1":"1","N":2}}
+        ]}"#;
+        let got = parse_sites(body);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].muni_code, "12208");
+    }
+
+    #[test]
+    fn parse_sites_leaves_the_code_empty_when_it_is_not_jp_plus_five_digits() {
+        // 空なら塗られずマーカーだけになる。"JP" を前提に [2..] を無条件で切らない。
+        for raw in [
+            r#""""#,
+            "null",
+            "12208",
+            r#""12208""#,
+            r#""JP1220""#,
+            r#""JP122080""#,
+            r#""US12208""#,
+            r#""JP1220A""#,
+            r#""JP 2208""#,
+            r#""日本12208""#,
+        ] {
+            let body = format!(
+                r#"{{"features":[{{"attributes":{{"fX":139.8,"fY":35.9,"CHIDAN_CODE":{raw},"SAIGAI_SYUBETSU_1":"3","N":5}}}}]}}"#
+            );
+            let got = parse_sites(&body);
+            assert_eq!(got.len(), 1, "行自体は残る: raw={raw}");
+            assert_eq!(got[0].muni_code, "", "raw={raw}");
+        }
+        // CHIDAN_CODE のキー自体が無い応答(旧いキャッシュ相当)でも壊れない。
+        let body = r#"{"features":[{"attributes":{"fX":139.8,"fY":35.9,"SAIGAI_SYUBETSU_1":"3","N":5}}]}"#;
+        assert_eq!(parse_sites(body)[0].muni_code, "");
     }
 
     #[test]
@@ -699,7 +800,7 @@ mod tests {
 
     #[test]
     fn a_site_with_no_kinds_reports_zero_and_unknown() {
-        let s = DisasterSite { lat: 35.0, lon: 139.0, kinds: Vec::new() };
+        let s = DisasterSite { lat: 35.0, lon: 139.0, muni_code: String::new(), kinds: Vec::new() };
         assert_eq!(s.total(), 0);
         assert_eq!(s.dominant(), DisasterKind::Unknown);
         assert_eq!(s.year_min(), None);
@@ -710,6 +811,7 @@ mod tests {
         let a = DisasterSite {
             lat: 35.0,
             lon: 139.0,
+            muni_code: "12208".to_string(),
             kinds: vec![
                 KindCount { kind: DisasterKind::Storm, count: 7, year_min: 1930, year_max: 2000 },
                 KindCount { kind: DisasterKind::Earthquake, count: 7, year_min: 1930, year_max: 2000 },
@@ -875,6 +977,34 @@ mod tests {
     }
 
     #[test]
+    fn fill_alpha_grows_in_five_steps() {
+        // 境界値。段の区切りは 5/15/40/100。
+        assert_eq!(fill_alpha(0), 70);
+        assert_eq!(fill_alpha(4), 70);
+        assert_eq!(fill_alpha(5), 120);
+        assert_eq!(fill_alpha(14), 120);
+        assert_eq!(fill_alpha(15), 170);
+        assert_eq!(fill_alpha(39), 170);
+        assert_eq!(fill_alpha(40), 215);
+        assert_eq!(fill_alpha(99), 215);
+        assert_eq!(fill_alpha(100), 255);
+        assert_eq!(fill_alpha(166), 255, "実測の最大件数");
+        assert_eq!(fill_alpha(u32::MAX), 255);
+    }
+
+    #[test]
+    fn fill_alpha_never_decreases_as_the_count_grows() {
+        // 「濃い=記録が多い」が崩れないこと(段を足すときの回帰確認)。
+        let mut prev = 0u8;
+        for n in [0u32, 1, 4, 5, 14, 15, 39, 40, 99, 100, 500, 10_000] {
+            let a = fill_alpha(n);
+            assert!(a >= prev, "n={n}: {a} < {prev}");
+            prev = a;
+        }
+        assert!(fill_alpha(0) > 0, "0件でも塗る側に倒す(記録が1件も無い市区町村はそもそも表に載らない)");
+    }
+
+    #[test]
     fn event_line_shows_date_name_kind_and_only_the_recorded_damage() {
         let evs = parse_events(EVENTS_SAMPLE);
         assert_eq!(evs[0].to_line(), "2019年9月 令和元年房総半島台風 風水害");
@@ -904,7 +1034,7 @@ mod tests {
     #[test]
     fn panel_content_falls_back_to_the_threshold_when_the_span_is_unknown() {
         let evs = parse_events(EVENTS_SAMPLE);
-        let blank = DisasterSite { lat: 35.0, lon: 139.0, kinds: Vec::new() };
+        let blank = DisasterSite { lat: 35.0, lon: 139.0, muni_code: String::new(), kinds: Vec::new() };
         let (title, _) = panel_content(&evs, &blank, 1926);
         assert!(title.contains("1926年以降"), "{title}");
         let (title_all, _) = panel_content(&evs, &blank, 0);
@@ -916,6 +1046,7 @@ mod tests {
         let site = DisasterSite {
             lat: 35.0,
             lon: 139.0,
+            muni_code: "12208".to_string(),
             kinds: vec![KindCount { kind: DisasterKind::Snow, count: 2, year_min: 1963, year_max: 1963 }],
         };
         let (title, _) = panel_content(&[], &site, 1926);
@@ -963,7 +1094,8 @@ mod tests {
         assert!(u.starts_with(ENDPOINT), "{u}");
         assert!(u.contains("where=SAIGAI_YEAR%3E%3D1926"), "{u}");
         assert!(u.contains("geometry=139%2C35.33%2C140%2C36"), "経度,緯度の順: {u}");
-        assert!(u.contains("groupByFieldsForStatistics=fX%2CfY%2CSAIGAI_SYUBETSU_1"), "{u}");
+        // CHIDAN_CODE を足しても行数は増えない(実測)。市区町村の塗りの結合キーになる。
+        assert!(u.contains("groupByFieldsForStatistics=fX%2CfY%2CCHIDAN_CODE%2CSAIGAI_SYUBETSU_1"), "{u}");
         assert!(u.contains("outStatistics=%5B%7B%22statisticType%22%3A%22count%22"), "{u}");
         assert!(u.contains("returnGeometry=false"), "{u}");
         assert!(u.ends_with("f=json"), "集計は f=geojson を受け付けない: {u}");
@@ -1001,12 +1133,13 @@ mod tests {
         let s = DisasterSite {
             lat: 35.955106,
             lon: 139.874828,
+            muni_code: "12208".to_string(),
             kinds: vec![KindCount { kind: DisasterKind::Storm, count: 60, year_min: 1926, year_max: 2019 }],
         };
         let json = serde_json::to_string(&s).unwrap();
         assert_eq!(
             json,
-            r#"{"lat":35.955106,"lon":139.874828,"kinds":[{"kind":"Storm","count":60,"year_min":1926,"year_max":2019}]}"#
+            r#"{"lat":35.955106,"lon":139.874828,"muni_code":"12208","kinds":[{"kind":"Storm","count":60,"year_min":1926,"year_max":2019}]}"#
         );
         assert_eq!(serde_json::from_str::<DisasterSite>(&json).unwrap(), s);
     }
@@ -1028,15 +1161,21 @@ mod tests {
         println!("sites: {}", sites.len());
         for s in sites.iter().take(5) {
             println!(
-                "{:.6},{:.6} total={} dominant={:?} r={}",
+                "{:.6},{:.6} muni={} total={} dominant={:?} r={} alpha={}",
                 s.lat,
                 s.lon,
+                s.muni_code,
                 s.total(),
                 s.dominant(),
-                marker_radius(s.total())
+                marker_radius(s.total()),
+                fill_alpha(s.total())
             );
         }
         assert!(!sites.is_empty(), "実際に関東で0地点は考えにくい");
+        // 市区町村コードが取れていること(1件でも欠けたら塗りに穴が空くので全件を見る)。
+        let missing = sites.iter().filter(|s| s.muni_code.is_empty()).count();
+        assert_eq!(missing, 0, "CHIDAN_CODE を読めなかった地点が {missing} 件ある");
+        assert!(sites.iter().all(|s| s.muni_code.len() == 5), "5桁でないコードが混ざっている");
 
         let s = &sites[0];
         let events = fetch_events(s.lat, s.lon, DEFAULT_SINCE_YEAR, EVENT_LIMIT).expect("live events");

@@ -35,7 +35,7 @@ pub(crate) const CHOICES: &[SettingChoice] = &[
 
 // 設定画面の項目行数(アコーディオン未展開時)。ui.rs のカーソル下移動の上限がこれを参照する。
 // settings_rows() が返す行数と必ず一致すること(下の回帰テスト settings_row_count_matches_rows で固定)。
-pub(crate) const SETTINGS_ROW_COUNT: usize = 29;
+pub(crate) const SETTINGS_ROW_COUNT: usize = 30;
 
 fn choice_for(idx: usize) -> Option<&'static SettingChoice> { CHOICES.iter().find(|c| c.idx == idx) }
 
@@ -147,6 +147,7 @@ pub(crate) fn setting_description(idx: usize) -> &'static str {
         } else {
             "読み上げの声: この端末(macOS以外)では読み上げ自体が動かないため効果は無い"
         },
+        29 => "過去災害の塗り: 過去災害を市区町村の境界ごとに塗り分けて出す(ハザードマップのような面表示)。色=最も多い災害種別・濃さ=記録の件数。OFFにすると従来の代表点マーカーだけになる。「過去災害」自体がOFFのときは何も出ない",
         28 => "渋滞状況の色分け: ルート確定後、Google Directionsで区間ごとの渋滞状況を追加確認し、混雑している区間だけルート線を黄(やや混雑)/赤(混雑)で上塗りする(順調な区間は基調色の青のまま)。道路網全体ではなく表示中のルートのみ。要Google APIキー。区間数に応じて1回のAdvanced課金対象リクエストを送る(無料枠超過分は1000件$8、個人利用なら通常は無料枠内)",
         _ => "Google APIキー: 検索(Geocoding)とStreet View共通。Enterで入力欄を開く(Cmd+V貼付も可)。環境変数TERMMAP_GOOGLE_API_KEYでも可",
     }
@@ -196,6 +197,7 @@ pub(crate) fn settings_rows(opts: &Args, cfg: &Config, picking: Option<usize>, o
         format!("過去災害 {}", onoff(cfg.disaster_enabled)),
         format!("{} 読み上げの声 {}", arrow(27), if cfg.voice_name.is_empty() { "システム既定".to_string() } else { crate::voice::display_voice_name(&cfg.voice_name).to_string() }),
         format!("渋滞状況の色分け {}", onoff(cfg.route_traffic_enabled)),
+        format!("過去災害の塗り {}", onoff(cfg.disaster_fill)),
     ];
     debug_assert_eq!(its.len(), SETTINGS_ROW_COUNT, "SETTINGS_ROW_COUNT と行数がずれている");
     // アコーディオン展開: 選択中の項目がpickable(3択以上)ならその直下に候補をインデント挿入し、他行を押し下げる
@@ -220,7 +222,7 @@ mod tests {
         for idx in [4usize, 5, 9, 12, 16, 18, 20, 27] {
             assert!(is_pickable(idx), "idx {idx} should be pickable");
         }
-        for idx in [0usize, 1, 2, 3, 6, 7, 8, 10, 11, 13, 14, 15, 17, 19, 28] {
+        for idx in [0usize, 1, 2, 3, 6, 7, 8, 10, 11, 13, 14, 15, 17, 19, 28, 29] {
             assert!(!is_pickable(idx), "idx {idx} should not be pickable");
         }
     }
@@ -365,6 +367,36 @@ mod tests {
     }
 
     #[test]
+    fn settings_rows_shows_the_disaster_fill_row_last() {
+        // 項目は必ず末尾に足す(既存 idx を動かすと ui.rs の生の数値比較と食い違う)。
+        let cfg = Config::default();
+        let (_, its, _) = settings_rows(&test_args(), &cfg, None, false, 29, 0);
+        assert_eq!(its.len(), SETTINGS_ROW_COUNT);
+        assert_eq!(its[29], "過去災害の塗り ON", "既定はON");
+        assert!(its[26].starts_with("過去災害 "), "レイヤ自体のON/OFF(26)は別の行のまま");
+        assert!(its[28].starts_with("渋滞状況の色分け"), "既存項目(28)の並びが動いていない");
+        let mut off = Config::default();
+        off.disaster_fill = false;
+        let (_, its_off, _) = settings_rows(&test_args(), &off, None, false, 29, 0);
+        assert_eq!(its_off[29], "過去災害の塗り OFF");
+    }
+
+    #[test]
+    fn setting_description_for_the_disaster_fill_row_explains_the_two_axes() {
+        let d = setting_description(29);
+        assert!(d.contains("過去災害の塗り"), "{d}");
+        assert!(d.contains("市区町村"), "何を塗るのかに触れる: {d}");
+        assert!(d.contains("種別") && d.contains("件数"), "色と濃さの意味に触れる: {d}");
+        assert_ne!(d, setting_description(26), "レイヤ本体の説明と混ざっていない");
+        assert_ne!(d, setting_description(17), "フォールバック(Google APIキー)と混ざっていない");
+    }
+
+    #[test]
+    fn the_disaster_fill_row_is_a_plain_toggle_not_a_picker() {
+        assert!(!is_pickable(29), "ON/OFF なのでアコーディオンを開かない");
+    }
+
+    #[test]
     fn setting_description_for_route_traffic_row_mentions_google_and_coloring() {
         let d = setting_description(28);
         assert!(d.contains("渋滞状況の色分け"), "{d}");
@@ -390,7 +422,7 @@ mod tests {
         // 0〜16,18〜28 は個別の説明文を持つ(idx=11/27は端末対応有無で文言が変わるが、いずれにせよ
         // 空でない。17=Google APIキーはフォールバック経由で別テストで確認するためここでは含めない)。
         let mut seen = Vec::new();
-        for idx in (0usize..=16).chain(18..=28) {
+        for idx in (0usize..=16).chain(18..=29) {
             let d = setting_description(idx);
             assert!(!d.is_empty(), "idx {idx} should have a description");
             if idx != 11 && idx != 27 { seen.push(d); } // 11/27は環境依存で文言が2通りあるため一意性判定から除外

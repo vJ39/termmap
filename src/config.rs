@@ -60,6 +60,7 @@ pub struct Config {
     pub camera_enabled: bool,         // 道路ライブカメラ(road-info-prvs.mlit.go.jp)を地図に重ねるか。既定false(ONにした人だけが外部サービスへ問い合わせる)
     pub regulation_enabled: bool,     // 通行規制(通行止め・車線規制等、road-info-prvs.mlit.go.jp)を地図に重ねるか。既定false(ONにした人だけが外部サービスへ問い合わせる)
     pub disaster_enabled: bool,       // 過去災害の発生履歴(NIED 災害事例データベース)を地図に重ねるか。既定false(ONにした人だけが外部サービスへ問い合わせる)
+    pub disaster_fill: bool,          // 過去災害を市区町村の塗り(コロプレス)で出すか。既定true。OFFなら従来の代表点マーカーだけになる。disaster_enabled がOFFならこの値に関わらず何も出ない
     pub route_traffic_enabled: bool,  // ルート確定後、Google Directions(departure_time=now)で区間ごとの渋滞状況を追加確認しルート線を色分けするか。既定false(ONにした人だけがGoogle APIへ追加問い合わせする。要Google APIキー・Advanced課金対象)
 }
 
@@ -96,6 +97,7 @@ impl Default for Config {
             camera_enabled: false,
             regulation_enabled: false,
             disaster_enabled: false,
+            disaster_fill: true,
             route_traffic_enabled: false,
         }
     }
@@ -246,6 +248,7 @@ pub fn load_config_from(path: &Path) -> Config {
             ("camera", "enabled") => { if let Some(b) = parse_bool(value) { cfg.camera_enabled = b; } }
             ("regulation", "enabled") => { if let Some(b) = parse_bool(value) { cfg.regulation_enabled = b; } }
             ("disaster", "enabled") => { if let Some(b) = parse_bool(value) { cfg.disaster_enabled = b; } }
+            ("disaster", "fill") => { if let Some(b) = parse_bool(value) { cfg.disaster_fill = b; } }
             ("route_traffic", "enabled") => { if let Some(b) = parse_bool(value) { cfg.route_traffic_enabled = b; } }
             // 旧スキーマ後方互換: [streetview] api_key を google_maps_api_key に取り込む(未設定時のみ)
             ("streetview", "api_key") => {
@@ -324,6 +327,7 @@ pub fn save_config_to(path: &Path, c: &Config) -> Result<(), String> {
          \n\
          [disaster]\n\
          enabled = {}\n\
+         fill = {}\n\
          \n\
          [route_traffic]\n\
          enabled = {}\n",
@@ -357,6 +361,7 @@ pub fn save_config_to(path: &Path, c: &Config) -> Result<(), String> {
         c.camera_enabled,
         c.regulation_enabled,
         c.disaster_enabled,
+        c.disaster_fill,
         c.route_traffic_enabled,
     );
 
@@ -522,6 +527,7 @@ mod tests {
             camera_enabled: true,
             regulation_enabled: true,
             disaster_enabled: true,
+            disaster_fill: false,
             route_traffic_enabled: true,
         };
         save_config_to(&path, &original).expect("save should succeed");
@@ -638,6 +644,29 @@ show_spots = maybe
         assert!(!cfg.regulation_enabled);
         assert!(!cfg.camera_enabled);
         cleanup(&path);
+    }
+
+    #[test]
+    fn disaster_fill_defaults_to_on_and_is_independent_of_the_layer_switch() {
+        // レイヤをONにする人は「地図で見たい」人で、その主目的が塗りなので既定ON。
+        assert!(Config::default().disaster_fill);
+        // 塗りだけを切ってマーカー表示へ戻せること(レイヤ自体のON/OFFとは別のキー)。
+        let path = unique_temp_path("disaster_fill_off");
+        std::fs::write(&path, "[disaster]\nenabled = true\nfill = false\n").unwrap();
+        let cfg = load_config_from(&path);
+        assert!(cfg.disaster_enabled);
+        assert!(!cfg.disaster_fill);
+        cleanup(&path);
+        // fill を書かない古い config.toml でも既定(ON)のまま読める。
+        let path2 = unique_temp_path("disaster_fill_absent");
+        std::fs::write(&path2, "[disaster]\nenabled = true\n").unwrap();
+        assert!(load_config_from(&path2).disaster_fill);
+        cleanup(&path2);
+        // 値が壊れていれば既定を保つ。
+        let path3 = unique_temp_path("disaster_fill_bogus");
+        std::fs::write(&path3, "[disaster]\nfill = \"maybe\"\n").unwrap();
+        assert!(load_config_from(&path3).disaster_fill);
+        cleanup(&path3);
     }
 
     #[test]
@@ -879,6 +908,7 @@ profile = "custom-profile"
             camera_enabled: false,
             regulation_enabled: false,
             disaster_enabled: false,
+            disaster_fill: true,
             route_traffic_enabled: false,
         };
         save_config_to(&path, &cfg).unwrap();
