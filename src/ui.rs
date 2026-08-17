@@ -2569,6 +2569,20 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 web_gps_active = false;
                 addr = "ライブ現在地(スマホ): OFF".into();
             }
+            // スマホ側のGeolocation APIが失敗した時の理由(web/touch-overlay.js::gpsErrorReason)。
+            // 「ボタンを押しても権限ダイアログすら出ない」といった切り分けをステータス行で
+            // できるようにする診断用。成功時は既存のGPSマーカー分岐がaddrを上書きする。
+            Some(Event::Paste(s)) if s.starts_with("\u{1}GPS_ERR\u{1}") => {
+                let reason = &s["\u{1}GPS_ERR\u{1}".len()..];
+                let msg = match reason {
+                    "denied" => "権限拒否(Safariのサイト設定/位置情報サービスを確認)",
+                    "unavailable" => "位置情報を取得できません",
+                    "timeout" => "取得がタイムアウトしました",
+                    "unsupported" => "この接続では使えません(HTTPS化を確認)",
+                    _ => "原因不明のエラー",
+                };
+                addr = format!("ライブ現在地(スマホ): 失敗 - {msg}");
+            }
             Some(Event::Paste(s)) if s.starts_with("\u{1}GPS\u{1}") => {
                 let rest = &s["\u{1}GPS\u{1}".len()..];
                 let mut parts = rest.splitn(2, '\u{1}');

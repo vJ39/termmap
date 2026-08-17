@@ -407,6 +407,19 @@
     t.paste('' + text);
   }
 
+  // navigator.geolocation の PositionError.code (1=PERMISSION_DENIED /
+  // 2=POSITION_UNAVAILABLE / 3=TIMEOUT) を診断用の短い理由文字列へ。
+  // 「権限ダイアログが一度も出ない」等の切り分けに、原因をステータス行へ出す。
+  function gpsErrorReason(err) {
+    if (!err) { return 'unknown'; }
+    switch (err.code) {
+      case 1: return 'denied';   // 権限拒否(サイト設定/OS設定で既にブロックされている場合も含む)
+      case 2: return 'unavailable';
+      case 3: return 'timeout';
+      default: return 'unknown';
+    }
+  }
+
   function toggleWebGps() {
     if (GPS_WATCH_ID !== null) {
       navigator.geolocation.clearWatch(GPS_WATCH_ID);
@@ -414,7 +427,12 @@
       sendMarkerPaste('GPS_STOP');
       return;
     }
-    if (!navigator.geolocation) { return; } // 非対応環境は何もしない
+    if (!navigator.geolocation) {
+      // Secure Context でない(HTTP接続)/ブラウザ非対応。watchPositionを呼ぶ前に
+      // 判明する唯一のケースなのでここで理由を確定して送る。
+      sendMarkerPaste('GPS_ERRunsupported');
+      return;
+    }
     GPS_WATCH_ID = navigator.geolocation.watchPosition(
       function (pos) {
         var now = Date.now();
@@ -422,7 +440,10 @@
         gpsLastSentAt = now;
         sendMarkerPaste('GPS' + pos.coords.latitude + '' + pos.coords.longitude);
       },
-      function () { GPS_WATCH_ID = null; }, // 権限拒否/取得失敗: 状態を戻すだけ
+      function (err) { // 権限拒否/取得失敗: 状態を戻し、原因をステータス行へ出す
+        GPS_WATCH_ID = null;
+        sendMarkerPaste('GPS_ERR' + gpsErrorReason(err));
+      },
       { enableHighAccuracy: true, maximumAge: 5000, timeout: 15000 }
     );
   }
