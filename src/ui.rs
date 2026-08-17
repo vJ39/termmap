@@ -50,135 +50,6 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
     // 状態遷移をテストできる状態にしておくため)。経緯は docs/ui-refactor-design.md。
     let mut st = uistate::UiState::new(a, cx, cy, z);
 
-    // メニュー項目/直接キー どちらからでも同じ処理を走らせる。
-    // lat/lon/cols/tr/route_nogos は各ループで再計算されるフレーム値。マクロ衛生性のため引数で受け取る。
-    macro_rules! run_action { ($act:expr, $lat:expr, $lon:expr, $cols:expr, $tr:expr, $nogos:expr) => {{
-        match $act {
-            MenuAction::SearchPlace => { st.input_cur = 0; st.focus = Focus::Search(String::new()); }
-            MenuAction::SearchPoi => { st.focus = Focus::PoiMenu; }
-            MenuAction::ShowAddress => { st.addr = reverse_geocode($lat, $lon).unwrap_or_else(|e| format!("({e})")); }
-            MenuAction::Recommend => {
-                if !st.cfg.llm_recommend_enabled { st.snd.play("error"); st.addr = "おすすめ: 設定でOFF(,でON)".into(); }
-                else if !recommend::claude_available(&st.cfg.llm_command) { st.snd.play("error"); st.addr = "おすすめ: claudeが無い(設定のLLM/コマンド確認)".into(); }
-                else { st.input_cur = 0; st.focus = Focus::Recommend(String::new()); }
-            }
-            MenuAction::RouteForm => { if st.wps.is_empty() { st.addr = "先に v で地点を置いてね".into(); } else { st.wp_sel = 0; st.grab = false; st.focus = Focus::WaypointList; } }
-            MenuAction::AddVia => { st.snd.play("pop"); wp_add(&mut st.wps, ($lat, $lon)); let (n_, j_) = trigger_route(&mut st.spec, &st.wps, &st.pois, &st.mode, 0, &st.cfg.google_maps_api_key, $nogos); st.route_note = n_; st.route_job = j_; st.addr = format!("地点を追加 #{}", st.wps.len()); }
-            MenuAction::RoadRoute => { st.input_cur = 0; st.focus = Focus::RoadSearch(String::new()); }
-            MenuAction::Wander => { st.focus = Focus::WanderForm { dist_km: a.dist.unwrap_or(40.0) }; } // 距離ゲージを開く(Enterで検索開始)
-            MenuAction::CycleMode => { st.mode = match mode_label(&st.mode) { "下道" => "highway", "高速" => "short", _ => "surface" }.to_string(); let (n_, j_) = trigger_route(&mut st.spec, &st.wps, &st.pois, &st.mode, 0, &st.cfg.google_maps_api_key, $nogos); st.route_note = n_; st.route_job = j_; }
-            MenuAction::AltRoute => {
-                if st.wps.len() >= 2 {
-                    st.route_alt = (st.route_alt + 1) % 4;
-                    let (nn, jj) = trigger_route(&mut st.spec, &st.wps, &st.pois, &st.mode, st.route_alt, &st.cfg.google_maps_api_key, $nogos);
-                    st.route_note = nn; st.route_job = jj;
-                } else { st.snd.play("error"); st.addr = "ルート未確定".into(); }
-            }
-            MenuAction::ClearRoute => { if !st.wps.is_empty() || !st.road_segs.is_empty() { st.clear_route_confirm = true; } }
-            MenuAction::ManageRoads => { if st.road_segs.is_empty() { st.snd.play("error"); st.addr = "道路の塊がまだ無い(rで道路を追加)".into(); } else { st.road_sel = 0; st.focus = Focus::RoadList; } }
-            MenuAction::ManageSpots => { st.cat_sel = 0; st.focus = Focus::SpotCatList; }
-            MenuAction::ToggleSpots => { st.show_spots = !st.show_spots; apply_spots(&mut st.spec, &st.spots, &st.spot_cats, st.show_spots); st.addr = if st.show_spots { "マイスポット表示".into() } else { "マイスポット非表示".into() }; }
-            MenuAction::ToggleElevation => {
-                st.show_elev = !st.show_elev;
-                if st.show_elev && (st.spec.routes.is_empty() || !st.route_ele.iter().any(|&z| z != 0.0)) { st.addr = "標高: ルート確定後に表示".into(); }
-            }
-            MenuAction::StreetView => {
-                if !streetview::available(&st.cfg.google_maps_api_key) { st.snd.play("error"); st.addr = "実写: APIキー未設定(config.toml [streetview])".into(); }
-                else {
-                    // 実写取得を別スレッドへ。focus は Map のまま(メニューは既に閉じている)でスピナーが回る。
-                    st.sv_fov = 90.0; // 開き直しなので既定ズームに戻す
-                    let (la, lo) = ($lat, $lon);
-                    let key = st.cfg.google_maps_api_key.clone();
-                    let (tx, rx) = std::sync::mpsc::channel();
-                    std::thread::spawn(move || {
-                        let r = streetview::fetch(la, lo, 0, 640, 480, 90.0, &key);
-                        let _ = tx.send((la, lo, 0, r));
-                    });
-                    st.street_job = Some(rx);
-                }
-            }
-            MenuAction::PlayRoute => {
-                if st.spec.routes.last().map_or(false, |r| r.pts.len() >= 2) {
-                    if st.play.is_some() {
-                        st.play = None; st.play_last_tick = None;
-                        st.play_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-                        st.play_prefetch_rx = None; st.play_prefetch_held = None;
-                        st.addr = "再生: 停止".into();
-                    } else {
-                        st.play = Some(0.0);
-                        st.play_last_tick = Some(std::time::Instant::now());
-                        st.play_wants_prefetch = true; // 実画像モードなら次フレームで先読みスレッドを起動する
-                        st.addr = "再生: 開始(Aで停止)".into();
-                    }
-                } else { st.snd.play("error"); st.addr = "再生: ルート未確定".into(); }
-            }
-            MenuAction::ToggleGps => {
-                if st.gps_rx.is_some() { st.gps_rx = None; st.addr = "ライブ現在地: OFF".into(); }
-                else {
-                    let bin = if std::path::Path::new("/opt/homebrew/bin/CoreLocationCLI").exists() { "/opt/homebrew/bin/CoreLocationCLI" } else { "CoreLocationCLI" };
-                    if gpslive::available(bin) { st.gps_rx = Some(gpslive::start_poller(bin.to_string(), 5)); st.gps_trail.clear(); st.gps_pos = None; st.addr = "ライブ現在地: ON(5秒ごと)".into(); }
-                    else { st.addr = "ライブ: CoreLocationCLI無し(brew install corelocationcli)".into(); }
-                }
-            }
-            MenuAction::ToggleRadar => { st.radar_toggle(); } // 雨雲レーダー(地図の C キーと同じ)
-            MenuAction::ViewCamera => { // 道路ライブカメラ(地図の N キーと同じ)
-                if !st.cfg.camera_enabled { st.snd.play("error"); st.addr = "道路ライブカメラ: OFF(設定で有効化)".into(); }
-                else {
-                    // 視野内で中心に一番近いカメラ。ここで層から直接引くのは、フレーム先頭で
-                    // 切り出した一覧の借用がこの時点(tick後)まで生きていられないため。
-                    let nearest = st.camera_layer.items(plotlayer::view_bbox(st.cx, st.cy, st.z)).into_iter()
-                        .min_by(|a, b| {
-                            let da = (a.lat - $lat).powi(2) + (a.lon - $lon).powi(2);
-                            let db = (b.lat - $lat).powi(2) + (b.lon - $lon).powi(2);
-                            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-                        })
-                        .cloned();
-                    match nearest {
-                        None => { st.snd.play("error"); st.addr = "道路ライブカメラ: 周辺に無し".into(); }
-                        Some(c) => {
-                            // キャッシュから読んだカメラは写真URLを持たない(URLに15分ごとの撮影
-                            // ディレクトリが入るため保存していない)。その場合だけ整備局ページを
-                            // 取り直してURLを補ってから画像を取る(押したときだけの1回)。
-                            if c.full_url.is_none() { st.addr = "📷カメラ情報を更新中…".into(); }
-                            let (tx, rx) = std::sync::mpsc::channel();
-                            std::thread::spawn(move || {
-                                let c = match c.full_url {
-                                    Some(_) => c,
-                                    None => camera::fetch_bureau(camera::nearest_bureau(c.lat, c.lon))
-                                        .ok()
-                                        .and_then(|cams| cams.into_iter().find(|x| x.id == c.id))
-                                        .unwrap_or(c),
-                                };
-                                let r = match c.full_url.clone() {
-                                    Some(url) => camera::fetch_image(&url),
-                                    None => Err("画像URLを取得できない".to_string()),
-                                };
-                                let _ = tx.send((c, r));
-                            });
-                            st.cam_job = Some(rx);
-                        }
-                    }
-                }
-            }
-            MenuAction::SaveRoute => { st.input_cur = st.route_name_hint.chars().count(); st.focus = Focus::SaveName(st.route_name_hint.clone()); }
-            MenuAction::LoadRoute => { st.route_names = list_named_routes(); st.rn_sel = 0; if st.route_names.is_empty() { st.addr = "お気に入り無し".into(); } else { st.focus = Focus::RouteList; } }
-            MenuAction::SaveGpx => match st.spec.routes.last() {
-                Some(rt) => st.addr = match write_gpx("termmap-route.gpx", &rt.pts) { Ok(_) => "GPX保存: termmap-route.gpx".into(), Err(e) => format!("({e})") },
-                None => { st.snd.play("error"); st.addr = "ルート未確定".into(); }
-            },
-            MenuAction::ShareQr => {
-                if st.wps.len() >= 2 {
-                    let (url, _) = gmaps_url(&st.wps);
-                    match qrcode::QrCode::with_error_correction_level(url.as_bytes(), qrcode::EcLevel::L) {
-                        Ok(c) => st.qr_view = Some(build_qr_view(&c, &st.cfg.qr_style)),
-                        Err(_) => st.addr = "QR生成失敗".into(),
-                    }
-                } else { st.snd.play("error"); st.addr = "ルート未確定".into(); }
-            }
-            MenuAction::Settings => { st.set_sel = 0; st.focus = Focus::Settings; voice::warm_voice_list(); }
-            MenuAction::Help => { st.help = true; st.help_page = 0; }
-        }
-    }};}
     let _ = write!(out, "\x1b[2J");
     loop {
         st.spin = st.spin.wrapping_add(1); // 通信中スピナーのアニメ用(毎フレーム進める)
@@ -1964,7 +1835,7 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
                         // 次フレームで確実に再構築させる(Resize時の扱いと同じ)。
                         KeyCode::Esc => { st.snd.play("back"); st.focus = Focus::Map; let _ = write!(out, "\x1b[2J"); st.force_reemit = true; }
                         KeyCode::Char(c) => match menu_action_for_key(c) {
-                            Some(act) => run_action!(act, lat, lon, cols, tr, &route_nogos),
+                            Some(act) => ui_action::run_action(&mut st, a, act, lat, lon, &route_nogos),
                             None => st.focus = Focus::Menu(MenuLevel::Categories),
                         },
                         _ => st.focus = Focus::Menu(MenuLevel::Categories),
@@ -1975,10 +1846,11 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
                         match k.code {
                             KeyCode::Up | KeyCode::Char('w') if !items.iter().any(|it| it.key == 'w') => { st.snd.play("click"); st.menu_item_sel = st.menu_item_sel.saturating_sub(1); st.focus = Focus::Menu(MenuLevel::Items(ci)); }
                             KeyCode::Down | KeyCode::Char('s') if !items.iter().any(|it| it.key == 's') => { st.snd.play("click"); if st.menu_item_sel + 1 < items.len() { st.menu_item_sel += 1; } st.focus = Focus::Menu(MenuLevel::Items(ci)); }
-                            KeyCode::Enter => run_action!(items[st.menu_item_sel].action, lat, lon, cols, tr, &route_nogos),
+                            // 選択中の項目を先に取り出す(&mut st を渡す式の中で st を読めないため)
+                            KeyCode::Enter => { let act = items[st.menu_item_sel].action; ui_action::run_action(&mut st, a, act, lat, lon, &route_nogos); }
                             KeyCode::Esc => { st.snd.play("back"); st.focus = Focus::Menu(MenuLevel::Categories); } // 上位カテゴリへ戻る
                             KeyCode::Char(c) => match items.iter().find(|it| it.key == c) {
-                                Some(it) => run_action!(it.action, lat, lon, cols, tr, &route_nogos),
+                                Some(it) => ui_action::run_action(&mut st, a, it.action, lat, lon, &route_nogos),
                                 None => st.focus = Focus::Menu(MenuLevel::Items(ci)),
                             },
                             _ => st.focus = Focus::Menu(MenuLevel::Items(ci)),
@@ -2064,7 +1936,7 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
                             KeyCode::Enter | KeyCode::Char(' ') => {
                                 if st.route_sel >= st.wps.len() { // 操作行を実行(run_action側でfocus遷移する場合あり=その時はそちら優先)
                                     let ai = st.route_sel - st.wps.len();
-                                    if ai < ROUTE_ACTS.len() { let act = ROUTE_ACTS[ai].1; run_action!(act, lat, lon, cols, tr, &route_nogos); }
+                                    if ai < ROUTE_ACTS.len() { let act = ROUTE_ACTS[ai].1; ui_action::run_action(&mut st, a, act, lat, lon, &route_nogos); }
                                 } else { // 点を選択中: 地図を寄せてパネルに留まる
                                     let (la, lo) = st.wps[st.route_sel]; let (nx, ny) = deg_to_pixel(la, lo, st.z); st.cx = nx; st.cy = ny;
                                     st.focus = Focus::RoutePanel;
@@ -2129,7 +2001,7 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
                                 // w/sで操作行(保存/GPX等)を選択中はEnterでその操作を実行
                                 let ai = st.route_sel - st.wps.len();
                                 let act = ROUTE_ACTS[ai].1;
-                                run_action!(act, lat, lon, cols, tr, &route_nogos);
+                                ui_action::run_action(&mut st, a, act, lat, lon, &route_nogos);
                             }
                             KeyCode::Enter => { // 中心付近の最寄りお気に入りにスナップ＋名前表示
                                 let mut best: Option<(f64, usize)> = None;
@@ -2221,7 +2093,7 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
                                     st.addr = format!("雨雲 {}", radar::frame_label(&st.radar_tl, st.radar_idx));
                                 }
                             }
-                            KeyCode::Char('A') => run_action!(MenuAction::PlayRoute, lat, lon, cols, tr, &route_nogos),
+                            KeyCode::Char('A') => ui_action::run_action(&mut st, a, MenuAction::PlayRoute, lat, lon, &route_nogos),
                             KeyCode::Char('G') => { // ライブ現在地(ブレッドクラム)の ON/OFF
                                 if st.gps_rx.is_some() { st.gps_rx = None; st.addr = "ライブ現在地: OFF".into(); }
                                 else {
@@ -2254,7 +2126,7 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
                                 } else { "実画像モード: OFF".into() };
                             }
                             // キー選定: C/K/L/V/P/I等の自然な字は全て他機能で使用済みのため空いている'N'を割当
-                            KeyCode::Char('N') => run_action!(MenuAction::ViewCamera, lat, lon, cols, tr, &route_nogos),
+                            KeyCode::Char('N') => ui_action::run_action(&mut st, a, MenuAction::ViewCamera, lat, lon, &route_nogos),
                             // 過去災害: 中心に一番近い地点の事例一覧を中央パネルへ(防災のB)。
                             KeyCode::Char('B') => {
                                 if !st.cfg.disaster_enabled { st.snd.play("error"); st.addr = "過去災害: OFF(設定で有効化)".into(); }
@@ -2331,7 +2203,7 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
                             KeyCode::Char('[') => { if st.play.is_some() { st.play_speed = (st.play_speed / 1.5).max(0.1); st.play_speed_bits.store(st.play_speed.to_bits(), std::sync::atomic::Ordering::Relaxed); st.addr = format!("再生速度 {:.2}x", st.play_speed); } else { wp_swap(&mut st.wps, &mut st.wp_sel, true); st.route_sel = st.wp_sel; { let (n_, j_) = trigger_route(&mut st.spec, &st.wps, &st.pois, &st.mode, 0, &st.cfg.google_maps_api_key, &route_nogos); st.route_note = n_; st.route_job = j_; } } }
                             KeyCode::Char(']') => { if st.play.is_some() { st.play_speed = (st.play_speed * 1.5).min(32.0); st.play_speed_bits.store(st.play_speed.to_bits(), std::sync::atomic::Ordering::Relaxed); st.addr = format!("再生速度 {:.2}x", st.play_speed); } else { wp_swap(&mut st.wps, &mut st.wp_sel, false); st.route_sel = st.wp_sel; { let (n_, j_) = trigger_route(&mut st.spec, &st.wps, &st.pois, &st.mode, 0, &st.cfg.google_maps_api_key, &route_nogos); st.route_note = n_; st.route_job = j_; } } }
                             KeyCode::Char('m') => { st.mode = match mode_label(&st.mode) { "下道" => "highway", "高速" => "short", _ => "surface" }.to_string(); { let (n_, j_) = trigger_route(&mut st.spec, &st.wps, &st.pois, &st.mode, 0, &st.cfg.google_maps_api_key, &route_nogos); st.route_note = n_; st.route_job = j_; } }
-                            KeyCode::Char('c') => run_action!(MenuAction::ClearRoute, lat, lon, cols, tr, &route_nogos),
+                            KeyCode::Char('c') => ui_action::run_action(&mut st, a, MenuAction::ClearRoute, lat, lon, &route_nogos),
                             KeyCode::Char('g') => match st.spec.routes.last() {
                                 Some(rt) => st.addr = match write_gpx("termmap-route.gpx", &rt.pts) { Ok(_) => "GPX保存: termmap-route.gpx".into(), Err(e) => format!("({e})") },
                                 None => { st.snd.play("error"); st.addr = "ルート未確定".into(); }
