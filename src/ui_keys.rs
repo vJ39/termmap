@@ -13,7 +13,6 @@ use crate::poi::*;
 use crate::route::*;
 use crate::share::*;
 use crate::spots::*;
-use crate::textedit::edit_line;
 use crate::tiles::TileLoader;
 use crate::ui_helpers::*;
 use crate::uistate::UiState;
@@ -51,137 +50,15 @@ pub(crate) fn dispatch(st: &mut UiState, k: KeyEvent, cx: &KeyCtx, out: &mut dyn
         Focus::SpotRename(buf, idx) => ui_keys_spots::spot_rename(st, k, buf, idx),
         Focus::SpotForm { name, url, field } => ui_keys_spots::spot_form(st, k, name, url, field, cx.lat, cx.lon),
         Focus::PoiKindForm { label, tag, field } => ui_keys_poi::poi_kind_form(st, k, label, tag, field),
-        Focus::WanderForm { mut dist_km } => match k.code { // おまかせ周回: 距離ゲージ
-            KeyCode::Left | KeyCode::Right => {
-                let step = if k.modifiers.contains(KeyModifiers::SHIFT) { 20.0 } else { 5.0 };
-                let d = if k.code == KeyCode::Left { -step } else { step };
-                dist_km = (dist_km + d).clamp(10.0, 200.0);
-                st.focus = Focus::WanderForm { dist_km };
-            }
-            KeyCode::Esc => { st.snd.play("back"); st.focus = Focus::Map; }
-            KeyCode::Enter => {
-                let origin = (lat, lon);
-                let shape = a.shape.clone();
-                let (tx, rx) = std::sync::mpsc::channel();
-                std::thread::spawn(move || {
-                    let r = wander_route(origin, dist_km, &shape);
-                    let _ = tx.send(r);
-                });
-                st.wander_job = Some(rx);
-                st.addr = format!("走りまくり: {dist_km:.0}km圏を検索中…");
-                st.focus = Focus::Map; // UIは生きたまま(スピナー表示・Escで中断)
-            }
-            _ => st.focus = Focus::WanderForm { dist_km },
-        },
+        Focus::WanderForm { dist_km } => ui_keys_route::wander_form(st, k, dist_km, cx),
         Focus::NearSearch(buf) => ui_keys_poi::near_search(st, k, buf, cx),
         Focus::PoiMenu => ui_keys_poi::poi_menu(st, k, cx),
         Focus::PoiList => ui_keys_poi::poi_list(st, k, cx.oh, cx.nogos),
-        Focus::SaveName(mut buf) => match k.code {
-            KeyCode::Enter => {
-                let name = buf.trim().to_string();
-                if !name.is_empty() {
-                    if list_named_routes().contains(&name) {
-                        st.save_confirm = Some(name);
-                        st.focus = Focus::SaveName(buf); // 上書き確認中も編集状態を保持(取消時はそのまま名前を変えられる)
-                    } else {
-                        st.addr = match save_named_route(&name, &st.mode, &st.wps) { Ok(_) => { st.snd.play("confirm"); st.route_name_hint = name.clone(); format!("保存: {name}") }, Err(e) => format!("({e})") };
-                    }
-                }
-            }
-            KeyCode::Esc => { st.snd.play("back"); }
-            other => { edit_line(&mut buf, &mut st.input_cur, other); st.focus = Focus::SaveName(buf); }
-        },
-        Focus::RouteFavMenu { sel } => match k.code { // お気に入りルート: 保存/呼び出しの小メニュー(Sキー)
-            KeyCode::Up | KeyCode::Char('w') => { st.focus = Focus::RouteFavMenu { sel: sel.saturating_sub(1) }; }
-            KeyCode::Down | KeyCode::Char('s') => { st.focus = Focus::RouteFavMenu { sel: (sel + 1).min(1) }; }
-            KeyCode::Enter => {
-                if sel == 0 { st.input_cur = st.route_name_hint.chars().count(); st.focus = Focus::SaveName(st.route_name_hint.clone()); }
-                else {
-                    st.route_names = list_named_routes(); st.rn_sel = 0;
-                    if st.route_names.is_empty() { st.addr = "お気に入り無し".into(); st.focus = Focus::Map; }
-                    else { st.focus = Focus::RouteList; }
-                }
-            }
-            KeyCode::Esc => { st.snd.play("back"); st.focus = Focus::Map; }
-            _ => st.focus = Focus::RouteFavMenu { sel },
-        },
-        Focus::RouteList => match k.code {
-            KeyCode::Up | KeyCode::Char('w') => { st.snd.play("click"); st.rn_sel = st.rn_sel.saturating_sub(1); st.focus = Focus::RouteList; }
-            KeyCode::Down | KeyCode::Char('s') => { st.snd.play("click"); if st.rn_sel + 1 < st.route_names.len() { st.rn_sel += 1; } st.focus = Focus::RouteList; }
-            KeyCode::Enter => {
-                if let Some(name) = st.route_names.get(st.rn_sel) {
-                    if let Some((w, m)) = load_named_route(name) {
-                        let (nx, ny) = deg_to_pixel(w[0].0, w[0].1, st.z); st.cx = nx; st.cy = ny;
-                        st.wps = w; st.mode = m; st.wp_sel = 0;
-                        st.route_name_hint = name.clone(); // 保存時にこの名前をそのまま提示する
-                        { let (n_, j_) = trigger_route(&mut st.spec, &st.wps, &st.pois, &st.mode, 0, &st.cfg.google_maps_api_key, &route_nogos); st.route_note = n_; st.route_job = j_; }
-                    }
-                }
-            }
-            KeyCode::Esc => {}
-            _ => st.focus = Focus::RouteList,
-        },
-        Focus::RoadList => match k.code { // 道路の塊の一覧(個別削除)
-            KeyCode::Up | KeyCode::Char('w') => { st.snd.play("click"); st.road_sel = st.road_sel.saturating_sub(1); st.focus = Focus::RoadList; }
-            KeyCode::Down | KeyCode::Char('s') => { st.snd.play("click"); if st.road_sel + 1 < st.road_segs.len() { st.road_sel += 1; } st.focus = Focus::RoadList; }
-            KeyCode::Char('x') => { // 選択した道路の塊を削除
-                if st.road_sel < st.road_segs.len() {
-                    st.road_segs.remove(st.road_sel);
-                    if st.road_sel >= st.road_segs.len() && st.road_sel > 0 { st.road_sel -= 1; }
-                    st.sync_roads();
-                }
-                if st.road_segs.is_empty() { // 空になったら閉じる。左袖の残像を残さないよう全消去する
-                    st.addr = "道路を全削除".into();
-                    st.focus = Focus::Map;
-                    let _ = write!(out, "\x1b[2J");
-                    st.force_reemit = true;
-                } else { st.focus = Focus::RoadList; }
-            }
-            // 閉じる → Map。左袖(道路一覧)の残像を残さないよう全消去する(Menu閉じる時と同じ理由)。
-            KeyCode::Esc => { st.snd.play("back"); st.focus = Focus::Map; let _ = write!(out, "\x1b[2J"); st.force_reemit = true; }
-            _ => st.focus = Focus::RoadList,
-        },
-        // 並べ替えビュー: ↑↓で選択(地図が追従)、Spaceで掴む↔置く、掴み中は↑↓で地点を移動
-        Focus::WaypointList => match k.code {
-            KeyCode::Up | KeyCode::BackTab | KeyCode::Char('w') => {
-                if !st.wps.is_empty() {
-                    if st.grab && st.wp_sel > 0 { st.wps.swap(st.wp_sel, st.wp_sel - 1); st.wp_sel -= 1; let (n_, j_) = trigger_route(&mut st.spec, &st.wps, &st.pois, &st.mode, 0, &st.cfg.google_maps_api_key, &route_nogos); st.route_note = n_; st.route_job = j_; }
-                    else { st.wp_sel = (st.wp_sel + st.wps.len() - 1) % st.wps.len(); }
-                    if let Some(&(la, lo)) = st.wps.get(st.wp_sel) { let (nx, ny) = deg_to_pixel(la, lo, st.z); st.cx = nx; st.cy = ny; }
-                }
-                st.focus = Focus::WaypointList;
-            }
-            KeyCode::Down | KeyCode::Tab | KeyCode::Char('s') => {
-                if !st.wps.is_empty() {
-                    if st.grab && st.wp_sel + 1 < st.wps.len() { st.wps.swap(st.wp_sel, st.wp_sel + 1); st.wp_sel += 1; let (n_, j_) = trigger_route(&mut st.spec, &st.wps, &st.pois, &st.mode, 0, &st.cfg.google_maps_api_key, &route_nogos); st.route_note = n_; st.route_job = j_; }
-                    else { st.wp_sel = (st.wp_sel + 1) % st.wps.len(); }
-                    if let Some(&(la, lo)) = st.wps.get(st.wp_sel) { let (nx, ny) = deg_to_pixel(la, lo, st.z); st.cx = nx; st.cy = ny; }
-                }
-                st.focus = Focus::WaypointList;
-            }
-            KeyCode::Char(' ') => { if !st.wps.is_empty() { st.grab = !st.grab; st.snd.play(if st.grab { "blip" } else { "pop" }); } st.focus = Focus::WaypointList; }
-            KeyCode::Char('+') | KeyCode::Char('=') => { if st.z < 19 { st.z += 1; st.cx *= 2.0; st.cy *= 2.0; st.restart_prefetch_on_zoom(); } st.focus = Focus::WaypointList; }
-            KeyCode::Char('-') | KeyCode::Char('_') => { if st.z > 2 { st.z -= 1; st.cx /= 2.0; st.cy /= 2.0; st.restart_prefetch_on_zoom(); } st.focus = Focus::WaypointList; }
-            KeyCode::Char('[') => { if st.wp_sel > 0 && st.wp_sel < st.wps.len() { st.wps.swap(st.wp_sel, st.wp_sel - 1); st.wp_sel -= 1; let (n_, j_) = trigger_route(&mut st.spec, &st.wps, &st.pois, &st.mode, 0, &st.cfg.google_maps_api_key, &route_nogos); st.route_note = n_; st.route_job = j_; if let Some(&(la, lo)) = st.wps.get(st.wp_sel) { let (nx, ny) = deg_to_pixel(la, lo, st.z); st.cx = nx; st.cy = ny; } } st.focus = Focus::WaypointList; }
-            KeyCode::Char(']') => { if st.wp_sel + 1 < st.wps.len() { st.wps.swap(st.wp_sel, st.wp_sel + 1); st.wp_sel += 1; let (n_, j_) = trigger_route(&mut st.spec, &st.wps, &st.pois, &st.mode, 0, &st.cfg.google_maps_api_key, &route_nogos); st.route_note = n_; st.route_job = j_; if let Some(&(la, lo)) = st.wps.get(st.wp_sel) { let (nx, ny) = deg_to_pixel(la, lo, st.z); st.cx = nx; st.cy = ny; } } st.focus = Focus::WaypointList; }
-            KeyCode::Char('x') => {
-                if !st.wps.is_empty() { let i = st.wp_sel.min(st.wps.len() - 1); st.wps.remove(i); if st.wp_sel >= st.wps.len() && st.wp_sel > 0 { st.wp_sel -= 1; } let (n_, j_) = trigger_route(&mut st.spec, &st.wps, &st.pois, &st.mode, 0, &st.cfg.google_maps_api_key, &route_nogos); st.route_note = n_; st.route_job = j_; }
-                st.grab = false;
-                if !st.wps.is_empty() { if let Some(&(la, lo)) = st.wps.get(st.wp_sel) { let (nx, ny) = deg_to_pixel(la, lo, st.z); st.cx = nx; st.cy = ny; } st.focus = Focus::WaypointList; } // 空になったら閉じる
-            }
-            KeyCode::Char('v') => { // 中心に地点を追加し、追加した点を選択(リストは wps から即再生成される)
-                st.snd.play("pop");
-                wp_add(&mut st.wps, (lat, lon));
-                st.wp_sel = st.wps.len().saturating_sub(1);
-                st.grab = false;
-                let (n_, j_) = trigger_route(&mut st.spec, &st.wps, &st.pois, &st.mode, 0, &st.cfg.google_maps_api_key, &route_nogos); st.route_note = n_; st.route_job = j_;
-                st.addr = format!("地点を追加 #{}", st.wps.len());
-                st.focus = Focus::WaypointList;
-            }
-            // 閉じる → Map。左袖(経由地一覧)の残像を残さないよう全消去する(Menu閉じる時と同じ理由)。
-            KeyCode::Esc | KeyCode::Enter => { st.grab = false; st.focus = Focus::Map; let _ = write!(out, "\x1b[2J"); st.force_reemit = true; }
-            _ => st.focus = Focus::WaypointList,
-        },
+        Focus::SaveName(buf) => ui_keys_route::save_name(st, k, buf),
+        Focus::RouteFavMenu { sel } => ui_keys_route::route_fav_menu(st, k, sel),
+        Focus::RouteList => ui_keys_route::route_list(st, k, cx.nogos),
+        Focus::RoadList => ui_keys_route::road_list(st, k, out),
+        Focus::WaypointList => ui_keys_route::waypoint_list(st, k, cx, out),
         // Space メニュー・トップ(カテゴリ選択)。文字キーは全カテゴリ横断で直接実行できる。
         Focus::Menu(MenuLevel::Categories) => match k.code {
             KeyCode::Up | KeyCode::Char('w') => { st.snd.play("click"); st.menu_cat_sel = st.menu_cat_sel.saturating_sub(1); st.focus = Focus::Menu(MenuLevel::Categories); }
@@ -216,48 +93,7 @@ pub(crate) fn dispatch(st: &mut UiState, k: KeyEvent, cx: &KeyCtx, out: &mut dyn
         Focus::ColorPick { cat } => ui_keys_spots::color_pick(st, k, cat),
         Focus::ShapePick { cat } => ui_keys_spots::shape_pick(st, k, cat),
         Focus::SettingsPick(idx) => ui_keys_settings::settings_pick(st, k, idx, cx.loader),
-        // ルート一覧にフォーカス中: ↑↓で点/操作行を選択、Enterで実行。矢印はパンでなく選択。
-        Focus::RoutePanel => {
-            match k.code {
-                KeyCode::Up | KeyCode::Char('w') => {
-                    st.route_sel = st.route_sel.saturating_sub(1);
-                    if st.route_sel < st.wps.len() { st.wp_sel = st.route_sel; let (la, lo) = st.wps[st.wp_sel]; let (nx, ny) = deg_to_pixel(la, lo, st.z); st.cx = nx; st.cy = ny; }
-                    st.focus = Focus::RoutePanel;
-                }
-                KeyCode::Down | KeyCode::Char('s') => {
-                    let total = st.wps.len() + ROUTE_ACTS.len();
-                    if st.route_sel + 1 < total { st.route_sel += 1; }
-                    if st.route_sel < st.wps.len() { st.wp_sel = st.route_sel; let (la, lo) = st.wps[st.wp_sel]; let (nx, ny) = deg_to_pixel(la, lo, st.z); st.cx = nx; st.cy = ny; }
-                    st.focus = Focus::RoutePanel;
-                }
-                KeyCode::Enter | KeyCode::Char(' ') => {
-                    if st.route_sel >= st.wps.len() { // 操作行を実行(run_action側でfocus遷移する場合あり=その時はそちら優先)
-                        let ai = st.route_sel - st.wps.len();
-                        if ai < ROUTE_ACTS.len() { let act = ROUTE_ACTS[ai].1; ui_action::run_action(st, a, act, lat, lon, &route_nogos); }
-                    } else { // 点を選択中: 地図を寄せてパネルに留まる
-                        let (la, lo) = st.wps[st.route_sel]; let (nx, ny) = deg_to_pixel(la, lo, st.z); st.cx = nx; st.cy = ny;
-                        st.focus = Focus::RoutePanel;
-                    }
-                }
-                KeyCode::Char('[') => { if st.route_sel < st.wps.len() && st.route_sel > 0 { st.wps.swap(st.route_sel, st.route_sel - 1); st.route_sel -= 1; st.wp_sel = st.route_sel; let (n_, j_) = trigger_route(&mut st.spec, &st.wps, &st.pois, &st.mode, 0, &st.cfg.google_maps_api_key, &route_nogos); st.route_note = n_; st.route_job = j_; } st.focus = Focus::RoutePanel; }
-                KeyCode::Char(']') => { if st.route_sel + 1 < st.wps.len() { st.wps.swap(st.route_sel, st.route_sel + 1); st.route_sel += 1; st.wp_sel = st.route_sel; let (n_, j_) = trigger_route(&mut st.spec, &st.wps, &st.pois, &st.mode, 0, &st.cfg.google_maps_api_key, &route_nogos); st.route_note = n_; st.route_job = j_; } st.focus = Focus::RoutePanel; }
-                KeyCode::Char('x') => {
-                    if st.route_sel < st.wps.len() { st.wps.remove(st.route_sel); if st.route_sel >= st.wps.len() && st.route_sel > 0 { st.route_sel -= 1; } st.wp_sel = st.route_sel.min(st.wps.len().saturating_sub(1)); let (n_, j_) = trigger_route(&mut st.spec, &st.wps, &st.pois, &st.mode, 0, &st.cfg.google_maps_api_key, &route_nogos); st.route_note = n_; st.route_job = j_; }
-                    if !st.wps.is_empty() { st.focus = Focus::RoutePanel; }
-                    else { // 空になったら地図へ。左袖の残像を残さないよう全消去する
-                        st.focus = Focus::Map;
-                        let _ = write!(out, "\x1b[2J");
-                        st.force_reemit = true;
-                    }
-                }
-                KeyCode::Char('v') => { st.snd.play("pop"); wp_add(&mut st.wps, (lat, lon)); let (n_, j_) = trigger_route(&mut st.spec, &st.wps, &st.pois, &st.mode, 0, &st.cfg.google_maps_api_key, &route_nogos); st.route_note = n_; st.route_job = j_; st.addr = format!("地点を追加 #{}", st.wps.len()); st.focus = Focus::RoutePanel; }
-                KeyCode::Char('+') | KeyCode::Char('=') => { if st.z < 19 { st.z += 1; st.cx *= 2.0; st.cy *= 2.0; st.restart_prefetch_on_zoom(); } st.focus = Focus::RoutePanel; }
-                KeyCode::Char('-') | KeyCode::Char('_') => { if st.z > 2 { st.z -= 1; st.cx /= 2.0; st.cy /= 2.0; st.restart_prefetch_on_zoom(); } st.focus = Focus::RoutePanel; }
-                // 地図へ戻る。左袖(ルート一覧)の残像を残さないよう全消去する(Menu閉じる時と同じ理由)。
-                KeyCode::Esc | KeyCode::Tab => { st.snd.play("back"); st.focus = Focus::Map; let _ = write!(out, "\x1b[2J"); st.force_reemit = true; }
-                _ => { st.focus = Focus::RoutePanel; }
-            }
-        }
+        Focus::RoutePanel => ui_keys_route::route_panel(st, k, cx, out),
         Focus::Map => {
             // Shift+矢印/大文字HJKL=常に高速(固定)。無印(矢印/小文字hjkl)=既定は細かい1歩で、
             // 同方向を短間隔(220ms以内)で押し続ける/連打するほど徐々に加速し、上限は高速の
