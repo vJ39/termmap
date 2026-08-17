@@ -46,6 +46,54 @@ pub fn primary_bbox(code: u32) -> (f64, f64, f64, f64) {
     (p / 1.5, 100.0 + u, (p + 1.0) / 1.5, 101.0 + u)
 }
 
+// ---- 広域セル(1次メッシュ4×4束) ----
+// JIS の規格単位ではなく、過去災害の集計を広域ズームで1リクエストにまとめるために
+// こちらで定めた刻み(docs/disaster-choropleth-wide-zoom-design.md §2.2/§2.3)。
+// 1次メッシュのままだと z9 の視野に48枚要り、plotlayer の MAX_CELLS_PER_JOB=9 で取得が止まる。
+// 4×4束ねると z9 で9枚に収まり、かつ1セルの集計行数が取得元の打ち切り(2,000行)に対して
+// 4割の余裕を残す(5×5束にすると余裕が1割まで減るので、ここが上げられる限界)。
+
+/// 広域セル1枚に入る1次メッシュの数(緯度・経度とも)。
+/// 1枚が緯度8/3度 × 経度4度(北緯35度で約296km × 365km)。
+pub const WIDE_BUNDLE: i64 = 4;
+
+// 広域セルの p4/u4 が取りうる範囲。1次メッシュの p,u が 0..=99 なので、その4分の1。
+const WIDE_MAX: i64 = 100 / WIDE_BUNDLE;
+
+/// bboxを覆う広域セルコード(4桁 = p4*100 + u4)を全て列挙する。
+/// 制約は primary_codes と同じ(範囲逆転・広すぎ・メッシュ空間の外では空)。
+pub fn wide_codes(lat_min: f64, lon_min: f64, lat_max: f64, lon_max: f64) -> Vec<u32> {
+    if !(lat_min <= lat_max && lon_min <= lon_max) {
+        return Vec::new();
+    }
+    // 1次メッシュの整数格子(p,u)へ落としてから、4で割った商の格子で数える。
+    // 負の側でも切り下げになるよう div_euclid を使う(-1/4 は 0 でなく -1)。
+    let a0 = ((lat_min * 1.5).floor() as i64).div_euclid(WIDE_BUNDLE);
+    let a1 = ((lat_max * 1.5).floor() as i64).div_euclid(WIDE_BUNDLE);
+    let b0 = (lon_min.floor() as i64 - 100).div_euclid(WIDE_BUNDLE);
+    let b1 = (lon_max.floor() as i64 - 100).div_euclid(WIDE_BUNDLE);
+    if (a1 - a0 + 1).saturating_mul(b1 - b0 + 1) > MAX_CODES as i64 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for a in a0..=a1 {
+        for b in b0..=b1 {
+            if (0..WIDE_MAX).contains(&a) && (0..WIDE_MAX).contains(&b) {
+                out.push((a * 100 + b) as u32);
+            }
+        }
+    }
+    out
+}
+
+/// 広域セルコード → (lat_min, lon_min, lat_max, lon_max)。
+pub fn wide_bbox(code: u32) -> (f64, f64, f64, f64) {
+    let p = (code / 100) as f64 * WIDE_BUNDLE as f64; // 南西端の1次メッシュ p
+    let u = (code % 100) as f64 * WIDE_BUNDLE as f64; // 同 u
+    let span = WIDE_BUNDLE as f64;
+    (p / 1.5, 100.0 + u, (p + span) / 1.5, 100.0 + u + span)
+}
+
 /// bboxを覆う2次メッシュコード(6桁)を全て列挙する。制約は primary_codes と同じ。
 pub fn secondary_codes(lat_min: f64, lon_min: f64, lat_max: f64, lon_max: f64) -> Vec<u32> {
     if !(lat_min <= lat_max && lon_min <= lon_max) {
@@ -379,5 +427,86 @@ mod tests {
         let code = half_mesh_code(35.68, 139.77).expect("東京駅");
         assert_eq!(code / 1_000, 533946);
         assert_eq!(secondary_codes(35.68, 139.77, 35.68, 139.77), vec![code / 1_000]);
+    }
+
+    // ---- 広域セル(1次メッシュ4×4束) ----
+
+    // 設計 §2.3 の既知値。東京(35.68,139.77)は p=53/u=39 なので p4=13・u4=9 → 1309。
+    #[test]
+    fn wide_codes_single_point_is_tokyo_1309() {
+        assert_eq!(wide_codes(35.68, 139.77, 35.68, 139.77), vec![1309]);
+    }
+
+    // 1次メッシュ5339 は広域セル1309 の中に丸ごと入る(4×4束ねたものなので入れ子になる)。
+    #[test]
+    fn a_primary_cell_nests_inside_its_wide_cell() {
+        let (ps, pw, pn, pe) = primary_bbox(5339);
+        let (s, w, n, e) = wide_bbox(1309);
+        assert!(s <= ps && pn <= n, "緯度がはみ出している: 1次({ps}..{pn}) 広域({s}..{n})");
+        assert!(w <= pw && pe <= e, "経度がはみ出している: 1次({pw}..{pe}) 広域({w}..{e})");
+    }
+
+    // 1枚は緯度8/3度 × 経度4度(設計 §2.2 の「北緯35度で約296km × 365km」)。
+    #[test]
+    fn wide_bbox_is_four_primary_cells_on_each_axis() {
+        for code in [1309u32, 0, 2424, 1610] {
+            let (s, w, n, e) = wide_bbox(code);
+            assert!((n - s - WIDE_BUNDLE as f64 / 1.5).abs() < 1e-9, "code={code} 緯度幅");
+            assert!((e - w - WIDE_BUNDLE as f64).abs() < 1e-9, "code={code} 経度幅");
+        }
+        // 既知値: 1309 は 緯度34.67〜37.33度 × 経度136〜140度(設計 §2.2 の最混雑セル)。
+        let (s, w, n, e) = wide_bbox(1309);
+        assert!((s - 34.6666666).abs() < 1e-6, "s={s}");
+        assert!((n - 37.3333333).abs() < 1e-6, "n={n}");
+        assert!((w - 136.0).abs() < 1e-9, "w={w}");
+        assert!((e - 140.0).abs() < 1e-9, "e={e}");
+    }
+
+    #[test]
+    fn wide_bbox_roundtrips_with_wide_codes() {
+        for code in [1309u32, 1610, 809, 1307] {
+            let (s, w, n, e) = wide_bbox(code);
+            let mid_lat = (s + n) / 2.0;
+            let mid_lon = (w + e) / 2.0;
+            assert_eq!(wide_codes(mid_lat, mid_lon, mid_lat, mid_lon), vec![code], "code={code}");
+        }
+    }
+
+    #[test]
+    fn wide_codes_spans_multiple_cells() {
+        // 経度136〜141度は広域セル2枚(u4=9 と u4=10)に跨る。
+        let codes = wide_codes(35.0, 136.5, 36.0, 141.0);
+        assert!(codes.len() > 1, "{codes:?}");
+        assert!(codes.contains(&1309), "{codes:?}");
+        assert!(codes.contains(&1310), "{codes:?}");
+    }
+
+    #[test]
+    fn wide_codes_empty_on_inverted_range() {
+        assert!(wide_codes(36.0, 139.0, 35.0, 140.0).is_empty()); // lat_min > lat_max
+        assert!(wide_codes(35.0, 140.0, 36.0, 139.0).is_empty()); // lon_min > lon_max
+    }
+
+    #[test]
+    fn wide_codes_skips_cells_outside_the_mesh_space() {
+        // 南半球/西経は1次メッシュ空間(p,u が 0..=99)の外なので、その4分の1の格子でも出さない。
+        assert!(wide_codes(-10.0, 139.0, -9.0, 140.0).is_empty());
+        assert!(wide_codes(35.0, -140.0, 36.0, -139.0).is_empty());
+    }
+
+    #[test]
+    fn wide_codes_returns_empty_when_the_area_is_absurdly_wide() {
+        // 世界全体。primary_codes と同じく「広すぎる」として空を返す。
+        assert!(wide_codes(-85.0, -180.0, 85.0, 180.0).is_empty());
+    }
+
+    // 取得範囲がセル1枚に収まる保証(隣のセルまで巻き込むと choropleth::tally が
+    // 同じ市区町村の件数を二重に足す。設計 §2.7)。
+    #[test]
+    fn shrink_keeps_a_wide_cell_from_leaking_into_its_neighbour() {
+        let b = wide_bbox(1309);
+        assert!(wide_codes(b.0, b.1, b.2, b.3).len() > 1, "素のbboxは境界で隣を拾う");
+        let s = shrink(b);
+        assert_eq!(wide_codes(s.0, s.1, s.2, s.3), vec![1309]);
     }
 }
