@@ -53,7 +53,8 @@ impl RegulationKind {
     // 種別ごとに視認性の良い独自配色にする。
     pub fn color(&self) -> [u8; 3] {
         match self {
-            RegulationKind::Closed => [220, 30, 30],
+            // 渋滞状況の色分け(route.rsのtraffic_level_color)のHeavy=赤と混同しないよう黒にする。
+            RegulationKind::Closed => [0, 0, 0],
             RegulationKind::LaneRestriction => [230, 140, 30],
             RegulationKind::AlternatingOneLane => [230, 200, 40],
             RegulationKind::ChainRequired => [60, 170, 230],
@@ -343,6 +344,12 @@ mod tests {
         assert_eq!(RegulationKind::from_code("06"), RegulationKind::ChainRequired);
         assert_eq!(RegulationKind::from_code("09"), RegulationKind::MovementRestriction);
         assert_eq!(RegulationKind::from_code("99"), RegulationKind::Other);
+    }
+
+    #[test]
+    fn closed_color_is_black_to_avoid_clash_with_traffic_congestion_red() {
+        // 渋滞状況の色分け(route.rs)のHeavy=赤[220,40,40]とほぼ同色だった旧[220,30,30]から変更。
+        assert_eq!(RegulationKind::Closed.color(), [0, 0, 0]);
     }
 
     // 実際のTukoKisei/5339.jsonの抜粋(2026/08/16 実測、1件)。

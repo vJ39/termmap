@@ -1135,7 +1135,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 Ok(segs) => {
                     if !segs.is_empty() {
                         spec.traffic_segments = segs.into_iter().map(|(color, pts)| Route { pts, color, thickness: 2 }).collect();
-                        route_note = route_note.map(|n| format!("{n} (渋滞: 緑/黄/赤)"));
+                        route_note = route_note.map(|n| format!("{n} (渋滞あり: 黄/赤)"));
                     } // 空(失敗・APIキー無し等)なら単色ルート線のまま静かに諦める
                     traffic_color_job = None; got_result = true;
                 }

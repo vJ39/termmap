@@ -147,7 +147,7 @@ pub(crate) fn setting_description(idx: usize) -> &'static str {
         } else {
             "読み上げの声: この端末(macOS以外)では読み上げ自体が動かないため効果は無い"
         },
-        28 => "渋滞状況の色分け: ルート確定後、Google Directionsで区間ごとの渋滞状況を追加確認し、ルート線を緑(順調)/黄(やや混雑)/赤(混雑)に色分けする。道路網全体ではなく表示中のルートのみ。要Google APIキー。区間数に応じて1回のAdvanced課金対象リクエストを送る(無料枠超過分は1000件$8、個人利用なら通常は無料枠内)",
+        28 => "渋滞状況の色分け: ルート確定後、Google Directionsで区間ごとの渋滞状況を追加確認し、混雑している区間だけルート線を黄(やや混雑)/赤(混雑)で上塗りする(順調な区間は基調色の青のまま)。道路網全体ではなく表示中のルートのみ。要Google APIキー。区間数に応じて1回のAdvanced課金対象リクエストを送る(無料枠超過分は1000件$8、個人利用なら通常は無料枠内)",
         _ => "Google APIキー: 検索(Geocoding)とStreet View共通。Enterで入力欄を開く(Cmd+V貼付も可)。環境変数TERMMAP_GOOGLE_API_KEYでも可",
     }
 }
@@ -368,7 +368,7 @@ mod tests {
     fn setting_description_for_route_traffic_row_mentions_google_and_coloring() {
         let d = setting_description(28);
         assert!(d.contains("渋滞状況の色分け"), "{d}");
-        assert!(d.contains("緑"), "3段階の色分けであることが説明文に無い: {d}");
+        assert!(d.contains("黄") && d.contains("赤"), "混雑区間の色分けであることが説明文に無い: {d}");
         assert!(d.contains("Google"), "{d}");
         assert_ne!(d, setting_description(17), "28がフォールバック(Google APIキー)と混ざっていない");
     }

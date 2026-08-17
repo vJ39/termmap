@@ -503,6 +503,8 @@ pub fn traffic_level(duration_s: f64, duration_in_traffic_s: Option<f64>) -> Tra
     if ratio >= 1.5 { TrafficLevel::Heavy } else if ratio >= 1.15 { TrafficLevel::Moderate } else { TrafficLevel::Smooth }
 }
 
+// Smoothは呼び出し側(colorize_route_by_traffic)で上塗りしない扱いのため、実際に描画で
+// 使われるのはModerate/Heavyのみ(Smoothの色は到達しない。列挙の網羅性のためだけに残す)。
 pub fn traffic_level_color(level: TrafficLevel) -> [u8; 3] {
     match level {
         TrafficLevel::Smooth => [0, 200, 60],
@@ -512,8 +514,10 @@ pub fn traffic_level_color(level: TrafficLevel) -> [u8; 3] {
 }
 
 // legs((duration_s, duration_in_traffic_s))をptsに沿って色分けした(色, 点列)の列へ変換する。
-// legs.len() != breakpoints_m.len()+1 なら空Vec(呼び出し側は単色描画にフォールバックする)。
-// 隣接区間は境界点を共有する(線が途切れて見えないように)。
+// Smooth(順調)区間はエントリを作らない(基調色の青のまま=何も上塗りしない)。
+// legs.len() != breakpoints_m.len()+1 なら空Vec(呼び出し側は基調色のままにフォールバックする)。
+// 出力されたエントリ同士は、間にSmooth区間を挟まない限り境界点を共有する
+// (線が途切れて見えないように)。
 pub fn colorize_route_by_traffic(
     pts: &[(f64, f64)],
     breakpoints_m: &[f64],
@@ -523,17 +527,21 @@ pub fn colorize_route_by_traffic(
         return Vec::new();
     }
     let cum = cumulative_distances_m(pts);
-    let mut out = Vec::with_capacity(legs.len());
+    let mut out = Vec::new();
     let mut start_idx = 0usize;
     for (i, &(duration, dit)) in legs.iter().enumerate() {
-        let color = traffic_level_color(traffic_level(duration, dit));
+        let level = traffic_level(duration, dit);
         let end_idx = if i < breakpoints_m.len() {
             let bp = breakpoints_m[i];
             cum.iter().position(|&d| d >= bp).unwrap_or(pts.len() - 1).max(start_idx + 1).min(pts.len() - 1)
         } else {
             pts.len() - 1
         };
-        out.push((color, pts[start_idx..=end_idx].to_vec()));
+        // Smooth(順調)区間は上塗りしない(=基調色の青のまま)。start_idxだけは
+        // 進めておき、後続区間の切り出し位置がずれないようにする。
+        if level != TrafficLevel::Smooth {
+            out.push((traffic_level_color(level), pts[start_idx..=end_idx].to_vec()));
+        }
         start_idx = end_idx;
     }
     out
@@ -985,32 +993,45 @@ mod tests {
     }
 
     #[test]
-    fn traffic_level_color_gives_three_distinct_colors() {
-        let s = traffic_level_color(TrafficLevel::Smooth);
-        let m = traffic_level_color(TrafficLevel::Moderate);
-        let h = traffic_level_color(TrafficLevel::Heavy);
-        assert_ne!(s, m); assert_ne!(m, h); assert_ne!(s, h);
+    fn traffic_level_color_moderate_and_heavy_are_distinct() {
+        // Smoothは上塗りしない(呼び出し側で使わない)ため、区別すべきはModerate/Heavyのみ。
+        assert_ne!(traffic_level_color(TrafficLevel::Moderate), traffic_level_color(TrafficLevel::Heavy));
     }
 
     #[test]
-    fn colorize_route_by_traffic_splits_into_segments_sharing_boundary_points() {
-        // 経線に沿った11点(35.00〜35.10、0.01度=約1.1km間隔)、3区間に分割。
-        let pts: Vec<(f64, f64)> = (0..=10).map(|i| (35.0 + i as f64 * 0.01, 139.0)).collect();
+    fn colorize_route_by_traffic_all_smooth_is_empty() {
+        // 全区間順調なら、基調色(青)のまま=上塗りするエントリは無い。
+        let pts: Vec<(f64, f64)> = (0..=4).map(|i| (35.0 + i as f64 * 0.01, 139.0)).collect();
         let total = polyline_len(&pts);
-        let breakpoints = traffic_breakpoints_m(total, 3);
-        // 1区間目=順調、2区間目=混雑、3区間目=渋滞データ欠損(Smooth扱い)。
-        let legs = vec![(900.0, Some(900.0)), (900.0, Some(900.0 * 1.6)), (900.0, None)];
+        let breakpoints = traffic_breakpoints_m(total, 4);
+        let legs = vec![(900.0, Some(900.0)); 4];
+        assert!(colorize_route_by_traffic(&pts, &breakpoints, &legs).is_empty());
+    }
+
+    #[test]
+    fn colorize_route_by_traffic_skips_smooth_and_keeps_boundary_alignment() {
+        // 経線に沿った5点(35.00〜35.04、0.01度=約1.1km間隔)を4区間(各区間=1点分)に分割。
+        // 区間順: 順調(スキップ)/混雑/順調(スキップ)/やや混雑、という並び。
+        let pts: Vec<(f64, f64)> = (0..=4).map(|i| (35.0 + i as f64 * 0.01, 139.0)).collect();
+        let total = polyline_len(&pts);
+        let breakpoints = traffic_breakpoints_m(total, 4);
+        let legs = vec![
+            (900.0, Some(900.0)),       // 区間0: 順調→出力されない
+            (900.0, Some(900.0 * 1.6)), // 区間1: 混雑(赤)
+            (900.0, Some(900.0)),       // 区間2: 順調→出力されない
+            (900.0, Some(900.0 * 1.2)), // 区間3: やや混雑(黄)
+        ];
         let segs = colorize_route_by_traffic(&pts, &breakpoints, &legs);
-        assert_eq!(segs.len(), 3);
-        assert_eq!(segs[0].0, traffic_level_color(TrafficLevel::Smooth));
-        assert_eq!(segs[1].0, traffic_level_color(TrafficLevel::Heavy));
-        assert_eq!(segs[2].0, traffic_level_color(TrafficLevel::Smooth));
-        // 隣接区間は境界点を共有し、線が途切れない。
-        assert_eq!(segs[0].1.last(), segs[1].1.first());
-        assert_eq!(segs[1].1.last(), segs[2].1.first());
-        // 全区間の点を合わせれば元のptsの始点・終点を覆う。
-        assert_eq!(segs[0].1.first(), pts.first());
-        assert_eq!(segs[2].1.last(), pts.last());
+        assert_eq!(segs.len(), 2, "順調な2区間はエントリを作らないはず: {segs:?}");
+        assert_eq!(segs[0].0, traffic_level_color(TrafficLevel::Heavy));
+        assert_eq!(segs[1].0, traffic_level_color(TrafficLevel::Moderate));
+        // 先頭(区間0=順調)は正しくスキップされ、混雑区間はptsの始点からは始まらない。
+        assert_ne!(segs[0].1.first(), pts.first());
+        // 最後のleg(区間3)はptsの終点まで届く。
+        assert_eq!(segs[1].1.last(), pts.last());
+        // 間に順調区間(区間2)を挟んでいるため、出力された2エントリの境界点はつながらない
+        // (=その間は基調色の青のまま、途切れて見えるのは正しい)。
+        assert_ne!(segs[0].1.last(), segs[1].1.first());
     }
 
     #[test]
