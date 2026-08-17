@@ -35,7 +35,7 @@ pub(crate) const CHOICES: &[SettingChoice] = &[
 
 // 設定画面の項目行数(アコーディオン未展開時)。ui.rs のカーソル下移動の上限がこれを参照する。
 // settings_rows() が返す行数と必ず一致すること(下の回帰テスト settings_row_count_matches_rows で固定)。
-pub(crate) const SETTINGS_ROW_COUNT: usize = 28;
+pub(crate) const SETTINGS_ROW_COUNT: usize = 29;
 
 fn choice_for(idx: usize) -> Option<&'static SettingChoice> { CHOICES.iter().find(|c| c.idx == idx) }
 
@@ -147,6 +147,7 @@ pub(crate) fn setting_description(idx: usize) -> &'static str {
         } else {
             "読み上げの声: この端末(macOS以外)では読み上げ自体が動かないため効果は無い"
         },
+        28 => "渋滞込み所要時間: ルート確定後、Google Directionsで現在の渋滞による遅延を追加確認する(1分未満の遅延は表示しない)。要Google APIキー。ONにした人だけがAdvanced課金対象のリクエストを追加で送る(無料枠超過分は1000件$8、個人利用なら通常は無料枠内)",
         _ => "Google APIキー: 検索(Geocoding)とStreet View共通。Enterで入力欄を開く(Cmd+V貼付も可)。環境変数TERMMAP_GOOGLE_API_KEYでも可",
     }
 }
@@ -194,6 +195,7 @@ pub(crate) fn settings_rows(opts: &Args, cfg: &Config, picking: Option<usize>, o
         format!("通行規制 {}", onoff(cfg.regulation_enabled)),
         format!("過去災害 {}", onoff(cfg.disaster_enabled)),
         format!("{} 読み上げの声 {}", arrow(27), if cfg.voice_name.is_empty() { "システム既定".to_string() } else { crate::voice::display_voice_name(&cfg.voice_name).to_string() }),
+        format!("渋滞込み所要時間 {}", onoff(cfg.route_traffic_enabled)),
     ];
     debug_assert_eq!(its.len(), SETTINGS_ROW_COUNT, "SETTINGS_ROW_COUNT と行数がずれている");
     // アコーディオン展開: 選択中の項目がpickable(3択以上)ならその直下に候補をインデント挿入し、他行を押し下げる
@@ -218,7 +220,7 @@ mod tests {
         for idx in [4usize, 5, 9, 12, 16, 18, 20, 27] {
             assert!(is_pickable(idx), "idx {idx} should be pickable");
         }
-        for idx in [0usize, 1, 2, 3, 6, 7, 8, 10, 11, 13, 14, 15, 17, 19] {
+        for idx in [0usize, 1, 2, 3, 6, 7, 8, 10, 11, 13, 14, 15, 17, 19, 28] {
             assert!(!is_pickable(idx), "idx {idx} should not be pickable");
         }
     }
@@ -353,6 +355,24 @@ mod tests {
     }
 
     #[test]
+    fn settings_rows_shows_route_traffic_row_after_voice_name() {
+        let mut cfg = Config::default();
+        cfg.route_traffic_enabled = true;
+        let (_, its, _) = settings_rows(&test_args(), &cfg, None, false, 28, 0);
+        assert_eq!(its.len(), SETTINGS_ROW_COUNT);
+        assert_eq!(its[28], "渋滞込み所要時間 ON");
+        assert!(its[27].contains("読み上げの声"), "既存項目(27)の並びが動いていない");
+    }
+
+    #[test]
+    fn setting_description_for_route_traffic_row_mentions_google_and_delay_threshold() {
+        let d = setting_description(28);
+        assert!(d.contains("渋滞込み所要時間"), "{d}");
+        assert!(d.contains("Google"), "{d}");
+        assert_ne!(d, setting_description(17), "28がフォールバック(Google APIキー)と混ざっていない");
+    }
+
+    #[test]
     fn pick_current_and_apply_pick_roundtrip_qr_style() {
         let mut cfg = Config::default();
         let mut style = "osm".to_string();
@@ -366,10 +386,10 @@ mod tests {
 
     #[test]
     fn setting_description_covers_every_known_row_distinctly() {
-        // 0〜16,18〜27 は個別の説明文を持つ(idx=11/27は端末対応有無で文言が変わるが、いずれにせよ
+        // 0〜16,18〜28 は個別の説明文を持つ(idx=11/27は端末対応有無で文言が変わるが、いずれにせよ
         // 空でない。17=Google APIキーはフォールバック経由で別テストで確認するためここでは含めない)。
         let mut seen = Vec::new();
-        for idx in (0usize..=16).chain(18..=27) {
+        for idx in (0usize..=16).chain(18..=28) {
             let d = setting_description(idx);
             assert!(!d.is_empty(), "idx {idx} should have a description");
             if idx != 11 && idx != 27 { seen.push(d); } // 11/27は環境依存で文言が2通りあるため一意性判定から除外

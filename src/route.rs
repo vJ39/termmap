@@ -402,23 +402,31 @@ fn project_onto_route(pt: (f64, f64), pts: &[(f64, f64)], cum: &[f64]) -> Option
     cum.get(best_i).copied()
 }
 
+// origin/destination/waypoints/avoid=highwaysの共通クエリ文字列を組み立てる
+// (fetch_google_route/fetch_traffic_delayで共有)。
+fn directions_common_params(wps: &[(f64, f64)], mode: &str, key: &str) -> String {
+    let origin = format!("{},{}", wps[0].0, wps[0].1);
+    let destination = format!("{},{}", wps[wps.len() - 1].0, wps[wps.len() - 1].1);
+    let mut s = format!("origin={origin}&destination={destination}&key={key}");
+    if wps.len() > 2 {
+        let via: Vec<String> = wps[1..wps.len() - 1].iter().map(|(la, lo)| format!("{la},{lo}")).collect();
+        s.push_str(&format!("&waypoints={}", via.join("|")));
+    }
+    // route_profile(mode) が "moped"(下道=高速回避)ならavoid=highwaysを付ける。
+    // "shortest"はGoogle側に直接の等価オプションが無いため素のまま(車での既定経路)。
+    if route_profile(mode) == "moped" {
+        s.push_str("&avoid=highways");
+    }
+    s
+}
+
 // Google Directions API(旧・レガシー版、Routes APIではない)でのフォールバック取得。
 // BRouterが失敗した時だけ最終手段として呼ばれる。標高データは提供されないため ele は空Vec、
 // 高速区間の判定手段が無いため hw_m は 0.0(料金概算は出ない=呼び出し側で自然にスキップされる)。
 fn fetch_google_route(wps: &[(f64, f64)], mode: &str, key: &str) -> Result<RouteResult, String> {
     if key.trim().is_empty() { return Err("Google APIキー未設定".to_string()); }
-    let origin = format!("{},{}", wps[0].0, wps[0].1);
-    let destination = format!("{},{}", wps[wps.len() - 1].0, wps[wps.len() - 1].1);
-    let mut url = format!("https://maps.googleapis.com/maps/api/directions/json?origin={origin}&destination={destination}&key={key}");
-    if wps.len() > 2 {
-        let via: Vec<String> = wps[1..wps.len() - 1].iter().map(|(la, lo)| format!("{la},{lo}")).collect();
-        url.push_str(&format!("&waypoints={}", via.join("|")));
-    }
-    // route_profile(mode) が "moped"(下道=高速回避)ならavoid=highwaysを付ける。
-    // "shortest"はGoogle側に直接の等価オプションが無いため素のまま(車での既定経路)。
-    if route_profile(mode) == "moped" {
-        url.push_str("&avoid=highways");
-    }
+    let params = directions_common_params(wps, mode, key);
+    let url = format!("https://maps.googleapis.com/maps/api/directions/json?{params}");
     let body = ureq::get(&url)
         .timeout(std::time::Duration::from_secs(20)).call()
         .map_err(|e| format!("Google route: {e}"))?
@@ -442,6 +450,78 @@ fn fetch_google_route(wps: &[(f64, f64)], mode: &str, key: &str) -> Result<Route
         time_s += leg.get("duration").and_then(|d| d.get("value")).and_then(|v| v.as_f64()).unwrap_or(0.0);
     }
     Ok(RouteResult { pts, ele: Vec::new(), dist_m, time_s, hw_m: 0.0, ascend_m: 0.0, via_google: true })
+}
+
+// ---- 渋滞込み所要時間の追加確認(#渋滞情報、docs/route-traffic-delay-design.md) ----
+//
+// BRouterには渋滞データが無いため、確定したルートとは別にGoogle Directionsへ
+// departure_time=nowで問い合わせ、渋滞込み所要時間(duration_in_traffic)と
+// 渋滞無し所要時間(duration)の差分だけを使う。ジオメトリは取得・使用しない。
+
+pub const ROUTE_TRAFFIC_DELAY_THRESHOLD_S: f64 = 60.0; // これ未満の遅延は誤差扱いで表示しない
+
+// 遅延が表示に値するか(閾値以上か)。
+pub fn should_show_traffic_delay(delay_s: f64) -> bool {
+    delay_s >= ROUTE_TRAFFIC_DELAY_THRESHOLD_S
+}
+
+// legs((duration_s, duration_in_traffic_s))から遅延合計(秒)を求める。
+// duration_in_trafficが無いleg(徒歩区間混在等)はdurationで代用(=そのlegの遅延は0扱い)。
+// 合計がマイナス(渋滞が無く早く着く)になる場合は0にクランプする(「遅延」表示の趣旨上)。
+pub fn traffic_delay_from_legs(legs: &[(f64, Option<f64>)]) -> f64 {
+    let mut delay = 0.0;
+    for &(duration, duration_in_traffic) in legs {
+        let dit = duration_in_traffic.unwrap_or(duration);
+        delay += dit - duration;
+    }
+    delay.max(0.0)
+}
+
+// Directions APIの生レスポンス(JSON文字列)からlegsの(duration, duration_in_traffic)を抜き出す。
+// ネットワークに触れない純関数。fetch_google_routeと同じエラー処理方針(status!=OK/routes無しはErr)。
+pub fn parse_directions_legs(body: &str) -> Result<Vec<(f64, Option<f64>)>, String> {
+    let v: serde_json::Value = serde_json::from_str(body).map_err(|e| format!("Directions parse: {e}"))?;
+    let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("");
+    if status != "OK" {
+        let msg = v.get("error_message").and_then(|m| m.as_str()).unwrap_or(status);
+        return Err(format!("Directions: {msg}"));
+    }
+    let route = v.get("routes").and_then(|r| r.get(0)).ok_or("Directions: routes無し")?;
+    let legs_arr = route.get("legs").and_then(|l| l.as_array()).ok_or("Directions: legs無し")?;
+    if legs_arr.is_empty() {
+        return Err("Directions: legs無し".to_string());
+    }
+    Ok(legs_arr
+        .iter()
+        .map(|leg| {
+            let duration = leg.get("duration").and_then(|d| d.get("value")).and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let duration_in_traffic = leg.get("duration_in_traffic").and_then(|d| d.get("value")).and_then(|v| v.as_f64());
+            (duration, duration_in_traffic)
+        })
+        .collect())
+}
+
+// wps・modeはfetch_google_routeと同じ意味。ジオメトリは使わず、遅延秒数(0以上)だけを返す。
+pub fn fetch_traffic_delay(wps: &[(f64, f64)], mode: &str, key: &str) -> Result<f64, String> {
+    if key.trim().is_empty() { return Err("Google APIキー未設定".to_string()); }
+    if wps.len() < 2 { return Err("2点以上必要".to_string()); }
+    let params = directions_common_params(wps, mode, key);
+    let url = format!("https://maps.googleapis.com/maps/api/directions/json?{params}&departure_time=now");
+    let body = ureq::get(&url)
+        .timeout(std::time::Duration::from_secs(20)).call()
+        .map_err(|e| format!("渋滞確認: {e}"))?
+        .into_string().map_err(|e| e.to_string())?;
+    let legs = parse_directions_legs(&body)?;
+    Ok(traffic_delay_from_legs(&legs))
+}
+
+// trigger_route/trigger_turn_pointsと同じ非ブロッキング方針。
+pub type TrafficDelayRx = std::sync::mpsc::Receiver<Result<f64, String>>;
+pub fn trigger_traffic_delay(wps: &[(f64, f64)], mode: &str, key: &str) -> TrafficDelayRx {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (w, m, k) = (wps.to_vec(), mode.to_string(), key.to_string());
+    std::thread::spawn(move || { let _ = tx.send(fetch_traffic_delay(&w, &m, &k)); });
+    rx
 }
 
 // Googleのポリラインエンコーディング(https://developers.google.com/maps/documentation/utilities/polylinealgorithm)
@@ -777,5 +857,84 @@ mod tests {
     #[test]
     fn waypoints_bbox_with_margin_none_for_empty_waypoints() {
         assert!(waypoints_bbox_with_margin(&[], 0.05).is_none());
+    }
+
+    // ---- 渋滞込み所要時間(route-traffic-delay-design.md) ----
+
+    #[test]
+    fn traffic_delay_from_legs_sums_the_difference() {
+        // 900s(渋滞無し)→1380s(渋滞あり)の遅延は480s。
+        let legs = vec![(900.0, Some(1380.0))];
+        assert_eq!(traffic_delay_from_legs(&legs), 480.0);
+    }
+
+    #[test]
+    fn traffic_delay_from_legs_sums_multiple_legs() {
+        let legs = vec![(900.0, Some(1380.0)), (600.0, Some(660.0))];
+        assert_eq!(traffic_delay_from_legs(&legs), 480.0 + 60.0);
+    }
+
+    #[test]
+    fn traffic_delay_from_legs_uses_duration_when_traffic_missing() {
+        // duration_in_trafficが無いleg(徒歩区間混在等)はdurationで代用=遅延0扱い。
+        let legs = vec![(900.0, Some(1380.0)), (300.0, None)];
+        assert_eq!(traffic_delay_from_legs(&legs), 480.0);
+    }
+
+    #[test]
+    fn traffic_delay_from_legs_clamps_negative_to_zero() {
+        // 渋滞が無く逆に早く着く場合、マイナス表示は誤解を招くので0にクランプ。
+        let legs = vec![(900.0, Some(800.0))];
+        assert_eq!(traffic_delay_from_legs(&legs), 0.0);
+    }
+
+    #[test]
+    fn traffic_delay_from_legs_empty_is_zero() {
+        assert_eq!(traffic_delay_from_legs(&[]), 0.0);
+    }
+
+    // 実際のDirections APIレスポンス形の抜粋(2legs、うち1つはduration_in_traffic無し)。
+    const DIRECTIONS_SAMPLE: &str = r#"{
+      "status": "OK",
+      "routes": [{
+        "legs": [
+          {
+            "distance": {"text": "10 km", "value": 10000},
+            "duration": {"text": "15 mins", "value": 900},
+            "duration_in_traffic": {"text": "23 mins", "value": 1380}
+          },
+          {
+            "distance": {"text": "5 km", "value": 5000},
+            "duration": {"text": "10 mins", "value": 600}
+          }
+        ]
+      }]
+    }"#;
+
+    #[test]
+    fn parse_directions_legs_extracts_duration_and_duration_in_traffic() {
+        let legs = parse_directions_legs(DIRECTIONS_SAMPLE).unwrap();
+        assert_eq!(legs, vec![(900.0, Some(1380.0)), (600.0, None)]);
+    }
+
+    #[test]
+    fn parse_directions_legs_errors_on_non_ok_status() {
+        let body = r#"{"status": "ZERO_RESULTS", "routes": []}"#;
+        assert!(parse_directions_legs(body).is_err());
+    }
+
+    #[test]
+    fn parse_directions_legs_errors_on_missing_routes_or_legs() {
+        assert!(parse_directions_legs(r#"{"status": "OK", "routes": []}"#).is_err());
+        assert!(parse_directions_legs(r#"{"status": "OK", "routes": [{}]}"#).is_err());
+        assert!(parse_directions_legs("not json").is_err());
+    }
+
+    #[test]
+    fn should_show_traffic_delay_thresholds_at_60_seconds() {
+        assert!(!should_show_traffic_delay(0.0));
+        assert!(!should_show_traffic_delay(59.0));
+        assert!(should_show_traffic_delay(60.0));
+        assert!(should_show_traffic_delay(480.0));
     }
 }

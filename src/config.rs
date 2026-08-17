@@ -60,6 +60,7 @@ pub struct Config {
     pub camera_enabled: bool,         // 道路ライブカメラ(road-info-prvs.mlit.go.jp)を地図に重ねるか。既定false(ONにした人だけが外部サービスへ問い合わせる)
     pub regulation_enabled: bool,     // 通行規制(通行止め・車線規制等、road-info-prvs.mlit.go.jp)を地図に重ねるか。既定false(ONにした人だけが外部サービスへ問い合わせる)
     pub disaster_enabled: bool,       // 過去災害の発生履歴(NIED 災害事例データベース)を地図に重ねるか。既定false(ONにした人だけが外部サービスへ問い合わせる)
+    pub route_traffic_enabled: bool,  // ルート確定後、Google Directions(departure_time=now)で渋滞込み所要時間を追加確認するか。既定false(ONにした人だけがGoogle APIへ追加問い合わせする。要Google APIキー・Advanced課金対象)
 }
 
 impl Default for Config {
@@ -95,6 +96,7 @@ impl Default for Config {
             camera_enabled: false,
             regulation_enabled: false,
             disaster_enabled: false,
+            route_traffic_enabled: false,
         }
     }
 }
@@ -244,6 +246,7 @@ pub fn load_config_from(path: &Path) -> Config {
             ("camera", "enabled") => { if let Some(b) = parse_bool(value) { cfg.camera_enabled = b; } }
             ("regulation", "enabled") => { if let Some(b) = parse_bool(value) { cfg.regulation_enabled = b; } }
             ("disaster", "enabled") => { if let Some(b) = parse_bool(value) { cfg.disaster_enabled = b; } }
+            ("route_traffic", "enabled") => { if let Some(b) = parse_bool(value) { cfg.route_traffic_enabled = b; } }
             // 旧スキーマ後方互換: [streetview] api_key を google_maps_api_key に取り込む(未設定時のみ)
             ("streetview", "api_key") => {
                 if cfg.google_maps_api_key.is_empty() {
@@ -320,6 +323,9 @@ pub fn save_config_to(path: &Path, c: &Config) -> Result<(), String> {
          enabled = {}\n\
          \n\
          [disaster]\n\
+         enabled = {}\n\
+         \n\
+         [route_traffic]\n\
          enabled = {}\n",
         c.llm_recommend_enabled,
         c.llm_model,
@@ -351,6 +357,7 @@ pub fn save_config_to(path: &Path, c: &Config) -> Result<(), String> {
         c.camera_enabled,
         c.regulation_enabled,
         c.disaster_enabled,
+        c.route_traffic_enabled,
     );
 
     // APIキーを含むので unix では 0600。書込中クラッシュで壊さないよう atomic。
@@ -515,6 +522,7 @@ mod tests {
             camera_enabled: true,
             regulation_enabled: true,
             disaster_enabled: true,
+            route_traffic_enabled: true,
         };
         save_config_to(&path, &original).expect("save should succeed");
         let loaded = load_config_from(&path);
@@ -629,6 +637,17 @@ show_spots = maybe
         // 他の外部レイヤを巻き込まない。
         assert!(!cfg.regulation_enabled);
         assert!(!cfg.camera_enabled);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn route_traffic_defaults_to_off_and_is_read_from_its_own_section() {
+        assert!(!Config::default().route_traffic_enabled);
+        let path = unique_temp_path("route_traffic_section");
+        std::fs::write(&path, "[route_traffic]\nenabled = true\n").unwrap();
+        let cfg = load_config_from(&path);
+        assert!(cfg.route_traffic_enabled);
+        assert!(!cfg.disaster_enabled);
         cleanup(&path);
     }
 
@@ -860,6 +879,7 @@ profile = "custom-profile"
             camera_enabled: false,
             regulation_enabled: false,
             disaster_enabled: false,
+            route_traffic_enabled: false,
         };
         save_config_to(&path, &cfg).unwrap();
         let loaded = load_config_from(&path);

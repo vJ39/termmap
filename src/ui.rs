@@ -152,6 +152,8 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     // 通行規制の詳細(Tキー。なぜ通れないかの規制原因等)。disaster_viewと同じ「見出し+本文行」形。
     let mut regulation_detail_view: Option<(String, Vec<String>)> = None;
     let mut regulation_detail_job: Option<std::sync::mpsc::Receiver<Result<regulation::ClosureDetail, String>>> = None;
+    // 渋滞込み所要時間(#渋滞情報)。ルート成功のたびに、設定ONならGoogle Directionsへ別途確認する。
+    let mut traffic_delay_job: Option<route::TrafficDelayRx> = None;
     // 読み上げの声(#78)の試聴。SettingsPick(27)でSpace=試聴/Enter確定後の1回再生の両方で使う。
     let mut voice_preview_job: Option<std::sync::mpsc::Receiver<Result<(), String>>> = None;
     // ルート計算と同じ非同期パターンで、検索/周辺/実写/おすすめの通信もバックグラウンド化する。
@@ -967,7 +969,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         }
         // ステータス行の文面組み立ては ui_status.rs へ切り出し済み。通信中スピナーの判定に使う
         // 各ジョブは有無しか見ないのでここで1つのフラグに畳んでから渡す。
-        let jobs_active = route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || cam_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some() || wander_job.is_some() || disaster_job.is_some() || regulation_detail_job.is_some();
+        let jobs_active = route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || cam_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some() || wander_job.is_some() || disaster_job.is_some() || regulation_detail_job.is_some() || traffic_delay_job.is_some();
         // 次の曲がり角の画面表示。音声案内(maybe_speak_turn)と同じくturn_points+現在地から
         // 求めるが、読み上げ済みかの状態は見ない(何度描画しても同じ内容を出したいため)。
         let next_turn = spec.routes.last()
@@ -1068,6 +1070,12 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     if route_nogos_truncated {
                         route_note = route_note.map(|n| format!("{n} (通行止めの一部は回避対象外)"));
                     }
+                    // 渋滞込み所要時間(#渋滞情報): ルートが変わるたびに問い合わせ直す。
+                    traffic_delay_job = if cfg.route_traffic_enabled && !cfg.google_maps_api_key.trim().is_empty() && wps.len() >= 2 {
+                        Some(route::trigger_traffic_delay(&wps, &mode, &cfg.google_maps_api_key))
+                    } else {
+                        None
+                    };
                     route_ele = r.ele;
                     route_ascend = r.ascend_m;
                     let tile_coords = geo::route_tile_coords(&r.pts, z);
@@ -1118,6 +1126,19 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 Ok(Err(e)) => { snd.play("error"); addr = format!("通行規制: {e}"); regulation_detail_job = None; got_result = true; }
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => { regulation_detail_job = None; }
+            }
+        }
+        if let Some(job) = &traffic_delay_job { // 渋滞込み所要時間(#渋滞情報)の到着
+            match job.try_recv() {
+                Ok(Ok(delay_s)) => {
+                    if route::should_show_traffic_delay(delay_s) {
+                        route_note = route_note.map(|n| format!("{n} (現在+{}分の遅れ)", (delay_s / 60.0).round() as i64));
+                    }
+                    traffic_delay_job = None; got_result = true;
+                }
+                Ok(Err(_e)) => { traffic_delay_job = None; got_result = true; } // 失敗は静かに諦める(ルート自体は既に表示済み)
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => { traffic_delay_job = None; }
             }
         }
         if let Some(job) = &voice_preview_job { // 読み上げの声(#78)の試聴結果
@@ -1315,7 +1336,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             // 主要道路は以前この条件から漏れていたが、4レイヤとも同じ扱いにする。
             || traffic_layer.job_active() || roads_layer.job_active()
             || camera_layer.job_active() || regulation_layer.job_active() || disaster_layer.job_active()
-            || disaster_job.is_some() || voice_preview_job.is_some() || regulation_detail_job.is_some();
+            || disaster_job.is_some() || voice_preview_job.is_some() || regulation_detail_job.is_some() || traffic_delay_job.is_some();
         let mut ev: Option<Event> = if got_result {
             None
         } else if polling {
@@ -1400,10 +1421,10 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             None => {} // 再描画のみ(計算待ち)
             Some(Event::Key(k)) if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) => {
                 // Ctrl-C: 進行中の全ジョブを中断(アプリは終了しない)
-                let any = route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || cam_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some() || wander_job.is_some() || disaster_job.is_some() || regulation_detail_job.is_some();
+                let any = route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || cam_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some() || wander_job.is_some() || disaster_job.is_some() || regulation_detail_job.is_some() || traffic_delay_job.is_some();
                 if any {
                     if route_job.is_some() { route_note = Some("中断".to_string()); }
-                    route_job = None; search_job = None; near_job = None; street_job = None; cam_job = None; recommend_job = None; road_job = None; catpoi_job = None; wander_job = None; disaster_job = None; regulation_detail_job = None;
+                    route_job = None; search_job = None; near_job = None; street_job = None; cam_job = None; recommend_job = None; road_job = None; catpoi_job = None; wander_job = None; disaster_job = None; regulation_detail_job = None; traffic_delay_job = None;
                     addr = "中断".into();
                 }
             }
@@ -1455,9 +1476,9 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             }
             // Map表示中のEscは進行中ジョブの中断に使う(サブ画面のEscは各Focusの取消のまま)
             Some(Event::Key(k)) if k.code == KeyCode::Esc && matches!(focus, Focus::Map)
-                && (route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || cam_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some() || wander_job.is_some() || disaster_job.is_some() || regulation_detail_job.is_some()) => {
+                && (route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || cam_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some() || wander_job.is_some() || disaster_job.is_some() || regulation_detail_job.is_some() || traffic_delay_job.is_some()) => {
                 if route_job.is_some() { route_note = Some("中断".to_string()); }
-                route_job = None; search_job = None; near_job = None; street_job = None; cam_job = None; recommend_job = None; road_job = None; catpoi_job = None; wander_job = None; disaster_job = None; regulation_detail_job = None;
+                route_job = None; search_job = None; near_job = None; street_job = None; cam_job = None; recommend_job = None; road_job = None; catpoi_job = None; wander_job = None; disaster_job = None; regulation_detail_job = None; traffic_delay_job = None;
                 addr = "中断".into();
             }
             Some(Event::Key(k)) => {
