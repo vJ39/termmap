@@ -211,7 +211,7 @@ fn build_spec(a: &Args, center_lat: f64, center_lon: f64) -> OverlaySpec {
         let (rl, ro) = a.home.unwrap_or((center_lat, center_lon));
         rings.push(Ring { lat: rl, lon: ro, radii_km: a.range.clone(), color: [255, 90, 90], thickness: 2 });
     }
-    OverlaySpec { pois: Vec::new(), routes: Vec::new(), roads: Vec::new(), traffic_segments: Vec::new(), rings, spots: Vec::new() }
+    OverlaySpec { pois: Vec::new(), routes: Vec::new(), expressway_segments: Vec::new(), roads: Vec::new(), traffic_segments: Vec::new(), rings, spots: Vec::new() }
 }
 // --route があれば BRouter で取得して spec に追加し、要約(距離/時間)を返す。--gpx 指定時は書き出し。
 fn attach_route(spec: &mut OverlaySpec, a: &Args) -> Result<Option<String>, String> {
@@ -219,6 +219,11 @@ fn attach_route(spec: &mut OverlaySpec, a: &Args) -> Result<Option<String>, Stri
     let r = fetch_route(wps, &a.route_mode, 0, "", "")?; // CLI一発描画はBRouterのみ・通行止め回避無し(Googleキー未提供=フォールバックしない)
     if let Some(g) = &a.gpx { write_gpx(g, &r.pts)?; }
     let summary = format!("ルート {} {}点", route_summary(&a.route_mode, &r), r.pts.len());
+    // 高速区間の点列は r.pts をムーブする前に作る。
+    spec.expressway_segments = route::expressway_polylines(&r.pts, &r.hw_segments)
+        .into_iter()
+        .map(|pts| Route { pts, color: route::EXPRESSWAY_COLOR, thickness: 2 })
+        .collect();
     spec.routes.push(Route { pts: r.pts, color: [0, 220, 255], thickness: 2 });
     Ok(Some(summary))
 }

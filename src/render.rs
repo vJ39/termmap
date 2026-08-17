@@ -158,9 +158,11 @@ pub struct Ring { pub lat: f64, pub lon: f64, pub radii_km: Vec<f64>, pub color:
 // 塗り直した色付きの線を保持する(routesの中身自体は差し替えない)。GPX保存・標高表示・
 // 次の曲がり案内は routes.last() を「ルート全体」として参照しているため、そちらを壊さないよう
 // 独立フィールドにしている。
-pub struct OverlaySpec { pub pois: Vec<Poi>, pub routes: Vec<Route>, pub roads: Vec<Route>, pub traffic_segments: Vec<Route>, pub rings: Vec<Ring>, pub spots: Vec<(f64, f64, [u8; 3], u8)> }
+// expressway_segments は高速道路を通る区間(#高速区間)用の別レイヤ。routes[0]と同じ経路のうち
+// 高速の部分だけを緑で上塗りする。traffic_segments と同じ理由で独立フィールドにしている。
+pub struct OverlaySpec { pub pois: Vec<Poi>, pub routes: Vec<Route>, pub expressway_segments: Vec<Route>, pub roads: Vec<Route>, pub traffic_segments: Vec<Route>, pub rings: Vec<Ring>, pub spots: Vec<(f64, f64, [u8; 3], u8)> }
 impl OverlaySpec {
-    pub fn is_empty(&self) -> bool { self.pois.is_empty() && self.routes.is_empty() && self.roads.is_empty() && self.traffic_segments.is_empty() && self.rings.is_empty() && self.spots.is_empty() }
+    pub fn is_empty(&self) -> bool { self.pois.is_empty() && self.routes.is_empty() && self.expressway_segments.is_empty() && self.roads.is_empty() && self.traffic_segments.is_empty() && self.rings.is_empty() && self.spots.is_empty() }
 }
 
 // インクマスク層。描画は最終出力寸法(resize後)で構築する。
@@ -253,6 +255,10 @@ pub fn build_overlay(spec: &OverlaySpec, cx: f64, cy: f64, z: u32, win_w: u32, w
     for rt in &spec.routes { // 経路(BRouterルート)
         let pts: Vec<(i32, i32)> = rt.pts.iter().map(|&(la, lo)| to_img(la, lo)).collect();
         draw_polyline(&mut ov, &pts, rt.color, rt.thickness);
+    }
+    for ex in &spec.expressway_segments { // 高速区間(ルート本体の上・渋滞の色分けの下)
+        let pts: Vec<(i32, i32)> = ex.pts.iter().map(|&(la, lo)| to_img(la, lo)).collect();
+        draw_polyline(&mut ov, &pts, ex.color, ex.thickness);
     }
     for rd in &spec.roads { // 道路の塊(別色レイヤ・BRouterルートの上に乗る)
         let pts: Vec<(i32, i32)> = rd.pts.iter().map(|&(la, lo)| to_img(la, lo)).collect();
@@ -618,13 +624,35 @@ mod tests {
         assert_eq!(ink_count(&ov3), 0);
     }
 
+    // 高速区間(#高速区間)はルート本体の上・渋滞の色分けの下に描く。高速区間が渋滞していれば
+    // 渋滞の色が上に乗る(今の混み具合の方が優先度が高い)。
+    #[test]
+    fn build_overlay_draws_expressway_over_route_and_under_traffic() {
+        let (lat, lon, z) = (35.0, 139.0, 10u32);
+        let (cx, cy) = deg_to_pixel(lat, lon, z);
+        let line = || vec![(lat, lon), (lat, lon)]; // 窓中心の1点だけを塗る線
+        let route = |c: [u8; 3]| Route { pts: line(), color: c, thickness: 1 };
+        let cyan = [0, 220, 255];
+        let green = [0, 230, 100];
+        let red = [220, 40, 40];
+
+        let mut spec = OverlaySpec { pois: Vec::new(), routes: vec![route(cyan)], expressway_segments: vec![route(green)],
+                                     roads: Vec::new(), traffic_segments: Vec::new(), rings: Vec::new(), spots: Vec::new() };
+        let ov = build_overlay(&spec, cx, cy, z, 8, 8, 1.0, 1.0, 8, 8, None);
+        assert_eq!(ov.get(4, 4), Some(green), "高速区間はルート本体(シアン)を上塗りする");
+
+        spec.traffic_segments = vec![route(red)];
+        let ov2 = build_overlay(&spec, cx, cy, z, 8, 8, 1.0, 1.0, 8, 8, None);
+        assert_eq!(ov2.get(4, 4), Some(red), "渋滞の色分けは高速区間より前面に出る");
+    }
+
     // build_overlay に雨雲を渡すと最背面に入る = 経路/マーカーは必ず雨雲より前面に残る。
     #[test]
     fn build_overlay_puts_radar_behind_markers() {
         let (lat, lon, z) = (35.0, 139.0, 10u32);
         let (cx, cy) = deg_to_pixel(lat, lon, z);
-        let spec = OverlaySpec { pois: Vec::new(), routes: Vec::new(), roads: Vec::new(), traffic_segments: Vec::new(),
-                                 rings: Vec::new(), spots: vec![(lat, lon, [1, 2, 3], 0)] };
+        let spec = OverlaySpec { pois: Vec::new(), routes: Vec::new(), expressway_segments: Vec::new(), roads: Vec::new(),
+                                 traffic_segments: Vec::new(), rings: Vec::new(), spots: vec![(lat, lon, [1, 2, 3], 0)] };
         let layer = RgbaImage::from_pixel(8, 8, image::Rgba([200, 0, 0, 255]));
         let ink = RadarInk { layer: &layer, density: 1.0 };
         let ov = build_overlay(&spec, cx, cy, z, 8, 8, 1.0, 1.0, 8, 8, Some(ink));

@@ -4,8 +4,12 @@ use crate::regulation::{ClosureEvent, RegulationKind};
 use crate::roadtrace::{point_at, polyline_len, sample_every};
 use serde::Deserialize;
 
+// hw_segments は高速区間の pts 上のインデックス範囲(両端を含む)。hw_m(距離の合計)と同じ判定で
+// 求めるので、表示する距離と色を塗る区間は必ず一致する。#[serde(default)] は via_google と同じ
+// 理由(旧形式のキャッシュJSONでパースを失敗させない)で付けるが、中身の正しさは
+// route_cache_path のスキーマ版で担保する。
 #[derive(serde::Serialize, serde::Deserialize)]
-pub struct RouteResult { pub pts: Vec<(f64, f64)>, pub ele: Vec<f64>, pub dist_m: f64, pub time_s: f64, pub hw_m: f64, pub ascend_m: f64, #[serde(default)] pub via_google: bool }
+pub struct RouteResult { pub pts: Vec<(f64, f64)>, pub ele: Vec<f64>, pub dist_m: f64, pub time_s: f64, pub hw_m: f64, #[serde(default)] pub hw_segments: Vec<(usize, usize)>, pub ascend_m: f64, #[serde(default)] pub via_google: bool }
 
 // ---- 通行止め回避(#通行止めを推奨しない) ----
 //
@@ -107,33 +111,113 @@ pub fn route_summary(mode: &str, r: &RouteResult) -> String {
     let mut s = format!("{} {:.1}km {}分", mode_label(mode), r.dist_m / 1000.0, (r.time_s / 60.0).round() as i64);
     if r.hw_m > 50.0 {
         let km = r.hw_m / 1000.0;
-        s.push_str(&format!(" 高速{km:.1}km ¥{}概算", (km * 30.0).round() as i64));
+        // 区間数は2つ以上のときだけ出す。「途中で一度高速を降りる」ことが分かる場合にだけ
+        // 意味がある情報で、常に出すと通常のルート(1区間)で冗長になる。
+        let segs = if r.hw_segments.len() >= 2 { format!("({}区間)", r.hw_segments.len()) } else { String::new() };
+        s.push_str(&format!(" 高速{km:.1}km{segs} ¥{}概算", (km * 30.0).round() as i64));
     }
     if r.via_google {
         s.push_str(" (Google経由)");
     }
     s
 }
-// 高速(motorway=有料道)区間の総メートル。料金概算に使う。
-// properties.messages([[headers],[row..]] は全て文字列)から Distance/WayTags 列を引く。
-fn expressway_meters(body: &str) -> f64 {
+// ---- 高速道路区間(#高速区間、docs/route-expressway-segment-design.md) ----
+//
+// BRouterの properties.messages は [[ヘッダ],[行..]] の文字列表で、各行は「直前の行の座標から、
+// その行の座標まで」の区間を表す。Longitude/Latitude は整数マイクロ度の文字列(139701812 =
+// 139.701812度)で、その座標は geometry.coordinates の頂点そのもの(=RouteResult.pts の頂点)と
+// インデックス昇順で一致する(3ルート424行で実測・未一致0)。よって座標の一致だけで pts の
+// インデックス範囲へ落とせ、距離を按分して位置を推定する必要はない。
+
+// 高速区間の色。日本の道路案内標識(高速=緑・一般道=青)に合わせる。ルート本体はシアンのまま。
+pub const EXPRESSWAY_COLOR: [u8; 3] = [0, 230, 100];
+// 座標一致の許容(マイクロ度)。±2マイクロ度≒0.2mで、丸め誤差だけを吸収する。
+const COORD_MATCH_TOL_UDEG: i64 = 2;
+
+// 度をマイクロ度の整数へ。messages 側の整数表現と突き合わせるために使う。
+fn to_micro_deg(d: f64) -> i64 { (d * 1e6).round() as i64 }
+
+// WayTags 1行分が高速道路か。"highway=motorway" の部分一致は "highway=motorway_link" にも
+// 当たる。ランプ・JCT連絡路を高速に含めるのは意図した挙動で(IC入口からIC出口まで線が途切れない)、
+// hw_m(料金概算)の集計と判定を揃えるために距離集計と区間抽出の両方からこの関数を呼ぶ。
+fn is_expressway_tags(waytags: &str) -> bool { waytags.contains("highway=motorway") }
+
+// BRouterの応答本文と、そこから作った pts から、(高速の合計メートル, pts のインデックス範囲)を
+// 求める。ネットワークに触れない純関数。
+//
+// 位置特定に一度でも失敗したら範囲は空で返し、距離だけ返す(色分けは出ないが距離と料金概算は
+// 従来通り出る)。距離の集計は行ごとに独立しているので、位置特定の成否に影響されない。
+pub fn expressway_segments(body: &str, pts: &[(f64, f64)]) -> (f64, Vec<(usize, usize)>) {
     let messages = match parse_brouter(body) {
         Some(r) => r.features.into_iter().find_map(|f| f.properties.map(|p| p.messages)).unwrap_or_default(),
-        None => return 0.0,
+        None => return (0.0, Vec::new()),
     };
-    if messages.is_empty() { return 0.0; }
-    let di = messages[0].iter().position(|h| h == "Distance");
-    let wi = messages[0].iter().position(|h| h == "WayTags");
-    let (di, wi) = match (di, wi) { (Some(d), Some(w)) => (d, w), _ => return 0.0 };
-    let mut m = 0.0;
-    for r in &messages[1..] {
-        if let (Some(d), Some(w)) = (r.get(di), r.get(wi)) {
-            if w.contains("highway=motorway") {
-                if let Ok(v) = d.parse::<f64>() { m += v; }
-            }
+    if messages.is_empty() { return (0.0, Vec::new()); }
+    let head = &messages[0];
+    let di = head.iter().position(|h| h == "Distance");
+    let wi = head.iter().position(|h| h == "WayTags");
+    let (di, wi) = match (di, wi) { (Some(d), Some(w)) => (d, w), _ => return (0.0, Vec::new()) };
+    let lon_i = head.iter().position(|h| h == "Longitude");
+    let lat_i = head.iter().position(|h| h == "Latitude");
+
+    // pts をマイクロ度の整数へ丸めた配列を1度だけ作る(行ごとに丸め直さない)。
+    let micro: Vec<(i64, i64)> = pts.iter().map(|&(la, lo)| (to_micro_deg(la), to_micro_deg(lo))).collect();
+    // 位置特定できる条件(座標の列がある・pts が空でない)。途中で失敗したら false に落とす。
+    let (mut locate, lon_i, lat_i) = match (lon_i, lat_i) {
+        (Some(a), Some(b)) if !micro.is_empty() => (true, a, b),
+        _ => (false, 0, 0),
+    };
+
+    let mut meters = 0.0;
+    let mut raw: Vec<(usize, usize)> = Vec::new();
+    let mut cursor = 0usize; // pts 走査の開始位置。前方向にしか進めない
+    let mut prev_idx = 0usize; // 直前の行が指した頂点(=この行の区間の始点)
+    for row in &messages[1..] {
+        let hw = row.get(wi).is_some_and(|w| is_expressway_tags(w));
+        if hw {
+            if let Some(Ok(v)) = row.get(di).map(|d| d.parse::<f64>()) { meters += v; }
+        }
+        if !locate { continue; }
+        // 座標をマイクロ度の整数として読み、cursor から前方へ走査して一致する頂点を探す。
+        // 前方向にしか進まないので、折り返す経路で同じ座標が2回出ても手前を誤って選ばない。
+        let parsed = match (row.get(lon_i), row.get(lat_i)) {
+            (Some(lo), Some(la)) => match (lo.trim().parse::<i64>(), la.trim().parse::<i64>()) {
+                (Ok(lo), Ok(la)) => Some((lo, la)),
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some((lo_u, la_u)) = parsed else { locate = false; continue };
+        let found = (cursor..micro.len())
+            .find(|&i| (micro[i].0 - la_u).abs() <= COORD_MATCH_TOL_UDEG && (micro[i].1 - lo_u).abs() <= COORD_MATCH_TOL_UDEG);
+        let Some(end_idx) = found else { locate = false; continue };
+        if hw { raw.push((prev_idx, end_idx)); }
+        prev_idx = end_idx;
+        // cursor は end_idx + 1 にしない。長さ0の行(同じ頂点を2回指す)が来ても同じ頂点で
+        // 受けられるようにするため。長さ0の範囲は最後に捨てる。
+        cursor = end_idx;
+    }
+    if !locate { return (meters, Vec::new()); }
+
+    // 隣り合う範囲を統合する(次の始点が直前の終点以下なら1つに繋ぐ)。
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (a, b) in raw {
+        match merged.last_mut() {
+            Some(last) if a <= last.1 => { if b > last.1 { last.1 = b; } }
+            _ => merged.push((a, b)),
         }
     }
-    m
+    // 始点と終点が同じ範囲は線として描けないので捨てる。距離は Distance 列の合計なので影響しない。
+    merged.retain(|&(a, b)| b > a);
+    (meters, merged)
+}
+
+// インデックス範囲を描画用の点列へ。pts の範囲外・2点未満になる範囲は捨てる。
+pub fn expressway_polylines(pts: &[(f64, f64)], segs: &[(usize, usize)]) -> Vec<Vec<(f64, f64)>> {
+    segs.iter()
+        .filter(|&&(a, b)| b > a && b < pts.len()) // b > a で2点以上、b < len で範囲内(a < b なので a も範囲内)
+        .map(|&(a, b)| pts[a..=b].to_vec())
+        .collect()
 }
 // geojson の LineString coordinates([[lon,lat,elev?],...]) を (lat,lon) 列へ。
 // lon/lat のどちらかを欠く点があれば None(既存挙動: 点が壊れていれば全体失敗)。
@@ -171,13 +255,26 @@ fn parse_geojson_props(body: &str) -> (f64, f64, f64) {
 // profile で正規化するので 下道/surface/quiet 等は同一ルートを共有。プロット不変なら再起動後も再利用。
 // nogos をキーに含めるのは必須(#通行止め回避): 含めないと、新しい通行止めが出現した後も
 // 通行止めを無視した古いキャッシュ済みルートを出し続けてしまう。
-fn route_cache_path(wps: &[(f64, f64)], mode: &str, alt: u32, nogos: &str) -> Option<std::path::PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    let mut key = format!("{}|{}|{}", route_profile(mode), alt, nogos);
+// RouteResult の中身の作り方を変えたらこの値を上げる(古い保存分を読まないようにするため)。
+// v2: hw_segments(高速区間)を追加。ルートキャッシュは期限を持たないので、版を上げないと
+// 「hw_m > 0 なのに hw_segments が空=距離は出るのに色が出ない」保存分が消えずに残る。
+const ROUTE_CACHE_SCHEMA: &str = "v2";
+// キー文字列とファイル名は、HOME に依存しない純関数として切り出してある(スキーマ版を上げれば
+// 別のファイル名になることをテストで確かめられるようにするため)。
+fn route_cache_key(schema: &str, wps: &[(f64, f64)], mode: &str, alt: u32, nogos: &str) -> String {
+    let mut key = format!("{}|{}|{}|{}", schema, route_profile(mode), alt, nogos);
     for (la, lo) in wps { key.push_str(&format!("|{la:.6},{lo:.6}")); }
+    key
+}
+fn route_cache_file_name(key: &str) -> String {
     let mut h: u64 = 0xcbf29ce4_84222325;
     for b in key.as_bytes() { h ^= *b as u64; h = h.wrapping_mul(0x100000001b3); }
-    Some(std::path::Path::new(&home).join(".config/termmap/route-cache").join(format!("{h:016x}.json")))
+    format!("{h:016x}.json")
+}
+fn route_cache_path(wps: &[(f64, f64)], mode: &str, alt: u32, nogos: &str) -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    let key = route_cache_key(ROUTE_CACHE_SCHEMA, wps, mode, alt, nogos);
+    Some(std::path::Path::new(&home).join(".config/termmap/route-cache").join(route_cache_file_name(&key)))
 }
 
 // mode: "short"=最短(shortest) / それ以外=裏道(safety)。wps は (lat,lon) 列。
@@ -258,8 +355,8 @@ fn fetch_route_once(wps: &[(f64, f64)], profile: &str, alt: u32, nogos: &str) ->
     let pts = parse_geojson_line(&body).ok_or("route: geometry parse失敗")?;
     let ele = parse_geojson_ele(&body);
     let (dist_m, time_s, ascend_m) = parse_geojson_props(&body);
-    let hw_m = expressway_meters(&body);
-    Ok(RouteResult { pts, ele, dist_m, time_s, hw_m, ascend_m, via_google: false })
+    let (hw_m, hw_segments) = expressway_segments(&body, &pts);
+    Ok(RouteResult { pts, ele, dist_m, time_s, hw_m, hw_segments, ascend_m, via_google: false })
 }
 
 // ---- 曲がり角(ターンバイターン音声案内用) ----
@@ -434,7 +531,8 @@ fn directions_common_params(wps: &[(f64, f64)], mode: &str, key: &str) -> String
 
 // Google Directions API(旧・レガシー版、Routes APIではない)でのフォールバック取得。
 // BRouterが失敗した時だけ最終手段として呼ばれる。標高データは提供されないため ele は空Vec、
-// 高速区間の判定手段が無いため hw_m は 0.0(料金概算は出ない=呼び出し側で自然にスキップされる)。
+// 高速区間の判定手段が無いため hw_m は 0.0(料金概算は出ない=呼び出し側で自然にスキップされる)、
+// hw_segments も空(高速区間の色分けは出ない)。
 fn fetch_google_route(wps: &[(f64, f64)], mode: &str, key: &str) -> Result<RouteResult, String> {
     if key.trim().is_empty() { return Err("Google APIキー未設定".to_string()); }
     let params = directions_common_params(wps, mode, key);
@@ -461,7 +559,7 @@ fn fetch_google_route(wps: &[(f64, f64)], mode: &str, key: &str) -> Result<Route
         dist_m += leg.get("distance").and_then(|d| d.get("value")).and_then(|v| v.as_f64()).unwrap_or(0.0);
         time_s += leg.get("duration").and_then(|d| d.get("value")).and_then(|v| v.as_f64()).unwrap_or(0.0);
     }
-    Ok(RouteResult { pts, ele: Vec::new(), dist_m, time_s, hw_m: 0.0, ascend_m: 0.0, via_google: true })
+    Ok(RouteResult { pts, ele: Vec::new(), dist_m, time_s, hw_m: 0.0, hw_segments: Vec::new(), ascend_m: 0.0, via_google: true })
 }
 
 // ---- 渋滞状況の色分け(#渋滞情報、docs/route-traffic-coloring-design.md) ----
@@ -655,6 +753,7 @@ pub type RouteRx = std::sync::mpsc::Receiver<Result<RouteResult, String>>;
 pub fn trigger_route(spec: &mut OverlaySpec, wps: &[(f64, f64)], pois: &[(f64, f64, String, PoiCat)], mode: &str, alt: u32, key: &str, nogos: &str) -> (Option<String>, Option<RouteRx>) {
     set_markers(spec, wps, pois);
     spec.routes.clear();
+    spec.expressway_segments.clear(); // 古いルートの高速区間を引き継がない
     if wps.len() >= 2 {
         let (tx, rx) = std::sync::mpsc::channel();
         let (w, m, k, n) = (wps.to_vec(), mode.to_string(), key.to_string(), nogos.to_string());
@@ -764,14 +863,175 @@ mod tests {
         assert!((ele[1] - 10.0).abs() < 1e-9);
     }
 
+    // ---- 高速道路区間(#高速区間) ----
+
+    // BRouter format=geojson の properties.messages を組み立てるテスト用ヘルパ。
+    // rows は (Longitude(マイクロ度), Latitude(マイクロ度), Distance(m), WayTags)。
+    // 列の並びは実測した応答(2026/08/17)と同じ。
+    fn br_body(rows: &[(i64, i64, &str, &str)]) -> String {
+        const HEAD: &str = r#"["Longitude","Latitude","Elevation","Distance","CostPerKm","ElevCost","TurnCost","NodeCost","InitialCost","WayTags","NodeTags","Time","Energy"]"#;
+        let rows: Vec<String> = rows.iter()
+            .map(|(lon, lat, d, w)| format!(r#"["{lon}","{lat}","3","{d}","0","0","0","0","0","{w}","","0","0"]"#))
+            .collect();
+        format!(r#"{{"features":[{{"properties":{{"messages":[{HEAD},{}]}}}}]}}"#, rows.join(","))
+    }
+    // マイクロ度 → (lat, lon) の度。messages 側と同じ座標で pts を組むために使う。
+    fn pt(lat_u: i64, lon_u: i64) -> (f64, f64) { (lat_u as f64 / 1e6, lon_u as f64 / 1e6) }
+    // 実測値まわりの新宿付近の頂点列(6点)。インデックス0..5。
+    fn sample_pts() -> Vec<(f64, f64)> {
+        vec![
+            pt(35_689_780, 139_701_812), // 0
+            pt(35_690_000, 139_702_000), // 1
+            pt(35_691_000, 139_703_000), // 2
+            pt(35_692_000, 139_704_000), // 3
+            pt(35_693_000, 139_705_000), // 4
+            pt(35_694_000, 139_706_000), // 5
+        ]
+    }
+
     #[test]
-    fn expressway_meters_sums_motorway() {
+    fn expressway_segments_sums_motorway_and_locates_one_range() {
+        // 高速1区間: 該当行の指す頂点(1→3)がインデックス範囲として1件返る
+        let body = br_body(&[
+            (139_702_000, 35_690_000, "50", "highway=residential"),
+            (139_704_000, 35_692_000, "100", "highway=motorway maxspeed=80"),
+            (139_706_000, 35_694_000, "50", "highway=residential"),
+        ]);
+        let (m, segs) = expressway_segments(&body, &sample_pts());
+        assert!((m - 100.0).abs() < 1e-9);
+        assert_eq!(segs, vec![(1, 3)]);
+    }
+
+    #[test]
+    fn expressway_segments_merges_consecutive_rows() {
+        // 連続する複数行(1→2→3→4)は1つの範囲(1,4)へ統合される。motorway_link も高速に数える。
+        let body = br_body(&[
+            (139_702_000, 35_690_000, "50", "highway=residential"),
+            (139_703_000, 35_691_000, "100", "highway=motorway"),
+            (139_704_000, 35_692_000, "200", "highway=motorway"),
+            (139_705_000, 35_693_000, "30", "highway=motorway_link"),
+            (139_706_000, 35_694_000, "50", "highway=residential"),
+        ]);
+        let (m, segs) = expressway_segments(&body, &sample_pts());
+        assert!((m - 330.0).abs() < 1e-9, "motorway_link(30m)も距離に入る: {m}");
+        assert_eq!(segs, vec![(1, 4)]);
+    }
+
+    #[test]
+    fn expressway_segments_keeps_two_ranges_split_by_surface_road() {
+        // 一般道を挟んだ高速2区間は統合されず2件になる(=途中で一度高速を降りている)
+        let body = br_body(&[
+            (139_702_000, 35_690_000, "100", "highway=motorway"),
+            (139_703_000, 35_691_000, "50", "highway=primary"),
+            (139_704_000, 35_692_000, "80", "highway=tertiary"),
+            (139_706_000, 35_694_000, "100", "highway=motorway"),
+        ]);
+        let (m, segs) = expressway_segments(&body, &sample_pts());
+        assert!((m - 200.0).abs() < 1e-9);
+        assert_eq!(segs, vec![(0, 1), (3, 5)]);
+    }
+
+    #[test]
+    fn expressway_segments_counts_motorway_link_alone() {
+        // ランプ(motorway_link)だけの行も高速として距離・範囲の両方に入る
+        let body = br_body(&[
+            (139_702_000, 35_690_000, "40", "highway=motorway_link oneway=yes"),
+        ]);
+        let (m, segs) = expressway_segments(&body, &sample_pts());
+        assert!((m - 40.0).abs() < 1e-9);
+        assert_eq!(segs, vec![(0, 1)]);
+    }
+
+    #[test]
+    fn expressway_segments_returns_distance_only_when_coords_do_not_match() {
+        // 座標が pts のどの頂点とも一致しない(位置特定に失敗)場合、hw_m は従来通り返り
+        // 範囲だけが空になる。色分けは出ないが距離と料金概算は出る。
+        let body = br_body(&[
+            (139_702_000, 35_690_000, "100", "highway=motorway"),
+        ]);
+        let other_pts = vec![pt(34_000_000, 135_000_000), pt(34_001_000, 135_001_000)];
+        let (m, segs) = expressway_segments(&body, &other_pts);
+        assert!((m - 100.0).abs() < 1e-9);
+        assert!(segs.is_empty());
+        // pts が空の場合も同じ(位置特定できないが距離は出る)
+        assert_eq!(expressway_segments(&body, &[]).1.len(), 0);
+        assert!((expressway_segments(&body, &[]).0 - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn expressway_segments_needs_distance_and_waytags_columns() {
+        // ヘッダに Distance/WayTags が無ければ何も分からない
         let body = r#"{"features":[{"properties":{"messages":[
-          ["Longitude","Latitude","Elevation","Distance","CostPerKm","ElevCost","TurnCost","NodeCost","InitialCost","WayTags","NodeTags","Time","Energy"],
-          ["1","2","3","100","0","0","0","0","0","highway=motorway maxspeed=80","","0","0"],
-          ["1","2","3","50","0","0","0","0","0","highway=residential","","0","0"]
+          ["Longitude","Latitude","Elevation"],
+          ["139702000","35690000","3"]
         ]}}]}"#;
-        assert!((expressway_meters(body) - 100.0).abs() < 1e-9);
+        assert_eq!(expressway_segments(body, &sample_pts()), (0.0, Vec::new()));
+    }
+
+    #[test]
+    fn expressway_segments_handles_empty_and_broken_body() {
+        assert_eq!(expressway_segments(r#"{"features":[{"properties":{"messages":[]}}]}"#, &sample_pts()), (0.0, Vec::new()));
+        assert_eq!(expressway_segments("not json", &sample_pts()), (0.0, Vec::new()));
+        assert_eq!(expressway_segments(r#"{"features":[]}"#, &sample_pts()), (0.0, Vec::new()));
+    }
+
+    #[test]
+    fn expressway_segments_drops_zero_length_range() {
+        // 同じ頂点を2回指す長さ0の行は線として描けないので範囲から捨てる。
+        // 距離は Distance 列の合計なので、この切り捨ての影響を受けない。
+        let body = br_body(&[
+            (139_702_000, 35_690_000, "50", "highway=residential"),
+            (139_702_000, 35_690_000, "60", "highway=motorway"), // 同じ頂点(1)を指す
+        ]);
+        let (m, segs) = expressway_segments(&body, &sample_pts());
+        assert!((m - 60.0).abs() < 1e-9);
+        assert!(segs.is_empty());
+    }
+
+    #[test]
+    fn expressway_segments_cursor_moves_forward_on_looping_route() {
+        // 折り返して同じ座標を2回通る経路。2行目のBは手前の頂点1ではなく、カーソル以降の
+        // 頂点3に一致しなければならない(前方向カーソルが効いていること)。
+        let pts = vec![
+            pt(35_690_000, 139_702_000), // 0 A
+            pt(35_691_000, 139_703_000), // 1 B
+            pt(35_692_000, 139_704_000), // 2 C
+            pt(35_691_000, 139_703_000), // 3 B(折り返して再訪)
+            pt(35_693_000, 139_705_000), // 4 D
+        ];
+        let body = br_body(&[
+            (139_704_000, 35_692_000, "50", "highway=residential"), // → 頂点2
+            (139_703_000, 35_691_000, "100", "highway=motorway"),   // → 頂点3(頂点1ではない)
+        ]);
+        let (m, segs) = expressway_segments(&body, &pts);
+        assert!((m - 100.0).abs() < 1e-9);
+        assert_eq!(segs, vec![(2, 3)]);
+    }
+
+    #[test]
+    fn expressway_segments_tolerates_rounding_within_two_micro_degrees() {
+        // 丸め誤差(±2マイクロ度≒0.2m)は一致とみなす
+        let body = br_body(&[
+            (139_702_001, 35_689_999, "100", "highway=motorway"),
+        ]);
+        let (m, segs) = expressway_segments(&body, &sample_pts());
+        assert!((m - 100.0).abs() < 1e-9);
+        assert_eq!(segs, vec![(0, 1)]);
+    }
+
+    #[test]
+    fn expressway_polylines_maps_ranges_to_point_lists() {
+        let pts = sample_pts();
+        // 正常な範囲は pts[a..=b] と同じ点列
+        let got = expressway_polylines(&pts, &[(1, 3)]);
+        assert_eq!(got, vec![pts[1..=3].to_vec()]);
+        // pts の範囲外を含む範囲は除外
+        assert!(expressway_polylines(&pts, &[(1, 99)]).is_empty());
+        // 2点未満(始点=終点、逆順)になる範囲は除外
+        assert!(expressway_polylines(&pts, &[(2, 2)]).is_empty());
+        assert!(expressway_polylines(&pts, &[(3, 1)]).is_empty());
+        // 複数範囲はそのまま複数の点列になる
+        assert_eq!(expressway_polylines(&pts, &[(0, 1), (3, 5)]).len(), 2);
     }
 
     #[test]
@@ -786,30 +1046,77 @@ mod tests {
         }
     }
 
+    // テスト用の RouteResult。距離・時間・高速区間だけを差し替える。
+    fn rr(dist_m: f64, time_s: f64, hw_m: f64, hw_segments: Vec<(usize, usize)>, via_google: bool) -> RouteResult {
+        RouteResult { pts: vec![], ele: vec![], dist_m, time_s, hw_m, hw_segments, ascend_m: 0.0, via_google }
+    }
+
     #[test]
     fn route_summary_marks_google_source() {
-        let g = RouteResult { pts: vec![], ele: vec![], dist_m: 261865.0, time_s: 11232.0, hw_m: 0.0, ascend_m: 0.0, via_google: true };
+        let g = rr(261865.0, 11232.0, 0.0, vec![], true);
         assert!(route_summary("highway", &g).contains("(Google経由)"));
-        let b = RouteResult { pts: vec![], ele: vec![], dist_m: 1000.0, time_s: 60.0, hw_m: 0.0, ascend_m: 0.0, via_google: false };
+        let b = rr(1000.0, 60.0, 0.0, vec![], false);
         assert!(!route_summary("highway", &b).contains("(Google経由)"));
+    }
+
+    #[test]
+    fn route_summary_shows_segment_count_only_when_two_or_more() {
+        // 1区間では区間数を出さない(従来通りの表示)
+        let one = rr(90000.0, 3600.0, 54738.0, vec![(95, 854)], false);
+        let s = route_summary("highway", &one);
+        assert!(s.contains("高速54.7km ¥1642概算"), "{s}");
+        assert!(!s.contains("区間"), "1区間では区間数を出さない: {s}");
+        // 2区間以上で「(N区間)」が付く
+        let two = rr(49291.0, 3000.0, 32294.0, vec![(95, 311), (628, 897)], false);
+        let s2 = route_summary("highway", &two);
+        assert!(s2.contains("高速32.3km(2区間) ¥969概算"), "{s2}");
+        // hw_m <= 50.0 では高速の表示自体が出ない(区間が入っていても出さない)
+        let short = rr(1000.0, 60.0, 50.0, vec![(0, 3), (5, 9)], false);
+        let s3 = route_summary("highway", &short);
+        assert!(!s3.contains("概算"), "{s3}");
+        assert!(!s3.contains("区間"), "{s3}");
     }
 
     #[test]
     fn should_persist_route_cache_rejects_google_fallback_results() {
         // Googleフォールバック結果をキャッシュしてしまうと、BRouterの一時的失敗が
         // 永久に固定表示され続ける事故になる(2026/08/17)。
-        let g = RouteResult { pts: vec![], ele: vec![], dist_m: 1.0, time_s: 1.0, hw_m: 0.0, ascend_m: 0.0, via_google: true };
-        assert!(!should_persist_route_cache(&g));
-        let b = RouteResult { pts: vec![], ele: vec![], dist_m: 1.0, time_s: 1.0, hw_m: 0.0, ascend_m: 0.0, via_google: false };
-        assert!(should_persist_route_cache(&b));
+        assert!(!should_persist_route_cache(&rr(1.0, 1.0, 0.0, vec![], true)));
+        assert!(should_persist_route_cache(&rr(1.0, 1.0, 0.0, vec![], false)));
     }
 
     #[test]
     fn route_result_serde_back_compat() {
-        // via_google が無い旧キャッシュJSONも #[serde(default)] で false として読める
+        // via_google / hw_segments が無い旧キャッシュJSONも #[serde(default)] で読める
         let old = r#"{"pts":[],"ele":[],"dist_m":0.0,"time_s":0.0,"hw_m":0.0,"ascend_m":0.0}"#;
         let r: RouteResult = serde_json::from_str(old).expect("旧JSONが読めること");
         assert!(!r.via_google);
+        assert!(r.hw_segments.is_empty());
+        // 新形式は往復して同じ内容に戻る
+        let saved = serde_json::to_string(&rr(1.0, 1.0, 100.0, vec![(1, 3)], false)).unwrap();
+        let back: RouteResult = serde_json::from_str(&saved).unwrap();
+        assert_eq!(back.hw_segments, vec![(1, 3)]);
+    }
+
+    #[test]
+    fn route_cache_key_carries_schema_version() {
+        // ルートキャッシュは期限を持たないので、RouteResult の作り方を変えたら
+        // スキーマ版で旧ファイルを読まないようにする(hw_segments が空のまま読まれると
+        // 「距離は出るのに色が出ない」状態が消えずに残る)。
+        let wps = [(35.690000, 139.701812), (35.255000, 139.152000)];
+        let key = route_cache_key(ROUTE_CACHE_SCHEMA, &wps, "highway", 0, "");
+        assert!(key.starts_with("v2|car-fast|0|"), "スキーマ版がキー先頭に入る: {key}");
+        // 版が違えば別のキー=別のファイル名になる(=旧キャッシュを拾わない)
+        let old_key = route_cache_key("v1", &wps, "highway", 0, "");
+        assert_ne!(key, old_key);
+        assert_ne!(route_cache_file_name(&key), route_cache_file_name(&old_key));
+        // 実際のパスも現行スキーマ版のファイル名になっている
+        if let Some(p) = route_cache_path(&wps, "highway", 0, "") {
+            assert_eq!(p.file_name().unwrap().to_string_lossy(), route_cache_file_name(&key));
+        }
+        // 従来通り profile で正規化され、nogos の違いは別キーになる
+        assert_eq!(key, route_cache_key(ROUTE_CACHE_SCHEMA, &wps, "fast", 0, ""));
+        assert_ne!(key, route_cache_key(ROUTE_CACHE_SCHEMA, &wps, "highway", 0, "139.7,35.6,100"));
     }
 
     // ---- 曲がり角(ターンバイターン) ----
@@ -1121,5 +1428,27 @@ mod tests {
             println!("status={code} body={}", resp.into_string().unwrap_or_default());
         }
         assert!(ok, "現状のNOGO_MAX_COUNT({NOGO_MAX_COUNT})でBRouterが失敗するなら要修正");
+    }
+
+    // 実ネットワークを叩く手動確認用(CIでは走らない)。新宿→小田原(car-fast)は実測で
+    // 高速1区間(インデックス95〜854・54,738m)になる。BRouterの出力形式が変わって位置特定が
+    // 効かなくなったらここで気付ける。`cargo test --release -- --ignored --nocapture`で実行。
+    #[test]
+    #[ignore]
+    fn live_expressway_segments_match_hw_meters_for_shinjuku_odawara() {
+        let url = "https://brouter.de/brouter?lonlats=139.701812,35.689780|139.152000,35.255000&profile=car-fast&alternativeidx=0&format=geojson";
+        let body = ureq::get(url)
+            .set("User-Agent", "termmap/0.1 (personal experiment)")
+            .timeout(std::time::Duration::from_secs(30)).call()
+            .expect("BRouter応答").into_string().expect("本文");
+        let pts = parse_geojson_line(&body).expect("geometry");
+        let (hw_m, segs) = expressway_segments(&body, &pts);
+        println!("pts={} hw_m={hw_m} segs={segs:?}", pts.len());
+        assert!(hw_m > 1000.0, "高速を通るルートのはず: hw_m={hw_m}");
+        assert_eq!(segs.len(), 1, "実測では1区間: {segs:?}");
+        // 範囲の点列をhaversineで測った長さは、BRouterのDistance合計と概ね一致する
+        // (実測の差は77.7kmに対し7m)。5%まで許容する。
+        let sum: f64 = expressway_polylines(&pts, &segs).iter().map(|p| polyline_len(p)).sum();
+        assert!((sum - hw_m).abs() / hw_m < 0.05, "区間長{sum} と hw_m {hw_m} が乖離");
     }
 }
