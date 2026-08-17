@@ -35,6 +35,22 @@ pub const DEFAULT_POPULATION_YEAR: u16 = 2025;
 pub const POPULATION_YEARS: [u16; 11] =
     [2020, 2025, 2030, 2035, 2040, 2045, 2050, 2055, 2060, 2065, 2070];
 
+/// `image_settle_low_res` が有効なとき、地図の移動中に許す解像度の上限(zoom の上乗せ段数)。
+/// 0 = scale1(横 map_cols / 縦 map_rows*2 px)まで落とす / 1 = mid 相当で止める。
+///
+/// docs/web-pan-smoothness-design.md §5.3 C-3 の見直し結果。設計は「1段だけ下げる
+/// (high→mid、mid→mid)」つまりここを 1 にする案を挙げているが、0 のままにしてある。
+/// 理由は2つ:
+///   - 実画像モードは PNG エンコードが重く、設計 §2.2 の実測で 30 回のパンに対し 7 コマ程度しか
+///     生成できない。mid は 1 コマ 75,747 B あり、移動中の解像度を上げるとコマ数がさらに落ちる。
+///     既定は mid なので、1 にすると既定の利用者にとって image_settle_low_res が何もしない設定になる。
+///   - 設計 §5.1 の対策A(サブピクセル切り出し)を入れたことで、移動中の scale1 でも 1/8 出力
+///     ピクセル単位で滑らかに動くようになった。§3.4 が問題にしていた「滑らかさが要る瞬間に
+///     一番粗い状態になる」は、解像度ではなく切り出しの側で解けている。
+/// 設計 §5.3 の結び「実画像モードは静止して見る用と位置づけ、ドラッグの滑らかさは AA モード側で
+/// 解くのが素直」に沿う判断。実機で移動中の粗さが気になるようなら 1 へ上げて比べる。
+pub const IMAGE_SETTLE_DELTA_CAP: u32 = 0;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub llm_recommend_enabled: bool,
@@ -54,7 +70,7 @@ pub struct Config {
     pub mono: bool,
     pub image_mode: bool,            // インライン画像(iTerm2 OSC1337)で実画像を描画。既定OFF(AA描画)
     pub image_res: String,           // 実画像モードの解像度: "high"(scale4)/"mid"(scale2)/"low"(scale1)。既定mid
-    pub image_settle_low_res: bool,  // 実画像モードで地図移動中は低解像度に落とすか。既定true(OFFなら常に設定解像度を維持)
+    pub image_settle_low_res: bool,  // 実画像モードで地図移動中は低解像度に落とすか。既定true(OFFなら常に設定解像度を維持。落とす先は IMAGE_SETTLE_DELTA_CAP)
     pub cross_color_idx: u8,         // 中心十字(クロスヘア)の色。spots::SPOT_PALETTEのindex(0..10循環)。既定2(金/従来の黄に近い)
     pub google_maps_api_key: String, // Google Maps系(Geocoding検索/Street View)共通キー。旧streetview_api_keyから改名
     pub streetview_enabled: bool,     // 実写(i)を使うか
