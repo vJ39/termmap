@@ -13,7 +13,7 @@ use crate::poi::*;
 use crate::route::*;
 use crate::share::*;
 use crate::spots::*;
-use crate::textedit::{edit_line, form_cur};
+use crate::textedit::edit_line;
 use crate::tiles::TileLoader;
 use crate::ui_helpers::*;
 use crate::uistate::UiState;
@@ -39,135 +39,18 @@ pub(crate) fn dispatch(st: &mut UiState, k: KeyEvent, cx: &KeyCtx, out: &mut dyn
     let KeyCtx { a, lat, lon, nogos: route_nogos, ow, oh, .. } = *cx;
     let cur = std::mem::replace(&mut st.focus, Focus::Map);
     match cur {
-        Focus::Search(mut buf) => match k.code {
-            KeyCode::Enter => { // 候補を一覧表示(左袖)。Enterで移動/s e vで経路点
-                let q = buf.trim().to_string();
-                if !q.is_empty() {
-                    // provider は Google キーの有無で分ける(キーあり=Google優先"g"/無し=Nominatim"n")。言語は ja 固定。
-                    let provider = if st.cfg.google_maps_api_key.trim().is_empty() { "n" } else { "g" };
-                    let ckey = searchcache::make_key(provider, "ja", &q, lat, lon);
-                    // キャッシュヒットは即適用(同期)。ミス時のみ別スレッドで検索(通信/サーバ障害は0件と区別)。
-                    // ヒット時は last_used を更新(LRU破棄の基準。次回 save 時に永続化される)。
-                    let hit = st.scache.get_mut(&ckey).map(|e| { e.last_used_at = searchcache::now_secs(); e.results.clone() });
-                    if let Some(v) = hit {
-                        if v.is_empty() { st.snd.play("error"); st.addr = format!("見つからない: {q}"); }
-                        else {
-                            st.pois = v.into_iter().take(8).map(|(la, lo, nm)| (la, lo, nm, PoiCat::Waypoint)).collect();
-                            st.poi_sel = 0;
-                            st.poi_label = format!("検索:{q}");
-                            set_markers(&mut st.spec, &st.wps, &st.pois);
-                            st.focus = Focus::PoiList;
-                        }
-                    } else {
-                        let q2 = q.clone(); let ckey2 = ckey.clone();
-                        let key = st.cfg.google_maps_api_key.clone();
-                        let (tx, rx) = std::sync::mpsc::channel();
-                        std::thread::spawn(move || {
-                            let r = geocode_list(&q2, Some((lat, lon)), &key).map_err(|e| e.to_string());
-                            let _ = tx.send((ckey2, q2, r));
-                        });
-                        st.search_job = Some(rx);
-                        st.focus = Focus::Map; // UIは生きたまま(スピナー表示・Escで中断)
-                    }
-                }
-            }
-            KeyCode::Esc => { st.snd.play("back"); }
-            other => { edit_line(&mut buf, &mut st.input_cur, other); st.focus = Focus::Search(buf); } // ←→/文字/BS/Del/Home/End
-        },
+        Focus::Search(buf) => ui_keys_poi::search(st, k, buf, cx.lat, cx.lon),
         Focus::SpotCatList => ui_keys_spots::spot_cat_list(st, k, out),
         Focus::Settings => ui_keys_settings::settings(st, k, cx.nogos, out),
         Focus::SettingsEdit(idx, buf) => ui_keys_settings::settings_edit(st, k, idx, buf),
-        Focus::RoadSearch(mut buf) => match k.code { // 道路名/ref で現在view内をルート化
-            KeyCode::Enter => {
-                let name = buf.trim().to_string();
-                if !name.is_empty() {
-                    let (n_lat, w_lon) = pixel_to_deg(st.cx - ow as f64 / 2.0, st.cy - oh as f64 / 2.0, st.z);
-                    let (s_lat, e_lon) = pixel_to_deg(st.cx + ow as f64 / 2.0, st.cy + oh as f64 / 2.0, st.z);
-                    let (tx, rx) = std::sync::mpsc::channel();
-                    let name2 = name.clone();
-                    std::thread::spawn(move || {
-                        let r = roadsearch::fetch(&name2, s_lat, w_lon, n_lat, e_lon);
-                        let _ = tx.send((name2, r));
-                    });
-                    st.road_job = Some(rx);
-                    st.focus = Focus::Map; // UIは生きたまま(スピナー表示・Escで中断)
-                }
-            }
-            KeyCode::Esc => { st.snd.play("back"); }
-            other => { edit_line(&mut buf, &mut st.input_cur, other); st.focus = Focus::RoadSearch(buf); }
-        },
-        Focus::Recommend(mut buf) => match k.code { // おすすめ: 方向性→claude -p→実在確認→候補一覧
-            KeyCode::Enter => {
-                let dir = buf.trim().to_string();
-                if !dir.is_empty() {
-                    // AI提案→実在確認(geocode)ループを別スレッドで回し、検証済みスポット列を返す。
-                    let cmd = st.cfg.llm_command.clone();
-                    let model = st.cfg.llm_model.clone();
-                    let key = st.cfg.google_maps_api_key.clone();
-                    let (tx, rx) = std::sync::mpsc::channel();
-                    std::thread::spawn(move || {
-                        let payload: Result<Vec<(f64, f64, String)>, String> = match recommend::recommend(&cmd, &model, &dir) {
-                            Ok(recs) => {
-                                let mut verified: Vec<(f64, f64, String)> = Vec::new();
-                                for r in recs.iter().take(8) {
-                                    let q = if r.area.is_empty() { r.name.clone() } else { format!("{} {}", r.area, r.name) };
-                                    if let Ok((la, lo)) = geocode(&q, Some((lat, lon)), &key) {
-                                        verified.push((la, lo, r.name.clone()));
-                                    }
-                                }
-                                Ok(verified)
-                            }
-                            Err(e) => Err(e),
-                        };
-                        let _ = tx.send(payload);
-                    });
-                    st.recommend_job = Some(rx);
-                    st.focus = Focus::Map; // UIは生きたまま(スピナー表示・Escで中断)
-                }
-            }
-            KeyCode::Esc => { st.snd.play("back"); }
-            other => { edit_line(&mut buf, &mut st.input_cur, other); st.focus = Focus::Recommend(buf); }
-        },
+        Focus::RoadSearch(buf) => ui_keys_poi::road_search(st, k, buf, cx.ow, cx.oh),
+        Focus::Recommend(buf) => ui_keys_poi::recommend(st, k, buf, cx.lat, cx.lon),
         Focus::SpotList => ui_keys_spots::spot_list(st, k),
         Focus::SpotEditName(buf, gi) => ui_keys_spots::spot_edit_name(st, k, buf, gi),
         Focus::NewCat(buf) => ui_keys_spots::new_cat(st, k, buf),
         Focus::SpotRename(buf, idx) => ui_keys_spots::spot_rename(st, k, buf, idx),
         Focus::SpotForm { name, url, field } => ui_keys_spots::spot_form(st, k, name, url, field, cx.lat, cx.lon),
-        Focus::PoiKindForm { mut label, mut tag, mut field } => match k.code { // 目的地カテゴリの新規追加フォーム
-            KeyCode::Up | KeyCode::BackTab => { field = (field + 3) % 4; st.input_cur = form_cur(&label, &tag, field); st.focus = Focus::PoiKindForm { label, tag, field }; }
-            KeyCode::Down | KeyCode::Tab => { field = (field + 1) % 4; st.input_cur = form_cur(&label, &tag, field); st.focus = Focus::PoiKindForm { label, tag, field }; }
-            KeyCode::Esc => { st.snd.play("back"); st.focus = Focus::PoiMenu; }
-            KeyCode::Enter => match field {
-                0 => { field = 1; st.input_cur = tag.chars().count(); st.focus = Focus::PoiKindForm { label, tag, field }; }
-                1 => { field = 2; st.input_cur = 0; st.focus = Focus::PoiKindForm { label, tag, field }; }
-                3 => st.focus = Focus::PoiMenu, // [戻る]
-                _ => { // 2 = [追加]
-                    let label_in = poi_kind_clean(label.trim());
-                    let t = tag.trim();
-                    let parts: Vec<&str> = t.splitn(2, '=').collect();
-                    let bad_char = |s: &str| s.contains('"') || s.contains('\\') || s.contains('\n');
-                    if label_in.is_empty() { st.addr = "表示名を入力してください".into(); st.focus = Focus::PoiKindForm { label, tag, field }; }
-                    else if parts.len() != 2 || parts[0].trim().is_empty() || parts[1].trim().is_empty() || bad_char(t) {
-                        st.addr = "OSMタグは key=value 形式(例: shop=bakery)".into();
-                        st.focus = Focus::PoiKindForm { label, tag, field };
-                    } else {
-                        let (tk, tv) = (parts[0].trim(), parts[1].trim());
-                        let key = next_free_key(&st.poi_kinds);
-                        let kind = PoiKind { key, label: label_in.clone(), filter: format!("nwr[\"{tk}\"=\"{tv}\"]"), cat: PoiCat::Other };
-                        st.poi_kinds.push(kind);
-                        let _ = save_poi_kinds(&st.poi_kinds);
-                        st.snd.play("confirm");
-                        st.addr = format!("カテゴリ追加: {label_in} ({key})");
-                        st.focus = Focus::PoiMenu;
-                    }
-                }
-            },
-            other => {
-                if field == 0 { edit_line(&mut label, &mut st.input_cur, other); }
-                else if field == 1 { edit_line(&mut tag, &mut st.input_cur, other); }
-                st.focus = Focus::PoiKindForm { label, tag, field };
-            }
-        },
+        Focus::PoiKindForm { label, tag, field } => ui_keys_poi::poi_kind_form(st, k, label, tag, field),
         Focus::WanderForm { mut dist_km } => match k.code { // おまかせ周回: 距離ゲージ
             KeyCode::Left | KeyCode::Right => {
                 let step = if k.modifiers.contains(KeyModifiers::SHIFT) { 20.0 } else { 5.0 };
@@ -190,113 +73,9 @@ pub(crate) fn dispatch(st: &mut UiState, k: KeyEvent, cx: &KeyCtx, out: &mut dyn
             }
             _ => st.focus = Focus::WanderForm { dist_km },
         },
-        Focus::NearSearch(mut buf) => match k.code {
-            KeyCode::Enter => {
-                let q = buf.trim().to_string();
-                if !q.is_empty() {
-                    // Overpass(遅い)を別スレッドへ。viewbox境界を先に確定して渡す。★マージは結果適用側で行う。
-                    let (vt, vl) = pixel_to_deg(st.cx - ow as f64 * 1.25, st.cy - oh as f64 * 1.25, st.z);
-                    let (vb, vr) = pixel_to_deg(st.cx + ow as f64 * 1.25, st.cy + oh as f64 * 1.25, st.z);
-                    let rlat = 2.0 / 111.0;
-                    let rlon = 2.0 / (111.0 * lat.to_radians().cos().abs().max(0.1));
-                    let (south, west) = (vb.min(lat - rlat), vl.min(lon - rlon));
-                    let (north, east) = (vt.max(lat + rlat), vr.max(lon + rlon));
-                    let q2 = q.clone();
-                    let (tx, rx) = std::sync::mpsc::channel();
-                    std::thread::spawn(move || {
-                        let v = search_nearby(&q2, south, west, north, east);
-                        let _ = tx.send((q2, v));
-                    });
-                    st.near_job = Some(rx);
-                    st.focus = Focus::Map; // UIは生きたまま(スピナー表示・Escで中断)
-                }
-            }
-            KeyCode::Esc => { st.snd.play("back"); }
-            other => { edit_line(&mut buf, &mut st.input_cur, other); st.focus = Focus::NearSearch(buf); }
-        },
-        Focus::PoiMenu => match k.code {
-            KeyCode::Esc => {}
-            KeyCode::Up | KeyCode::Char('w') => { st.snd.play("click"); st.poimenu_sel = st.poimenu_sel.saturating_sub(1); st.focus = Focus::PoiMenu; }
-            KeyCode::Down | KeyCode::Char('s') => { st.snd.play("click"); if st.poimenu_sel + 1 <= st.poi_kinds.len() { st.poimenu_sel += 1; } st.focus = Focus::PoiMenu; }
-            KeyCode::Char('/') => { st.input_cur = 0; st.focus = Focus::NearSearch(String::new()); }
-            KeyCode::Char('n') => { st.input_cur = 0; st.focus = Focus::PoiKindForm { label: String::new(), tag: String::new(), field: 0 }; } // 新規カテゴリ追加
-            KeyCode::Char('[') if st.poimenu_sel > 0 && st.poimenu_sel < st.poi_kinds.len() => {
-                st.poi_kinds.swap(st.poimenu_sel, st.poimenu_sel - 1); st.poimenu_sel -= 1;
-                let _ = save_poi_kinds(&st.poi_kinds);
-                st.focus = Focus::PoiMenu;
-            }
-            KeyCode::Char(']') if st.poimenu_sel + 1 < st.poi_kinds.len() => {
-                st.poi_kinds.swap(st.poimenu_sel, st.poimenu_sel + 1); st.poimenu_sel += 1;
-                let _ = save_poi_kinds(&st.poi_kinds);
-                st.focus = Focus::PoiMenu;
-            }
-            KeyCode::Char('x') if st.poimenu_sel < st.poi_kinds.len() => {
-                let removed = st.poi_kinds.remove(st.poimenu_sel);
-                if st.poimenu_sel >= st.poi_kinds.len() && st.poimenu_sel > 0 { st.poimenu_sel -= 1; }
-                let _ = save_poi_kinds(&st.poi_kinds);
-                st.addr = format!("カテゴリ削除: {}", removed.label);
-                st.focus = Focus::PoiMenu;
-            }
-            KeyCode::Enter | KeyCode::Char(_) => {
-                // Enter=選択行 / キー1文字=対応カテゴリ。最終行(=poi_kinds.len())はキーワード周辺検索。
-                let idx = if let KeyCode::Char(c) = k.code { st.poi_kinds.iter().position(|kk| kk.key == c) } else { Some(st.poimenu_sel) };
-                match idx {
-                    Some(i) if i >= st.poi_kinds.len() => { st.input_cur = 0; st.focus = Focus::NearSearch(String::new()); }
-                    Some(i) => {
-                        let kind = st.poi_kinds[i].clone();
-                        let label = kind.label.clone();
-                        // 中心・ズームは先に取り出す(&mut UiState 越しだと move クロージャが
-                        // st ごと持って行こうとするため。読む値も読む時点も変わらない)。
-                        let (mcx, mcy, mz) = (st.cx, st.cy, st.z);
-                        let (tx, rx) = std::sync::mpsc::channel();
-                        std::thread::spawn(move || {
-                            let r = poi_search(&kind, mcx, mcy, mz, ow, oh, lat, lon);
-                            let _ = tx.send((label, r));
-                        });
-                        st.catpoi_job = Some(rx);
-                        st.focus = Focus::Map; // UIは生きたまま(スピナー表示・Escで中断)
-                    }
-                    None => st.focus = Focus::PoiMenu,
-                }
-            }
-            _ => st.focus = Focus::PoiMenu,
-        },
-        Focus::PoiList => match k.code {
-            KeyCode::Up | KeyCode::Char('w') => { st.snd.play("click"); st.poi_sel = st.poi_sel.saturating_sub(1); if let Some(p) = st.pois.get(st.poi_sel) { let (nx, ny) = deg_to_pixel(p.0, p.1, st.z); st.cx = nx; st.cy = ny; } st.focus = Focus::PoiList; } // 選択に地図追従
-            KeyCode::Down | KeyCode::Char('s') => { st.snd.play("click"); if st.poi_sel + 1 < st.pois.len() { st.poi_sel += 1; } if let Some(p) = st.pois.get(st.poi_sel) { let (nx, ny) = deg_to_pixel(p.0, p.1, st.z); st.cx = nx; st.cy = ny; } st.focus = Focus::PoiList; }
-            KeyCode::Left | KeyCode::Char('a') => { st.cx -= (oh as f64 / 8.0).max(1.0); st.focus = Focus::PoiList; } // ←→/hjklで地図を微パン(一覧選択は動かさない)
-            KeyCode::Right | KeyCode::Char('d') => { st.cx += (oh as f64 / 8.0).max(1.0); st.focus = Focus::PoiList; }
-            KeyCode::Char('h') => { st.cx -= (oh as f64 / 8.0).max(1.0); st.focus = Focus::PoiList; }
-            KeyCode::Char('l') => { st.cx += (oh as f64 / 8.0).max(1.0); st.focus = Focus::PoiList; }
-            KeyCode::Char('k') => { st.cy -= (oh as f64 / 8.0).max(1.0); st.focus = Focus::PoiList; }
-            KeyCode::Char('j') => { st.cy += (oh as f64 / 8.0).max(1.0); st.focus = Focus::PoiList; }
-            KeyCode::Char('+') | KeyCode::Char('=') => { if st.z < 19 { st.z += 1; st.cx *= 2.0; st.cy *= 2.0; st.restart_prefetch_on_zoom(); } st.focus = Focus::PoiList; } // +/-でズーム
-            KeyCode::Char('-') | KeyCode::Char('_') => { if st.z > 2 { st.z -= 1; st.cx /= 2.0; st.cy /= 2.0; st.restart_prefetch_on_zoom(); } st.focus = Focus::PoiList; }
-            KeyCode::Enter => { // 選択地点へ移動(明示)
-                if let Some(p) = st.pois.get(st.poi_sel) { let (nx, ny) = deg_to_pixel(p.0, p.1, st.z); st.cx = nx; st.cy = ny; }
-                st.focus = Focus::PoiList;
-            }
-            KeyCode::Char('v') => { // 選択地点をルートに追加(末尾)
-                if let Some(p) = st.pois.get(st.poi_sel) {
-                    st.snd.play("pop");
-                    wp_add(&mut st.wps, (p.0, p.1));
-                    let (n_, j_) = trigger_route(&mut st.spec, &st.wps, &st.pois, &st.mode, 0, &st.cfg.google_maps_api_key, &route_nogos); st.route_note = n_; st.route_job = j_;
-                    st.addr = format!("地点を追加 #{}", st.wps.len());
-                }
-                st.focus = Focus::PoiList;
-            }
-            KeyCode::Char('f') => st.focus = Focus::PoiMenu,
-            KeyCode::Char('P') => { // 選択結果をお気に入りスポットに登録(カテゴリを選ばせる)
-                if let Some(p) = st.pois.get(st.poi_sel) {
-                    if st.spot_cats.is_empty() { let _ = ensure_spot_cat("お気に入り", &mut st.spot_cats); }
-                    st.pending_spot = Some((p.0, p.1, p.2.clone()));
-                    st.cat_sel = 0;
-                    st.focus = Focus::SpotCatList;
-                } else { st.focus = Focus::PoiList; }
-            }
-            KeyCode::Esc => { st.pois.clear(); set_markers(&mut st.spec, &st.wps, &st.pois); }
-            _ => st.focus = Focus::PoiList,
-        },
+        Focus::NearSearch(buf) => ui_keys_poi::near_search(st, k, buf, cx),
+        Focus::PoiMenu => ui_keys_poi::poi_menu(st, k, cx),
+        Focus::PoiList => ui_keys_poi::poi_list(st, k, cx.oh, cx.nogos),
         Focus::SaveName(mut buf) => match k.code {
             KeyCode::Enter => {
                 let name = buf.trim().to_string();

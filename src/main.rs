@@ -32,6 +32,7 @@ mod ui_jobs;    // バックグラウンドジョブの結果取り込み(毎フ
 mod ui_keys;    // Focusごとのキー処理(画面ごとの分岐)
 mod ui_keys_settings; // 設定画面のキー処理
 mod ui_keys_spots;    // マイスポット(カテゴリ/一覧/登録フォーム/ピッカー)のキー処理
+mod ui_keys_poi;      // 探して候補を出す画面(地名/道路名/AIおすすめ/目的地カテゴリ/周辺検索)のキー処理
 mod ui_helpers; // interactive() の外にあった小さなヘルパー群
 mod focus;      // 対話UIの画面状態(Focus)
 #[allow(dead_code)] // ui.rs への配線(OSC 9997 送出)はこれから
