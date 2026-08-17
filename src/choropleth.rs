@@ -13,7 +13,7 @@ use crate::disaster::{self, DisasterKind, DisasterSite};
 use crate::geo::{deg_to_pixel, pixel_to_deg};
 use crate::geopoly;
 use crate::muni::MuniArea;
-use crate::render::{fill_rings_rgba, stroke_rings_rgba};
+use crate::render::fill_rings_rgba;
 use image::RgbaImage;
 use std::collections::HashMap;
 
@@ -29,17 +29,19 @@ pub const DEFAULT_OPACITY: f64 = 0.45;
 /// 6なら 6x6=36画素に1点で、braille のセル(2x4画素)4〜5個に1点に収まる。
 pub const STIPPLE_SPACING: u32 = 6;
 
-/// 縁取りのアルファ。件数5段の塗り(disaster::fill_alpha)と別に固定値にするのは、
-/// z14では塗りを出さず縁取りだけで区画を示すため(そこで薄いと境界が読めない)。
-const OUTLINE_ALPHA: u8 = 210;
-
 /// 塗りをどう出すか。`opacity` はこのモジュールでは使わず、呼び出し側が
 /// `render::blend_rgba_over` / `InkLayer` へ渡す濃さとして持ち回る
 /// (層の中身は濃さに依存しないので、濃さを変えてもラスタライズし直す必要が無い)。
+///
+/// 硬い輪郭線(旧・stroke_rings_rgba)は廃止した。市区町村1区域が19px程度まで縮む広域
+/// ズームでは、1px幅の縁取りだけで面積の1割前後を占めてしまい、輪郭が塗りより目立って
+/// しまう(docs/disaster-choropleth-wide-zoom-design.md §2.5)。代わりに`blur_radius`で
+/// 塗り自体をボックスブラーし、隣接区域の境界を滲ませて見せる(フォントのアンチエイリアシングと
+/// 同じ考え方。docs/disaster-choropleth-unlimited-zoom-design.md §4)。0ならブラー無し。
 pub struct Shading {
     pub opacity: f64,
     pub fill: bool,
-    pub outline: bool,
+    pub blur_radius: u32,
 }
 
 /// 5桁の市区町村コード → (件数, 最多種別)。
@@ -95,7 +97,7 @@ pub fn build_layer(
     h: u32,
     sh: Shading,
 ) -> Option<RgbaImage> {
-    if w == 0 || h == 0 || (!sh.fill && !sh.outline) {
+    if w == 0 || h == 0 || !sh.fill {
         return None;
     }
     let counts = tally(sites);
@@ -126,16 +128,88 @@ pub fn build_layer(
             })
             .collect();
         let c = kind.color();
-        if sh.fill {
-            fill_rings_rgba(&mut img, &rings, [c[0], c[1], c[2], disaster::fill_alpha(total)]);
-        }
-        if sh.outline {
-            // 塗りの後に引くので、縁取りが塗りの上に乗る。
-            stroke_rings_rgba(&mut img, &rings, [c[0], c[1], c[2], OUTLINE_ALPHA], 1);
-        }
+        fill_rings_rgba(&mut img, &rings, [c[0], c[1], c[2], disaster::fill_alpha(total)]);
         drew = true;
     }
-    drew.then_some(img)
+    if !drew {
+        return None;
+    }
+    if sh.blur_radius > 0 {
+        img = blur_rgba(&img, sh.blur_radius);
+    }
+    Some(img)
+}
+
+/// ズームに応じたブラー半径(px)。広域ほど区域が小さく縁が荒れて見えるため強めに掛ける。
+/// z9未満・fill無効時は呼び出し側で使わない想定なので、範囲外のズームは0(ブラー無し)。
+pub fn blur_radius_for_zoom(z: u32) -> u32 {
+    match z {
+        9 => 3,
+        10 => 2,
+        11 => 1,
+        _ => 0,
+    }
+}
+
+/// RGBA画像に軽いボックスブラーを掛ける(radius=0はimgをそのまま返す)。事前乗算アルファ
+/// (色×アルファ)で平均してから戻すことで、記録の無い市区町村(透明)との境界でも
+/// 黒ずんだ縁(暗いハロー)が出ずに自然に滲む。横→縦の分離ブラーなので
+/// O(w*h*radius)で済む(市区町村の輪郭線を廃止する代わりに使う。設計 §4.1)。
+pub fn blur_rgba(img: &RgbaImage, radius: u32) -> RgbaImage {
+    if radius == 0 {
+        return img.clone();
+    }
+    let (w, h) = img.dimensions();
+    let premult: Vec<[f64; 4]> = img
+        .pixels()
+        .map(|p| {
+            let a = p[3] as f64 / 255.0;
+            [p[0] as f64 * a, p[1] as f64 * a, p[2] as f64 * a, a]
+        })
+        .collect();
+    let h_pass = box_blur_pass(&premult, w as usize, h as usize, radius, true);
+    let v_pass = box_blur_pass(&h_pass, w as usize, h as usize, radius, false);
+    let mut out = RgbaImage::new(w, h);
+    for (i, px) in v_pass.iter().enumerate() {
+        let a = px[3];
+        let (r, g, b) = if a > 1e-6 { (px[0] / a, px[1] / a, px[2] / a) } else { (0.0, 0.0, 0.0) };
+        let x = (i as u32) % w;
+        let y = (i as u32) / w;
+        out.put_pixel(
+            x,
+            y,
+            image::Rgba([r.clamp(0.0, 255.0) as u8, g.clamp(0.0, 255.0) as u8, b.clamp(0.0, 255.0) as u8, (a.clamp(0.0, 1.0) * 255.0) as u8]),
+        );
+    }
+    out
+}
+
+// 事前乗算済みの4チャンネル(r*a,g*a,b*a,a)配列に、1軸ぶんの単純平均(ボックス)ブラーを掛ける。
+fn box_blur_pass(data: &[[f64; 4]], w: usize, h: usize, radius: u32, horizontal: bool) -> Vec<[f64; 4]> {
+    let r = radius as i64;
+    let mut out = vec![[0.0f64; 4]; data.len()];
+    for y in 0..h {
+        for x in 0..w {
+            let mut sum = [0.0f64; 4];
+            let mut count = 0.0f64;
+            for d in -r..=r {
+                let (xx, yy) = if horizontal { (x as i64 + d, y as i64) } else { (x as i64, y as i64 + d) };
+                if xx < 0 || xx >= w as i64 || yy < 0 || yy >= h as i64 {
+                    continue;
+                }
+                let idx = yy as usize * w + xx as usize;
+                for c in 0..4 {
+                    sum[c] += data[idx][c];
+                }
+                count += 1.0;
+            }
+            let idx = y * w + x;
+            for c in 0..4 {
+                out[idx][c] = sum[c] / count;
+            }
+        }
+    }
+    out
 }
 
 /// 中心十字がいる市区町村の名前と件数(ステータス行用)。
@@ -211,7 +285,17 @@ mod tests {
     }
 
     fn shading() -> Shading {
-        Shading { opacity: DEFAULT_OPACITY, fill: true, outline: true }
+        Shading { opacity: DEFAULT_OPACITY, fill: true, blur_radius: 0 }
+    }
+
+    #[test]
+    fn blur_radius_for_zoom_gets_weaker_as_zoom_increases_then_zero() {
+        assert_eq!(blur_radius_for_zoom(9), 3);
+        assert_eq!(blur_radius_for_zoom(10), 2);
+        assert_eq!(blur_radius_for_zoom(11), 1);
+        assert_eq!(blur_radius_for_zoom(12), 0);
+        assert_eq!(blur_radius_for_zoom(13), 0);
+        assert_eq!(blur_radius_for_zoom(8), 0, "z8はfillの対象外なので値は使われないが0で安全側");
     }
 
     fn painted(img: &RgbaImage) -> usize {
@@ -327,31 +411,27 @@ mod tests {
         let sites = vec![site("12208", &[(DisasterKind::Storm, 60)])];
         let areas = vec![area("1220800", "野田市", 35.5, 139.5)];
         let (cx, cy, z, w, h) = window();
-        // 地点が無い / コードが無い / 境界が無い / 寸法ゼロ / 塗りも縁取りもOFF
+        // 地点が無い / コードが無い / 境界が無い / 寸法ゼロ / 塗りOFF
         assert!(build_layer(&[], &refs(&areas), cx, cy, z, w, h, shading()).is_none());
         let nocode = vec![site("", &[(DisasterKind::Storm, 60)])];
         assert!(build_layer(&refs(&nocode), &refs(&areas), cx, cy, z, w, h, shading()).is_none());
         assert!(build_layer(&refs(&sites), &[], cx, cy, z, w, h, shading()).is_none());
         assert!(build_layer(&refs(&sites), &refs(&areas), cx, cy, z, 0, h, shading()).is_none());
-        let off = Shading { opacity: DEFAULT_OPACITY, fill: false, outline: false };
+        let off = Shading { opacity: DEFAULT_OPACITY, fill: false, blur_radius: 0 };
         assert!(build_layer(&refs(&sites), &refs(&areas), cx, cy, z, w, h, off).is_none());
     }
 
     #[test]
-    fn build_layer_can_draw_the_outline_without_the_fill() {
+    fn build_layer_blurs_the_fill_when_blur_radius_is_set() {
         let sites = vec![site("12208", &[(DisasterKind::Storm, 60)])];
         let areas = vec![area("1220800", "野田市", 35.5, 139.5)];
         let (cx, cy, z, w, h) = window();
-        let outline_only = Shading { opacity: DEFAULT_OPACITY, fill: false, outline: true };
-        let a = build_layer(&refs(&sites), &refs(&areas), cx, cy, z, w, h, outline_only).expect("縁取りだけでも層は出る");
-        let both = build_layer(&refs(&sites), &refs(&areas), cx, cy, z, w, h, shading()).expect("塗る対象がある");
-        assert!(painted(&a) > 0, "z14 では縁取りだけで区画を示す");
-        assert!(painted(&a) < painted(&both), "縁取りだけなら塗りより画素が少ない");
-        // 縁取りだけのときは区域の内側が透明。
-        let (gx, gy) = deg_to_pixel(35.55, 139.55, z);
-        let (px, py) = ((gx - (cx - w as f64 / 2.0)) as u32, (gy - (cy - h as f64 / 2.0)) as u32);
-        assert_eq!(a.get_pixel(px, py)[3], 0);
-        assert!(both.get_pixel(px, py)[3] > 0);
+        let sharp = build_layer(&refs(&sites), &refs(&areas), cx, cy, z, w, h, shading()).expect("塗る対象がある");
+        let blurred_sh = Shading { opacity: DEFAULT_OPACITY, fill: true, blur_radius: 3 };
+        let blurred = build_layer(&refs(&sites), &refs(&areas), cx, cy, z, w, h, blurred_sh).expect("塗る対象がある");
+        // ブラーは境界を滲ませて画素数(不透明な画素)を広げる。中身が全く同じなら意味が無い。
+        assert!(painted(&blurred) >= painted(&sharp), "ブラー後に不透明画素が減るのはおかしい");
+        assert_ne!(sharp.as_raw(), blurred.as_raw(), "ブラーで画素が変わっていない");
     }
 
     #[test]
@@ -447,7 +527,7 @@ mod tests {
         let z = 11;
         let (cx, cy) = deg_to_pixel(35.681236, 139.767125, z);
         let (w, h) = (320u32, 200u32);
-        let sh = Shading { opacity: DEFAULT_OPACITY, fill: true, outline: true };
+        let sh = Shading { opacity: DEFAULT_OPACITY, fill: true, blur_radius: 0 };
         let img = build_layer(&site_refs, &area_refs, cx, cy, z, w, h, sh).expect("東京で1区域も塗れないのはおかしい");
         let filled = img.pixels().filter(|p| p[3] > 0).count();
         let coverage = filled as f64 / (w * h) as f64;
@@ -465,14 +545,17 @@ mod tests {
 
     // 広域ズーム(z9)の裏取り。実ネットワークを叩く手動確認用。
     // 「広域なら地方でも見比べられる」(広域版 §0.7)という主張が実データで成り立つかを見る。
+    // 取得自体はdisaster::fetch_sitesを直接1回叩く(plotlayerの1次メッシュ分割は経由しない。
+    // ここで確認したいのは描画側の見え方で、取得のセル分割は無関係)。
     #[test]
     #[ignore]
     fn live_paint_a_wide_zoom_screen_at_z9() {
-        // 最も混む広域セル1309(緯度34.67〜37.33度・経度136〜140度)。東京も岐阜北部もこの中。
-        let cell = crate::mesh::shrink(crate::mesh::wide_bbox(1309));
+        // 最も混む範囲(緯度34.67〜37.33度・経度136〜140度、旧・広域セル1309相当)。
+        // 東京も岐阜北部もこの中に入る。
+        let cell = crate::mesh::shrink((34.666667, 136.0, 37.333333, 140.0));
         let sites = crate::disaster::fetch_sites(cell.0, cell.1, cell.2, cell.3, disaster::DEFAULT_SINCE_YEAR)
             .expect("live fetch should succeed");
-        println!("広域セル1309: 地点 {} 件", sites.len());
+        println!("範囲内: 地点 {} 件", sites.len());
         assert!(
             !crate::disaster::truncation_seen(),
             "2,000行の打ち切りに当たっている(市区町村がまるごと塗られなくなる)"
@@ -493,13 +576,18 @@ mod tests {
         assert!(coverage > 0.5, "都心の z9 画面がほとんど塗られていない: {coverage:.3}");
 
         // 地方(岐阜北部): z11 では画面が1区域=全画面1色になるが、z9 なら複数区域が
-        // 別の色/濃さで並ぶ。縁取りを消して、塗りの値だけで数える。
+        // 別の色/濃さで並ぶ。
         let (cx, cy) = deg_to_pixel(36.24, 137.25, z);
-        let fill_only = Shading { opacity: DEFAULT_OPACITY, fill: true, outline: false };
-        let img = build_layer(&site_refs, &area_refs, cx, cy, z, w, h, fill_only).expect("岐阜北部 z9 で1区域も塗れない");
+        let img = build_layer(&site_refs, &area_refs, cx, cy, z, w, h, shading()).expect("岐阜北部 z9 で1区域も塗れない");
         let shades: std::collections::HashSet<[u8; 4]> =
             img.pixels().filter(|p| p[3] > 0).map(|p| [p[0], p[1], p[2], p[3]]).collect();
         println!("岐阜北部 z9 の塗り分け {} 種類: {shades:?}", shades.len());
         assert!(shades.len() >= 2, "地方の z9 が1色に潰れている: {shades:?}");
+
+        // ブラーを掛けると、輪郭線無しでも隣接区域の境界が滲んで見える
+        // (硬いエッジではなく段階的な変化になる。設計 unlimited-zoom §4)。
+        let blurred_sh = Shading { opacity: DEFAULT_OPACITY, fill: true, blur_radius: 2 };
+        let blurred = build_layer(&site_refs, &area_refs, cx, cy, z, w, h, blurred_sh).expect("岐阜北部 z9 で1区域も塗れない");
+        assert!(painted(&blurred) >= painted(&img), "ブラー後に不透明画素が減るのはおかしい");
     }
 }

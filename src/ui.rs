@@ -346,7 +346,6 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
         // (1区域19px)の両方が成立しないため(広域版 §2.5)。
         let fill_on = st.cfg.disaster_enabled && st.cfg.disaster_fill;
         let choropleth_fill = fill_on && (9..=13).contains(&st.z);
-        let choropleth_outline = fill_on && (9..=14).contains(&st.z);
         // 件数リングは塗りが件数を担っている間は出さない(中心の小さな塊は常に残すので、
         // B キーが何を指しているかは画面から分かる)。
         let disaster_rings = !choropleth_fill;
@@ -545,11 +544,13 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
             st.camera_layer.generation().hash(&mut h);
             st.regulation_layer.generation().hash(&mut h);
             st.disaster_layer.generation().hash(&mut h);
-            // 過去災害の塗り: 境界セルが届くたび、また塗り/縁取りの出し分けが変わるたびに
+            // 過去災害の塗り: 境界セルが届くたび、また塗りの出し分け/ブラー半径が変わるたびに
             // ラスタライズし直す(逆に、パンもズームもしていないフレームでは1回も走らない)。
+            // ブラー半径は地図ズーム(st.z)依存で、choropleth_fillがtrueのままでもz9→z10のように
+            // 変わることがあるため、rzだけでは足りず個別にhashする。
             st.boundary_layer.generation().hash(&mut h);
             choropleth_fill.hash(&mut h);
-            choropleth_outline.hash(&mut h);
+            choropleth::blur_radius_for_zoom(st.z).hash(&mut h);
             disaster_markers.hash(&mut h); // 代表点マーカーの出し分け(z11未満では出さない)
             st.population_layer.generation().hash(&mut h);
             // 人口メッシュ: ON/OFF・年次・濃さを変えたら描き直す(セル表は動かないため generation
@@ -594,10 +595,10 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
                         // 3経路それぞれへ同じ値を渡す。設定行にするのは Stage2。
                         opacity: choropleth::DEFAULT_OPACITY,
                         fill: choropleth_fill,
-                        outline: choropleth_outline,
+                        blur_radius: choropleth::blur_radius_for_zoom(st.z),
                     };
                     let choro_opacity = choro_shading.opacity;
-                    let choro_layer: Option<RgbaImage> = if choropleth_fill || choropleth_outline {
+                    let choro_layer: Option<RgbaImage> = if choropleth_fill {
                         choropleth::build_layer(&disaster_sites, &muni_areas, rcx, rcy, rz, rw, rh, choro_shading)
                     } else { None };
                     // 500mメッシュ人口。人口なし=透明の面レイヤを作る(設計 §7.1)。

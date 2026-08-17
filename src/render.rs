@@ -588,6 +588,9 @@ pub fn fill_rings_rgba(img: &mut RgbaImage, rings: &[Vec<(i32, i32)>], color: [u
 }
 
 // リングの輪郭(縁取り)。塗りより前面・雨雲より背面。リングは閉じている必要はない。
+// 過去災害コロプレスは輪郭線を廃止したため(choropleth.rs参照)、現状呼び出し元は無いが、
+// ポリゴン一般の描画プリミティブとして残す(将来また輪郭付きの面レイヤが要る場合に使う)。
+#[allow(dead_code)]
 pub fn stroke_rings_rgba(img: &mut RgbaImage, rings: &[Vec<(i32, i32)>], color: [u8; 4], thickness: u32) {
     for ring in rings {
         if ring.len() < 2 { continue; }

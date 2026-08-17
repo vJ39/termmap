@@ -147,6 +147,9 @@ pub struct PlotLayer<T> {
     fetch: FetchFn<T>,
     // メモリ上に保持するセル数の上限。1セルの重さがレイヤによって2桁違うのでレイヤごとに持つ。
     max_in_memory: usize,
+    // 1回のジョブで取りに行けるセル数の上限。過去災害/境界だけ usize::MAX(実質無制限)にする
+    // (設計 docs/disaster-choropleth-unlimited-zoom-design.md §3.2)。他レイヤは全て既定値。
+    max_cells_per_job: usize,
     cells: HashMap<String, Cached<T>>,
     // キー → この時刻(epoch秒)までは再取得を試みない。
     retry_after: HashMap<String, u64>,
@@ -176,6 +179,25 @@ impl<T: Serialize + serde::de::DeserializeOwned + PlotItem + Send + 'static> Plo
         cells_for: CellsFn,
         fetch: FetchFn<T>,
     ) -> Self {
+        Self::new_full(layer, min_zoom, data_lag_secs, max_in_memory, MAX_CELLS_PER_JOB, cells_for, fetch)
+    }
+
+    // 1回のジョブで取りに行けるセル数の上限を持たない版。過去災害/境界が使う
+    // (設計 docs/disaster-choropleth-unlimited-zoom-design.md §3.2)。cells_for が返す順序で
+    // 中心から近い順に1個ずつ取得が進む(disaster_cellsのソートに依存する)。
+    fn new_uncapped(layer: Layer, min_zoom: u32, data_lag_secs: u64, cells_for: CellsFn, fetch: FetchFn<T>) -> Self {
+        Self::new_full(layer, min_zoom, data_lag_secs, MAX_CELLS_IN_MEMORY, usize::MAX, cells_for, fetch)
+    }
+
+    fn new_full(
+        layer: Layer,
+        min_zoom: u32,
+        data_lag_secs: u64,
+        max_in_memory: usize,
+        max_cells_per_job: usize,
+        cells_for: CellsFn,
+        fetch: FetchFn<T>,
+    ) -> Self {
         PlotLayer {
             layer,
             min_zoom,
@@ -183,6 +205,7 @@ impl<T: Serialize + serde::de::DeserializeOwned + PlotItem + Send + 'static> Plo
             cells_for,
             fetch,
             max_in_memory,
+            max_cells_per_job,
             cells: HashMap::new(),
             retry_after: HashMap::new(),
             job: None,
@@ -238,7 +261,7 @@ impl<T: Serialize + serde::de::DeserializeOwned + PlotItem + Send + 'static> Plo
             return changed;
         }
         let keys = (self.cells_for)(view_bbox(cx, cy, z));
-        if keys.len() > MAX_CELLS_PER_JOB {
+        if keys.len() > self.max_cells_per_job {
             self.suppressed = true;
             return changed;
         }
@@ -429,21 +452,31 @@ fn boundary_cells(b: Bbox) -> Vec<String> {
     muni::relm_indices(b).iter().map(|i| format!("{BOUNDARY_KEY_PREFIX}{i}")).collect()
 }
 
-// 過去災害のセルキーの接頭辞。1次メッシュのコード(4桁)と広域セルのコード(4桁)は見た目が
-// 同じなので、これが無いと旧キーのキャッシュを別地域の矩形として読んでしまう。
-const DISASTER_KEY_PREFIX: &str = "w";
-
-// 過去災害は1次メッシュを4×4束ねた広域セル単位で取る(mesh::wide_codes)。1次メッシュのままだと
-// z9 の視野に48枚必要で MAX_CELLS_PER_JOB=9 に当たり、広域では1枚も取れなくなる
-// (設計 §2.2)。取得元は広いbboxの集計を1リクエストで返すので、枚数を減らす方が速くて軽い。
-// キーには年代しきい値を足した複合キーにする(例 "w1309_1926"、全期間は "w1309_0")。
-// しきい値を切り替えても別ファイルになって混ざらない。
+// 過去災害は交通量・規制と同じ1次メッシュだが、キーに年代しきい値を足した複合キーにする
+// (例 "5339_1926"、全期間は "5339_0")。しきい値を切り替えても別ファイルになって混ざらない。
+// disaster/boundaryはMAX_CELLS_PER_JOBの上限を持たない(new_uncapped、設計
+// docs/disaster-choropleth-unlimited-zoom-design.md §3.2)ため、広域で1次メッシュが
+// 何十枚要っても取得を止めない。その代わり中心から近い順に並べて返し、spawn_jobが
+// 1個ずつ順に取っていく間、常に「今見ている場所の近く」から埋まるようにする(同 §3.3)。
 fn disaster_cells(b: Bbox) -> Vec<String> {
     let since = disaster_since().max(0);
-    mesh::wide_codes(b.0, b.1, b.2, b.3)
-        .iter()
-        .map(|c| format!("{DISASTER_KEY_PREFIX}{c:04}_{since}"))
-        .collect()
+    let mut codes = mesh::primary_codes(b.0, b.1, b.2, b.3);
+    sort_codes_by_distance_from_center(&mut codes, mesh::primary_bbox, b);
+    codes.iter().map(|c| format!("{c}_{since}")).collect()
+}
+
+// codesを、bの中心に近いセルの中心が先頭になるよう並べ替える(度単位の平面近似で十分。
+// 優先度付けが目的で、厳密な距離は要らない)。
+fn sort_codes_by_distance_from_center(codes: &mut [u32], bbox_of: fn(u32) -> Bbox, view: Bbox) {
+    let center = ((view.0 + view.2) / 2.0, (view.1 + view.3) / 2.0);
+    codes.sort_by(|&a, &b| {
+        let d = |code: u32| {
+            let (s, w, n, e) = bbox_of(code);
+            let c = ((s + n) / 2.0, (w + e) / 2.0);
+            (c.0 - center.0).powi(2) + (c.1 - center.1).powi(2)
+        };
+        d(a).partial_cmp(&d(b)).unwrap_or(std::cmp::Ordering::Equal)
+    });
 }
 
 // 人口メッシュのセルは都道府県まるごと("01"〜"47")。取得元が都道府県単位でしかファイルを
@@ -454,13 +487,10 @@ fn population_cells(b: Bbox) -> Vec<String> {
     population::prefectures_for(b).iter().map(|p| format!("{p:02}")).collect()
 }
 
-// "w1309_1926" → (1309, 1926)。接頭辞が無い旧形式("5339_1926")は弾く。
-// 旧キーは数字として読めてしまうため、素通しすると1次メッシュのコードを広域セルのコードとして
-// 解釈し、まったく別の地域を取りに行く(ディスクには旧形式のファイルが残っている・設計 §2.6)。
+// "5339_1926" → (5339, 1926)。
 fn split_disaster_key(key: &str) -> Result<(u32, i32), String> {
     let bad = || format!("不正なセルキー: {key}");
-    let rest = key.strip_prefix(DISASTER_KEY_PREFIX).ok_or_else(bad)?;
-    let (code, since) = rest.split_once('_').ok_or_else(bad)?;
+    let (code, since) = key.split_once('_').ok_or_else(bad)?;
     let code = code.parse::<u32>().map_err(|_| bad())?;
     let since = since.parse::<i32>().map_err(|_| bad())?;
     Ok((code, since))
@@ -518,7 +548,7 @@ fn fetch_population_cell(key: &str, _scratch: &mut Option<String>) -> Result<Vec
 // コード単位で件数を足して2倍の市区町村ができる(設計 §2.7)。
 fn fetch_disaster_cell(key: &str, _scratch: &mut Option<String>) -> Result<Vec<disaster::DisasterSite>, String> {
     let (code, since) = split_disaster_key(key)?;
-    let (s, w, n, e) = mesh::shrink(mesh::wide_bbox(code));
+    let (s, w, n, e) = mesh::shrink(mesh::primary_bbox(code));
     disaster::fetch_sites(s, w, n, e, since)
 }
 
@@ -564,14 +594,14 @@ pub fn regulation() -> PlotLayer<regulation::ClosureEvent> {
 /// 複合キー単位。取得元が広いbboxの集計を1リクエストで返すので、他レイヤより粗い刻みにしてある
 /// (設計 §2.2)。z11以上でも最大4枚・典型1枚で済み、パンによる再取得も減る。
 pub fn disaster() -> PlotLayer<disaster::DisasterSite> {
-    PlotLayer::new(Layer::Disaster, 9, 0, disaster_cells, fetch_disaster_cell)
+    PlotLayer::new_uncapped(Layer::Disaster, 9, 0, disaster_cells, fetch_disaster_cell)
 }
 
 /// 市区町村境界(気象庁 class20s)。過去災害の塗り(コロプレス)にだけ使うので、ズーム下限は
 /// 過去災害と揃える(片方だけ取れていて塗れない、という状態を作らない)。
 /// 領域は全国で10しかなく、視野に掛かるのは z11 で1〜2枚・z9 でも最大5枚(設計 §0.2)。
 pub fn boundary() -> PlotLayer<muni::MuniArea> {
-    PlotLayer::new(Layer::Boundary, 9, 0, boundary_cells, fetch_boundary_cell)
+    PlotLayer::new_uncapped(Layer::Boundary, 9, 0, boundary_cells, fetch_boundary_cell)
 }
 
 /// 500mメッシュ別推計人口(国土数値情報)。都道府県単位・z11未満では取得しない。
@@ -690,6 +720,10 @@ mod tests {
 
     fn test_layer_capped(cells_for: CellsFn, cap: usize) -> PlotLayer<TestItem> {
         PlotLayer::new_with_cap(Layer::Traffic, 0, 0, cap, cells_for, test_fetch)
+    }
+
+    fn test_layer_uncapped(cells_for: CellsFn, min_zoom: u32) -> PlotLayer<TestItem> {
+        PlotLayer::new_uncapped(Layer::Traffic, min_zoom, 0, cells_for, test_fetch)
     }
 
     #[test]
@@ -997,35 +1031,22 @@ mod tests {
     }
 
     #[test]
-    fn disaster_cells_tag_the_wide_code_with_the_year_threshold() {
+    fn disaster_cells_tag_the_mesh_code_with_the_year_threshold() {
         let (cx, cy) = tokyo_center(12);
-        let cells = disaster_cells(view_bbox(cx, cy, 12));
-        assert!(cells.contains(&format!("w1309_{}", disaster::DEFAULT_SINCE_YEAR)), "{cells:?}");
-        // 広域セル(1次メッシュ4×4束)の格子。接頭辞と接尾辞を外すと mesh::wide_codes と一致する。
-        let bare: Vec<u32> = cells
-            .iter()
-            .map(|k| k.trim_start_matches('w').split('_').next().unwrap().parse().unwrap())
-            .collect();
         let b = view_bbox(cx, cy, 12);
-        assert_eq!(bare, mesh::wide_codes(b.0, b.1, b.2, b.3));
-    }
-
-    // 広域セルのコードは4桁ゼロ詰め(p4・u4 とも 0〜24)。桁が揺れるとキーが別物になるので固定する。
-    #[test]
-    fn disaster_cell_codes_are_zero_padded_to_four_digits() {
-        // 沖縄(26.21,127.68)は p=39 → p4=9 / u=27 → u4=6 なので "w0906_..." になる。
-        let (cx, cy) = deg_to_pixel(26.21, 127.68, 12);
-        let cells = disaster_cells(view_bbox(cx, cy, 12));
-        assert!(cells.contains(&format!("w0906_{}", disaster::DEFAULT_SINCE_YEAR)), "{cells:?}");
-        for k in &cells {
-            let code = k.trim_start_matches('w').split('_').next().unwrap();
-            assert_eq!(code.len(), 4, "コードが4桁でない: {k}");
-        }
+        let cells = disaster_cells(b);
+        assert!(cells.contains(&format!("5339_{}", disaster::DEFAULT_SINCE_YEAR)), "{cells:?}");
+        // 交通量/規制と同じ1次メッシュの格子(接尾辞を外すと primary_cells と同じ集合になる)。
+        let mut got: Vec<u32> = cells.iter().map(|k| k.split('_').next().unwrap().parse().unwrap()).collect();
+        let mut want = mesh::primary_codes(b.0, b.1, b.2, b.3);
+        got.sort_unstable();
+        want.sort_unstable();
+        assert_eq!(got, want);
     }
 
     #[test]
     fn disaster_cell_keys_are_accepted_by_the_disk_cache() {
-        // plotcache::valid_key は英数字と - _ の16文字以内しか許さない("w1309_1926" は10文字)。
+        // plotcache::valid_key は英数字と - _ の16文字以内しか許さない。
         let _env = TestEnv::new("diskey");
         for z in [9u32, 11] {
             let (cx, cy) = tokyo_center(z);
@@ -1041,12 +1062,9 @@ mod tests {
 
     #[test]
     fn split_disaster_key_round_trips_with_disaster_cells() {
-        assert_eq!(split_disaster_key("w1309_1926").unwrap(), (1309, 1926));
-        assert_eq!(split_disaster_key("w0906_0").unwrap(), (906, 0), "全期間・ゼロ詰め");
-        // 旧形式(1次メッシュ)は受け付けない。黙って通すと "5339" を広域コードとして解釈して
-        // まったく別の地域の bbox を取りに行ってしまう。
-        assert!(split_disaster_key("5339_1926").is_err(), "旧形式のキーは弾く");
-        for bad in ["w1309", "", "w_1926", "w1309_", "wabc_1926", "w1309_x", "w1309-1926", "1309_1926"] {
+        assert_eq!(split_disaster_key("5339_1926").unwrap(), (5339, 1926));
+        assert_eq!(split_disaster_key("906_0").unwrap(), (906, 0), "全期間");
+        for bad in ["5339", "", "_1926", "5339_", "abc_1926", "5339_x", "5339-1926"] {
             assert!(split_disaster_key(bad).is_err(), "key={bad:?}");
         }
         // disaster_cells が作るキーは必ず読み戻せる。
@@ -1054,37 +1072,65 @@ mod tests {
         for k in disaster_cells(view_bbox(cx, cy, 11)) {
             let (code, since) = split_disaster_key(&k).unwrap_or_else(|e| panic!("{e}"));
             assert_eq!(since, disaster::DEFAULT_SINCE_YEAR);
-            assert_eq!(mesh::wide_bbox(code), mesh::wide_bbox(code), "コードから矩形が引ける");
+            let _ = mesh::primary_bbox(code); // コードから矩形が引ける(パニックしない)ことの確認
         }
     }
 
-    // 広域セルの必要枚数は z9 が最大で、そこが MAX_CELLS_PER_JOB のちょうど上限になる
-    // (設計 §2.2/§7)。束ねの大きさや VIEW_HALF_PX を後から動かすと黙って取得が止まるので、
-    // この境界はテストで固定する。
+    // 過去災害/境界は MAX_CELLS_PER_JOB の上限を持たない(new_uncapped)。z9で1次メッシュ
+    // 48枚が必要な東京でも、1件も取りに行かず諦める(suppressed)ことなくmissingが積まれる。
+    // 設計 docs/disaster-choropleth-unlimited-zoom-design.md §3.2。
+    // 実際のdisaster()は実ネットワークを叩くfetch_disaster_cellを使うため、ここでは
+    // ten_cells(10件、通常上限9を超える)+test_fetch(モック)の組み合わせで安全に確認する。
     #[test]
-    fn disaster_cells_stay_within_the_job_cap_at_the_zoom_floor() {
-        let places = [
-            (35.68, 139.77, "東京"),
-            (34.69, 135.52, "大阪"),
-            (43.06, 141.35, "札幌"),
-            (26.21, 127.68, "那覇"),
-            (33.59, 130.40, "福岡"),
-            (38.27, 140.87, "仙台"),
-            (36.24, 137.25, "岐阜北部"),
-            (42.42, 142.42, "北海道日高"),
-            (33.73, 135.98, "紀伊半島南部"),
-            (39.72, 140.57, "秋田内陸"),
-        ];
-        for z in [9u32, 10, 11, 12] {
-            for (lat, lon, name) in places {
-                let (cx, cy) = deg_to_pixel(lat, lon, z);
-                let n = disaster_cells(view_bbox(cx, cy, z)).len();
-                assert!(n <= MAX_CELLS_PER_JOB, "z{z} {name} で {n} セル");
-                if z >= 10 {
-                    assert!(n <= 4, "z{z} {name} は4枚以内のはずが {n} セル");
-                }
-            }
-        }
+    fn uncapped_layer_does_not_suppress_when_more_than_the_normal_cap_is_needed() {
+        let _env = TestEnv::new("uncapped");
+        let mut l = test_layer_uncapped(ten_cells, 0);
+        let (cx, cy) = tokyo_center(14);
+        l.tick(cx, cy, 14, true);
+        assert!(!l.suppressed(), "上限無しレイヤは10セル要求でもsuppressedにならない");
+        assert_eq!(l.view_keys.len(), 10, "上限を気にせず全セルをview_keysへ積む");
+    }
+
+    // 実際にz9の東京(48セル)でも同様にsuppressedにならないこと(disaster_cellsの実出力件数で確認)。
+    #[test]
+    fn disaster_cells_exceed_the_normal_job_cap_at_wide_zoom_but_layer_is_uncapped() {
+        let (cx, cy) = tokyo_center(9);
+        let n = disaster_cells(view_bbox(cx, cy, 9)).len();
+        assert!(n > MAX_CELLS_PER_JOB, "z9 東京で {n} セル(通常上限 {MAX_CELLS_PER_JOB} を超えているはず)");
+        let _env = TestEnv::new("uncapped_real_cells");
+        let mut l = test_layer_uncapped(disaster_cells, 0);
+        l.tick(cx, cy, 9, true);
+        assert!(!l.suppressed(), "実際のdisaster_cells件数({n})でもsuppressedにならない");
+        assert_eq!(l.view_keys.len(), n);
+    }
+
+    // 中心から近いセルほど先に来る(取得の優先度)。既知の並びで固定する:
+    // 東京中心の視野では、東京駅を含むメッシュ(5339)が最初に来るはず。
+    #[test]
+    fn disaster_cells_are_ordered_nearest_to_center_first() {
+        let (cx, cy) = tokyo_center(9);
+        let cells = disaster_cells(view_bbox(cx, cy, 9));
+        assert!(cells.len() > 1, "並び順を確認するには2件以上要る: {cells:?}");
+        assert_eq!(cells[0], format!("5339_{}", disaster::DEFAULT_SINCE_YEAR), "先頭は中心を含むメッシュのはず: {cells:?}");
+    }
+
+    #[test]
+    fn sort_codes_by_distance_from_center_orders_nearest_first() {
+        // primary_bboxの実コードで、東京(5339)・大阪(5235)・札幌(6441)相当のものを使う。
+        let mut codes = vec![6441u32, 5235, 5339];
+        let tokyo_view = mesh::primary_bbox(5339);
+        sort_codes_by_distance_from_center(&mut codes, mesh::primary_bbox, tokyo_view);
+        assert_eq!(codes[0], 5339, "視野の中心自身のコードが最初に来るはず: {codes:?}");
+    }
+
+    #[test]
+    fn sort_codes_by_distance_from_center_handles_empty_and_single() {
+        let mut empty: Vec<u32> = Vec::new();
+        sort_codes_by_distance_from_center(&mut empty, mesh::primary_bbox, (35.0, 139.0, 36.0, 140.0));
+        assert!(empty.is_empty());
+        let mut single = vec![5339u32];
+        sort_codes_by_distance_from_center(&mut single, mesh::primary_bbox, (35.0, 139.0, 36.0, 140.0));
+        assert_eq!(single, vec![5339]);
     }
 
     // 6種の実データ型が、実際にディスクへ書いて読み戻せること
@@ -1231,7 +1277,7 @@ mod tests {
     // 数字として読めてしまうため、素通しすると別地域の矩形を取りに行く(設計 §2.6)。
     #[test]
     fn fetch_disaster_cell_rejects_a_key_it_did_not_produce() {
-        for bad in ["", "5339_1926", "w1309", "w_1926", "wxyz_1926", "1309_1926"] {
+        for bad in ["", "5339", "_1926", "5339_", "abc_1926", "5339_x", "5339-1926"] {
             assert!(fetch_disaster_cell(bad, &mut None).is_err(), "key={bad:?}");
         }
     }
