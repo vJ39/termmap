@@ -60,7 +60,7 @@ pub struct Config {
     pub camera_enabled: bool,         // 道路ライブカメラ(road-info-prvs.mlit.go.jp)を地図に重ねるか。既定false(ONにした人だけが外部サービスへ問い合わせる)
     pub regulation_enabled: bool,     // 通行規制(通行止め・車線規制等、road-info-prvs.mlit.go.jp)を地図に重ねるか。既定false(ONにした人だけが外部サービスへ問い合わせる)
     pub disaster_enabled: bool,       // 過去災害の発生履歴(NIED 災害事例データベース)を地図に重ねるか。既定false(ONにした人だけが外部サービスへ問い合わせる)
-    pub route_traffic_enabled: bool,  // ルート確定後、Google Directions(departure_time=now)で渋滞込み所要時間を追加確認するか。既定false(ONにした人だけがGoogle APIへ追加問い合わせする。要Google APIキー・Advanced課金対象)
+    pub route_traffic_enabled: bool,  // ルート確定後、Google Directions(departure_time=now)で区間ごとの渋滞状況を追加確認しルート線を色分けするか。既定false(ONにした人だけがGoogle APIへ追加問い合わせする。要Google APIキー・Advanced課金対象)
 }
 
 impl Default for Config {

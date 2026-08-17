@@ -1,7 +1,7 @@
 // ルーティング (BRouter 公開API)・高速料金/expressway 計算・GPX 出力
 use crate::render::{OverlaySpec, Poi, PoiCat};
 use crate::regulation::{ClosureEvent, RegulationKind};
-use crate::roadtrace::sample_every;
+use crate::roadtrace::{point_at, polyline_len, sample_every};
 use serde::Deserialize;
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -415,7 +415,7 @@ fn project_onto_route(pt: (f64, f64), pts: &[(f64, f64)], cum: &[f64]) -> Option
 }
 
 // origin/destination/waypoints/avoid=highwaysの共通クエリ文字列を組み立てる
-// (fetch_google_route/fetch_traffic_delayで共有)。
+// (fetch_google_route/fetch_traffic_coloringで共有)。
 fn directions_common_params(wps: &[(f64, f64)], mode: &str, key: &str) -> String {
     let origin = format!("{},{}", wps[0].0, wps[0].1);
     let destination = format!("{},{}", wps[wps.len() - 1].0, wps[wps.len() - 1].1);
@@ -464,29 +464,113 @@ fn fetch_google_route(wps: &[(f64, f64)], mode: &str, key: &str) -> Result<Route
     Ok(RouteResult { pts, ele: Vec::new(), dist_m, time_s, hw_m: 0.0, ascend_m: 0.0, via_google: true })
 }
 
-// ---- 渋滞込み所要時間の追加確認(#渋滞情報、docs/route-traffic-delay-design.md) ----
+// ---- 渋滞状況の色分け(#渋滞情報、docs/route-traffic-coloring-design.md) ----
 //
-// BRouterには渋滞データが無いため、確定したルートとは別にGoogle Directionsへ
-// departure_time=nowで問い合わせ、渋滞込み所要時間(duration_in_traffic)と
-// 渋滞無し所要時間(duration)の差分だけを使う。ジオメトリは取得・使用しない。
+// BRouterには渋滞データが無いため、確定したルート pts を距離ベースで区間分割し、
+// 区間境界を中間waypointとしてGoogle Directions(departure_time=now)へ1回問い合わせ、
+// 区間ごとのduration_in_trafficから緑/黄/赤の色分けを作る。道路網全体ではなく、
+// 表示中のルート線だけを塗り分ける(TrafficLayer相当の面データはGoogle側に取得手段が無い)。
 
-pub const ROUTE_TRAFFIC_DELAY_THRESHOLD_S: f64 = 60.0; // これ未満の遅延は誤差扱いで表示しない
+const TRAFFIC_SEGMENT_TARGET_M: f64 = 5_000.0; // 目標区間長。短いルートは実際の区間数がこれより少ない
+const TRAFFIC_MAX_WAYPOINTS: usize = 23; // Google Directions APIの中間waypoint上限
 
-// 遅延が表示に値するか(閾値以上か)。
-pub fn should_show_traffic_delay(delay_s: f64) -> bool {
-    delay_s >= ROUTE_TRAFFIC_DELAY_THRESHOLD_S
+// ルート総延長(m)から区間数を決める(1以上、TRAFFIC_MAX_WAYPOINTS+1以下)。
+pub fn traffic_segment_count(total_len_m: f64) -> usize {
+    if total_len_m <= 0.0 { return 1; }
+    ((total_len_m / TRAFFIC_SEGMENT_TARGET_M).round() as usize).clamp(1, TRAFFIC_MAX_WAYPOINTS + 1)
 }
 
-// legs((duration_s, duration_in_traffic_s))から遅延合計(秒)を求める。
-// duration_in_trafficが無いleg(徒歩区間混在等)はdurationで代用(=そのlegの遅延は0扱い)。
-// 合計がマイナス(渋滞が無く早く着く)になる場合は0にクランプする(「遅延」表示の趣旨上)。
-pub fn traffic_delay_from_legs(legs: &[(f64, Option<f64>)]) -> f64 {
-    let mut delay = 0.0;
-    for &(duration, duration_in_traffic) in legs {
-        let dit = duration_in_traffic.unwrap_or(duration);
-        delay += dit - duration;
+// 区間境界の累積距離(m)の配列(区間数-1個。0とtotal_len_mそのものは含まない)。
+pub fn traffic_breakpoints_m(total_len_m: f64, segments: usize) -> Vec<f64> {
+    if segments <= 1 { return Vec::new(); }
+    (1..segments).map(|i| total_len_m * i as f64 / segments as f64).collect()
+}
+
+// 区間境界のwaypoint座標(pts上の対応点)。
+pub fn traffic_waypoints(pts: &[(f64, f64)], breakpoints_m: &[f64]) -> Vec<(f64, f64)> {
+    breakpoints_m.iter().map(|&d| point_at(pts, d)).collect()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TrafficLevel { Smooth, Moderate, Heavy }
+
+// duration_in_traffic/durationの比で3段階に分類する。欠損・duration<=0はSmooth扱い
+// (渋滞として過剰に赤く塗らない側へ倒す)。
+pub fn traffic_level(duration_s: f64, duration_in_traffic_s: Option<f64>) -> TrafficLevel {
+    let Some(t) = duration_in_traffic_s else { return TrafficLevel::Smooth };
+    if duration_s <= 0.0 { return TrafficLevel::Smooth; }
+    let ratio = t / duration_s;
+    if ratio >= 1.5 { TrafficLevel::Heavy } else if ratio >= 1.15 { TrafficLevel::Moderate } else { TrafficLevel::Smooth }
+}
+
+pub fn traffic_level_color(level: TrafficLevel) -> [u8; 3] {
+    match level {
+        TrafficLevel::Smooth => [0, 200, 60],
+        TrafficLevel::Moderate => [230, 200, 0],
+        TrafficLevel::Heavy => [220, 40, 40],
     }
-    delay.max(0.0)
+}
+
+// legs((duration_s, duration_in_traffic_s))をptsに沿って色分けした(色, 点列)の列へ変換する。
+// legs.len() != breakpoints_m.len()+1 なら空Vec(呼び出し側は単色描画にフォールバックする)。
+// 隣接区間は境界点を共有する(線が途切れて見えないように)。
+pub fn colorize_route_by_traffic(
+    pts: &[(f64, f64)],
+    breakpoints_m: &[f64],
+    legs: &[(f64, Option<f64>)],
+) -> Vec<([u8; 3], Vec<(f64, f64)>)> {
+    if pts.len() < 2 || legs.len() != breakpoints_m.len() + 1 {
+        return Vec::new();
+    }
+    let cum = cumulative_distances_m(pts);
+    let mut out = Vec::with_capacity(legs.len());
+    let mut start_idx = 0usize;
+    for (i, &(duration, dit)) in legs.iter().enumerate() {
+        let color = traffic_level_color(traffic_level(duration, dit));
+        let end_idx = if i < breakpoints_m.len() {
+            let bp = breakpoints_m[i];
+            cum.iter().position(|&d| d >= bp).unwrap_or(pts.len() - 1).max(start_idx + 1).min(pts.len() - 1)
+        } else {
+            pts.len() - 1
+        };
+        out.push((color, pts[start_idx..=end_idx].to_vec()));
+        start_idx = end_idx;
+    }
+    out
+}
+
+// wps・modeはfetch_google_routeと同じ意味だが、waypointsは pts を区間分割して作った中間点
+// (元のユーザー経由地とは無関係)。失敗しても呼び出し側は「色分けなし」に静かにフォール
+// バックできるよう常に(空なら空)Vecを返す。
+fn fetch_traffic_coloring(pts: &[(f64, f64)], mode: &str, key: &str) -> Vec<([u8; 3], Vec<(f64, f64)>)> {
+    if key.trim().is_empty() || pts.len() < 2 {
+        return Vec::new();
+    }
+    let total_len = polyline_len(pts);
+    let segments = traffic_segment_count(total_len);
+    let breakpoints = traffic_breakpoints_m(total_len, segments);
+    let waypoints = traffic_waypoints(pts, &breakpoints);
+    let mut via_wps = Vec::with_capacity(waypoints.len() + 2);
+    via_wps.push(pts[0]);
+    via_wps.extend(waypoints.iter().copied());
+    via_wps.push(pts[pts.len() - 1]);
+    let params = directions_common_params(&via_wps, mode, key);
+    let url = format!("https://maps.googleapis.com/maps/api/directions/json?{params}&departure_time=now");
+    let body = match ureq::get(&url).timeout(std::time::Duration::from_secs(20)).call() {
+        Ok(r) => match r.into_string() { Ok(s) => s, Err(_) => return Vec::new() },
+        Err(_) => return Vec::new(),
+    };
+    let legs = match parse_directions_legs(&body) { Ok(l) => l, Err(_) => return Vec::new() };
+    colorize_route_by_traffic(pts, &breakpoints, &legs)
+}
+
+// trigger_route/trigger_turn_pointsと同じ非ブロッキング方針。
+pub type TrafficColorRx = std::sync::mpsc::Receiver<Vec<([u8; 3], Vec<(f64, f64)>)>>;
+pub fn trigger_traffic_coloring(pts: &[(f64, f64)], mode: &str, key: &str) -> TrafficColorRx {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (p, m, k) = (pts.to_vec(), mode.to_string(), key.to_string());
+    std::thread::spawn(move || { let _ = tx.send(fetch_traffic_coloring(&p, &m, &k)); });
+    rx
 }
 
 // Directions APIの生レスポンス(JSON文字列)からlegsの(duration, duration_in_traffic)を抜き出す。
@@ -511,29 +595,6 @@ pub fn parse_directions_legs(body: &str) -> Result<Vec<(f64, Option<f64>)>, Stri
             (duration, duration_in_traffic)
         })
         .collect())
-}
-
-// wps・modeはfetch_google_routeと同じ意味。ジオメトリは使わず、遅延秒数(0以上)だけを返す。
-pub fn fetch_traffic_delay(wps: &[(f64, f64)], mode: &str, key: &str) -> Result<f64, String> {
-    if key.trim().is_empty() { return Err("Google APIキー未設定".to_string()); }
-    if wps.len() < 2 { return Err("2点以上必要".to_string()); }
-    let params = directions_common_params(wps, mode, key);
-    let url = format!("https://maps.googleapis.com/maps/api/directions/json?{params}&departure_time=now");
-    let body = ureq::get(&url)
-        .timeout(std::time::Duration::from_secs(20)).call()
-        .map_err(|e| format!("渋滞確認: {e}"))?
-        .into_string().map_err(|e| e.to_string())?;
-    let legs = parse_directions_legs(&body)?;
-    Ok(traffic_delay_from_legs(&legs))
-}
-
-// trigger_route/trigger_turn_pointsと同じ非ブロッキング方針。
-pub type TrafficDelayRx = std::sync::mpsc::Receiver<Result<f64, String>>;
-pub fn trigger_traffic_delay(wps: &[(f64, f64)], mode: &str, key: &str) -> TrafficDelayRx {
-    let (tx, rx) = std::sync::mpsc::channel();
-    let (w, m, k) = (wps.to_vec(), mode.to_string(), key.to_string());
-    std::thread::spawn(move || { let _ = tx.send(fetch_traffic_delay(&w, &m, &k)); });
-    rx
 }
 
 // Googleのポリラインエンコーディング(https://developers.google.com/maps/documentation/utilities/polylinealgorithm)
@@ -881,38 +942,89 @@ mod tests {
         assert!(waypoints_bbox_with_margin(&[], 0.05).is_none());
     }
 
-    // ---- 渋滞込み所要時間(route-traffic-delay-design.md) ----
+    // ---- 渋滞状況の色分け(route-traffic-coloring-design.md) ----
 
     #[test]
-    fn traffic_delay_from_legs_sums_the_difference() {
-        // 900s(渋滞無し)→1380s(渋滞あり)の遅延は480s。
-        let legs = vec![(900.0, Some(1380.0))];
-        assert_eq!(traffic_delay_from_legs(&legs), 480.0);
+    fn traffic_segment_count_clamps_between_1_and_max() {
+        assert_eq!(traffic_segment_count(0.0), 1);
+        assert_eq!(traffic_segment_count(-100.0), 1);
+        assert_eq!(traffic_segment_count(1_000.0), 1); // 5km未満の短いルート→1区間
+        assert_eq!(traffic_segment_count(15_000.0), 3); // 目標5kmちょうど3区間
+        assert_eq!(traffic_segment_count(10_000_000.0), TRAFFIC_MAX_WAYPOINTS + 1); // 長大ルートは上限でクランプ
     }
 
     #[test]
-    fn traffic_delay_from_legs_sums_multiple_legs() {
-        let legs = vec![(900.0, Some(1380.0)), (600.0, Some(660.0))];
-        assert_eq!(traffic_delay_from_legs(&legs), 480.0 + 60.0);
+    fn traffic_breakpoints_m_empty_for_single_segment() {
+        assert_eq!(traffic_breakpoints_m(10_000.0, 1), Vec::<f64>::new());
     }
 
     #[test]
-    fn traffic_delay_from_legs_uses_duration_when_traffic_missing() {
-        // duration_in_trafficが無いleg(徒歩区間混在等)はdurationで代用=遅延0扱い。
-        let legs = vec![(900.0, Some(1380.0)), (300.0, None)];
-        assert_eq!(traffic_delay_from_legs(&legs), 480.0);
+    fn traffic_breakpoints_m_splits_evenly() {
+        let bp = traffic_breakpoints_m(30_000.0, 3);
+        assert_eq!(bp, vec![10_000.0, 20_000.0]);
     }
 
     #[test]
-    fn traffic_delay_from_legs_clamps_negative_to_zero() {
-        // 渋滞が無く逆に早く着く場合、マイナス表示は誤解を招くので0にクランプ。
-        let legs = vec![(900.0, Some(800.0))];
-        assert_eq!(traffic_delay_from_legs(&legs), 0.0);
+    fn traffic_waypoints_matches_point_at() {
+        let pts = vec![(35.0, 139.0), (35.1, 139.0)]; // 経線に沿った約11.1km
+        let total = polyline_len(&pts);
+        let bp = vec![total / 2.0];
+        let wps = traffic_waypoints(&pts, &bp);
+        assert_eq!(wps, vec![point_at(&pts, total / 2.0)]);
     }
 
     #[test]
-    fn traffic_delay_from_legs_empty_is_zero() {
-        assert_eq!(traffic_delay_from_legs(&[]), 0.0);
+    fn traffic_level_thresholds() {
+        assert_eq!(traffic_level(900.0, Some(900.0 * 1.10)), TrafficLevel::Smooth); // 1.15未満
+        assert_eq!(traffic_level(900.0, Some(900.0 * 1.15)), TrafficLevel::Moderate); // 境界=Moderate側
+        assert_eq!(traffic_level(900.0, Some(900.0 * 1.49)), TrafficLevel::Moderate);
+        assert_eq!(traffic_level(900.0, Some(900.0 * 1.5)), TrafficLevel::Heavy); // 境界=Heavy側
+        assert_eq!(traffic_level(900.0, Some(900.0 * 2.0)), TrafficLevel::Heavy);
+        assert_eq!(traffic_level(900.0, None), TrafficLevel::Smooth); // 欠損は過剰に赤く塗らない側
+        assert_eq!(traffic_level(0.0, Some(100.0)), TrafficLevel::Smooth); // duration<=0は判定不能
+    }
+
+    #[test]
+    fn traffic_level_color_gives_three_distinct_colors() {
+        let s = traffic_level_color(TrafficLevel::Smooth);
+        let m = traffic_level_color(TrafficLevel::Moderate);
+        let h = traffic_level_color(TrafficLevel::Heavy);
+        assert_ne!(s, m); assert_ne!(m, h); assert_ne!(s, h);
+    }
+
+    #[test]
+    fn colorize_route_by_traffic_splits_into_segments_sharing_boundary_points() {
+        // 経線に沿った11点(35.00〜35.10、0.01度=約1.1km間隔)、3区間に分割。
+        let pts: Vec<(f64, f64)> = (0..=10).map(|i| (35.0 + i as f64 * 0.01, 139.0)).collect();
+        let total = polyline_len(&pts);
+        let breakpoints = traffic_breakpoints_m(total, 3);
+        // 1区間目=順調、2区間目=混雑、3区間目=渋滞データ欠損(Smooth扱い)。
+        let legs = vec![(900.0, Some(900.0)), (900.0, Some(900.0 * 1.6)), (900.0, None)];
+        let segs = colorize_route_by_traffic(&pts, &breakpoints, &legs);
+        assert_eq!(segs.len(), 3);
+        assert_eq!(segs[0].0, traffic_level_color(TrafficLevel::Smooth));
+        assert_eq!(segs[1].0, traffic_level_color(TrafficLevel::Heavy));
+        assert_eq!(segs[2].0, traffic_level_color(TrafficLevel::Smooth));
+        // 隣接区間は境界点を共有し、線が途切れない。
+        assert_eq!(segs[0].1.last(), segs[1].1.first());
+        assert_eq!(segs[1].1.last(), segs[2].1.first());
+        // 全区間の点を合わせれば元のptsの始点・終点を覆う。
+        assert_eq!(segs[0].1.first(), pts.first());
+        assert_eq!(segs[2].1.last(), pts.last());
+    }
+
+    #[test]
+    fn colorize_route_by_traffic_empty_on_leg_count_mismatch() {
+        let pts = vec![(35.0, 139.0), (35.1, 139.0)];
+        let breakpoints = vec![5_000.0];
+        let legs = vec![(900.0, Some(900.0))]; // 2区間分のbreakpointsに対しlegが1つしか無い
+        assert!(colorize_route_by_traffic(&pts, &breakpoints, &legs).is_empty());
+    }
+
+    #[test]
+    fn colorize_route_by_traffic_empty_for_too_few_points() {
+        let legs = vec![(900.0, Some(900.0))];
+        assert!(colorize_route_by_traffic(&[(35.0, 139.0)], &[], &legs).is_empty());
     }
 
     // 実際のDirections APIレスポンス形の抜粋(2legs、うち1つはduration_in_traffic無し)。
@@ -950,14 +1062,6 @@ mod tests {
         assert!(parse_directions_legs(r#"{"status": "OK", "routes": []}"#).is_err());
         assert!(parse_directions_legs(r#"{"status": "OK", "routes": [{}]}"#).is_err());
         assert!(parse_directions_legs("not json").is_err());
-    }
-
-    #[test]
-    fn should_show_traffic_delay_thresholds_at_60_seconds() {
-        assert!(!should_show_traffic_delay(0.0));
-        assert!(!should_show_traffic_delay(59.0));
-        assert!(should_show_traffic_delay(60.0));
-        assert!(should_show_traffic_delay(480.0));
     }
 
     // 実ネットワークを叩く手動確認用(CIでは走らない)。事故調査(新宿→釈迦堂PA、長距離ルートで

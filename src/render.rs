@@ -154,9 +154,13 @@ pub struct Route { pub pts: Vec<(f64, f64)>, pub color: [u8; 3], pub thickness: 
 pub struct Ring { pub lat: f64, pub lon: f64, pub radii_km: Vec<f64>, pub color: [u8; 3], pub thickness: u32 }
 // roads は道路名検索(r)で追加した道路の「塊」を保持する別レイヤ。routes(BRouterルート)とは
 // 独立で、trigger_route の routes.clear() では消えない。個別追加・個別削除できる。
-pub struct OverlaySpec { pub pois: Vec<Poi>, pub routes: Vec<Route>, pub roads: Vec<Route>, pub rings: Vec<Ring>, pub spots: Vec<(f64, f64, [u8; 3], u8)> }
+// traffic_segments は渋滞状況の色分け(#渋滞情報)用の別レイヤ。routes[0]と同じ経路を区間ごとに
+// 塗り直した色付きの線を保持する(routesの中身自体は差し替えない)。GPX保存・標高表示・
+// 次の曲がり案内は routes.last() を「ルート全体」として参照しているため、そちらを壊さないよう
+// 独立フィールドにしている。
+pub struct OverlaySpec { pub pois: Vec<Poi>, pub routes: Vec<Route>, pub roads: Vec<Route>, pub traffic_segments: Vec<Route>, pub rings: Vec<Ring>, pub spots: Vec<(f64, f64, [u8; 3], u8)> }
 impl OverlaySpec {
-    pub fn is_empty(&self) -> bool { self.pois.is_empty() && self.routes.is_empty() && self.roads.is_empty() && self.rings.is_empty() && self.spots.is_empty() }
+    pub fn is_empty(&self) -> bool { self.pois.is_empty() && self.routes.is_empty() && self.roads.is_empty() && self.traffic_segments.is_empty() && self.rings.is_empty() && self.spots.is_empty() }
 }
 
 // インクマスク層。描画は最終出力寸法(resize後)で構築する。
@@ -252,6 +256,10 @@ pub fn build_overlay(spec: &OverlaySpec, cx: f64, cy: f64, z: u32, win_w: u32, w
     for rd in &spec.roads { // 道路の塊(別色レイヤ・BRouterルートの上に乗る)
         let pts: Vec<(i32, i32)> = rd.pts.iter().map(|&(la, lo)| to_img(la, lo)).collect();
         draw_polyline(&mut ov, &pts, rd.color, rd.thickness);
+    }
+    for tr in &spec.traffic_segments { // 渋滞状況の色分け(BRouterルートと同じ経路を上塗り)
+        let pts: Vec<(i32, i32)> = tr.pts.iter().map(|&(la, lo)| to_img(la, lo)).collect();
+        draw_polyline(&mut ov, &pts, tr.color, tr.thickness);
     }
     for p in &spec.pois { // マーカー(最前面)
         let (ix, iy) = to_img(p.lat, p.lon);
@@ -614,7 +622,7 @@ mod tests {
     fn build_overlay_puts_radar_behind_markers() {
         let (lat, lon, z) = (35.0, 139.0, 10u32);
         let (cx, cy) = deg_to_pixel(lat, lon, z);
-        let spec = OverlaySpec { pois: Vec::new(), routes: Vec::new(), roads: Vec::new(),
+        let spec = OverlaySpec { pois: Vec::new(), routes: Vec::new(), roads: Vec::new(), traffic_segments: Vec::new(),
                                  rings: Vec::new(), spots: vec![(lat, lon, [1, 2, 3], 0)] };
         let layer = RgbaImage::from_pixel(8, 8, image::Rgba([200, 0, 0, 255]));
         let ink = RadarInk { layer: &layer, density: 1.0 };
