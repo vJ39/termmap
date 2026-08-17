@@ -133,8 +133,11 @@ fn fetch_traffic_coloring(pts: &[(f64, f64)], mode: &str, key: &str) -> Vec<([u8
   パラメータ(会話でユーザーから指定済み):
   - 監視区間の本数はズーム(拡大)状況に応じて絞る
   - 表示範囲があまりに広域な場合はそもそもGoogle Directionsへ問い合わせない
-  - 更新間隔30分、取得結果はTTL30分のメモリ上キャッシュ(ディスクへは保存しない。
-    時々刻々変わるデータを長期キャッシュしない[[feedback-fallback-result-cache-poisoning]])
+  - 更新間隔30分。取得結果はTTL30分でディスクにも保存する(再起動しても直前の状態を
+    失わないため)。ただしBRouterルートキャッシュ(route_cache_path)のような無期限保存は
+    しない=読み出し時に必ず鮮度(取得時刻からの経過)を確認し、TTLを超えていれば
+    キャッシュミス扱いで再取得する。無期限保存はしないという点が
+    [[feedback-fallback-result-cache-poisoning]]の教訓を踏まえた要件
 - 表示後の周期的な再取得(渋滞状況の経時変化への追従)。ルート確定時の1回取得のみ
 - BRouterが失敗しGoogleへフォールバックした場合の色分け(フォールバック結果はそもそも
   ディスクキャッシュしない方針[[feedback-fallback-result-cache-poisoning]]で、かつ
