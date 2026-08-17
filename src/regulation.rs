@@ -313,6 +313,42 @@ pub fn detail_panel_content(d: &ClosureDetail) -> (String, Vec<String>) {
     (title, lines)
 }
 
+// ---- 規制原因アイコン(#規制原因アイコン、docs/regulation-cause-icons-design.md) ----
+//
+// ClosureDetail.cause(自由記述文字列)をキーワード一致で分類し、事故✕/工事の
+// アイコンを出すための下ごしらえ。実データ調査(2026/08/17、60件サンプル)では
+// 「事故」は0件で災害・工事系が主だったが、将来別データ源が加わった時の受け皿として
+// Accidentも区分だけ用意する。
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CauseCategory { Accident, Construction, Other }
+
+// causeからキーワード一致で分類する。「事故」を含むならAccident(工事も同時に
+// 含んでいてもAccident優先=より重大な情報を見せる側へ倒す)。次に「工事」または
+// 「作業」を含むならConstruction。どちらも無ければOther(アイコン無し)。
+pub fn categorize_cause(cause: &str) -> CauseCategory {
+    if cause.contains("事故") {
+        CauseCategory::Accident
+    } else if cause.contains("工事") || cause.contains("作業") {
+        CauseCategory::Construction
+    } else {
+        CauseCategory::Other
+    }
+}
+
+// 分類→(色, マーカー形状)。形状はrender.rsのdraw_marker用(1=三角, 6=✕)。
+// Otherはアイコン無し(呼び出し側は従来通りラインのみ描画する)。
+pub fn cause_icon(category: CauseCategory) -> Option<([u8; 3], u8)> {
+    match category {
+        CauseCategory::Accident => Some(([230, 30, 30], 6)),   // 赤系・✕
+        CauseCategory::Construction => Some(([255, 200, 0], 1)), // 黄・三角(警告的形状を流用)
+        CauseCategory::Other => None,
+    }
+}
+// 規制ラインの中点(アイコンを置く座標)を求める closure_icon_position は、
+// このモジュールがcrate::に依存しない方針(冒頭コメント参照)のため、
+// roadtrace::polyline_len/point_atを使うui_helpers.rs側に置く。
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,6 +380,43 @@ mod tests {
         assert_eq!(RegulationKind::from_code("06"), RegulationKind::ChainRequired);
         assert_eq!(RegulationKind::from_code("09"), RegulationKind::MovementRestriction);
         assert_eq!(RegulationKind::from_code("99"), RegulationKind::Other);
+    }
+
+    #[test]
+    fn categorize_cause_detects_accident() {
+        assert_eq!(categorize_cause("事故"), CauseCategory::Accident);
+        assert_eq!(categorize_cause("多重事故のため"), CauseCategory::Accident);
+    }
+
+    #[test]
+    fn categorize_cause_detects_construction_keywords() {
+        assert_eq!(categorize_cause("工事"), CauseCategory::Construction);
+        assert_eq!(categorize_cause("道路工事"), CauseCategory::Construction);
+        assert_eq!(categorize_cause("架橋工事"), CauseCategory::Construction);
+        assert_eq!(categorize_cause("作業"), CauseCategory::Construction);
+    }
+
+    #[test]
+    fn categorize_cause_unrelated_text_and_empty_are_other() {
+        // 実データ(2026/08/17調査)で観測された災害・損壊系はOther扱い。
+        assert_eq!(categorize_cause("道路損壊"), CauseCategory::Other);
+        assert_eq!(categorize_cause("災害等"), CauseCategory::Other);
+        assert_eq!(categorize_cause("土砂崩れ"), CauseCategory::Other);
+        assert_eq!(categorize_cause("落石"), CauseCategory::Other);
+        assert_eq!(categorize_cause(""), CauseCategory::Other);
+    }
+
+    #[test]
+    fn categorize_cause_prefers_accident_when_both_keywords_present() {
+        assert_eq!(categorize_cause("工事現場での事故"), CauseCategory::Accident);
+    }
+
+    #[test]
+    fn cause_icon_accident_and_construction_are_distinct_other_is_none() {
+        let a = cause_icon(CauseCategory::Accident).unwrap();
+        let c = cause_icon(CauseCategory::Construction).unwrap();
+        assert_ne!(a, c);
+        assert_eq!(cause_icon(CauseCategory::Other), None);
     }
 
     #[test]

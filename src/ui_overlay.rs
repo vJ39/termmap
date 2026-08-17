@@ -234,8 +234,8 @@ pub(crate) fn draw_color_pick<W: Write>(out: &mut W, cols: u32, map_rows: u32, c
 pub(crate) fn draw_shape_pick<W: Write>(out: &mut W, cols: u32, map_rows: u32, shape_sel: u8) {
     const BG: &str = "\x1b[30;47m";
     const RST: &str = "\x1b[0m";
-    // 形状index順のグリフ(0四角 1三角 2丸 3菱形 4十字 5星)。描画実体は render の marker_inside。
-    const GLYPHS: [&str; NUM_MARKER_SHAPES as usize] = ["■", "▲", "●", "◆", "＋", "✦"];
+    // 形状index順のグリフ(0四角 1三角 2丸 3菱形 4十字 5星 6✕)。描画実体は render の marker_inside。
+    const GLYPHS: [&str; NUM_MARKER_SHAPES as usize] = ["■", "▲", "●", "◆", "＋", "✦", "✕"];
     let iw = NUM_MARKER_SHAPES as usize * 4 + 2; // 各形4セル(枠含む)+左余白2
     let blank = " ".repeat(iw);
     let mut sw = String::from(BG);

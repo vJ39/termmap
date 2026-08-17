@@ -72,6 +72,29 @@ pub(crate) fn persist_full_state(cx: f64, cy: f64, z: u32, opts: &Args, wps: &[(
     let _ = config::save_config(cfg);
 }
 
+// ---- 規制原因アイコン(#規制原因アイコン、docs/regulation-cause-icons-design.md) ----
+
+// 規制ラインの中点(アイコンを置く座標)。空ならNone、1点のみならその点。
+// regulation.rsはcrate::に依存しない方針のため、roadtrace側を使うここに置く。
+pub(crate) fn closure_icon_position(line: &[(f64, f64)]) -> Option<(f64, f64)> {
+    if line.is_empty() { return None; }
+    if line.len() == 1 { return Some(line[0]); }
+    let total = roadtrace::polyline_len(line);
+    Some(roadtrace::point_at(line, total / 2.0))
+}
+
+// 表示中のClosedイベントのうち、まだcauseキャッシュに無い最初の1件のdetail_idを返す
+// (無ければNone=今フレームは新規フェッチしない)。detail_id空文字は対象外。
+// 同時に1件だけフェッチする(呼び出し側でcause_jobが空の時だけ呼ぶ)ためのレート制限。
+pub(crate) fn next_closure_to_categorize<'a>(
+    visible: &[&'a regulation::ClosureEvent],
+    cached: &std::collections::HashMap<String, regulation::CauseCategory>,
+) -> Option<&'a str> {
+    visible.iter()
+        .map(|e| e.detail_id.as_str())
+        .find(|id| !id.is_empty() && !cached.contains_key(*id))
+}
+
 // 端末状態を RAII で復元する。パニック/早期return でも Drop で raw mode と代替スクリーンを必ず戻す。
 pub(crate) struct TermGuard;
 impl TermGuard {
@@ -87,5 +110,67 @@ impl Drop for TermGuard {
         let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste,
             crossterm::cursor::Show, crossterm::terminal::LeaveAlternateScreen);
         let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use regulation::{ClosureEvent, RegulationKind};
+
+    #[test]
+    fn closure_icon_position_empty_is_none() {
+        assert_eq!(closure_icon_position(&[]), None);
+    }
+
+    #[test]
+    fn closure_icon_position_single_point_is_that_point() {
+        assert_eq!(closure_icon_position(&[(35.0, 139.0)]), Some((35.0, 139.0)));
+    }
+
+    #[test]
+    fn closure_icon_position_is_the_midpoint_of_a_straight_line() {
+        // 経線に沿った直線なので、中点は緯度の単純平均に近い。
+        let pos = closure_icon_position(&[(35.0, 139.0), (35.02, 139.0)]).unwrap();
+        assert!((pos.0 - 35.01).abs() < 1e-3, "{pos:?}");
+        assert!((pos.1 - 139.0).abs() < 1e-6, "{pos:?}");
+    }
+
+    fn ev(id: &str) -> ClosureEvent {
+        ClosureEvent { line: vec![(35.0, 139.0), (35.01, 139.0)], kind: RegulationKind::Closed, detail_id: id.to_string(), active: true }
+    }
+
+    #[test]
+    fn next_closure_to_categorize_returns_first_uncached() {
+        let a = ev("a"); let b = ev("b");
+        let visible = vec![&a, &b];
+        let mut cached = std::collections::HashMap::new();
+        cached.insert("a".to_string(), regulation::CauseCategory::Other);
+        assert_eq!(next_closure_to_categorize(&visible, &cached), Some("b"));
+    }
+
+    #[test]
+    fn next_closure_to_categorize_none_when_all_cached() {
+        let a = ev("a");
+        let visible = vec![&a];
+        let mut cached = std::collections::HashMap::new();
+        cached.insert("a".to_string(), regulation::CauseCategory::Construction);
+        assert_eq!(next_closure_to_categorize(&visible, &cached), None);
+    }
+
+    #[test]
+    fn next_closure_to_categorize_skips_empty_detail_id() {
+        let a = ev(""); let b = ev("b");
+        let visible = vec![&a, &b];
+        let cached = std::collections::HashMap::new();
+        assert_eq!(next_closure_to_categorize(&visible, &cached), Some("b"));
+    }
+
+    #[test]
+    fn next_closure_to_categorize_prefers_visible_order() {
+        let a = ev("a"); let b = ev("b");
+        let visible = vec![&a, &b];
+        let cached = std::collections::HashMap::new();
+        assert_eq!(next_closure_to_categorize(&visible, &cached), Some("a"));
     }
 }

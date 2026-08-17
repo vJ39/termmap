@@ -34,7 +34,7 @@
 | 4 | キャッシュ | メモリのみ(ディスク保存しない)。規制原因は一度確定した内容が事後変わることは想定しにくく、無期限保持で問題ない。プロセス再起動時は再取得(小さなHTMLの再取得コストは軽微) |
 | 5 | アイコン位置 | 規制ラインの中点(`roadtrace::polyline_len`+`point_at`で算出) |
 | 6 | アイコン見た目 | 事故=✕(新規マーカー形状、対角線の交差)・赤系。工事=三角(既存の警告的形状)・黄色 |
-| 7 | 描画 | `OverlaySpec`に`regulation_markers: Vec<(f64,f64,[u8;3],u8)>`を追加(spotsと同じ形状のタプル)。既存の規制ライン描画とは独立で、ラインの上に重ね描きする |
+| 7 | 描画 | 通行規制のライン自体は`OverlaySpec`を経由せず、ui.rs内で直接`OverlayLayer`へ`draw_line`する専用の描画ブロック(`if cfg.regulation_enabled { for ev in &regulation_events { ... draw_line(...) } }`)を持つ。アイコンもこの同じブロック内に`render::draw_marker`を追加呼び出しして重ね描きする(`OverlaySpec`に新フィールドは追加しない) |
 
 ## 2. 実装
 
@@ -75,14 +75,17 @@ fn next_closure_to_categorize<'a>(
   `regulation::fetch_detail`を1件だけ起動する(Tキーの詳細取得と同じ inline スレッド方式)
 - ポーリングで結果を受け取ったら`categorize_cause(&detail.cause)`を`cause_cache`へ格納し
   `cause_job = None`(失敗時もキャッシュへ`Other`相当を入れて無限リトライを避ける)
-- 毎フレームの描画直前、表示中のClosedイベントで`cause_cache`にAccident/Constructionが
-  あるものについて`closure_icon_position`+`cause_icon`から`spec.regulation_markers`を組み立てる
+- 既存の`if cfg.regulation_enabled { for ev in &regulation_events { ... draw_line(...) } }`
+  ブロック内で、`ev.detail_id`が`cause_cache`にAccident/Constructionとして載っていれば、
+  `closure_icon_position(&ev.line)`+`cause_icon`で得た座標・色・形状を`render::draw_marker`で
+  同じ`ov`(OverlayLayer)へ重ね描きする(`draw_line`によるライン描画のすぐ後)
 - jobs_active/polling/Ctrl-C中断チェーンに`cause_job`を含める
 
 ### 2.4 render.rs
 
-`OverlaySpec`に`regulation_markers: Vec<(f64, f64, [u8; 3], u8)>`を追加。`spec.roads`の後・
-`spec.pois`の前に`draw_marker`で描画する(spotsと同じ`size=4`)。
+`draw_marker`を`pub fn`にする(既存の`draw_line`/`draw_ring`と同じく、ui.rsのink描画ブロックから
+直接呼べるようにするため)。`OverlaySpec`に新フィールドは追加しない(通行規制の描画は元々
+`OverlaySpec`を経由しない別経路のため)。
 
 ### 2.5 marker形状
 

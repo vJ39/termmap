@@ -176,8 +176,8 @@ impl OverlayLayer {
         self.ink[(y as usize) * (self.w as usize) + x as usize]
     }
 }
-// マーカー形状。0=四角 1=三角(上向) 2=丸 3=菱形 4=十字 5=星(8方向)。カテゴリ別の識別用。
-pub const NUM_MARKER_SHAPES: u8 = 6;
+// マーカー形状。0=四角 1=三角(上向) 2=丸 3=菱形 4=十字 5=星(8方向) 6=✕(対角線・規制原因アイコン用)。カテゴリ別の識別用。
+pub const NUM_MARKER_SHAPES: u8 = 7;
 fn marker_inside(dx: i32, dy: i32, half: i32, shape: u8) -> bool {
     match shape {
         1 => dx.abs() <= dy + half,                    // 三角(頂点上)
@@ -185,10 +185,11 @@ fn marker_inside(dx: i32, dy: i32, half: i32, shape: u8) -> bool {
         3 => dx.abs() + dy.abs() <= half,               // 菱形
         4 => dx == 0 || dy == 0,                        // 十字
         5 => dx == 0 || dy == 0 || dx.abs() == dy.abs(), // 星(8方向)
+        6 => dx.abs() == dy.abs(),                       // ✕(対角線のみ、十字線は無し)
         _ => true,                                      // 四角
     }
 }
-fn draw_marker(ov: &mut OverlayLayer, ix: i32, iy: i32, color: [u8; 3], size: i32, shape: u8) {
+pub fn draw_marker(ov: &mut OverlayLayer, ix: i32, iy: i32, color: [u8; 3], size: i32, shape: u8) {
     let half = size / 2;
     // ハロー: 形状を1px膨張させた暗色
     for dy in -half - 1..=half + 1 { for dx in -half - 1..=half + 1 {

@@ -154,6 +154,11 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     let mut regulation_detail_job: Option<std::sync::mpsc::Receiver<Result<regulation::ClosureDetail, String>>> = None;
     // 渋滞状況の色分け(#渋滞情報)。ルート成功のたびに、設定ONならGoogle Directionsへ別途確認する。
     let mut traffic_color_job: Option<route::TrafficColorRx> = None;
+    // 規制原因アイコン(事故✕/工事)。表示中のClosedイベントについて1件ずつ規制原因を
+    // バックグラウンドで取得し分類する(セッション内メモリのみ、無期限保持)。
+    // 結果にdetail_idを添えて返す(ClosureDetail自体はidを持たないため紐付けに必要)。
+    let mut cause_cache: std::collections::HashMap<String, regulation::CauseCategory> = std::collections::HashMap::new();
+    let mut cause_job: Option<std::sync::mpsc::Receiver<(String, Result<regulation::ClosureDetail, String>)>> = None;
     // 読み上げの声(#78)の試聴。SettingsPick(27)でSpace=試聴/Enter確定後の1回再生の両方で使う。
     let mut voice_preview_job: Option<std::sync::mpsc::Receiver<Result<(), String>>> = None;
     // ルート計算と同じ非同期パターンで、検索/周辺/実写/おすすめの通信もバックグラウンド化する。
@@ -628,6 +633,21 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             roads_layer.items(plot_view).into_iter().map(|r| r.pts.as_slice()).collect();
         let camera_points = camera_layer.items(plot_view);
         let regulation_events = regulation_layer.items(plot_view);
+        // 規制原因アイコン(#規制原因アイコン): 表示中のClosedイベントから未分類の1件を選び、
+        // 他にジョブが走っていなければバックグラウンドで規制原因を取得する
+        // (同時に1件だけ=道路情報提供システムへの負荷を抑えるレート制限)。
+        if cfg.regulation_enabled && cause_job.is_none() {
+            let visible_closed: Vec<&regulation::ClosureEvent> = regulation_events.iter().copied()
+                .filter(|e| e.kind == regulation::RegulationKind::Closed)
+                .collect();
+            if let Some(id) = next_closure_to_categorize(&visible_closed, &cause_cache) {
+                let id = id.to_string();
+                let (tx, rx) = std::sync::mpsc::channel();
+                let id2 = id.clone();
+                std::thread::spawn(move || { let _ = tx.send((id2, regulation::fetch_detail(&id))); });
+                cause_job = Some(rx);
+            }
+        }
         let disaster_sites = disaster_layer.items(plot_view);
 
         // 通行止めルート回避(#通行止めを推奨しない)。表示中の視野(plot_view)ではなく、
@@ -890,6 +910,17 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                 ((gx - (rcx - rw as f64 / 2.0)).floor() as i32, (gy - (rcy - rh as f64 / 2.0)).floor() as i32)
                             }).collect();
                             for w in pts.windows(2) { draw_line(&mut ov, w[0].0, w[0].1, w[1].0, w[1].1, ev.kind.color(), 3); }
+                            // 規制原因アイコン(#規制原因アイコン): 事故✕/工事のみ、区間の中点に重ね描き。
+                            if let Some(category) = cause_cache.get(&ev.detail_id) {
+                                if let Some((color, shape)) = regulation::cause_icon(*category) {
+                                    if let Some((la, lo)) = closure_icon_position(&ev.line) {
+                                        let (gx, gy) = deg_to_pixel(la, lo, rz);
+                                        let ix = (gx - (rcx - rw as f64 / 2.0)).floor() as i32;
+                                        let iy = (gy - (rcy - rh as f64 / 2.0)).floor() as i32;
+                                        draw_marker(&mut ov, ix, iy, color, 4, shape);
+                                    }
+                                }
+                            }
                         }
                     }
                     if cfg.disaster_enabled { // 過去災害(Bでその地点の事例一覧)
@@ -970,7 +1001,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         }
         // ステータス行の文面組み立ては ui_status.rs へ切り出し済み。通信中スピナーの判定に使う
         // 各ジョブは有無しか見ないのでここで1つのフラグに畳んでから渡す。
-        let jobs_active = route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || cam_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some() || wander_job.is_some() || disaster_job.is_some() || regulation_detail_job.is_some() || traffic_color_job.is_some();
+        let jobs_active = route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || cam_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some() || wander_job.is_some() || disaster_job.is_some() || regulation_detail_job.is_some() || traffic_color_job.is_some() || cause_job.is_some();
         // 次の曲がり角の画面表示。音声案内(maybe_speak_turn)と同じくturn_points+現在地から
         // 求めるが、読み上げ済みかの状態は見ない(何度描画しても同じ内容を出したいため)。
         let next_turn = spec.routes.last()
@@ -1141,6 +1172,19 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 }
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => { traffic_color_job = None; }
+            }
+        }
+        if let Some(job) = &cause_job { // 規制原因アイコン(#規制原因アイコン)の分類結果到着
+            match job.try_recv() {
+                Ok((id, result)) => {
+                    // 失敗時もOther相当でキャッシュする(でないと同じ1件を毎フレーム
+                    // 再試行し続け、cause_jobが常にSomeになってレート制限が効かなくなる)。
+                    let category = result.map(|d| regulation::categorize_cause(&d.cause)).unwrap_or(regulation::CauseCategory::Other);
+                    cause_cache.insert(id, category);
+                    cause_job = None; got_result = true;
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => { cause_job = None; }
             }
         }
         if let Some(job) = &voice_preview_job { // 読み上げの声(#78)の試聴結果
@@ -1338,7 +1382,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             // 主要道路は以前この条件から漏れていたが、4レイヤとも同じ扱いにする。
             || traffic_layer.job_active() || roads_layer.job_active()
             || camera_layer.job_active() || regulation_layer.job_active() || disaster_layer.job_active()
-            || disaster_job.is_some() || voice_preview_job.is_some() || regulation_detail_job.is_some() || traffic_color_job.is_some();
+            || disaster_job.is_some() || voice_preview_job.is_some() || regulation_detail_job.is_some() || traffic_color_job.is_some() || cause_job.is_some();
         let mut ev: Option<Event> = if got_result {
             None
         } else if polling {
@@ -1423,10 +1467,10 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             None => {} // 再描画のみ(計算待ち)
             Some(Event::Key(k)) if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) => {
                 // Ctrl-C: 進行中の全ジョブを中断(アプリは終了しない)
-                let any = route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || cam_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some() || wander_job.is_some() || disaster_job.is_some() || regulation_detail_job.is_some() || traffic_color_job.is_some();
+                let any = route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || cam_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some() || wander_job.is_some() || disaster_job.is_some() || regulation_detail_job.is_some() || traffic_color_job.is_some() || cause_job.is_some();
                 if any {
                     if route_job.is_some() { route_note = Some("中断".to_string()); }
-                    route_job = None; search_job = None; near_job = None; street_job = None; cam_job = None; recommend_job = None; road_job = None; catpoi_job = None; wander_job = None; disaster_job = None; regulation_detail_job = None; traffic_color_job = None;
+                    route_job = None; search_job = None; near_job = None; street_job = None; cam_job = None; recommend_job = None; road_job = None; catpoi_job = None; wander_job = None; disaster_job = None; regulation_detail_job = None; traffic_color_job = None; cause_job = None;
                     addr = "中断".into();
                 }
             }
@@ -1478,9 +1522,9 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             }
             // Map表示中のEscは進行中ジョブの中断に使う(サブ画面のEscは各Focusの取消のまま)
             Some(Event::Key(k)) if k.code == KeyCode::Esc && matches!(focus, Focus::Map)
-                && (route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || cam_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some() || wander_job.is_some() || disaster_job.is_some() || regulation_detail_job.is_some() || traffic_color_job.is_some()) => {
+                && (route_job.is_some() || search_job.is_some() || near_job.is_some() || street_job.is_some() || cam_job.is_some() || recommend_job.is_some() || road_job.is_some() || catpoi_job.is_some() || wander_job.is_some() || disaster_job.is_some() || regulation_detail_job.is_some() || traffic_color_job.is_some() || cause_job.is_some()) => {
                 if route_job.is_some() { route_note = Some("中断".to_string()); }
-                route_job = None; search_job = None; near_job = None; street_job = None; cam_job = None; recommend_job = None; road_job = None; catpoi_job = None; wander_job = None; disaster_job = None; regulation_detail_job = None; traffic_color_job = None;
+                route_job = None; search_job = None; near_job = None; street_job = None; cam_job = None; recommend_job = None; road_job = None; catpoi_job = None; wander_job = None; disaster_job = None; regulation_detail_job = None; traffic_color_job = None; cause_job = None;
                 addr = "中断".into();
             }
             Some(Event::Key(k)) => {
