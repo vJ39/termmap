@@ -991,7 +991,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     let mut inks: Vec<InkLayer> = Vec::new();
                     if radar_ink {
                         if let Some(l) = &choro_layer {
-                            inks.push(InkLayer::Stipple { layer: l, spacing: choropleth::STIPPLE_SPACING });
+                            inks.push(InkLayer::Stipple { layer: l, base: choropleth::STIPPLE_SPACING });
                         }
                         if let Some(l) = &pop_layer {
                             inks.push(InkLayer::Dither { layer: l, density: population_opacity_value(&cfg) });

@@ -269,7 +269,7 @@ pub fn build_overlay(spec: &OverlaySpec, cx: f64, cy: f64, z: u32, win_w: u32, w
     for ink in inks {
         match ink {
             InkLayer::Dither { layer, density } => ink_radar_into_overlay(&mut ov, layer, RADAR_INK_MIN_ALPHA, *density),
-            InkLayer::Stipple { layer, spacing } => stipple_rgba_into_overlay(&mut ov, layer, *spacing),
+            InkLayer::Stipple { layer, base } => stipple_rgba_into_overlay_graded(&mut ov, layer, *base),
         }
     }
     let left = cx - win_w as f64 / 2.0;
@@ -348,8 +348,9 @@ pub fn blend_rgba_over(base: &mut RgbImage, layer: &RgbaImage, opacity: f64) {
 pub enum InkLayer<'a> {
     // 雨雲・人口メッシュ(値なし=透明)。4x4 Bayer のディザで間引く。density は 0.0..=1.0。
     Dither { layer: &'a RgbaImage, density: f64 },
-    // 市区町村の塗り等の「大きな面」。spacing 画素ごとに1点だけ置く疎な点描で間引く。
-    Stipple { layer: &'a RgbaImage, spacing: u32 },
+    // 市区町村の塗り等の「大きな面」。疎な点描で間引く。base は最も濃い階級での間隔で、
+    // 薄い階級ほど間隔が広がる(層のアルファ=件数の階級が点の密度として読める)。
+    Stipple { layer: &'a RgbaImage, base: u32 },
 }
 
 // RgbaImage の軸平行な矩形を塗る。範囲外はクリップする。x1/y1 は半開区間(含まない)。
@@ -440,7 +441,25 @@ pub fn ink_radar_into_overlay(ov: &mut OverlayLayer, layer: &RgbaImage, min_alph
 // 疎な点描でインクを置くときの「不透明」の下限。完全透明(何も無い)だけを弾く。
 const STIPPLE_MIN_ALPHA: u8 = 1;
 
-// braille/edge へ「大きな面」を乗せるための疎な点描。spacing×spacing のブロックごとに1点だけ置く。
+// 層のアルファ(コロプレスなら件数の5段)を点描の間隔へ落とす。base が最も濃い階級の間隔で、
+// 薄い階級ほど広げる(設計 docs/disaster-choropleth-wide-zoom-design.md §3.2)。
+//
+// 5段(70/120/170/215/255)をそのまま5種類の間隔にはしない。**braille の1セルは横2×縦4画素**
+// なので、間隔の差が2画素未満だと見た目が変わらない。密(base)/中(base×1.5)/疎(base×2・base×3)
+// の3〜4段へ丸めた方が、実際に読める差になる。
+// 判定は段の中間値(95/145/193/235)で切る。縁取り(choropleth の OUTLINE_ALPHA=210)は
+// 最も濃い側に入るので、薄い区域の中でも間引かれずに輪郭として残る。
+fn stipple_spacing_for(alpha: u8, base: u32) -> u32 {
+    let b = base.max(1);
+    match alpha {
+        0..=94 => b * 3,       // α70  件数 0〜4
+        95..=144 => b * 2,     // α120 件数 5〜14
+        145..=192 => b * 3 / 2, // α170 件数 15〜39
+        _ => b,                // α215/255 件数 40以上・縁取り
+    }
+}
+
+// braille/edge へ「大きな面」を乗せるための疎な点描。ブロックごとに1点だけ置く。
 //
 // **面塗りに BAYER4 のディザ(ink_radar_into_overlay)をそのまま使ってはいけない**。
 // render_braille は「そのセル(2x4画素)にオーバーレイのインクが1つでもあれば、セル全体の文字色を
@@ -448,30 +467,53 @@ const STIPPLE_MIN_ALPHA: u8 = 1;
 // braille の1セルはそのタイルのちょうど半分を覆う。最も薄い density=0.35 でも、どの位相でも
 // 必ず3画素にインクが乗る = 全セルが塗り色に化ける。雨雲は降っている場所だけなので実害が無いが、
 // 市区町村の塗りは画面の大半を覆うため線画が丸ごと単色になってしまう。
-// spacing=8 なら色が付くセルは約12%(braille セル8個に1点)に収まる。
+//
+// ブロックの大きさを固定にせず、そのブロックで最も濃いアルファから決めるのが「階級対応」の要点。
+// 固定間隔だと **アルファの値がまったく効かず、件数の情報が落ちて色相しか残らない**
+// (実データの9割近くが風水害なので、画面全体が同じ密度の青い粒になる)。
+// 間隔ごとに1周ずつ回し、そのブロックの階級が自分の間隔と一致するときだけ点を置く。
+// 1つのブロックはただ1つの階級に属するので、同じ場所へ二重に置かれることはない。
 //
 // ブロック内で最初に見つかった不透明画素の位置へ置く(ブロックの原点を固定で見ない)のは、
 // 面だけでなく1px幅の縁取りも点として残すため。原点固定だと縁取りがほぼ全部間引かれて消える。
-pub fn stipple_rgba_into_overlay(ov: &mut OverlayLayer, layer: &RgbaImage, spacing: u32) {
-    let s = spacing.max(1); // 0 を渡されても全画素に置く(=1)側へ倒す。0除算・無限ループを作らない
+pub fn stipple_rgba_into_overlay_graded(ov: &mut OverlayLayer, layer: &RgbaImage, base: u32) {
+    let b = base.max(1); // 0 を渡されても 1 側へ倒す。0除算・無限ループを作らない
     let (lw, lh) = layer.dimensions();
     let (w, h) = (ov.w.min(lw), ov.h.min(lh));
-    let mut by = 0;
-    while by < h {
-        let mut bx = 0;
-        while bx < w {
-            'blk: for y in by..(by + s).min(h) {
-                for x in bx..(bx + s).min(w) {
-                    let p = layer.get_pixel(x, y);
-                    if p[3] >= STIPPLE_MIN_ALPHA {
-                        ov.put(x as i32, y as i32, [p[0], p[1], p[2]]);
-                        break 'blk; // 1ブロック1点
+    if w == 0 || h == 0 { return; }
+    // 階級が取りうる間隔。昇順・重複なし(base=1 では倍率を掛けても同じ値になる段がある)。
+    let mut spacings = [b, b * 3 / 2, b * 2, b * 3];
+    spacings.sort_unstable();
+    let mut prev = 0;
+    for s in spacings {
+        if s == prev { continue; }
+        prev = s;
+        let mut by = 0;
+        while by < h {
+            let mut bx = 0;
+            while bx < w {
+                // ブロック内の「最も濃いアルファ」と「最初の不透明画素」を1周で拾う。
+                let mut top: u8 = 0;
+                let mut first: Option<(u32, u32)> = None;
+                'blk: for y in by..(by + s).min(h) {
+                    for x in bx..(bx + s).min(w) {
+                        let a = layer.get_pixel(x, y)[3];
+                        if a < STIPPLE_MIN_ALPHA { continue; }
+                        if first.is_none() { first = Some((x, y)); }
+                        if a > top { top = a; }
+                        if top == u8::MAX { break 'blk; } // これ以上濃くならない
                     }
                 }
+                if let Some((x, y)) = first {
+                    if stipple_spacing_for(top, b) == s {
+                        let p = layer.get_pixel(x, y);
+                        ov.put(x as i32, y as i32, [p[0], p[1], p[2]]);
+                    }
+                }
+                bx += s;
             }
-            bx += s;
+            by += s;
         }
-        by += s;
     }
 }
 
@@ -908,33 +950,74 @@ mod tests {
         let back = RgbaImage::from_pixel(8, 8, image::Rgba([10, 20, 30, 255]));  // コロプレス
         let front = RgbaImage::from_pixel(8, 8, image::Rgba([200, 0, 0, 255]));  // 雨雲
         let ov = build_overlay(&spec, cx, cy, z, 8, 8, 1.0, 1.0, 8, 8, &[
-            InkLayer::Stipple { layer: &back, spacing: 1 },
+            InkLayer::Stipple { layer: &back, base: 1 },
             InkLayer::Dither { layer: &front, density: 1.0 },
         ]);
         assert_eq!(ov.get(0, 0), Some([200, 0, 0]), "後ろの要素(雨雲)が前面");
         // 順序を入れ替えれば結果も入れ替わる。
         let ov2 = build_overlay(&spec, cx, cy, z, 8, 8, 1.0, 1.0, 8, 8, &[
             InkLayer::Dither { layer: &front, density: 1.0 },
-            InkLayer::Stipple { layer: &back, spacing: 1 },
+            InkLayer::Stipple { layer: &back, base: 1 },
         ]);
         assert_eq!(ov2.get(0, 0), Some([10, 20, 30]));
     }
 
-    // ---- stipple_rgba_into_overlay(braille/edge 用の面塗りインク) ----
+    // ---- stipple_rgba_into_overlay_graded(braille/edge 用の面塗りインク) ----
+
+    // 一様なアルファで埋めたレイヤ(コロプレスの1区域の中身に相当)。
+    fn flat_layer(w: u32, h: u32, alpha: u8) -> RgbaImage {
+        RgbaImage::from_pixel(w, h, image::Rgba([0, 65, 255, alpha]))
+    }
 
     #[test]
     fn stipple_places_exactly_one_dot_per_block() {
-        // 8x8 の全面塗り。spacing=4 なら 2x2=4ブロック → 4点。
+        // 8x8 の全面塗り。base=4・最も濃い階級(α255)なら 2x2=4ブロック → 4点。
         let mut ov = OverlayLayer::new(8, 8);
-        stipple_rgba_into_overlay(&mut ov, &rain_layer(8, 8), 4);
+        stipple_rgba_into_overlay_graded(&mut ov, &rain_layer(8, 8), 4);
         assert_eq!(ink_count(&ov), 4);
         for (x, y) in [(0u32, 0u32), (4, 0), (0, 4), (4, 4)] {
             assert!(ov.get(x, y).is_some(), "ブロック原点({x},{y})に点が無い");
         }
-        // spacing=8 なら 8x8 全体で1ブロック=1点(設計の既定値。braille セル8個に1点)。
+        // base=8 なら 8x8 全体で1ブロック=1点。
         let mut ov8 = OverlayLayer::new(8, 8);
-        stipple_rgba_into_overlay(&mut ov8, &rain_layer(8, 8), 8);
+        stipple_rgba_into_overlay_graded(&mut ov8, &rain_layer(8, 8), 8);
         assert_eq!(ink_count(&ov8), 1);
+    }
+
+    // 件数の階級(disaster::fill_alpha の5段)ごとに点の密度が変わること(設計 §3.2)。
+    // 48x48・base=6 での期待値は、間隔 6/6/9/12/18 の格子の交点数そのもの。
+    #[test]
+    fn stipple_grades_the_spacing_by_the_alpha_of_the_block() {
+        let counts: Vec<usize> = [70u8, 120, 170, 215, 255]
+            .iter()
+            .map(|&a| {
+                let mut ov = OverlayLayer::new(48, 48);
+                stipple_rgba_into_overlay_graded(&mut ov, &flat_layer(48, 48, a), 6);
+                ink_count(&ov)
+            })
+            .collect();
+        assert_eq!(counts, vec![9, 16, 36, 64, 64], "階級ごとの点数: {counts:?}");
+        // 濃い階級ほど点が多い(逆転しない)。上2段は同じ間隔へ丸めるので等しい。
+        for w in counts.windows(2) {
+            assert!(w[0] <= w[1], "薄い階級の方が密になっている: {counts:?}");
+        }
+        assert!(counts[0] < counts[2], "最も薄い段と中間の段が区別できていない");
+        assert_eq!(counts[3], counts[4], "上2段は同じ間隔へ丸める(braille で差が出ないため)");
+    }
+
+    // 縁取り(OUTLINE_ALPHA=210)は最も濃い階級に入るので、薄い区域の中でも間引かれずに残る。
+    #[test]
+    fn stipple_keeps_a_one_pixel_outline_at_the_densest_spacing() {
+        let mut layer = RgbaImage::from_pixel(48, 48, image::Rgba([0, 0, 0, 0]));
+        for x in 0..48 {
+            layer.put_pixel(x, 20, image::Rgba([70, 130, 245, 210]));
+        }
+        let mut ov = OverlayLayer::new(48, 48);
+        stipple_rgba_into_overlay_graded(&mut ov, &layer, 6);
+        assert_eq!(ink_count(&ov), 8, "48px の線に base=6 なら8点");
+        for x in [0u32, 6, 42] {
+            assert_eq!(ov.get(x, 20), Some([70, 130, 245]), "縁取りの上に点が無い(x={x})");
+        }
     }
 
     // Bayer(4x4周期)より遥かに疎になること。同じ面を覆っても braille のセルが単色に潰れない。
@@ -944,8 +1027,8 @@ mod tests {
         let mut dither = OverlayLayer::new(16, 16);
         ink_radar_into_overlay(&mut dither, &layer, 32, 0.35); // 最も薄いディザ
         let mut stipple = OverlayLayer::new(16, 16);
-        stipple_rgba_into_overlay(&mut stipple, &layer, 8);
-        assert_eq!(ink_count(&stipple), 4, "16x16 を spacing=8 で覆うと4点");
+        stipple_rgba_into_overlay_graded(&mut stipple, &layer, 8);
+        assert_eq!(ink_count(&stipple), 4, "16x16 を base=8 で覆うと4点");
         assert!(ink_count(&stipple) * 8 < ink_count(&dither), "{} vs {}", ink_count(&stipple), ink_count(&dither));
     }
 
@@ -953,14 +1036,14 @@ mod tests {
     fn stipple_never_places_a_dot_on_a_transparent_pixel() {
         // 全面透明なら1点も置かない。
         let mut ov = OverlayLayer::new(8, 8);
-        stipple_rgba_into_overlay(&mut ov, &RgbaImage::from_pixel(8, 8, image::Rgba([0, 65, 255, 0])), 4);
+        stipple_rgba_into_overlay_graded(&mut ov, &RgbaImage::from_pixel(8, 8, image::Rgba([0, 65, 255, 0])), 4);
         assert_eq!(ink_count(&ov), 0);
         // ブロック内に不透明画素が1つだけあるとき、点はその画素の上に置かれる(原点ではなく)。
         // 1px幅の縁取りが間引きで消えないようにするための性質。
         let mut layer = RgbaImage::from_pixel(8, 8, image::Rgba([0, 0, 0, 0]));
         layer.put_pixel(3, 2, image::Rgba([9, 8, 7, 255]));
         let mut ov2 = OverlayLayer::new(8, 8);
-        stipple_rgba_into_overlay(&mut ov2, &layer, 8);
+        stipple_rgba_into_overlay_graded(&mut ov2, &layer, 8);
         assert_eq!(ink_count(&ov2), 1);
         assert_eq!(ov2.get(3, 2), Some([9, 8, 7]));
         assert_eq!(ov2.get(0, 0), None);
@@ -971,29 +1054,33 @@ mod tests {
         let mut layer = RgbaImage::from_pixel(4, 4, image::Rgba([0, 0, 0, 0]));
         layer.put_pixel(0, 0, image::Rgba([70, 130, 245, 170])); // 風水害の色
         let mut ov = OverlayLayer::new(4, 4);
-        stipple_rgba_into_overlay(&mut ov, &layer, 4);
+        stipple_rgba_into_overlay_graded(&mut ov, &layer, 4);
         assert_eq!(ov.get(0, 0), Some([70, 130, 245]), "アルファは落として色だけ使う");
     }
 
     #[test]
     fn stipple_handles_odd_spacings_and_mismatched_dimensions() {
-        // spacing=0 は 1 として扱う(0除算・無限ループを作らない)。
+        // base=0 は 1 として扱う(0除算・無限ループを作らない)。
         let mut ov = OverlayLayer::new(4, 4);
-        stipple_rgba_into_overlay(&mut ov, &rain_layer(4, 4), 0);
+        stipple_rgba_into_overlay_graded(&mut ov, &rain_layer(4, 4), 0);
         assert_eq!(ink_count(&ov), 16);
-        // 端数ブロック(8 を spacing=3 で割ると 3+3+2)でもはみ出さない。
+        // base=0 は薄い階級でも止まらない(間隔の倍率を掛けても0にならない)。
+        let mut ov0 = OverlayLayer::new(4, 4);
+        stipple_rgba_into_overlay_graded(&mut ov0, &flat_layer(4, 4, 70), 0);
+        assert!(ink_count(&ov0) > 0, "base=0・最も薄い階級で1点も置かれない");
+        // 端数ブロック(8 を base=3 で割ると 3+3+2)でもはみ出さない。
         let mut ov2 = OverlayLayer::new(8, 8);
-        stipple_rgba_into_overlay(&mut ov2, &rain_layer(8, 8), 3);
+        stipple_rgba_into_overlay_graded(&mut ov2, &rain_layer(8, 8), 3);
         assert_eq!(ink_count(&ov2), 9, "3x3 ブロック");
         // 寸法違い・空レイヤでパニックしない。
         let mut ov3 = OverlayLayer::new(4, 4);
-        stipple_rgba_into_overlay(&mut ov3, &rain_layer(10, 10), 4);
+        stipple_rgba_into_overlay_graded(&mut ov3, &rain_layer(10, 10), 4);
         assert_eq!(ink_count(&ov3), 1);
         let mut ov4 = OverlayLayer::new(4, 4);
-        stipple_rgba_into_overlay(&mut ov4, &rain_layer(2, 1), 4);
+        stipple_rgba_into_overlay_graded(&mut ov4, &rain_layer(2, 1), 4);
         assert_eq!(ink_count(&ov4), 1);
         let mut ov5 = OverlayLayer::new(4, 4);
-        stipple_rgba_into_overlay(&mut ov5, &RgbaImage::new(0, 0), 4);
+        stipple_rgba_into_overlay_graded(&mut ov5, &RgbaImage::new(0, 0), 4);
         assert_eq!(ink_count(&ov5), 0);
     }
 

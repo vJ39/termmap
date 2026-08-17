@@ -22,9 +22,12 @@ use std::collections::HashMap;
 /// 常に画面の大半を覆うため。同じ濃さだと下の地図が読めなくなる。
 pub const DEFAULT_OPACITY: f64 = 0.45;
 
-/// braille/edge で面を点描にするときの間隔(画素)。8なら 8x8=64画素に1点で、
-/// braille のセル(2x4画素)8個に1点 = 色が付くセルは約12%に収まる。
-pub const STIPPLE_SPACING: u32 = 8;
+/// braille/edge で面を点描にするときの、**最も濃い階級での**間隔(画素)。
+/// 薄い階級ほど render 側で間隔が広がる(6 / 9 / 12 / 18)ので、件数が点の密度として読める。
+/// 固定間隔8から6へ下げるのは、階級を疎らな側へ広げるぶん最も濃い側を詰めて全体の見え方を保つため
+/// (docs/disaster-choropleth-wide-zoom-design.md §3.2)。
+/// 6なら 6x6=36画素に1点で、braille のセル(2x4画素)4〜5個に1点に収まる。
+pub const STIPPLE_SPACING: u32 = 6;
 
 /// 縁取りのアルファ。件数5段の塗り(disaster::fill_alpha)と別に固定値にするのは、
 /// z14では塗りを出さず縁取りだけで区画を示すため(そこで薄いと境界が読めない)。
