@@ -36,7 +36,7 @@ pub(crate) struct KeyCtx<'a> {
 
 pub(crate) fn dispatch(st: &mut UiState, k: KeyEvent, cx: &KeyCtx, out: &mut dyn Write) -> bool {
     // 分岐の中身は ui.rs から動かしていないので、フレームの値はもとと同じ名前で受け取る。
-    let KeyCtx { a, loader, lat, lon, nogos: route_nogos, ow, oh } = *cx;
+    let KeyCtx { a, lat, lon, nogos: route_nogos, ow, oh, .. } = *cx;
     let cur = std::mem::replace(&mut st.focus, Focus::Map);
     match cur {
         Focus::Search(mut buf) => match k.code {
@@ -129,111 +129,8 @@ pub(crate) fn dispatch(st: &mut UiState, k: KeyEvent, cx: &KeyCtx, out: &mut dyn
             KeyCode::Esc => { st.snd.play("back"); st.pending_spot = None; st.focus = Focus::Map; let _ = write!(out, "\x1b[2J"); st.force_reemit = true; }
             _ => st.focus = Focus::SpotCatList,
         },
-        Focus::Settings => { let mut stay = true; let mut changed = false; match k.code { // 設定画面
-            KeyCode::Up | KeyCode::Char('w') => { st.snd.play("click"); st.set_sel = st.set_sel.saturating_sub(1); }
-            // 下端は settings.rs の行数定義から取る(生の数値で持つと項目追加のたびに手で同期する羽目になる)
-            KeyCode::Down | KeyCode::Char('s') => { st.snd.play("click"); if st.set_sel + 1 < settings::SETTINGS_ROW_COUNT { st.set_sel += 1; } }
-            KeyCode::Left | KeyCode::Right => {
-                if st.set_sel == 6 { let d = if k.code == KeyCode::Left { -100.0 } else { 100.0 }; st.cfg.sample_interval_m = (st.cfg.sample_interval_m + d).clamp(100.0, 5000.0); changed = true; }
-            }
-            KeyCode::Enter | KeyCode::Char(' ') => {
-                if st.set_sel == 6 { // 道路の点間隔: インライン数値編集を開く
-                    let b = format!("{}", st.cfg.sample_interval_m as i64);
-                    st.input_cur = b.chars().count();
-                    st.focus = Focus::SettingsEdit(6, b);
-                    stay = false;
-                } else if st.set_sel == 17 { // Google APIキー: インラインテキスト編集を開く(Cmd+V貼付も引き続き可)
-                    let b = st.cfg.google_maps_api_key.clone();
-                    st.input_cur = b.chars().count();
-                    st.focus = Focus::SettingsEdit(17, b);
-                    stay = false;
-                } else if settings::is_pickable(st.set_sel) { // 3択以上の項目: サイドの一覧(SettingsPick)を開いて直接選ぶ
-                    st.set_pick_sel = settings::pick_current(st.set_sel, &st.cfg, &st.opts.style);
-                    st.focus = Focus::SettingsPick(st.set_sel);
-                    stay = false;
-                } else {
-                    changed = true;
-                    match st.set_sel {
-                        // 表示に効くAAスタイル(braille/classify/edge/mono)は、map_sigに含まれない
-                        // opts側の状態なので、切替時はforce_reemitで確実に次フレーム反映させる。
-                        0 => { st.opts.braille = !st.opts.braille; st.force_reemit = true; }
-                        1 => { st.opts.classify = !st.opts.classify; st.force_reemit = true; }
-                        2 => { st.opts.edge = !st.opts.edge; st.force_reemit = true; }
-                        3 => { st.opts.mono = !st.opts.mono; st.force_reemit = true; }
-                        7 => { st.cfg.show_spots = !st.cfg.show_spots; st.show_spots = st.cfg.show_spots; apply_spots(&mut st.spec, &st.spots, &st.spot_cats, st.show_spots); }
-                        8 => st.cfg.llm_recommend_enabled = !st.cfg.llm_recommend_enabled,
-                        10 => st.cfg.streetview_enabled = !st.cfg.streetview_enabled,
-                        11 => { st.cfg.image_mode = !st.cfg.image_mode; st.force_reemit = true; }
-                        13 => st.cfg.image_settle_low_res = !st.cfg.image_settle_low_res,
-                        14 => { st.cfg.sound_enabled = !st.cfg.sound_enabled; st.snd = sound::Sound::new(st.cfg.sound_enabled); st.snd.play("confirm"); }
-                        15 => { // オンボーディング: マーカーの削除=毎回表示 / 作成=次回から非表示
-                            if let Some(p) = onboarded_marker() {
-                                if p.exists() { let _ = std::fs::remove_file(&p); st.addr = "オンボーディング: 毎回表示に戻した".into(); }
-                                else { let _ = crate::fsutil::write_atomic(&p, b"1", None); st.addr = "オンボーディング: 次回から非表示".into(); }
-                            }
-                        }
-                        19 => { // 雨雲レーダー: 起動時の既定を切り替え、いま表示中の地図にも即反映する
-                            st.cfg.radar_enabled = !st.cfg.radar_enabled;
-                            if st.cfg.radar_enabled != st.radar_on { st.radar_toggle(); }
-                        }
-                        21 => { // ルート音声案内: ONにした時、既にルートがあれば曲がり角を取りに行く
-                            st.cfg.voice_guide_enabled = !st.cfg.voice_guide_enabled;
-                            if st.cfg.voice_guide_enabled {
-                                if let Some(pts) = st.spec.routes.last().map(|rt| rt.pts.clone()) {
-                                    st.turn_job = Some(trigger_turn_points(&st.wps, &st.mode, 0, &pts, &route_nogos));
-                                }
-                            }
-                        }
-                        // 道路交通量/ライブカメラ/通行規制: ONにした時の後始末は不要。
-                        // 次のtickでセル表を見に行き、キャッシュがfreshならディスクから
-                        // 即座に出す(ONにした瞬間に前回の内容が出て、必要なら裏で更新される)。
-                        22 => { st.cfg.traffic_enabled = !st.cfg.traffic_enabled; }
-                        23 => { st.cfg.voice_speak_local = !st.cfg.voice_speak_local; }
-                        24 => { st.cfg.camera_enabled = !st.cfg.camera_enabled; }
-                        25 => { st.cfg.regulation_enabled = !st.cfg.regulation_enabled; }
-                        26 => { // 過去災害: ONにした直後だけ出典を1回出す(雨雲レーダーと同じ扱い)
-                            st.cfg.disaster_enabled = !st.cfg.disaster_enabled;
-                            if st.cfg.disaster_enabled { st.addr = "過去災害: 防災科学技術研究所 災害事例データベース".into(); }
-                        }
-                        28 => { // 渋滞状況の色分け: 次にルートが確定したタイミングで初めて問い合わせる
-                            st.cfg.route_traffic_enabled = !st.cfg.route_traffic_enabled;
-                            if st.cfg.route_traffic_enabled && st.cfg.google_maps_api_key.trim().is_empty() {
-                                st.addr = "渋滞状況の色分け: Google APIキー未設定".into();
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            KeyCode::Esc => { st.snd.play("back"); stay = false; let _ = write!(out, "\x1b[2J"); st.force_reemit = true; } // 閉じる→Map。他の左袖パネルと同じく残像防止に全消去+再emit
-            _ => {}
-        }
-        if changed { // 変更のたびに opts→cfg を同期して即保存(sを押さなくてよい)
-            st.cfg.braille = st.opts.braille; st.cfg.classify = st.opts.classify; st.cfg.edge = st.opts.edge; st.cfg.mono = st.opts.mono; st.cfg.style = st.opts.style.clone();
-            let _ = config::save_config(&st.cfg);
-        }
-        if stay { st.focus = Focus::Settings; } },
-        Focus::SettingsEdit(idx, mut buf) => match k.code {
-            KeyCode::Enter => {
-                if idx == 6 {
-                    match buf.trim().parse::<f64>() {
-                        Ok(v) => { st.cfg.sample_interval_m = v.clamp(100.0, 5000.0); let _ = config::save_config(&st.cfg); st.addr = format!("道路の点間隔: {}m", st.cfg.sample_interval_m as i64); }
-                        Err(_) => { st.snd.play("error"); st.addr = "数値を入力してください(例: 800)".into(); }
-                    }
-                } else if idx == 17 {
-                    let v = buf.trim().to_string();
-                    if v.chars().all(|c| c.is_ascii_graphic() || c == ' ') {
-                        st.cfg.google_maps_api_key = v; let _ = config::save_config(&st.cfg); st.addr = "APIキー設定(自動保存)".into();
-                    } else { st.snd.play("error"); st.addr = "APIキーに使えない文字が含まれています".into(); }
-                }
-                st.focus = Focus::Settings;
-            }
-            KeyCode::Esc => { st.snd.play("back"); st.focus = Focus::Settings; } // 編集を破棄
-            // 数値欄(道路の点間隔)は数字/小数点/マイナスのみ受け付ける。APIキー欄は制御文字・改行を弾く。
-            KeyCode::Char(c) if idx == 6 && !(c.is_ascii_digit() || c == '.' || c == '-') => {}
-            KeyCode::Char(c) if idx == 17 && !(c.is_ascii_graphic() || c == ' ') => {}
-            other => { edit_line(&mut buf, &mut st.input_cur, other); st.focus = Focus::SettingsEdit(idx, buf); }
-        },
+        Focus::Settings => ui_keys_settings::settings(st, k, cx.nogos, out),
+        Focus::SettingsEdit(idx, buf) => ui_keys_settings::settings_edit(st, k, idx, buf),
         Focus::RoadSearch(mut buf) => match k.code { // 道路名/ref で現在view内をルート化
             KeyCode::Enter => {
                 let name = buf.trim().to_string();
@@ -730,42 +627,7 @@ pub(crate) fn dispatch(st: &mut UiState, k: KeyEvent, cx: &KeyCtx, out: &mut dyn
                 _ => st.focus = Focus::ShapePick { cat },
             }
         }
-        // 設定画面の一覧ピッカー: 地図種別/既定ルート/AIモデル/画像解像度/中心十字の色を↑↓/w・sで選びEnterで確定
-        Focus::SettingsPick(idx) => {
-            let n = settings::pick_labels(idx, &st.cfg).len().max(1);
-            match k.code {
-                KeyCode::Up | KeyCode::Char('w') => { st.set_pick_sel = (st.set_pick_sel + n - 1) % n; st.focus = Focus::SettingsPick(idx); }
-                KeyCode::Down | KeyCode::Char('s') => { st.set_pick_sel = (st.set_pick_sel + 1) % n; st.focus = Focus::SettingsPick(idx); }
-                // 読み上げの声(27)だけ: Spaceでカーソル位置の声を試聴(確定せず一覧も閉じない)。
-                KeyCode::Char(' ') if idx == 27 => {
-                    if let Some((v, _)) = settings::voice_choices(&st.cfg).get(st.set_pick_sel) {
-                        st.voice_preview_job = Some(voice::preview_voice(v, "300メートル先、左折です"));
-                        let name = if v.is_empty() { "システム既定".to_string() } else { voice::display_voice_name(v).to_string() };
-                        st.addr = format!("試聴: {name}(この端末で再生)");
-                    }
-                    st.focus = Focus::SettingsPick(idx);
-                }
-                KeyCode::Enter => {
-                    let eff = settings::apply_pick(idx, st.set_pick_sel, &mut st.cfg, &mut st.opts.style);
-                    // スタイル変更時、キャッシュ自体はもう消さない(TileKeyがstyleを含むため
-                    // 別styleと混ざる心配は無く、むしろ残しておくことで切替直後に旧styleを
-                    // フォールバック仮表示できる)。ローダーの未着手依頼だけ捨てる(旧styleの
-                    // 取得依頼が溜まり続けないように)。
-                    if eff.cache_clear { loader.clear_pending(); }
-                    if eff.force_reemit { st.force_reemit = true; }
-                    let _ = config::save_config(&st.cfg);
-                    // 読み上げの声(27)は確定した声が実際に使えるか、確定時にも1回再生して確かめる。
-                    if idx == 27 {
-                        st.voice_preview_job = Some(voice::preview_voice(&st.cfg.voice_name, "300メートル先、左折です"));
-                        let name = if st.cfg.voice_name.is_empty() { "システム既定".to_string() } else { voice::display_voice_name(&st.cfg.voice_name).to_string() };
-                        st.addr = format!("試聴: {name}(この端末で再生)");
-                    }
-                    st.focus = Focus::Settings;
-                }
-                KeyCode::Esc => { st.snd.play("back"); st.focus = Focus::Settings; } // 変更せず閉じる
-                _ => st.focus = Focus::SettingsPick(idx),
-            }
-        }
+        Focus::SettingsPick(idx) => ui_keys_settings::settings_pick(st, k, idx, cx.loader),
         // ルート一覧にフォーカス中: ↑↓で点/操作行を選択、Enterで実行。矢印はパンでなく選択。
         Focus::RoutePanel => {
             match k.code {

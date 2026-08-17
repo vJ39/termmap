@@ -30,6 +30,7 @@ mod uistate;    // 対話ループの状態(UiState)
 mod ui_action;  // メニュー項目/直接キーから走らせる処理(MenuActionの実行部)
 mod ui_jobs;    // バックグラウンドジョブの結果取り込み(毎フレーム1回)
 mod ui_keys;    // Focusごとのキー処理(画面ごとの分岐)
+mod ui_keys_settings; // 設定画面のキー処理
 mod ui_helpers; // interactive() の外にあった小さなヘルパー群
 mod focus;      // 対話UIの画面状態(Focus)
 #[allow(dead_code)] // ui.rs への配線(OSC 9997 送出)はこれから
