@@ -666,7 +666,7 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
         }
         // ステータス行の文面組み立ては ui_status.rs へ切り出し済み。通信中スピナーの判定に使う
         // 各ジョブは有無しか見ないのでここで1つのフラグに畳んでから渡す。
-        let jobs_active = st.route_job.is_some() || st.search_job.is_some() || st.near_job.is_some() || st.street_job.is_some() || st.cam_job.is_some() || st.recommend_job.is_some() || st.road_job.is_some() || st.catpoi_job.is_some() || st.wander_job.is_some() || st.disaster_job.is_some() || st.regulation_detail_job.is_some() || st.traffic_color_job.is_some() || st.cause_job.is_some();
+        let jobs_active = st.jobs_active();
         // 次の曲がり角の画面表示。音声案内(maybe_speak_turn)と同じくturn_points+現在地から
         // 求めるが、読み上げ済みかの状態は見ない(何度描画しても同じ内容を出したいため)。
         let next_turn = st.spec.routes.last()
@@ -1040,14 +1040,14 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
         // is_busy()に加えgenerationのスナップショット比較も見る(#53): このフレームの再構築後、
         // is_busy()を読むまでの間に最後の1枚がちょうど着地しinflightが空になっていた場合、
         // is_busy()だけではその1枚の反映漏れを検知できずread()でブロックしてしまうため。
-        let polling = st.route_job.is_some() || st.search_job.is_some() || st.near_job.is_some() || st.street_job.is_some() || st.cam_job.is_some() || st.recommend_job.is_some() || st.road_job.is_some() || st.catpoi_job.is_some() || st.wander_job.is_some() || st.gps_rx.is_some() || st.play.is_some() || settling || loader.is_busy() || loader.generation() != loader_gen_snapshot
+        let polling = st.jobs_active() || st.voice_preview_job.is_some()
+            || st.gps_rx.is_some() || st.play.is_some() || settling || loader.is_busy() || loader.generation() != loader_gen_snapshot
             || st.radar_clock.is_some() // 雨雲: 背景ポーラーからの時刻一覧を取りこぼさない
             // 道路交通量/主要道路/ライブカメラ/通行規制の背景取得完了を、キー入力無しでも
             // 取りこぼさない(結果が最大60秒(IDLE_SAVE_INTERVAL)反映されない事故を防ぐ)。
             // 主要道路は以前この条件から漏れていたが、4レイヤとも同じ扱いにする。
             || st.traffic_layer.job_active() || st.roads_layer.job_active()
-            || st.camera_layer.job_active() || st.regulation_layer.job_active() || st.disaster_layer.job_active()
-            || st.disaster_job.is_some() || st.voice_preview_job.is_some() || st.regulation_detail_job.is_some() || st.traffic_color_job.is_some() || st.cause_job.is_some();
+            || st.camera_layer.job_active() || st.regulation_layer.job_active() || st.disaster_layer.job_active();
         let mut ev: Option<Event> = if got_result {
             None
         } else if polling {
@@ -1132,12 +1132,7 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
             None => {} // 再描画のみ(計算待ち)
             Some(Event::Key(k)) if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) => {
                 // Ctrl-C: 進行中の全ジョブを中断(アプリは終了しない)
-                let any = st.route_job.is_some() || st.search_job.is_some() || st.near_job.is_some() || st.street_job.is_some() || st.cam_job.is_some() || st.recommend_job.is_some() || st.road_job.is_some() || st.catpoi_job.is_some() || st.wander_job.is_some() || st.disaster_job.is_some() || st.regulation_detail_job.is_some() || st.traffic_color_job.is_some() || st.cause_job.is_some();
-                if any {
-                    if st.route_job.is_some() { st.route_note = Some("中断".to_string()); }
-                    st.route_job = None; st.search_job = None; st.near_job = None; st.street_job = None; st.cam_job = None; st.recommend_job = None; st.road_job = None; st.catpoi_job = None; st.wander_job = None; st.disaster_job = None; st.regulation_detail_job = None; st.traffic_color_job = None; st.cause_job = None;
-                    st.addr = "中断".into();
-                }
+                if st.jobs_active() { st.cancel_jobs(); }
             }
             Some(Event::Key(k)) if st.onboard => { // 何かキーで閉じる。d のときだけ「次回から非表示」マーカーを書く(既定は毎回表示)
                 if matches!(k.code, KeyCode::Char('d') | KeyCode::Char('D')) {
@@ -1186,11 +1181,8 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
                 } else { st.addr = "消去を取消".into(); }
             }
             // Map表示中のEscは進行中ジョブの中断に使う(サブ画面のEscは各Focusの取消のまま)
-            Some(Event::Key(k)) if k.code == KeyCode::Esc && matches!(st.focus, Focus::Map)
-                && (st.route_job.is_some() || st.search_job.is_some() || st.near_job.is_some() || st.street_job.is_some() || st.cam_job.is_some() || st.recommend_job.is_some() || st.road_job.is_some() || st.catpoi_job.is_some() || st.wander_job.is_some() || st.disaster_job.is_some() || st.regulation_detail_job.is_some() || st.traffic_color_job.is_some() || st.cause_job.is_some()) => {
-                if st.route_job.is_some() { st.route_note = Some("中断".to_string()); }
-                st.route_job = None; st.search_job = None; st.near_job = None; st.street_job = None; st.cam_job = None; st.recommend_job = None; st.road_job = None; st.catpoi_job = None; st.wander_job = None; st.disaster_job = None; st.regulation_detail_job = None; st.traffic_color_job = None; st.cause_job = None;
-                st.addr = "中断".into();
+            Some(Event::Key(k)) if k.code == KeyCode::Esc && matches!(st.focus, Focus::Map) && st.jobs_active() => {
+                st.cancel_jobs();
             }
             Some(Event::Key(k)) => {
                 let cur = std::mem::replace(&mut st.focus, Focus::Map);

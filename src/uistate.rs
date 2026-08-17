@@ -416,6 +416,48 @@ impl UiState {
         }
     }
 
+    // 「利用者が結果を待っている」ジョブが1本でも走っているか。ステータス行のスピナー・
+    // 入力待ちのポーリング判定・中断(Ctrl-C / 地図のEsc)の可否で同じ一覧を見る必要があり、
+    // もとは同じ13本の並びが ui.rs に4回書かれていた。ジョブを増やすときはここだけ直す。
+    // 声の試聴(voice_preview_job)は中断の対象外なので、この一覧には入れない。
+    pub(crate) fn jobs_active(&self) -> bool {
+        self.route_job.is_some()
+            || self.search_job.is_some()
+            || self.near_job.is_some()
+            || self.street_job.is_some()
+            || self.cam_job.is_some()
+            || self.recommend_job.is_some()
+            || self.road_job.is_some()
+            || self.catpoi_job.is_some()
+            || self.wander_job.is_some()
+            || self.disaster_job.is_some()
+            || self.regulation_detail_job.is_some()
+            || self.traffic_color_job.is_some()
+            || self.cause_job.is_some()
+    }
+
+    // 進行中ジョブを全部捨てる(Ctrl-C と 地図の Esc)。受信側を落とすだけで、走っている
+    // スレッドは結果を送れずに終わる。ルート計算だけは経路欄にも「中断」を残す。
+    pub(crate) fn cancel_jobs(&mut self) {
+        if self.route_job.is_some() {
+            self.route_note = Some("中断".to_string());
+        }
+        self.route_job = None;
+        self.search_job = None;
+        self.near_job = None;
+        self.street_job = None;
+        self.cam_job = None;
+        self.recommend_job = None;
+        self.road_job = None;
+        self.catpoi_job = None;
+        self.wander_job = None;
+        self.disaster_job = None;
+        self.regulation_detail_job = None;
+        self.traffic_color_job = None;
+        self.cause_job = None;
+        self.addr = "中断".into();
+    }
+
     // road_segs の変更後に描画用の spec.roads を作り直す(trigger_route等では消えない別レイヤ)。
     pub(crate) fn sync_roads(&mut self) {
         self.spec.roads = self
@@ -585,5 +627,85 @@ mod tests {
         assert_eq!(st.spec.roads[0].pts, vec![(35.0, 139.0), (35.1, 139.1)]);
         assert_eq!(st.spec.roads[0].color, [1, 2, 3]);
         assert_eq!(st.spec.roads[1].thickness, 2);
+    }
+
+    // 13本すべてに受信口を差す。送信側は捨てる(結果は使わず有無だけを見るテストのため)。
+    fn fill_all_jobs(st: &mut UiState) {
+        st.route_job = Some(std::sync::mpsc::channel().1);
+        st.search_job = Some(std::sync::mpsc::channel().1);
+        st.near_job = Some(std::sync::mpsc::channel().1);
+        st.street_job = Some(std::sync::mpsc::channel().1);
+        st.cam_job = Some(std::sync::mpsc::channel().1);
+        st.recommend_job = Some(std::sync::mpsc::channel().1);
+        st.road_job = Some(std::sync::mpsc::channel().1);
+        st.catpoi_job = Some(std::sync::mpsc::channel().1);
+        st.wander_job = Some(std::sync::mpsc::channel().1);
+        st.disaster_job = Some(std::sync::mpsc::channel().1);
+        st.regulation_detail_job = Some(std::sync::mpsc::channel().1);
+        st.traffic_color_job = Some(std::sync::mpsc::channel().1);
+        st.cause_job = Some(std::sync::mpsc::channel().1);
+    }
+
+    #[test]
+    fn jobs_active_is_false_while_nothing_runs() {
+        let st = test_state();
+        assert!(!st.jobs_active());
+    }
+
+    #[test]
+    fn jobs_active_notices_each_job_one_at_a_time() {
+        // 1本ずつ差して、13本とも一覧に入っていることを確かめる(足し忘れ検出が目的)。
+        let mut probes: Vec<Box<dyn Fn(&mut UiState)>> = Vec::new();
+        probes.push(Box::new(|st: &mut UiState| st.route_job = Some(std::sync::mpsc::channel().1)));
+        probes.push(Box::new(|st: &mut UiState| st.search_job = Some(std::sync::mpsc::channel().1)));
+        probes.push(Box::new(|st: &mut UiState| st.near_job = Some(std::sync::mpsc::channel().1)));
+        probes.push(Box::new(|st: &mut UiState| st.street_job = Some(std::sync::mpsc::channel().1)));
+        probes.push(Box::new(|st: &mut UiState| st.cam_job = Some(std::sync::mpsc::channel().1)));
+        probes.push(Box::new(|st: &mut UiState| st.recommend_job = Some(std::sync::mpsc::channel().1)));
+        probes.push(Box::new(|st: &mut UiState| st.road_job = Some(std::sync::mpsc::channel().1)));
+        probes.push(Box::new(|st: &mut UiState| st.catpoi_job = Some(std::sync::mpsc::channel().1)));
+        probes.push(Box::new(|st: &mut UiState| st.wander_job = Some(std::sync::mpsc::channel().1)));
+        probes.push(Box::new(|st: &mut UiState| st.disaster_job = Some(std::sync::mpsc::channel().1)));
+        probes.push(Box::new(|st: &mut UiState| st.regulation_detail_job = Some(std::sync::mpsc::channel().1)));
+        probes.push(Box::new(|st: &mut UiState| st.traffic_color_job = Some(std::sync::mpsc::channel().1)));
+        probes.push(Box::new(|st: &mut UiState| st.cause_job = Some(std::sync::mpsc::channel().1)));
+        assert_eq!(probes.len(), 13);
+        for (i, set) in probes.iter().enumerate() {
+            let mut st = test_state();
+            set(&mut st);
+            assert!(st.jobs_active(), "{i}番目のジョブが一覧から漏れている");
+        }
+    }
+
+    #[test]
+    fn jobs_active_ignores_the_voice_preview() {
+        // 声の試聴は中断の対象外。スピナーも出さない(短時間で終わるため)。
+        let mut st = test_state();
+        st.voice_preview_job = Some(std::sync::mpsc::channel().1);
+        assert!(!st.jobs_active());
+    }
+
+    #[test]
+    fn cancel_jobs_drops_everything_and_reports() {
+        let mut st = test_state();
+        fill_all_jobs(&mut st);
+        st.voice_preview_job = Some(std::sync::mpsc::channel().1);
+        st.turn_job = Some(std::sync::mpsc::channel().1);
+        st.cancel_jobs();
+        assert!(!st.jobs_active());
+        assert_eq!(st.addr, "中断");
+        assert_eq!(st.route_note.as_deref(), Some("中断"), "経路欄にも残す");
+        assert!(st.voice_preview_job.is_some(), "試聴は止めない");
+        assert!(st.turn_job.is_some(), "曲がり角の取得も止めない(ルート線に付随する裏方)");
+    }
+
+    #[test]
+    fn cancel_jobs_keeps_the_route_note_quiet_when_no_route_was_running() {
+        let mut st = test_state();
+        st.route_note = Some("40.0km".into());
+        st.search_job = Some(std::sync::mpsc::channel().1);
+        st.cancel_jobs();
+        assert_eq!(st.route_note.as_deref(), Some("40.0km"), "ルート計算中でなければ経路欄は触らない");
+        assert_eq!(st.addr, "中断");
     }
 }
