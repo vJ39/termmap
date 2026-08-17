@@ -107,6 +107,20 @@ impl DisasterKind {
         }
     }
 
+    /// Bキーの事例一覧に添える色凡例の6種(表示順は rank() と同じ)。Unknown は未知コード用で
+    /// 実データではまず出現しないため、凡例には混ぜない(出ない色を凡例に載せると読み手が
+    /// 「あの色は?」と探す先が増えるだけになる)。
+    pub fn legend_kinds() -> [DisasterKind; 6] {
+        [
+            DisasterKind::Earthquake,
+            DisasterKind::Volcano,
+            DisasterKind::Storm,
+            DisasterKind::Slope,
+            DisasterKind::Snow,
+            DisasterKind::OtherWeather,
+        ]
+    }
+
     // 件数が同じ種別が並んだときの優先順(dominant の決まり方を固定するためだけの順序)。
     // 応答の行順に依存させると、同じ地点でも取得のたびに色が入れ替わりうる。
     fn rank(&self) -> u8 {
@@ -676,6 +690,19 @@ mod tests {
         colors.sort();
         colors.dedup();
         assert_eq!(colors.len(), kinds.len(), "種別ごとに違う色であること");
+    }
+
+    // Bキーの事例一覧に添える色凡例(コロプレスの色分けと同じ意味)。Unknownは実データの6分類の
+    // どれにも当たらない未知コード用で、通常は出現しない。凡例に混ぜると「7色目」があるように
+    // 誤読されるため除く。
+    #[test]
+    fn legend_kinds_covers_the_six_known_categories_but_not_unknown() {
+        let kinds = DisasterKind::legend_kinds();
+        assert_eq!(kinds.len(), 6);
+        assert!(!kinds.contains(&DisasterKind::Unknown));
+        let mut seen: Vec<DisasterKind> = kinds.to_vec();
+        seen.sort_by_key(|k| k.rank());
+        assert_eq!(kinds.to_vec(), seen, "凡例は rank() の順(色・意味が安定した並び)で出す");
     }
 
     #[test]

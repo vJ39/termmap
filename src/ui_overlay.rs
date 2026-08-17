@@ -259,10 +259,59 @@ pub(crate) fn draw_shape_pick<W: Write>(out: &mut W, cols: u32, map_rows: u32, s
     let _ = write!(out, "\x1b[{};{}H{}{}{}", r0 + 5, c0, BG, blank, RST);
 }
 
+fn disp_width(s: &str) -> usize { unicode_width::UnicodeWidthStr::width(s) }
+
+// 凡例1項目のプレーン表示幅を測るための文字列(色は含まない)。実際の描画は legend_row_colored が
+// 色を被せて組み立てる(fit_cells は SGR エスケープを解さず幅計算が壊れるため、幅の計算だけは
+// 常にこちらのプレーン版で行う)。
+fn legend_item_plain(kind: disaster::DisasterKind) -> String {
+    format!("■{}", kind.label())
+}
+
+// 過去災害の色凡例(6種)を iw 幅に収まる行へ貪欲に折り返す。1行に入り切らない幅でも、
+// 1項目だけの行にはする(空行は作らない)。
+fn wrap_legend(iw: usize) -> Vec<Vec<disaster::DisasterKind>> {
+    let mut rows: Vec<Vec<disaster::DisasterKind>> = vec![Vec::new()];
+    let mut w = 0usize;
+    for kind in disaster::DisasterKind::legend_kinds() {
+        let item_w = disp_width(&legend_item_plain(kind));
+        let need = if w == 0 { item_w } else { w + 1 + item_w };
+        if need > iw && w > 0 {
+            rows.push(Vec::new());
+            w = 0;
+        }
+        let row = rows.last_mut().expect("直前に必ず1行積んである");
+        if !row.is_empty() { w += 1; }
+        row.push(kind);
+        w += item_w;
+    }
+    rows
+}
+
+// 凡例1行ぶんの色付き文字列。パネルの背景(黒文字/白背景)を保つため、色を変えたあとは
+// "\x1b[0m" ではなく "\x1b[30m"(黒文字のみ)へ戻す(0mだと背景色も消えてしまう)。
+// 幅の計算は legend_item_plain のプレーン版を使い、iw ちょうどまで空白でパディングする。
+fn legend_row_colored(kinds: &[disaster::DisasterKind], iw: usize, truecolor: bool) -> String {
+    let mut s = String::new();
+    let mut w = 0usize;
+    for (i, kind) in kinds.iter().enumerate() {
+        if i > 0 { s.push(' '); w += 1; }
+        let [r, g, b] = kind.color();
+        s.push_str(&sgr_fg(r, g, b, truecolor));
+        s.push('■');
+        s.push_str("\x1b[30m");
+        s.push_str(kind.label());
+        w += disp_width(&legend_item_plain(*kind));
+    }
+    while w < iw { s.push(' '); w += 1; }
+    s
+}
+
 // 過去災害の事例一覧(中央パネル・Bキーで開く。何かキーで消える)。
 // draw_popup が1行専用なので、draw_onboarding と同じ組み方の複数行パネルとして別に持つ。
 // 地点は市区町村の代表点なので「災害が起きた場所そのもの」ではない。それを取り違えられないよう、
 // 出典と一緒に「市区町村単位の記録」であることを常時1行で出す。
+// 色の意味(コロプレスの塗り・マーカーと共通)が分かるよう、種別ごとの色凡例を脚注の上に添える。
 pub(crate) fn draw_disaster_panel<W: Write>(
     out: &mut W,
     cols: u32,
@@ -274,30 +323,41 @@ pub(crate) fn draw_disaster_panel<W: Write>(
     const BG: &str = "\x1b[30;47m";
     const RST: &str = "\x1b[0m";
     let iw = (cols as usize).saturating_sub(6).clamp(24, 96);
-    // 枠(空行・見出し・区切り2本・脚注・操作案内)を除いた残りが本文に使える行数。
-    const CHROME_ROWS: usize = 9;
-    let max_body = (map_rows as usize).saturating_sub(CHROME_ROWS).max(1);
+    let legend_rows = wrap_legend(iw.saturating_sub(1));
+    // 枠(空行・見出し・区切り2本・凡例・脚注・操作案内)を除いた残りが本文に使える行数。
+    let chrome_rows = 9 + legend_rows.len();
+    let max_body = (map_rows as usize).saturating_sub(chrome_rows).max(1);
     let shown = lines.len().min(max_body);
     let rule = format!(" {}", "─".repeat(iw.saturating_sub(2)));
-    let mut rows: Vec<String> = vec![String::new(), format!(" {title}"), rule.clone()];
+    let tc_ok = truecolor_safe();
+    // fit_cells は SGR エスケープを解さないため、色付き行(Styled)はそのまま書き出し、
+    // それ以外(Plain)だけ fit_cells でパディング・切り詰めを行う。
+    enum Row { Plain(String), Styled(String) }
+    let mut rows: Vec<Row> = vec![Row::Plain(String::new()), Row::Plain(format!(" {title}")), Row::Plain(rule.clone())];
     for l in lines.iter().take(shown) {
-        rows.push(format!(" {l}"));
+        rows.push(Row::Plain(format!(" {l}")));
     }
     if lines.len() > shown {
-        rows.push(format!(" …ほか{}件(画面に収まらない)", lines.len() - shown));
+        rows.push(Row::Plain(format!(" …ほか{}件(画面に収まらない)", lines.len() - shown)));
     }
-    rows.push(rule);
+    rows.push(Row::Plain(rule));
+    for kinds in &legend_rows {
+        rows.push(Row::Styled(format!(" {}", legend_row_colored(kinds, iw.saturating_sub(1), tc_ok))));
+    }
     if truncated {
         // 集計が上限で打ち切られると件数が黙って過少になる。黙って過少にしない。
-        rows.push(" ※取得上限で打ち切られた集計がある(件数は下限)".to_string());
+        rows.push(Row::Plain(" ※取得上限で打ち切られた集計がある(件数は下限)".to_string()));
     }
-    rows.push(" 市区町村単位の記録  出典: 防災科学技術研究所 災害事例データベース".to_string());
-    rows.push(" 任意のキー(Esc/q)で閉じる".to_string());
-    rows.push(String::new());
+    rows.push(Row::Plain(" 市区町村単位の記録  出典: 防災科学技術研究所 災害事例データベース".to_string()));
+    rows.push(Row::Plain(" 任意のキー(Esc/q)で閉じる".to_string()));
+    rows.push(Row::Plain(String::new()));
     let r0 = ((map_rows as usize).saturating_sub(rows.len()) / 2).max(1) as u32;
     let c0 = ((cols as usize).saturating_sub(iw) / 2).max(1) as u32;
-    for (i, ln) in rows.iter().enumerate() {
-        let _ = write!(out, "\x1b[{};{}H{}{}{}", r0 + i as u32, c0, BG, fit_cells(ln, iw), RST);
+    for (i, row) in rows.iter().enumerate() {
+        match row {
+            Row::Plain(ln) => { let _ = write!(out, "\x1b[{};{}H{}{}{}", r0 + i as u32, c0, BG, fit_cells(ln, iw), RST); }
+            Row::Styled(ln) => { let _ = write!(out, "\x1b[{};{}H{}{}{}", r0 + i as u32, c0, BG, ln, RST); }
+        }
     }
 }
 
@@ -411,5 +471,79 @@ pub(crate) fn draw_elevation_band<W: Write>(out: &mut W, cols: u32, map_rows: u3
                 let _ = write!(out, "\x1b[{};{}H\x1b[1;31m|\x1b[0m", map_rows + 2 + i as u32, col + 1 + AXIS_W);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::disaster::DisasterKind;
+
+    // SGRエスケープ(\x1b[...m)を取り除いた可視文字列。幅・文字内容の検証に使う。
+    fn visible_text(s: &str) -> String {
+        let mut out = String::new();
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' {
+                for n in chars.by_ref() {
+                    if n == 'm' { break; }
+                }
+                continue;
+            }
+            out.push(c);
+        }
+        out
+    }
+
+    #[test]
+    fn wrap_legend_fits_all_six_kinds_on_one_row_when_wide_enough() {
+        let rows = wrap_legend(96);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], DisasterKind::legend_kinds().to_vec());
+    }
+
+    #[test]
+    fn wrap_legend_splits_into_multiple_rows_when_narrow_and_never_exceeds_the_width() {
+        let rows = wrap_legend(24);
+        assert!(rows.len() > 1, "24幅では6種が1行に収まらないはず");
+        for row in &rows {
+            assert!(!row.is_empty(), "空行を作らない");
+            let w: usize = row.iter().map(|k| disp_width(&legend_item_plain(*k))).sum::<usize>()
+                + row.len().saturating_sub(1);
+            assert!(w <= 24, "row width {w} exceeds 24: {row:?}");
+        }
+        let total: usize = rows.iter().map(|r| r.len()).sum();
+        assert_eq!(total, 6, "6種が過不足なく分配される");
+    }
+
+    #[test]
+    fn legend_row_colored_contains_every_kind_colour_and_resets_to_black_between_items() {
+        let kinds = DisasterKind::legend_kinds();
+        let row = legend_row_colored(&kinds, 96, true);
+        for k in kinds {
+            let [r, g, b] = k.color();
+            assert!(row.contains(&sgr_fg(r, g, b, true)), "{k:?} の色が含まれる");
+        }
+        assert_eq!(row.matches("\x1b[30m").count(), kinds.len(), "各項目のあとに黒文字へ戻す(背景色は保つ)");
+    }
+
+    #[test]
+    fn legend_row_colored_visible_text_matches_plain_items_and_pads_to_width() {
+        let kinds = DisasterKind::legend_kinds();
+        let row = legend_row_colored(&kinds, 96, true);
+        let visible = visible_text(&row);
+        assert_eq!(disp_width(&visible), 96, "iw幅ちょうどにパディングされる(背景色を保つため)");
+        let expected_prefix: String =
+            kinds.iter().map(|k| legend_item_plain(*k)).collect::<Vec<_>>().join(" ");
+        assert!(visible.starts_with(&expected_prefix), "visible={visible:?}");
+    }
+
+    #[test]
+    fn legend_row_colored_falls_back_to_256_colour_when_truecolor_is_off() {
+        let kinds = [DisasterKind::Earthquake];
+        let row = legend_row_colored(&kinds, 20, false);
+        let [r, g, b] = DisasterKind::Earthquake.color();
+        assert!(row.contains(&sgr_fg(r, g, b, false)));
+        assert!(!row.contains("38;2;"), "truecolor無効なら24bitコードを使わない");
     }
 }
