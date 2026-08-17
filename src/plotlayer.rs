@@ -1,5 +1,5 @@
-// 地図に重ねるプロットデータ(道路交通量・主要道路・道路ライブカメラ・通行規制・過去災害)の
-// 取得段取り。ui.rs にほぼ同一の取得ブロックが4つ並んでいたものを1つにまとめたもの。
+// 地図に重ねるプロットデータ(道路交通量・主要道路・道路ライブカメラ・通行規制・過去災害・
+// 市区町村境界)の取得段取り。ui.rs にほぼ同一の取得ブロックが4つ並んでいたものを1つにまとめたもの。
 // 設計は docs/plot-data-disk-cache-design.md §6.3/§7。
 //
 // 旧実装との違いは3点。
@@ -11,7 +11,7 @@
 //      受信コードの形(try_recv + Disconnected で畳む)は旧実装と同じ。
 
 use crate::plotcache::{self, Cached, Layer};
-use crate::{camera, disaster, mesh, regulation, roadsearch, traffic};
+use crate::{camera, disaster, mesh, muni, regulation, roadsearch, traffic};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -92,6 +92,11 @@ impl PlotItem for regulation::ClosureEvent {
 impl PlotItem for disaster::DisasterSite {
     fn bounds(&self) -> Bbox {
         (self.lat, self.lon, self.lat, self.lon)
+    }
+}
+impl PlotItem for muni::MuniArea {
+    fn bounds(&self) -> Bbox {
+        self.bbox // パース時に全リングから計算済み
     }
 }
 
@@ -363,6 +368,16 @@ pub fn set_disaster_since(year: i32) {
     DISASTER_SINCE.store(year.max(0), Ordering::Relaxed);
 }
 
+// 市区町村境界のセルキーの接頭辞。plotcache::valid_key(英数字と - _ の16文字以内)に収まる短さにする
+// ("c20s0"〜"c20s9" で5文字)。
+const BOUNDARY_KEY_PREFIX: &str = "c20s";
+
+// 市区町村境界は取得元(気象庁 class20s)が全国を10ファイルに分けているので、そのファイル単位を
+// セルにする。視野bboxと各ファイルの外接矩形(muni::RELM)が交差するものを全部返す。
+fn boundary_cells(b: Bbox) -> Vec<String> {
+    muni::relm_indices(b).iter().map(|i| format!("{BOUNDARY_KEY_PREFIX}{i}")).collect()
+}
+
 // 過去災害は交通量・規制と同じ1次メッシュだが、キーに年代しきい値を足した複合キーにする
 // (例 "5339_1926"、全期間は "5339_0")。しきい値を切り替えても別ファイルになって混ざらない。
 fn disaster_cells(b: Bbox) -> Vec<String> {
@@ -428,7 +443,15 @@ fn fetch_disaster_cell(key: &str, _scratch: &mut Option<String>) -> Result<Vec<d
     disaster::fetch_sites(s, w, n, e, since)
 }
 
-// ---- 5レイヤの組み立て ----
+fn fetch_boundary_cell(key: &str, _scratch: &mut Option<String>) -> Result<Vec<muni::MuniArea>, String> {
+    let index = key
+        .strip_prefix(BOUNDARY_KEY_PREFIX)
+        .and_then(|s| s.parse::<usize>().ok())
+        .ok_or_else(|| format!("不正なセルキー: {key}"))?;
+    muni::fetch_relm(index)
+}
+
+// ---- 6レイヤの組み立て ----
 
 /// 道路交通量(JARTIC)。1次メッシュ単位・z11未満では取得しない。
 pub fn traffic() -> PlotLayer<traffic::TrafficPoint> {
@@ -463,6 +486,13 @@ pub fn regulation() -> PlotLayer<regulation::ClosureEvent> {
 /// 「このレイヤだけ端が欠けている」状態にならない。
 pub fn disaster() -> PlotLayer<disaster::DisasterSite> {
     PlotLayer::new(Layer::Disaster, 11, 0, disaster_cells, fetch_disaster_cell)
+}
+
+/// 市区町村境界(気象庁 class20s)。過去災害の塗り(コロプレス)にだけ使うので、ズーム下限は
+/// 過去災害と揃える(片方だけ取れていて塗れない、という状態を作らない)。
+/// 領域は全国で10しかなく、視野に掛かるのは実測で1〜2枚。
+pub fn boundary() -> PlotLayer<muni::MuniArea> {
+    PlotLayer::new(Layer::Boundary, 11, 0, boundary_cells, fetch_boundary_cell)
 }
 
 #[cfg(test)]
@@ -908,10 +938,10 @@ mod tests {
         }
     }
 
-    // 5種の実データ型が、実際にディスクへ書いて読み戻せること
+    // 6種の実データ型が、実際にディスクへ書いて読み戻せること
     // (型ごとの serde 単体テストとは別に、plotcache を通した往復を1本で押さえる)。
     #[test]
-    fn all_five_real_item_types_survive_a_trip_through_the_disk_cache() {
+    fn all_six_real_item_types_survive_a_trip_through_the_disk_cache() {
         let _env = TestEnv::new("realtypes");
         let root = _env.root.clone();
         let now = plotcache::now_secs();
@@ -956,6 +986,7 @@ mod tests {
         let d = vec![disaster::DisasterSite {
             lat: 35.955106,
             lon: 139.874828,
+            muni_code: "12208".to_string(),
             kinds: vec![disaster::KindCount {
                 kind: disaster::DisasterKind::Storm,
                 count: 60,
@@ -968,10 +999,21 @@ mod tests {
             plotcache::load::<disaster::DisasterSite>(&root, Layer::Disaster, "5339_1926", now).unwrap().items,
             d
         );
+
+        let m = vec![muni::MuniArea {
+            code: "1220800".to_string(),
+            name: "野田市".to_string(),
+            rings: vec![vec![(35.9, 139.8), (35.9, 139.9), (36.0, 139.9)]],
+            bbox: (35.9, 139.8, 36.0, 139.9),
+        }];
+        plotcache::store(&root, Layer::Boundary, "c20s3", &m, now, now).unwrap();
+        let back = plotcache::load::<muni::MuniArea>(&root, Layer::Boundary, "c20s3", now).unwrap();
+        assert_eq!(back.items, m);
+        assert_eq!(back.items[0].muni_code(), "12208", "読み戻した区域から結合キーが引ける");
     }
 
     #[test]
-    fn the_five_real_layers_use_the_ttls_and_zoom_floors_from_the_design() {
+    fn the_six_real_layers_use_the_ttls_and_zoom_floors_from_the_design() {
         assert_eq!(traffic().min_zoom, 11);
         assert_eq!(traffic().data_lag_secs, 25 * 60);
         assert_eq!(roads().min_zoom, 14);
@@ -983,5 +1025,59 @@ mod tests {
         assert_eq!(disaster().layer.fresh_ttl().as_secs(), 30 * 24 * 3600, "過去災害は30日");
         assert_eq!(disaster().layer.stale_limit(), None, "古い集計が誤りになることはない");
         assert_eq!(disaster().data_lag_secs, 0);
+        // 市区町村境界は過去災害の塗りにだけ使うので、ズーム下限を過去災害と揃える。
+        assert_eq!(boundary().min_zoom, disaster().min_zoom, "塗りだけ端が欠ける状態を作らない");
+        assert_eq!(boundary().layer.fresh_ttl().as_secs(), 180 * 24 * 3600, "境界は180日");
+        assert_eq!(boundary().layer.stale_limit(), None, "古くても境界が誤りになることはない");
+        assert_eq!(boundary().data_lag_secs, 0);
+    }
+
+    #[test]
+    fn boundary_cells_name_the_class20s_file_that_covers_the_view() {
+        let (cx, cy) = tokyo_center(14);
+        assert_eq!(boundary_cells(view_bbox(cx, cy, 14)), vec!["c20s3".to_string()], "関東");
+        // z11 の視野(±約56km)は中部の矩形にも掛かるので複数返るが、関東は必ず入っている。
+        let (cx11, cy11) = tokyo_center(11);
+        let wide = boundary_cells(view_bbox(cx11, cy11, 11));
+        assert!(wide.contains(&"c20s3".to_string()), "{wide:?}");
+        let (cx, cy) = deg_to_pixel(43.06, 141.35, 11);
+        assert_eq!(boundary_cells(view_bbox(cx, cy, 11)), vec!["c20s0".to_string()], "北海道");
+        let (cx, cy) = deg_to_pixel(26.21, 127.68, 11);
+        assert_eq!(boundary_cells(view_bbox(cx, cy, 11)), vec!["c20s9".to_string()], "沖縄");
+        // 日本の外では取りに行かない。
+        let (cx, cy) = deg_to_pixel(48.85, 2.35, 11);
+        assert!(boundary_cells(view_bbox(cx, cy, 11)).is_empty(), "パリ");
+    }
+
+    #[test]
+    fn boundary_cell_keys_are_accepted_by_the_disk_cache() {
+        // plotcache::valid_key は英数字と - _ の16文字以内しか許さない("c20s3" は5文字)。
+        let _env = TestEnv::new("bndkey");
+        for i in 0..muni::RELM_COUNT {
+            let k = format!("{BOUNDARY_KEY_PREFIX}{i}");
+            assert!(
+                plotcache::store(&_env.root, Layer::Boundary, &k, &[test_item(1.0)], 0, 0).is_ok(),
+                "キー {k} がディスク層に弾かれる"
+            );
+        }
+    }
+
+    #[test]
+    fn boundary_cells_stay_within_the_job_cap_everywhere_in_japan() {
+        for (lat, lon) in [(35.68, 139.77), (43.06, 141.35), (26.21, 127.68), (34.69, 135.52), (36.5, 138.7)] {
+            for z in [11u32, 12, 14] {
+                let (cx, cy) = deg_to_pixel(lat, lon, z);
+                let n = boundary_cells(view_bbox(cx, cy, z)).len();
+                assert!(n <= MAX_CELLS_PER_JOB, "z{z} {lat},{lon} で {n} セル");
+            }
+        }
+    }
+
+    #[test]
+    fn fetch_boundary_cell_rejects_a_key_it_did_not_produce() {
+        // ネットワークに出る前に弾かれること(範囲内の番号だけは実通信になるので試さない)。
+        for bad in ["", "3", "c20s", "c20sx", "5339", "c20s-1"] {
+            assert!(fetch_boundary_cell(bad, &mut None).is_err(), "key={bad:?}");
+        }
     }
 }

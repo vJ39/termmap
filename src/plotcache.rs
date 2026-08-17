@@ -1,8 +1,9 @@
-// 地図に重ねるプロットデータ(道路交通量・主要道路・道路ライブカメラ・通行規制・過去災害)の
-// ディスク層。キー1件=1ファイルのJSONで保存し、種別ごとに違うTTLで期限切れにする。
-// 設計は docs/plot-data-disk-cache-design.md §3/§5/§8。
+// 地図に重ねるプロットデータ(道路交通量・主要道路・道路ライブカメラ・通行規制・過去災害・
+// 市区町村境界)のディスク層。キー1件=1ファイルのJSONで保存し、種別ごとに違うTTLで期限切れにする。
+// 設計は docs/plot-data-disk-cache-design.md §3/§5/§8、境界は
+// docs/disaster-choropleth-design.md §2.7。
 //
-// 保存先: ~/.config/termmap/plot-cache/v1/{traffic,roads,camera,regulation,disaster}/{キー}.json
+// 保存先: ~/.config/termmap/plot-cache/v1/{traffic,roads,camera,regulation,disaster,boundary}/{キー}.json
 //   {"v":1,"key":"5339","fetched_at":1755330000,"data_at":1755328500,"items":[ ... ]}
 //
 // このファイルはディスクしか知らない(ネットワークにもデータ型にも触れない)。種別ごとの差
@@ -27,10 +28,11 @@ pub enum Layer {
     Camera,
     Regulation,
     Disaster,
+    Boundary,
 }
 
-pub const ALL_LAYERS: [Layer; 5] =
-    [Layer::Traffic, Layer::Roads, Layer::Camera, Layer::Regulation, Layer::Disaster];
+pub const ALL_LAYERS: [Layer; 6] =
+    [Layer::Traffic, Layer::Roads, Layer::Camera, Layer::Regulation, Layer::Disaster, Layer::Boundary];
 
 const MINUTE: u64 = 60;
 const HOUR: u64 = 60 * MINUTE;
@@ -45,6 +47,7 @@ impl Layer {
             Layer::Camera => "camera",
             Layer::Regulation => "regulation",
             Layer::Disaster => "disaster",
+            Layer::Boundary => "boundary",
         }
     }
 
@@ -55,6 +58,7 @@ impl Layer {
     /// 通行規制10分=数十分〜数日で変わり、かつ通行止めは安全に直結するので短くする。
     /// 過去災害30日=起きた災害そのものは変わらない。変わるのは「新しい災害が起きて登録される」
     /// 「既存事例の記述が修正される」の2つで、いずれも月単位(主要道路・地図タイルと同じ性格)。
+    /// 市区町村境界180日=区域定義は市町村合併等でごく稀にしか変わらない。
     pub fn fresh_ttl(&self) -> Duration {
         Duration::from_secs(match self {
             Layer::Traffic => 5 * MINUTE,
@@ -62,6 +66,7 @@ impl Layer {
             Layer::Camera => 7 * DAY,
             Layer::Regulation => 10 * MINUTE,
             Layer::Disaster => 30 * DAY,
+            Layer::Boundary => 180 * DAY,
         })
     }
 
@@ -70,11 +75,12 @@ impl Layer {
     /// 通行規制24時間=災害・工事の通行止めは日単位で続くため、それまでは「N時間前時点の規制」
     /// として出す価値がある。道路とカメラは古くても実害が無い(新設が出ないだけ)ので上限なし。
     /// 過去災害も同じで、古い集計が誤りになることはない(新しい事例が出ないだけ)。
+    /// 市区町村境界も同じ(古くなっても境界が誤りになることはない)。
     pub fn stale_limit(&self) -> Option<Duration> {
         match self {
             Layer::Traffic => Some(Duration::from_secs(60 * MINUTE)),
             Layer::Regulation => Some(Duration::from_secs(24 * HOUR)),
-            Layer::Roads | Layer::Camera | Layer::Disaster => None,
+            Layer::Roads | Layer::Camera | Layer::Disaster | Layer::Boundary => None,
         }
     }
 
@@ -86,6 +92,8 @@ impl Layer {
             Layer::Camera => 16,
             Layer::Regulation => 200,
             Layer::Disaster => 200,
+            // 境界は気象庁の10分割ファイルそのものなので、10枚より増えることがない。
+            Layer::Boundary => 10,
         }
     }
 
@@ -98,6 +106,9 @@ impl Layer {
             Layer::Regulation => 20 * MB,
             // 1次メッシュ1枚が実測25KB以下なので、200セルでも約5MB。他レイヤと桁を揃えた余裕値。
             Layer::Disaster => 20 * MB,
+            // class20s は10枚で実測2.98MB。(緯度,経度)のJSON配列へ展開すると数倍になるので
+            // 10MBを上限にしておく(上限に当たるようなら格納形式を見直す合図)。
+            Layer::Boundary => 10 * MB,
         }
     }
 }
