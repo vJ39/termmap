@@ -128,16 +128,17 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     let mut turn_points: Vec<route::TurnPoint> = Vec::new();
     let mut turn_job: Option<route::TurnRx> = None;
     let mut voice_guide: Option<voice::VoiceGuide> = None;
-    // 地図に重ねる5種のプロットデータ。取得単位(メッシュ/整備局)・TTL・ズーム下限・ディスク
-    // 永続化はすべて plotlayer/plotcache 側が持つ。ここは毎フレーム tick して結果を読むだけ。
+    // 地図に重ねる6種のプロットデータ。取得単位(メッシュ/整備局/都道府県)・TTL・ズーム下限・
+    // ディスク永続化はすべて plotlayer/plotcache 側が持つ。ここは毎フレーム tick して結果を読むだけ。
     // 道路交通量は cfg.traffic_enabled、カメラは camera_enabled、規制は regulation_enabled、
-    // 過去災害は disaster_enabled で ON/OFFする。
+    // 過去災害は disaster_enabled、500mメッシュ人口は population_enabled で ON/OFFする。
     // 主要道路(#73)は交通量の観測点をラインへスナップする下地なので交通量と連動する。
     let mut traffic_layer = plotlayer::traffic();
     let mut roads_layer = plotlayer::roads();
     let mut camera_layer = plotlayer::camera();
     let mut regulation_layer = plotlayer::regulation();
     let mut disaster_layer = plotlayer::disaster();
+    let mut population_layer = plotlayer::population();
     // 期限切れ/上限超過のキャッシュ掃除は1セッション1回、最初のアイドル到達時に別スレッドで走らせる
     // (起動を遅くせず、無操作のたびにディレクトリを走査もしない)。
     let mut plot_gc_done = false;
@@ -221,6 +222,20 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     // 地図での C キーも同じ処理)。OFFにするとき背景ポーラーの drop はスレッドを join するため、
     // 取得中(HTTPは最大20秒)にここで待つと入力が固まる。停止フラグは drop 側で即座に立つので、
     // join だけを別スレッドへ逃がしてUIを待たせない。
+    // 500mメッシュ人口の表示/非表示。雨雲と違い背景ポーラーを持たないので、設定を反転して
+    // 保存するだけでよい(次の tick が cfg.population_enabled を見てセルを取りに行く)。
+    // ONにした直後は出典と、取得が重いことを1回だけ知らせる(31MBが無言で落ちないように)。
+    macro_rules! population_toggle { () => {
+        cfg.population_enabled = !cfg.population_enabled;
+        let _ = config::save_config(&cfg);
+        addr = if cfg.population_enabled {
+            format!("人口メッシュ: ON({}年) {}", cfg.population_year, population::ATTRIBUTION)
+        } else {
+            "人口メッシュ: OFF".to_string()
+        };
+        // 再描画は cfg.population_enabled を map_sig に混ぜてあるので自動で起きる(force_reemit不要)。
+    }; }
+
     macro_rules! radar_toggle { () => {
         if radar_on {
             radar_on = false;
@@ -302,6 +317,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 }
             }
             MenuAction::ToggleRadar => { radar_toggle!(); } // 雨雲レーダー(地図の C キーと同じ)
+            MenuAction::TogglePopulation => { population_toggle!(); } // 500mメッシュ人口(地図の U キーと同じ)
             MenuAction::ViewCamera => { // 道路ライブカメラ(地図の N キーと同じ)
                 if !cfg.camera_enabled { snd.play("error"); addr = "道路ライブカメラ: OFF(設定で有効化)".into(); }
                 else {
@@ -649,6 +665,21 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             }
         }
         let disaster_sites = disaster_layer.items(plot_view);
+        let population_meshes =
+            if cfg.population_enabled { population_layer.items(plot_view) } else { Vec::new() };
+        // 表示する年次(設定)。configを手書きで壊されても必ず描ける索引へ落とす。
+        let population_year_idx = population::year_index(cfg.population_year)
+            .unwrap_or_else(|| population::year_index(config::DEFAULT_POPULATION_YEAR).unwrap_or(1));
+        // 中心のクロスヘアが指すメッシュの人口密度(ステータス行に実数値で出す・設計 §7.6)。
+        // 階級の幅(1,000〜4,000等)しか読めない色分けを、1つの数字で補う。
+        // 中心は必ず視野の中にあるので、切り出し済みの population_meshes から拾う
+        // (layer.items() をもう一度呼ぶと全セル(最大16万件)をもう1周することになる)。
+        let population_here = mesh::half_mesh_code(lat, lon).and_then(|code| {
+            population_meshes
+                .iter()
+                .find(|m| m.mesh == code)
+                .and_then(|m| population::density(m, population_year_idx))
+        });
 
         // 通行止めルート回避(#通行止めを推奨しない)。表示中の視野(plot_view)ではなく、
         // 経由地全体を覆うbboxで実施中の通行止めを見て、BRouterのnogosへ変換する。
@@ -799,6 +830,14 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             camera_layer.generation().hash(&mut h);
             regulation_layer.generation().hash(&mut h);
             disaster_layer.generation().hash(&mut h);
+            population_layer.generation().hash(&mut h);
+            // 人口メッシュ: ON/OFF・年次・濃さを変えたら描き直す(セル表は動かないため generation
+            // だけでは変化を拾えない)。
+            cfg.population_enabled.hash(&mut h);
+            if cfg.population_enabled {
+                population_year_idx.hash(&mut h);
+                population_opacity_value(&cfg).to_bits().hash(&mut h);
+            }
             Some(h.finish())
         };
 
@@ -826,16 +865,26 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                         radar_tl.get(radar_idx)
                             .and_then(|f| build_radar_window_nowait(rcx, rcy, rz, rw, rh, f, &loader))
                     } else { None };
+                    // 500mメッシュ人口。人口なし=透明の面レイヤを作る(設計 §7.1)。
+                    // 雨雲より背面に置く(人口は数年変わらない下地・雨雲は現況)。
+                    let pop_layer: Option<RgbaImage> = if cfg.population_enabled && !population_meshes.is_empty() {
+                        Some(build_population_layer(&population_meshes, population_year_idx,
+                                                    population::Metric::Density, rcx, rcy, rz, rw, rh))
+                    } else { None };
                     // 実画像モードはここで地図へ直接アルファ合成する(オーバーレイはこの後に焼くので
-                    // 経路/POI/中心十字は常に雨雲より前面に残る)。
+                    // 経路/POI/中心十字は常に雨雲・人口より前面に残る)。人口 → 雨雲 の順で重ねる。
                     if img_inline {
+                        if let Some(l) = &pop_layer { blend_rgba_over(&mut img, l, population_opacity_value(&cfg)); }
                         if let Some(l) = &radar_layer { blend_rgba_over(&mut img, l, radar_opacity_value(&cfg)); }
                     }
                     // braille/edge は OverlayLayer へインクとして焼く(build_overlay の先頭で最背面に入る)。
-                    let ink = if radar_ink {
-                        radar_layer.as_ref().map(|l| RadarInk { layer: l, density: radar_opacity_value(&cfg) })
-                    } else { None };
-                    let mut ov = build_overlay(&spec, rcx, rcy, rz, rw, rh, 1.0, 1.0, rw, rh, ink);
+                    // 渡す順がそのまま重ね順(先頭が最背面)。
+                    let mut inks: Vec<RadarInk> = Vec::new();
+                    if radar_ink {
+                        if let Some(l) = &pop_layer { inks.push(RadarInk { layer: l, density: population_opacity_value(&cfg) }); }
+                        if let Some(l) = &radar_layer { inks.push(RadarInk { layer: l, density: radar_opacity_value(&cfg) }); }
+                    }
+                    let mut ov = build_overlay(&spec, rcx, rcy, rz, rw, rh, 1.0, 1.0, rw, rh, &inks);
                     let (mx, my) = (rw as i32 / 2, rh as i32 / 2); // 中心クロスヘア(色は設定で選択可)
                     let cross = SPOT_PALETTE[cfg.cross_color_idx as usize % SPOT_PALETTE.len()];
                     draw_line(&mut ov, mx - 6, my, mx + 6, my, cross, 1);
@@ -947,8 +996,14 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                     } else {
                         // インク経路(braille/edge)は ov に入れ済みなので render 側では合成しない。
                         // halfblock/classify はここで渡し、classify は recolor 後に混ざる。
-                        let rd = if radar_ink { None } else { radar_layer.as_ref().map(|l| (l, radar_opacity_value(&cfg))) };
-                        render(&img, &opts, Some(&ov), rd)
+                        // 人口 → 雨雲 の順で地図へアルファ合成する(braille/edge は上で ov のインクに
+                        // 入れ済みなので、ここでは渡さない)。
+                        let mut blends: Vec<(&RgbaImage, f64)> = Vec::new();
+                        if !radar_ink {
+                            if let Some(l) = &pop_layer { blends.push((l, population_opacity_value(&cfg))); }
+                            if let Some(l) = &radar_layer { blends.push((l, radar_opacity_value(&cfg))); }
+                        }
+                        render(&img, &opts, Some(&ov), &blends)
                     }
                 }
                 Err(e) => {
@@ -1037,6 +1092,17 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             },
             // 過去災害は事例数でなく地点数を出す(1地点に最大166件が重なるため)。
             // 事例一覧(Bキー)の取得中もスピナーではなくこのレイヤの表示で分かるようにする。
+            population: ui_status::PopulationStatus {
+                job_active: population_layer.job_active(),
+                // 取得中のセルキーは都道府県コード2桁。名前に直して「北海道を取得中…」と出す。
+                fetching: population_layer
+                    .fetching_key()
+                    .and_then(|k| k.parse::<u8>().ok())
+                    .map(|p| population::pref_name(p).to_string())
+                    .filter(|n| !n.is_empty()),
+                wide_area: population_layer.suppressed(),
+                density: population_here,
+            },
             disaster: ui_status::PlotStatus {
                 count: disaster_sites.len(),
                 job_active: disaster_layer.job_active() || disaster_job.is_some(),
@@ -1145,6 +1211,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         got_result |= camera_layer.tick(cx, cy, z, cfg.camera_enabled);
         got_result |= regulation_layer.tick(cx, cy, z, cfg.regulation_enabled);
         got_result |= disaster_layer.tick(cx, cy, z, cfg.disaster_enabled);
+        got_result |= population_layer.tick(cx, cy, z, cfg.population_enabled);
         if let Some(job) = &disaster_job { // Bキーで頼んだ事例一覧(2段目)の到着
             match job.try_recv() {
                 Ok(Ok(panel)) => { disaster_view = Some(panel); disaster_job = None; got_result = true; }
@@ -1380,8 +1447,11 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             // 道路交通量/主要道路/ライブカメラ/通行規制の背景取得完了を、キー入力無しでも
             // 取りこぼさない(結果が最大60秒(IDLE_SAVE_INTERVAL)反映されない事故を防ぐ)。
             // 主要道路は以前この条件から漏れていたが、4レイヤとも同じ扱いにする。
+            // 人口メッシュは1セルの取得に数十秒かかるため、ここから漏れると
+            // 「取得中…」の表示すら出ないまま画面が固まって見える(PTY実機で確認済み)。
             || traffic_layer.job_active() || roads_layer.job_active()
             || camera_layer.job_active() || regulation_layer.job_active() || disaster_layer.job_active()
+            || population_layer.job_active()
             || disaster_job.is_some() || voice_preview_job.is_some() || regulation_detail_job.is_some() || traffic_color_job.is_some() || cause_job.is_some();
         let mut ev: Option<Event> = if got_result {
             None
@@ -1686,6 +1756,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                         cfg.disaster_enabled = !cfg.disaster_enabled;
                                         if cfg.disaster_enabled { addr = "過去災害: 防災科学技術研究所 災害事例データベース".into(); }
                                     }
+                                    29 => { population_toggle!(); } // 人口メッシュ: Uキー・Spaceメニューと共通処理
                                     28 => { // 渋滞状況の色分け: 次にルートが確定したタイミングで初めて問い合わせる
                                         cfg.route_traffic_enabled = !cfg.route_traffic_enabled;
                                         if cfg.route_traffic_enabled && cfg.google_maps_api_key.trim().is_empty() {
@@ -2409,6 +2480,9 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                 if show_elev && (spec.routes.is_empty() || !route_ele.iter().any(|&z| z != 0.0)) { addr = "標高: ルート確定後に表示".into(); }
                             }
                             KeyCode::Char('C') => { radar_toggle!(); } // 雨雲レーダー(気象庁ナウキャスト)の表示/非表示。Spaceメニュー・設定画面と共通処理
+                            // 500mメッシュ人口(国土数値情報)の表示/非表示。Pはマイスポット・Cは雨雲で
+                            // 埋まっているため、空いている U を割り当てている。
+                            KeyCode::Char('U') => { population_toggle!(); }
                             KeyCode::Char('>') => { // 表示時刻を未来へ1コマ(OFFなら発見しやすさのためONにする)
                                 if !radar_on {
                                     radar_turn_on!();

@@ -32,6 +32,13 @@ pub(crate) fn build_qr_view(c: &qrcode::QrCode, style: &str) -> QrView {
 pub(crate) fn radar_opacity_value(cfg: &config::Config) -> f64 {
     match cfg.radar_opacity.as_str() { "light" => 0.35, "strong" => 0.75, _ => 0.55 }
 }
+// 人口メッシュの不透明度(0.0..=1.0)。雨雲と同じ3択・同じ値。面を塗る唯一のレイヤなので、
+// ここを1.0にすると道路も経路も完全に消えて地図が読めなくなる。
+// 実際に塗られる濃さは、この値に階級ごとのアルファ(薄い階級=40 / 都心=230)が掛かる。
+pub(crate) fn population_opacity_value(cfg: &config::Config) -> f64 {
+    match cfg.population_opacity.as_str() { "light" => 0.35, "strong" => 0.75, _ => 0.55 }
+}
+
 // targetTimes(フレーム時刻一覧)の再取得間隔(秒)の既定。ナウキャスト自体が5分更新なので、
 // これより短くしても新しい情報は無い。設定 [radar] refresh_sec で変えられる。
 pub(crate) const RADAR_REFRESH_SECS: u64 = 300;

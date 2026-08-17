@@ -229,13 +229,14 @@ pub fn draw_ring(ov: &mut OverlayLayer, cx: i32, cy: i32, radius: i32, color: [u
     }
 }
 // spec(緯度経度) を 表示画像座標へ射影して焼く。win_w/h=元画像寸法, scale=resize比, out_w/h=最終寸法。
-// radar は braille/edge 経路の雨雲インク(None なら従来と同じ)。最背面に最初に焼く。
+// inks は braille/edge 経路の半透明レイヤ(雨雲・人口メッシュ)を焼いたもの。最背面に先に焼く。
+// 並び順がそのまま重ね順(先頭が最背面)。人口は数年変わらない下地なので雨雲より前に渡す。
 pub fn build_overlay(spec: &OverlaySpec, cx: f64, cy: f64, z: u32, win_w: u32, win_h: u32,
                  scale_x: f64, scale_y: f64, out_w: u32, out_h: u32,
-                 radar: Option<RadarInk>) -> OverlayLayer {
+                 inks: &[RadarInk]) -> OverlayLayer {
     let mut ov = OverlayLayer::new(out_w, out_h);
-    // 雨雲(最背面)。リング/経路/道路/POI/スポットはこの後に描かれるので、常に雨雲より前面になる。
-    if let Some(r) = radar { ink_radar_into_overlay(&mut ov, r.layer, RADAR_INK_MIN_ALPHA, r.density); }
+    // 半透明レイヤ(最背面)。リング/経路/道路/POI/スポットはこの後に描かれるので、常に前面になる。
+    for r in inks { ink_radar_into_overlay(&mut ov, r.layer, RADAR_INK_MIN_ALPHA, r.density); }
     let left = cx - win_w as f64 / 2.0;
     let top = cy - win_h as f64 / 2.0;
     let to_img = |lat: f64, lon: f64| -> (i32, i32) {
@@ -302,8 +303,58 @@ pub fn blend_rgba_over(base: &mut RgbImage, layer: &RgbaImage, opacity: f64) {
     }
 }
 
-// braille/edge 経路で雨雲を焼くときの指定。build_overlay へ渡す。
-// layer は build_radar_window_nowait が返す降水レイヤ(降水なし=透明)、density はディザの密度。
+// RgbaImage の軸平行な矩形を塗る。範囲外はクリップする。x1/y1 は半開区間(含まない)。
+// 500mメッシュは全件が軸平行の矩形(実データ50,074件を検査して例外なし)なので、汎用の
+// 多角形塗りつぶしは要らない。1描画で数千枚を塗るため、単純な二重ループのほうが速い(設計 §7.2)。
+// 左右/上下が逆転した引数でも、幅0・高さ0として何も塗らない(暗黙に入れ替えたりしない)。
+pub fn fill_rect_rgba(layer: &mut RgbaImage, x0: i32, y0: i32, x1: i32, y1: i32, color: [u8; 4]) {
+    let (w, h) = layer.dimensions();
+    let cx0 = x0.max(0) as u32;
+    let cy0 = y0.max(0) as u32;
+    let cx1 = x1.clamp(0, w as i32) as u32;
+    let cy1 = y1.clamp(0, h as i32) as u32;
+    for y in cy0..cy1 {
+        for x in cx0..cx1 {
+            layer.put_pixel(x, y, image::Rgba(color));
+        }
+    }
+}
+
+// 500mメッシュ人口を、出力寸法の RgbaImage へ塗る(人口なし=透明のまま)。
+// 面を塗るので OverlayLayer(不透明1色インク)ではなく RgbaImage を作って合成する。
+// OverlayLayer へ直接塗ると下の地図が完全に消えて、地図アプリとして機能しなくなる(設計 §7.1)。
+pub fn build_population_layer(
+    meshes: &[&crate::population::PopMesh],
+    year_idx: usize,
+    metric: crate::population::Metric,
+    cx: f64, cy: f64, z: u32, out_w: u32, out_h: u32,
+) -> RgbaImage {
+    let mut layer = RgbaImage::from_pixel(out_w, out_h, image::Rgba([0, 0, 0, 0]));
+    let left = cx - out_w as f64 / 2.0;
+    let top = cy - out_h as f64 / 2.0;
+    for m in meshes {
+        let Some(class) = crate::population::class_of(m, year_idx, metric) else { continue };
+        // 矩形は MESH_ID から復元する(幾何は保存していない)。緯度は北が小さい画素座標になるので
+        // north→y0 / south→y1 の順で対応する。
+        let (s, w, n, e) = crate::mesh::half_mesh_bbox(m.mesh);
+        let (gx0, gy0) = deg_to_pixel(n, w, z);
+        let (gx1, gy1) = deg_to_pixel(s, e, z);
+        let x0 = (gx0 - left).floor() as i32;
+        let y0 = (gy0 - top).floor() as i32;
+        // 1枚が1px未満に潰れても消えないよう、幅・高さは最低1pxを確保する
+        // (z11でも8pxあるので通常は効かないが、端数で0pxになる境目を塗り残さないための保険)。
+        let x1 = ((gx1 - left).floor() as i32).max(x0 + 1);
+        let y1 = ((gy1 - top).floor() as i32).max(y0 + 1);
+        fill_rect_rgba(&mut layer, x0, y0, x1, y1, crate::population::class_color(class));
+    }
+    layer
+}
+
+// braille/edge 経路で半透明レイヤを焼くときの指定。build_overlay へ渡す。
+// layer は「値がない画素=透明」の RgbaImage(雨雲なら降水なし、人口なら人口なし)、
+// density はディザの密度。
+// 雨雲専用だった頃の名前のままにしてある(型名を InkLayer へ、関数名を ink_rgba_into_overlay へ
+// 改名するのが素直だが、ui.rs へ余分な差分を出さないため見送り。設計 §7.3)。
 pub struct RadarInk<'a> { pub layer: &'a RgbaImage, pub density: f64 }
 
 // インクを置く「降水あり」のアルファ下限。気象庁ナウキャストのタイルは降水域=不透明/降水なし=
@@ -316,12 +367,15 @@ const RADAR_INK_MIN_ALPHA: u8 = 32;
 // 1.0 で全塗りになる(設計 §7.3 の 薄い/標準/濃い をそのまま密度で表現できる)。
 const BAYER4: [[u8; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
 
-// braille/edge 用。降水域を OverlayLayer の「インク」として置く。
+// braille/edge 用。値のある領域を OverlayLayer の「インク」として置く。
 // これらのモードは「ドットが立つか立たないか」しかなく背景色の概念が無いため、アルファ合成では
 // 降水として読めない(braille)/降水の境界が全部輪郭になって線画が壊れる(edge)。
 // alpha が min_alpha 以上の画素のみ対象。さらに density(0.0..=1.0)でディザ間引きして
 // スクリーンドア状に下の地図を透かす(全画素塗ると不透明インクなので地図が完全に隠れる)。
-// インクの色は降水強度の色(気象庁の配色)をそのまま使うので、braille でも強弱が色で読める。
+// 間引きの密度は画素のアルファで変調する。雨雲はアルファが0か255の2値なので従来と同じ挙動に
+// なるが、人口メッシュは階級ごとにアルファが違う(薄い階級=まばら)ので、その濃淡が
+// braille でもドットの密度として読めるようになる(設計 §7.3)。
+// インクの色はレイヤの色(雨雲なら降水強度の気象庁配色)をそのまま使うので、色でも強弱が読める。
 pub fn ink_radar_into_overlay(ov: &mut OverlayLayer, layer: &RgbaImage, min_alpha: u8, density: f64) {
     let d = density.clamp(0.0, 1.0);
     if d <= 0.0 { return; }
@@ -332,8 +386,9 @@ pub fn ink_radar_into_overlay(ov: &mut OverlayLayer, layer: &RgbaImage, min_alph
     for y in 0..ov.h.min(lh) {
         for x in 0..ov.w.min(lw) {
             let p = layer.get_pixel(x, y);
-            if p[3] < floor { continue; }                                      // 降水なし
-            if (BAYER4[(y % 4) as usize][(x % 4) as usize] as f64) >= th { continue; } // ディザ間引き
+            if p[3] < floor { continue; }                                      // 値なし(降水なし/人口なし)
+            // アルファで変調したディザ間引き。アルファ255なら th そのまま(従来の挙動)。
+            if (BAYER4[(y % 4) as usize][(x % 4) as usize] as f64) >= th * (p[3] as f64 / 255.0) { continue; }
             ov.put(x as i32, y as i32, [p[0], p[1], p[2]]);
         }
     }
@@ -522,10 +577,14 @@ mod tests {
         ink_radar_into_overlay(&mut ov, &layer, 32, 1.0);
         assert_eq!(ink_count(&ov), 0);
         // 閾値ちょうどは対象(「min_alpha 以上」)。
+        // アルファ変調(設計 §7.3)を入れたので、閾値ぎりぎりのアルファ32では density=1.0 でも
+        // 全塗り(16)にはならず、まばらに置かれる。ここで見たいのは「置くか置かないか」の
+        // 境界なので、点数そのものではなく 0 でないことを見る。
+        // (全塗りになることは ink_density_bounds が全画素アルファ255で押さえている)
         let mut ov2 = OverlayLayer::new(4, 4);
         let layer2 = RgbaImage::from_pixel(4, 4, image::Rgba([0, 65, 255, 32]));
         ink_radar_into_overlay(&mut ov2, &layer2, 32, 1.0);
-        assert_eq!(ink_count(&ov2), 16);
+        assert!(ink_count(&ov2) > 0, "閾値ちょうどのアルファが弾かれている");
     }
 
     // min_alpha=0 を渡されても、完全透明(降水なし)は置かない(全面インクで地図が消える事故を防ぐ)。
@@ -627,12 +686,12 @@ mod tests {
                                  rings: Vec::new(), spots: vec![(lat, lon, [1, 2, 3], 0)] };
         let layer = RgbaImage::from_pixel(8, 8, image::Rgba([200, 0, 0, 255]));
         let ink = RadarInk { layer: &layer, density: 1.0 };
-        let ov = build_overlay(&spec, cx, cy, z, 8, 8, 1.0, 1.0, 8, 8, Some(ink));
+        let ov = build_overlay(&spec, cx, cy, z, 8, 8, 1.0, 1.0, 8, 8, &[ink]);
         assert_eq!(ov.get(4, 4), Some([1, 2, 3]));    // 窓中心のマーカーが雨雲を上書きしている
         assert_eq!(ov.get(0, 0), Some([200, 0, 0]));  // マーカーの無い所は雨雲のインク
 
-        // radar=None なら従来どおり(マーカー以外は何も置かれない)。
-        let ov2 = build_overlay(&spec, cx, cy, z, 8, 8, 1.0, 1.0, 8, 8, None);
+        // インクが無ければ従来どおり(マーカー以外は何も置かれない)。
+        let ov2 = build_overlay(&spec, cx, cy, z, 8, 8, 1.0, 1.0, 8, 8, &[]);
         assert_eq!(ov2.get(4, 4), Some([1, 2, 3]));
         assert_eq!(ov2.get(0, 0), None);
     }
@@ -818,5 +877,213 @@ mod tests {
         assert_eq!(decoded.dimensions(), (3, 2));
         assert_eq!(decoded.get_pixel(0, 0), &image::Rgb([255, 0, 0]));
         assert_eq!(decoded.get_pixel(2, 1), &image::Rgb([0, 128, 255]));
+    }
+
+    // ---- fill_rect_rgba(人口メッシュの矩形塗り) ----
+
+    fn clear_layer(w: u32, h: u32) -> RgbaImage { RgbaImage::from_pixel(w, h, image::Rgba([0, 0, 0, 0])) }
+    fn painted(l: &RgbaImage) -> usize { l.pixels().filter(|p| p[3] > 0).count() }
+
+    #[test]
+    fn fill_rect_paints_a_half_open_rectangle() {
+        let mut l = clear_layer(6, 5);
+        fill_rect_rgba(&mut l, 1, 1, 4, 3, [10, 20, 30, 128]);
+        assert_eq!(painted(&l), 3 * 2, "x=1..4 / y=1..3 の6画素");
+        assert_eq!(*l.get_pixel(1, 1), image::Rgba([10, 20, 30, 128]));
+        assert_eq!(*l.get_pixel(3, 2), image::Rgba([10, 20, 30, 128]));
+        assert_eq!(l.get_pixel(4, 1)[3], 0, "x1 は含まない");
+        assert_eq!(l.get_pixel(1, 3)[3], 0, "y1 は含まない");
+        assert_eq!(l.get_pixel(0, 1)[3], 0);
+    }
+
+    #[test]
+    fn fill_rect_clips_to_the_layer_instead_of_panicking() {
+        let mut l = clear_layer(4, 4);
+        fill_rect_rgba(&mut l, -3, -3, 2, 2, [1, 2, 3, 255]); // 左上へはみ出す
+        assert_eq!(painted(&l), 4);
+        assert_eq!(*l.get_pixel(0, 0), image::Rgba([1, 2, 3, 255]));
+
+        let mut l2 = clear_layer(4, 4);
+        fill_rect_rgba(&mut l2, 2, 2, 100, 100, [1, 2, 3, 255]); // 右下へはみ出す
+        assert_eq!(painted(&l2), 4);
+        assert_eq!(*l2.get_pixel(3, 3), image::Rgba([1, 2, 3, 255]));
+
+        let mut l3 = clear_layer(4, 4);
+        fill_rect_rgba(&mut l3, -50, -50, -10, -10, [1, 2, 3, 255]); // 完全に画面外
+        assert_eq!(painted(&l3), 0);
+        fill_rect_rgba(&mut l3, 10, 10, 20, 20, [1, 2, 3, 255]);
+        assert_eq!(painted(&l3), 0);
+    }
+
+    #[test]
+    fn fill_rect_with_zero_or_inverted_extent_paints_nothing() {
+        let mut l = clear_layer(4, 4);
+        fill_rect_rgba(&mut l, 1, 1, 1, 3, [1, 2, 3, 255]); // 幅0
+        fill_rect_rgba(&mut l, 1, 1, 3, 1, [1, 2, 3, 255]); // 高さ0
+        fill_rect_rgba(&mut l, 3, 3, 1, 1, [1, 2, 3, 255]); // 左右上下が逆転
+        assert_eq!(painted(&l), 0);
+    }
+
+    #[test]
+    fn fill_rect_on_an_empty_layer_does_not_panic() {
+        let mut l = RgbaImage::new(0, 0);
+        fill_rect_rgba(&mut l, 0, 0, 4, 4, [1, 2, 3, 255]);
+        assert_eq!(painted(&l), 0);
+    }
+
+    // ---- build_population_layer ----
+
+    fn pop_mesh(code: u32, pop2025: f32) -> crate::population::PopMesh {
+        let mut pop = [0.0f32; crate::population::YEARS.len()];
+        pop[1] = pop2025;
+        crate::population::PopMesh { mesh: code, pop, aged: [f32::NAN; crate::population::AGED_YEARS] }
+    }
+
+    #[test]
+    fn the_population_layer_paints_only_meshes_that_have_people() {
+        let code = 533946123;
+        let (s, w, n, e) = crate::mesh::half_mesh_bbox(code);
+        let (cx, cy) = deg_to_pixel((s + n) / 2.0, (w + e) / 2.0, 14);
+        let dense = pop_mesh(code, 5000.0); // 20,000人/km² = 最上位の階級
+        let empty = pop_mesh(code, 0.0);
+
+        let l = build_population_layer(&[&dense], 1, crate::population::Metric::Density, cx, cy, 14, 64, 64);
+        assert!(painted(&l) > 0, "人口があるメッシュが塗られていない");
+        assert_eq!(*l.get_pixel(32, 32), image::Rgba(crate::population::class_color(6)));
+
+        let l2 = build_population_layer(&[&empty], 1, crate::population::Metric::Density, cx, cy, 14, 64, 64);
+        assert_eq!(painted(&l2), 0, "人口0のメッシュは塗らない(無人・海・山)");
+
+        // 指標が Stage2 のものなら何も塗らない(§7.5)。
+        let l3 = build_population_layer(&[&dense], 1, crate::population::Metric::Aging, cx, cy, 14, 64, 64);
+        assert_eq!(painted(&l3), 0);
+    }
+
+    #[test]
+    fn the_population_layer_leaves_everything_else_transparent() {
+        // 視野から外れたメッシュは1画素も塗らない(items() の絞り込みが漏れても壊れない)。
+        let code = 533946123;
+        let (cx, cy) = deg_to_pixel(43.06, 141.35, 14); // 札幌(遠く離れた場所)
+        let l = build_population_layer(&[&pop_mesh(code, 5000.0)], 1, crate::population::Metric::Density, cx, cy, 14, 64, 64);
+        assert_eq!(painted(&l), 0);
+    }
+
+    #[test]
+    fn a_denser_mesh_gets_a_more_opaque_colour_than_a_sparse_one() {
+        let code = 533946123;
+        let (s, w, n, e) = crate::mesh::half_mesh_bbox(code);
+        let (cx, cy) = deg_to_pixel((s + n) / 2.0, (w + e) / 2.0, 14);
+        let sparse = build_population_layer(&[&pop_mesh(code, 10.0)], 1, crate::population::Metric::Density, cx, cy, 14, 32, 32);
+        let dense = build_population_layer(&[&pop_mesh(code, 5000.0)], 1, crate::population::Metric::Density, cx, cy, 14, 32, 32);
+        assert!(sparse.get_pixel(16, 16)[3] < dense.get_pixel(16, 16)[3], "薄い階級ほど地図が透ける");
+    }
+
+    #[test]
+    fn adjacent_meshes_tile_without_a_gap() {
+        // 隣り合う500mメッシュ(南西と南東)が隙間なく並ぶ。塗り残しの筋が出ないことの確認。
+        let sw = 533946121;
+        let se = 533946122;
+        let (s, w, n, _e) = crate::mesh::half_mesh_bbox(sw);
+        let (cx, cy) = deg_to_pixel((s + n) / 2.0, w, 15);
+        let l = build_population_layer(
+            &[&pop_mesh(sw, 5000.0), &pop_mesh(se, 5000.0)],
+            1, crate::population::Metric::Density, cx, cy, 15, 128, 32,
+        );
+        // 中心の行を横に走査して、塗られた画素が途切れないこと。
+        let row: Vec<bool> = (0..128).map(|x| l.get_pixel(x, 16)[3] > 0).collect();
+        let first = row.iter().position(|v| *v).expect("塗られていない");
+        let last = row.iter().rposition(|v| *v).unwrap();
+        assert!(last - first > 20, "2枚ぶんの幅が出ていない");
+        assert!(row[first..=last].iter().all(|v| *v), "メッシュの継ぎ目に塗り残しがある");
+    }
+
+    // ---- インクのアルファ変調(設計 §7.3) ----
+
+    // アルファ128の画素は255の画素より点数が少ない(濃淡がドットの密度として読める)。
+    #[test]
+    fn ink_density_is_modulated_by_the_pixel_alpha() {
+        let mut full = OverlayLayer::new(8, 8);
+        ink_radar_into_overlay(&mut full, &RgbaImage::from_pixel(8, 8, image::Rgba([200, 0, 0, 255])), 32, 0.75);
+        let mut half = OverlayLayer::new(8, 8);
+        ink_radar_into_overlay(&mut half, &RgbaImage::from_pixel(8, 8, image::Rgba([200, 0, 0, 128])), 32, 0.75);
+        let mut faint = OverlayLayer::new(8, 8);
+        ink_radar_into_overlay(&mut faint, &RgbaImage::from_pixel(8, 8, image::Rgba([200, 0, 0, 40])), 32, 0.75);
+        assert!(ink_count(&half) < ink_count(&full), "半透明の方が点が多い/同じ");
+        assert!(ink_count(&faint) < ink_count(&half), "最も薄い階級の点が減っていない");
+        assert!(ink_count(&full) > 0 && ink_count(&faint) > 0, "どの階級も完全には消えない");
+    }
+
+    // 人口メッシュの階級ごとのアルファが、そのまま braille のドット密度の差になる。
+    #[test]
+    fn each_population_class_gets_a_distinct_ink_density() {
+        let mut prev = 0usize;
+        for c in 1..=6u8 {
+            let col = crate::population::class_color(c);
+            let mut ov = OverlayLayer::new(16, 16);
+            ink_radar_into_overlay(&mut ov, &RgbaImage::from_pixel(16, 16, image::Rgba(col)), 32, 1.0);
+            let n = ink_count(&ov);
+            assert!(n > prev, "階級{c}の点数が前の階級より増えていない({prev} → {n})");
+            prev = n;
+        }
+    }
+
+    // 複数のインク層は渡した順に焼かれる(先頭が最背面)。人口 → 雨雲 の順。
+    #[test]
+    fn build_overlay_stacks_inks_in_order_with_the_first_at_the_back() {
+        let (lat, lon, z) = (35.0, 139.0, 10u32);
+        let (cx, cy) = deg_to_pixel(lat, lon, z);
+        let spec = OverlaySpec { pois: Vec::new(), routes: Vec::new(), roads: Vec::new(), traffic_segments: Vec::new(),
+                                 rings: Vec::new(), spots: Vec::new() };
+        let pop = RgbaImage::from_pixel(8, 8, image::Rgba([100, 20, 110, 255]));
+        let rain = RgbaImage::from_pixel(8, 8, image::Rgba([0, 65, 255, 255]));
+        let ov = build_overlay(&spec, cx, cy, z, 8, 8, 1.0, 1.0, 8, 8,
+                               &[RadarInk { layer: &pop, density: 1.0 }, RadarInk { layer: &rain, density: 1.0 }]);
+        assert_eq!(ov.get(0, 0), Some([0, 65, 255]), "後から渡した雨雲が人口を上書きする");
+    }
+
+    // 実データを通した端から端までの確認(設計 §12「実データが要る確認」)。
+    // 取得 → 展開 → 解析 → 矩形の復元 → 塗り まで、実際に画面へ出るものを1本で辿る。
+    // 実行: cargo test --release -- --ignored --nocapture render::tests::live_
+    #[test]
+    #[ignore = "ネットワークと数MBの取得が要る"]
+    fn live_tottori_paints_the_city_and_leaves_the_mountains_readable() {
+        let meshes = crate::population::fetch_prefecture(31).expect("鳥取(31)の取得");
+        assert_eq!(meshes.len(), 4083, "設計 §2.2 の実測値と件数が違う");
+        let refs: Vec<&crate::population::PopMesh> = meshes.iter().collect();
+
+        // 鳥取市中心部(35.5011, 134.2351)を z12 で見る。
+        let (cx, cy) = deg_to_pixel(35.5011, 134.2351, 12);
+        let l = build_population_layer(&refs, 1, crate::population::Metric::Density, cx, cy, 12, 400, 200);
+        let total = (l.width() * l.height()) as usize;
+        let n = painted(&l);
+        assert!(n > 0, "市街地を見ているのに1画素も塗られていない");
+        // 全面が塗り潰されると地図が読めない(設計 §1 の3つ目の制約)。人口ゼロの帯が必ず残る。
+        assert!(n < total, "画面全体が塗り潰されている({n}/{total})");
+        println!("鳥取市 z12: {n}/{total} 画素を塗った({:.0}%)", n as f64 / total as f64 * 100.0);
+
+        // 最も濃い階級のアルファでも不透明にはならない = 下の地図が必ず透ける。
+        assert!(l.pixels().filter(|p| p[3] > 0).all(|p| p[3] < 255));
+
+        // 毎フレームの走査コスト(設計 §6.5 は「16万件×矩形交差で1描画あたり1ミリ秒未満」と
+        // 見積もっている)。実データで測って、その見積りが外れていないことを確かめる。
+        let view = (35.45, 134.15, 35.55, 134.32);
+        let t = std::time::Instant::now();
+        let mut kept = 0usize;
+        for _ in 0..10 {
+            kept = refs.iter().filter(|m| {
+                let b = crate::mesh::half_mesh_bbox(m.mesh);
+                b.0 <= view.2 && b.2 >= view.0 && b.1 <= view.3 && b.3 >= view.1
+            }).count();
+        }
+        let per_pass = t.elapsed().as_secs_f64() / 10.0;
+        println!("視野フィルタ: {}件 → {kept}件 / 1回 {:.3}ms", refs.len(), per_pass * 1000.0);
+        assert!(per_pass < 0.010, "1回の走査に{:.1}msかかっている(毎フレーム回すには重い)", per_pass * 1000.0);
+
+        // 中心のメッシュの実数値(ステータス行に出る値)が引ける。
+        let code = crate::mesh::half_mesh_code(35.5011, 134.2351).expect("鳥取市のメッシュ");
+        let here = meshes.iter().find(|m| m.mesh == code).expect("中心のメッシュがデータに無い");
+        let d = crate::population::density(here, 1).expect("密度");
+        println!("中心 {code}: {d:.0}人/km²");
+        assert!(d > 0.0 && d < 100_000.0, "市街地の密度として不自然: {d}");
     }
 }

@@ -1,8 +1,8 @@
-// 地図に重ねるプロットデータ(道路交通量・主要道路・道路ライブカメラ・通行規制・過去災害)の
-// ディスク層。キー1件=1ファイルのJSONで保存し、種別ごとに違うTTLで期限切れにする。
+// 地図に重ねるプロットデータ(道路交通量・主要道路・道路ライブカメラ・通行規制・過去災害・
+// 500mメッシュ人口)のディスク層。キー1件=1ファイルのJSONで保存し、種別ごとに違うTTLで期限切れにする。
 // 設計は docs/plot-data-disk-cache-design.md §3/§5/§8。
 //
-// 保存先: ~/.config/termmap/plot-cache/v1/{traffic,roads,camera,regulation,disaster}/{キー}.json
+// 保存先: ~/.config/termmap/plot-cache/v1/{traffic,roads,camera,regulation,disaster,population}/{キー}.json
 //   {"v":1,"key":"5339","fetched_at":1755330000,"data_at":1755328500,"items":[ ... ]}
 //
 // このファイルはディスクしか知らない(ネットワークにもデータ型にも触れない)。種別ごとの差
@@ -27,10 +27,11 @@ pub enum Layer {
     Camera,
     Regulation,
     Disaster,
+    Population,
 }
 
-pub const ALL_LAYERS: [Layer; 5] =
-    [Layer::Traffic, Layer::Roads, Layer::Camera, Layer::Regulation, Layer::Disaster];
+pub const ALL_LAYERS: [Layer; 6] =
+    [Layer::Traffic, Layer::Roads, Layer::Camera, Layer::Regulation, Layer::Disaster, Layer::Population];
 
 const MINUTE: u64 = 60;
 const HOUR: u64 = 60 * MINUTE;
@@ -45,6 +46,7 @@ impl Layer {
             Layer::Camera => "camera",
             Layer::Regulation => "regulation",
             Layer::Disaster => "disaster",
+            Layer::Population => "population",
         }
     }
 
@@ -62,6 +64,10 @@ impl Layer {
             Layer::Camera => 7 * DAY,
             Layer::Regulation => 10 * MINUTE,
             Layer::Disaster => 30 * DAY,
+            // 人口メッシュ365日=推計の改定は数年に1度(前版が令和2年国勢調査ベース・2024年12月公開)。
+            // 他レイヤの最長(30日)より2桁近く動きが遅く、1都道府県が最大31MBあるので、
+            // 再取得を年1回より頻繁に起こす理由が無い。版が上がったときは FORMAT_VERSION 側で切る。
+            Layer::Population => 365 * DAY,
         })
     }
 
@@ -74,7 +80,8 @@ impl Layer {
         match self {
             Layer::Traffic => Some(Duration::from_secs(60 * MINUTE)),
             Layer::Regulation => Some(Duration::from_secs(24 * HOUR)),
-            Layer::Roads | Layer::Camera | Layer::Disaster => None,
+            // 人口メッシュも同じ(古い推計が誤りになることはなく、新しい版が出て置き換わるだけ)。
+            Layer::Roads | Layer::Camera | Layer::Disaster | Layer::Population => None,
         }
     }
 
@@ -86,6 +93,8 @@ impl Layer {
             Layer::Camera => 16,
             Layer::Regulation => 200,
             Layer::Disaster => 200,
+            // 都道府県は47しかない。これ以上のキーは原理的に生じない。
+            Layer::Population => 47,
         }
     }
 
@@ -98,6 +107,9 @@ impl Layer {
             Layer::Regulation => 20 * MB,
             // 1次メッシュ1枚が実測25KB以下なので、200セルでも約5MB。他レイヤと桁を揃えた余裕値。
             Layer::Disaster => 20 * MB,
+            // 47都道府県すべてを訪れた場合の見込み73MBに余裕を持たせた値(設計 §5.2/§6.2)。
+            // 到達したら gc が取得の古い順に削り、必要になれば取り直す。
+            Layer::Population => 96 * MB,
         }
     }
 }
@@ -443,6 +455,32 @@ mod tests {
         store(&root, Layer::Regulation, "5339", &pts(), 1_000_000, 1_000_000).unwrap();
         assert!(load::<Pt>(&root, Layer::Regulation, "5339", 1_000_000 + 24 * 3600).is_some());
         assert!(load::<Pt>(&root, Layer::Regulation, "5339", 1_000_001 + 24 * 3600).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // 人口メッシュ: fresh 365日の境界と、都道府県コードをキーにした往復(設計 §6.2/§12)。
+    #[test]
+    fn population_entry_stays_fresh_for_a_year_then_turns_stale() {
+        let root = temp_root("popttl");
+        store(&root, Layer::Population, "01", &pts(), 1_000_000, 1_000_000).unwrap();
+        let at = |now: u64| {
+            load::<Pt>(&root, Layer::Population, "01", now).unwrap().is_fresh(Layer::Population, now)
+        };
+        assert!(at(1_000_000), "取得直後は fresh");
+        assert!(at(1_000_000 + 365 * DAY - 1), "365日の1秒前はまだ fresh");
+        assert!(!at(1_000_000 + 365 * DAY), "365日ちょうどで stale へ切り替わる");
+        // stale上限は無いので、10年後でも中身は読める(取り直しの必要が生じるだけ)。
+        assert!(load::<Pt>(&root, Layer::Population, "01", 1_000_000 + 3650 * DAY).is_some());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn population_cell_keys_are_zero_padded_prefecture_codes() {
+        let root = temp_root("popkey");
+        for key in ["01", "13", "47"] {
+            assert!(store(&root, Layer::Population, key, &pts(), 0, 0).is_ok(), "key={key}");
+            assert!(root.join("v1/population").join(format!("{key}.json")).is_file());
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 

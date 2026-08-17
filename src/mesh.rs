@@ -84,6 +84,62 @@ pub fn secondary_bbox(code: u32) -> (f64, f64, f64, f64) {
     (lat_min, lon_min, lat_min + 1.0 / 12.0, lon_min + 1.0 / 8.0)
 }
 
+// ---- 2分の1地域メッシュ(500mメッシュ・9桁) ----
+// 3次メッシュ(約1km)を4分割したもの。国土数値情報の500mメッシュ別将来推計人口が使う単位で、
+// 桁の意味は次のとおり(docs/population-mesh-overlay-design.md §2.4)。
+//
+//   MESH_ID = p p u u  r c  r3 c3  q      例: 523351132
+//             └1次┘   └2次┘└3次┘ └500m┘
+//   q: 1=南西 2=南東 3=北西 4=北東
+//   高さ 1/240 度(緯度15秒) / 幅 1/160 度(経度22.5秒)
+//
+// 500mメッシュの格子は「緯度を1/240度・経度を1/160度で刻んだ整数格子」そのものなので、
+// 下の2関数はどちらもその格子番号を経由して計算する(secondary_codes が 1/12・1/8 の格子を
+// 経由しているのと同じ流儀)。1次メッシュ1枚は緯度160×経度160区画に分かれる。
+
+// 1次メッシュ1枚に入る500mメッシュの数(緯度・経度とも)。2/3度 ÷ 1/240度 = 1度 ÷ 1/160度 = 160。
+const HALF_PER_PRIMARY: i64 = 160;
+
+/// 9桁の2分の1地域メッシュコード → (lat_min, lon_min, lat_max, lon_max)。
+/// 桁が壊れている(q が 1..=4 の外など)場合も矩形は返す(呼び出し側で弾く必要が無いように、
+/// 各桁を取り出す位置だけを見て素直に計算する)。
+pub fn half_mesh_bbox(code: u32) -> (f64, f64, f64, f64) {
+    let q = code % 10; // 500m区画(1=南西 2=南東 3=北西 4=北東)
+    let c3 = (code / 10) % 10; // 3次メッシュ 経度側
+    let r3 = (code / 100) % 10; // 3次メッシュ 緯度側
+    let c = (code / 1000) % 10; // 2次メッシュ 経度側
+    let r = (code / 10000) % 10; // 2次メッシュ 緯度側
+    let u = (code / 100_000) % 100; // 1次メッシュ 経度側
+    let p = code / 10_000_000; // 1次メッシュ 緯度側
+    let qi = q.saturating_sub(1).min(3); // 0..=3 へ丸める(0 と 1 はどちらも南西)
+    let lat_min = p as f64 / 1.5 + r as f64 / 12.0 + r3 as f64 / 120.0 + (qi / 2) as f64 / 240.0;
+    let lon_min = 100.0 + u as f64 + c as f64 / 8.0 + c3 as f64 / 80.0 + (qi % 2) as f64 / 160.0;
+    (lat_min, lon_min, lat_min + 1.0 / 240.0, lon_min + 1.0 / 160.0)
+}
+
+/// 緯度経度 → その点を含む2分の1地域メッシュコード(9桁)。half_mesh_bbox の逆。
+/// 日本のメッシュ空間(p,u が 0..=99)の外なら None。
+/// 中心のクロスヘアが指すメッシュの実数値を出す(設計 §7.6)ために使う。
+pub fn half_mesh_code(lat: f64, lon: f64) -> Option<u32> {
+    if !lat.is_finite() || !lon.is_finite() {
+        return None;
+    }
+    // 500mメッシュの整数格子番号(南西端を含む・北東端は次の区画)。
+    let ga = (lat * 240.0).floor() as i64;
+    let gb = (lon * 160.0).floor() as i64;
+    let p = ga.div_euclid(HALF_PER_PRIMARY);
+    let u = gb.div_euclid(HALF_PER_PRIMARY) - 100;
+    if !(0..100).contains(&p) || !(0..100).contains(&u) {
+        return None;
+    }
+    let ia = ga.rem_euclid(HALF_PER_PRIMARY); // 1次メッシュ内の緯度側 0..160
+    let ib = gb.rem_euclid(HALF_PER_PRIMARY); // 同 経度側 0..160
+    let (r, r3, half_r) = (ia / 20, (ia % 20) / 2, ia % 2);
+    let (c, c3, half_c) = (ib / 20, (ib % 20) / 2, ib % 2);
+    let q = half_r * 2 + half_c + 1; // 1=南西 2=南東 3=北西 4=北東
+    Some((p * 10_000_000 + u * 100_000 + r * 10_000 + c * 1_000 + r3 * 100 + c3 * 10 + q) as u32)
+}
+
 /// メッシュ矩形の各辺をわずかに内側へ寄せた矩形。取得元へ「このメッシュぶんだけ」を頼むとき、
 /// 境界がちょうど次のメッシュの下端と一致して隣まで巻き込まれるのを防ぐ
 /// (取得元は floor でメッシュへ割り戻すため、上端をそのまま渡すと隣のコードが混ざる)。
@@ -230,5 +286,98 @@ mod tests {
         let b = secondary_bbox(533946);
         let s = shrink(b);
         assert_eq!(secondary_codes(s.0, s.1, s.2, s.3), vec![533946]);
+    }
+
+    // ---- 2分の1地域メッシュ(500mメッシュ) ----
+
+    // 設計 §2.4 / §12 の既知値。実データ(鳥取)の feature と一致することを確認済みの値。
+    #[test]
+    fn half_mesh_bbox_matches_the_known_value_from_the_design() {
+        let (s, w, n, e) = half_mesh_bbox(523351132);
+        assert!((s - 35.0916666).abs() < 1e-6, "s={s}");
+        assert!((w - 133.16875).abs() < 1e-9, "w={w}");
+        assert!((n - 35.0958333).abs() < 1e-6, "n={n}");
+        assert!((e - 133.175).abs() < 1e-9, "e={e}");
+    }
+
+    // 1枚の大きさは緯度15秒(1/240度)×経度22.5秒(1/160度)で、コードによらず一定。
+    #[test]
+    fn half_mesh_bbox_is_always_fifteen_by_twenty_two_point_five_seconds() {
+        for code in [523351132u32, 533945764, 644142001, 362317894] {
+            let (s, w, n, e) = half_mesh_bbox(code);
+            assert!((n - s - 1.0 / 240.0).abs() < 1e-12, "code={code}");
+            assert!((e - w - 1.0 / 160.0).abs() < 1e-12, "code={code}");
+        }
+    }
+
+    // q=1..4 が 南西/南東/北西/北東 の順に並ぶ(3次メッシュ1枚を4分割している)。
+    #[test]
+    fn the_four_quadrants_tile_their_tertiary_mesh() {
+        let base = 52335113; // 3次メッシュ(8桁)
+        let sw = half_mesh_bbox(base * 10 + 1);
+        let se = half_mesh_bbox(base * 10 + 2);
+        let nw = half_mesh_bbox(base * 10 + 3);
+        let ne = half_mesh_bbox(base * 10 + 4);
+        assert!((sw.0 - se.0).abs() < 1e-12, "南の2枚は緯度が同じ");
+        assert!((nw.0 - ne.0).abs() < 1e-12, "北の2枚は緯度が同じ");
+        assert!(sw.0 < nw.0, "北の方が緯度が高い");
+        assert!((sw.1 - nw.1).abs() < 1e-12, "西の2枚は経度が同じ");
+        assert!(sw.1 < se.1, "東の方が経度が高い");
+        // 4枚を合わせると3次メッシュ1枚(緯度1/120度・経度1/80度)をちょうど覆う。
+        assert!((ne.2 - sw.0 - 1.0 / 120.0).abs() < 1e-12);
+        assert!((ne.3 - sw.1 - 1.0 / 80.0).abs() < 1e-12);
+        // 南西の北東角が、北東の南西角になる(隙間も重なりも無い)。
+        assert!((sw.2 - nw.0).abs() < 1e-12);
+        assert!((sw.3 - se.1).abs() < 1e-12);
+    }
+
+    // 500mメッシュ4枚×4枚…が上位のメッシュに入れ子で収まる(1次/2次との整合)。
+    #[test]
+    fn half_mesh_nests_inside_its_primary_and_secondary_mesh() {
+        let code = 533946123;
+        let (s, w, n, e) = half_mesh_bbox(code);
+        let (ps, pw, pn, pe) = primary_bbox(code / 100_000); // 上4桁 = 1次メッシュ
+        assert!(ps <= s && n <= pn && pw <= w && e <= pe, "1次からはみ出している");
+        let (ss, sw_, sn, se_) = secondary_bbox(code / 1_000); // 上6桁 = 2次メッシュ
+        assert!(ss <= s && n <= sn && sw_ <= w && e <= se_, "2次からはみ出している");
+    }
+
+    #[test]
+    fn half_mesh_code_is_the_inverse_of_half_mesh_bbox() {
+        for code in [523351132u32, 533946123, 644142001, 362317894, 533945764] {
+            let (s, w, n, e) = half_mesh_bbox(code);
+            let (mid_lat, mid_lon) = ((s + n) / 2.0, (w + e) / 2.0);
+            assert_eq!(half_mesh_code(mid_lat, mid_lon), Some(code), "code={code}");
+            // 南西角のすぐ内側も同じコードになる(境界ちょうどは浮動小数の丸めでどちらに転ぶか
+            // 決まらないので、区画の内側であることが分かる最小の量だけずらして見る)。
+            assert_eq!(half_mesh_code(s + 1e-9, w + 1e-9), Some(code), "南西角 code={code}");
+        }
+    }
+
+    #[test]
+    fn half_mesh_code_uses_all_four_quadrant_digits() {
+        let base = half_mesh_bbox(523351131); // 南西
+        let (s, w) = (base.0, base.1);
+        let (dy, dx) = (1.0 / 480.0, 1.0 / 320.0); // 500m区画の半分
+        assert_eq!(half_mesh_code(s + dy, w + dx), Some(523351131), "南西");
+        assert_eq!(half_mesh_code(s + dy, w + dx + 1.0 / 160.0), Some(523351132), "南東");
+        assert_eq!(half_mesh_code(s + dy + 1.0 / 240.0, w + dx), Some(523351133), "北西");
+        assert_eq!(half_mesh_code(s + dy + 1.0 / 240.0, w + dx + 1.0 / 160.0), Some(523351134), "北東");
+    }
+
+    #[test]
+    fn half_mesh_code_is_none_outside_the_japanese_mesh_space() {
+        assert!(half_mesh_code(48.85, 2.35).is_none()); // パリ
+        assert!(half_mesh_code(-33.87, 151.21).is_none()); // シドニー(南半球)
+        assert!(half_mesh_code(f64::NAN, 139.0).is_none());
+        assert!(half_mesh_code(35.0, f64::INFINITY).is_none());
+    }
+
+    // 東京駅は 2次メッシュ 533946 の中。上6桁が secondary_codes の結果と一致する。
+    #[test]
+    fn half_mesh_code_agrees_with_the_secondary_mesh_of_the_same_point() {
+        let code = half_mesh_code(35.68, 139.77).expect("東京駅");
+        assert_eq!(code / 1_000, 533946);
+        assert_eq!(secondary_codes(35.68, 139.77, 35.68, 139.77), vec![code / 1_000]);
     }
 }

@@ -12,6 +12,10 @@ qrcode = { version = "0.14", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 unicode-width = "0.1"
+# 500mメッシュ人口(国土数値情報)のzipを展開するために使う。image → png 経由で既にビルドへ
+# 入っている実装(flate2 1.1.9)を直接参照できるようにするだけで、新しいサードパーティのコードは
+# 増えない(docs/population-mesh-overlay-design.md §3)。zipコンテナの解析は自前。
+flate2 = "1"
 
 [profile.release]
 opt-level = 3

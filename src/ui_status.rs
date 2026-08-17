@@ -10,7 +10,8 @@ use crate::settings;
 use crate::spots::Spot;
 use crate::tiles::{radar_progress, TileLoader};
 
-// プロットレイヤ(道路交通量・道路ライブカメラ・通行規制・過去災害)1つぶんの表示状態。
+// プロットレイヤ(道路交通量・道路ライブカメラ・通行規制・過去災害・500mメッシュ人口)
+// 1つぶんの表示状態。
 // 件数しか見ないので、アイテムそのものではなく畳んだ値を受け取る。
 pub(crate) struct PlotStatus {
     /// 表示範囲に出ている件数。
@@ -21,6 +22,19 @@ pub(crate) struct PlotStatus {
     pub stale_age_secs: Option<u64>,
     /// ズーム下限より広域で、取得を止めているか。
     pub wide_area: bool,
+}
+
+// 人口メッシュのステータス。他レイヤと違い「件数」ではなく中心のメッシュの実数値を出すので、
+// PlotStatus とは別の型にしてある(設計 §7.6)。
+pub(crate) struct PopulationStatus {
+    /// 背景取得が走っているか。
+    pub job_active: bool,
+    /// いま取りに行っている都道府県名(1セルに数十秒かかるので何を待っているかを出す)。
+    pub fetching: Option<String>,
+    /// ズーム下限より広域で、取得を止めているか。
+    pub wide_area: bool,
+    /// 中心のクロスヘアが指すメッシュの人口密度(人/km²)。データが無ければ None。
+    pub density: Option<f64>,
 }
 
 // build_status_line が読むループ状態。Option のうち有無しか見ないもの(通信中ジョブ・GPS)は
@@ -57,6 +71,7 @@ pub(crate) struct StatusCtx<'a> {
     pub camera: PlotStatus,
     pub regulation: PlotStatus,
     pub disaster: PlotStatus,
+    pub population: PopulationStatus,
     pub addr: &'a str,
     pub wps: &'a [(f64, f64)],
     pub z: u32,
@@ -95,6 +110,48 @@ fn plot_label(enabled: bool, icon: &str, unit: &str, suffix: &str, none_txt: &st
     format!("{icon}{}{unit}{age}{suffix}{updating} ", s.count)
 }
 
+// 人口メッシュの表記。色分けだけだと階級の幅(1,000〜4,000等)しか読めないので、中心の
+// クロスヘアが指すメッシュの実数値を出す(設計 §7.6)。
+//   👥1,240人/km²        通常時
+//   👥北海道を取得中…    取得中(何を待っているかが分かる。1セルに数十秒かかるため)
+//   👥取得中…            取得中(まだどのセルか決まっていない)
+//   👥人口データ無し     索引に無い(海上・無人域)。原典にもデータが無いので「0」とは言わない
+//   👥広域では非表示     z11未満
+fn population_label(enabled: bool, s: &PopulationStatus) -> String {
+    if !enabled {
+        return String::new();
+    }
+    if let Some(name) = &s.fetching {
+        return format!("👥{name}を取得中… ");
+    }
+    if s.job_active {
+        return "👥取得中… ".to_string();
+    }
+    match s.density {
+        Some(d) => format!("👥{}人/km² ", thousands(d.round() as i64)),
+        None if s.wide_area => "👥広域では非表示 ".to_string(),
+        None => "👥人口データ無し ".to_string(),
+    }
+}
+
+// 3桁ごとにカンマを入れる(人/km² は最大63,000程度になるので区切らないと読みにくい)。
+fn thousands(v: i64) -> String {
+    let neg = v < 0;
+    let digits = v.unsigned_abs().to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3 + 1);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    if neg {
+        format!("-{out}")
+    } else {
+        out
+    }
+}
+
 // 経過時間の粗い表記(ステータス行は幅が限られるので1単位だけ出す)。
 fn format_age(secs: u64) -> String {
     if secs < 60 {
@@ -113,7 +170,7 @@ pub(crate) fn build_status_line(c: StatusCtx) -> String {
         focus, save_confirm, spot_move_confirm, spots, cur_cat, pending_spot, set_sel, poi_label,
         route_note, clear_route_confirm, jobs_active, spin, gps_live, web_gps_active, play,
         play_speed, radar_on, radar_tl, radar_idx, radar_follow, loader, rcx, rcy, rz, rw, rh,
-        cfg, traffic, camera, regulation, disaster,
+        cfg, traffic, camera, regulation, disaster, population,
         addr, wps, z, lat, lon, next_turn,
     } = c;
     match focus {
@@ -203,13 +260,15 @@ pub(crate) fn build_status_line(c: StatusCtx) -> String {
             // 過去災害: 件数ではなく**地点数**を出す(事例数だと数千になり他レイヤと桁が合わない)。
             // (B)はカメラの(N)と同じで、押すと詳細が出るキーがあることを示す。
             let disaster_txt = plot_label(cfg.disaster_enabled, "🌊", "地点", "(B)", "記録無し", &disaster);
+            // 500mメッシュ人口: 件数ではなく中心のメッシュの人口密度(人/km²)を出す。
+            let population_txt = population_label(cfg.population_enabled, &population);
             // 一時メッセージが無い時は底面にロゴを常時表示。メッセージ発生時はそちらを優先。
             let msg = if addr.is_empty() { "◉╌╌╌► termmap · terminal touring map   ".to_string() } else { format!("» {addr} « ") };
             // 下部バーは細く。全操作は Space メニューから選べる
             let route_hint = if wps.is_empty() { "v=地点を置く".to_string() } else { format!("{}点 v足す w/s選択(操作行までEnterで実行) Tab=左の一覧へ(並替/操作)", wps.len()) };
             // 次の曲がり角(音声案内と同じデータソース。ONでルート走行中のみ出る)。
             let turn_txt = next_turn.as_deref().unwrap_or("");
-            let base = format!(" {spinner}{msg}{live}{playing}{radar_txt}{traffic_txt}{camera_txt}{regulation_txt}{disaster_txt}{turn_txt}z{z} {lat:.4},{lon:.4} ｜ {route_hint} ｜ Space:メニュー ?ヘルプ q終了");
+            let base = format!(" {spinner}{msg}{live}{playing}{radar_txt}{traffic_txt}{camera_txt}{regulation_txt}{disaster_txt}{population_txt}{turn_txt}z{z} {lat:.4},{lon:.4} ｜ {route_hint} ｜ Space:メニュー ?ヘルプ q終了");
             match route_note { Some(rn) => format!("{base} | {rn} "), None => base }
         }
     }
@@ -256,6 +315,7 @@ mod tests {
         camera: PlotStatus,
         regulation: PlotStatus,
         disaster: PlotStatus,
+        population: PopulationStatus,
         addr: String,
         wps: Vec<(f64, f64)>,
         z: u32,
@@ -274,6 +334,7 @@ mod tests {
                 radar_on: false, radar_tl: radar::Timeline::default(), radar_idx: 0, radar_follow: true,
                 cfg: Config::default(),
                 traffic: idle_plot(), camera: idle_plot(), regulation: idle_plot(), disaster: idle_plot(),
+                population: idle_population(),
                 addr: String::new(), wps: Vec::new(), z: 14, lat: 35.0, lon: 139.0, next_turn: None,
             }
         }
@@ -294,6 +355,12 @@ mod tests {
                 camera: clone_plot(&self.camera),
                 regulation: clone_plot(&self.regulation),
                 disaster: clone_plot(&self.disaster),
+                population: PopulationStatus {
+                    job_active: self.population.job_active,
+                    fetching: self.population.fetching.clone(),
+                    wide_area: self.population.wide_area,
+                    density: self.population.density,
+                },
                 addr: &self.addr, wps: &self.wps, z: self.z, lat: self.lat, lon: self.lon,
                 next_turn: &self.next_turn,
             })
@@ -302,6 +369,9 @@ mod tests {
 
     fn idle_plot() -> PlotStatus {
         PlotStatus { count: 0, job_active: false, stale_age_secs: None, wide_area: false }
+    }
+    fn idle_population() -> PopulationStatus {
+        PopulationStatus { job_active: false, fetching: None, wide_area: false, density: None }
     }
     fn clone_plot(p: &PlotStatus) -> PlotStatus {
         PlotStatus {
@@ -623,5 +693,85 @@ mod tests {
         assert_eq!(f.line(), " ルート一覧: ↑↓/ws選択 Enter実行 [ ]並替 x削除 v追加 +/-拡縮 Esc/Tabで地図へ | 経路探索に失敗 ");
         f.route_note = None;
         assert_eq!(f.line(), " ルート一覧: ↑↓/ws選択 Enter実行 [ ]並替 x削除 v追加 +/-拡縮 Esc/Tabで地図へ ");
+    }
+
+    // ---- 500mメッシュ人口(設計 §7.6) ----
+
+    // OFFのときは1文字も出さない(他のレイヤと同じ)。
+    #[test]
+    fn population_label_is_absent_while_the_layer_is_off() {
+        let mut f = Fixture::new(Focus::Map);
+        f.population.density = Some(1240.0);
+        assert!(!f.line().contains("👥"), "OFFなのに出ている");
+    }
+
+    // 色分けだけでは階級の幅しか読めないので、中心のメッシュの実数値を出す。
+    #[test]
+    fn population_label_shows_the_density_at_the_crosshair() {
+        let mut f = Fixture::new(Focus::Map);
+        f.cfg.population_enabled = true;
+        f.population.density = Some(1240.0);
+        assert!(f.line().contains("👥1,240人/km²"), "{}", f.line());
+        // 桁が大きくても読めるよう3桁区切りにする(最大63,000人/km²程度)。
+        f.population.density = Some(63184.0);
+        assert!(f.line().contains("👥63,184人/km²"), "{}", f.line());
+        // 小数は四捨五入して整数で出す。
+        f.population.density = Some(99.6);
+        assert!(f.line().contains("👥100人/km²"), "{}", f.line());
+        f.population.density = Some(0.0);
+        assert!(f.line().contains("👥0人/km²"), "人口0のメッシュも「無し」とは言わない: {}", f.line());
+    }
+
+    // 1セルに数十秒かかるので、何を待っているのかが分かるようにする。
+    #[test]
+    fn population_label_names_the_prefecture_being_fetched() {
+        let mut f = Fixture::new(Focus::Map);
+        f.cfg.population_enabled = true;
+        f.population.job_active = true;
+        f.population.fetching = Some("北海道".to_string());
+        assert!(f.line().contains("👥北海道を取得中…"), "{}", f.line());
+        // まだどのセルか決まっていない間は名前なしで出す。
+        f.population.fetching = None;
+        assert!(f.line().contains("👥取得中…"), "{}", f.line());
+    }
+
+    // 索引に無い(海上・無人域)ときは「0」ではなく「データ無し」。原典にもデータが無いため。
+    #[test]
+    fn population_label_distinguishes_no_data_from_a_wide_view() {
+        let mut f = Fixture::new(Focus::Map);
+        f.cfg.population_enabled = true;
+        assert!(f.line().contains("👥人口データ無し"), "{}", f.line());
+        f.population.wide_area = true;
+        assert!(f.line().contains("👥広域では非表示"), "{}", f.line());
+        // 取得中はどちらより優先(取りに行っている最中に「無し」と言わない)。
+        f.population.job_active = true;
+        assert!(f.line().contains("👥取得中…"), "{}", f.line());
+    }
+
+    // 他レイヤと同時にONでも並んで出る(どれかが消えたりしない)。
+    #[test]
+    fn population_label_sits_alongside_the_other_layers() {
+        let mut f = Fixture::new(Focus::Map);
+        f.cfg.population_enabled = true;
+        f.cfg.disaster_enabled = true;
+        f.cfg.traffic_enabled = true;
+        f.population.density = Some(320.0);
+        f.disaster.count = 4;
+        f.traffic.count = 7;
+        let line = f.line();
+        assert!(line.contains("🚗7地点"), "{line}");
+        assert!(line.contains("🌊4地点(B)"), "{line}");
+        assert!(line.contains("👥320人/km²"), "{line}");
+    }
+
+    #[test]
+    fn thousands_groups_digits_from_the_right() {
+        assert_eq!(thousands(0), "0");
+        assert_eq!(thousands(7), "7");
+        assert_eq!(thousands(999), "999");
+        assert_eq!(thousands(1000), "1,000");
+        assert_eq!(thousands(63184), "63,184");
+        assert_eq!(thousands(1234567), "1,234,567");
+        assert_eq!(thousands(-1234), "-1,234");
     }
 }
