@@ -1640,6 +1640,12 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                         cfg.disaster_enabled = !cfg.disaster_enabled;
                                         if cfg.disaster_enabled { addr = "過去災害: 防災科学技術研究所 災害事例データベース".into(); }
                                     }
+                                    28 => { // 渋滞込み所要時間: 次にルートが確定したタイミングで初めて問い合わせる
+                                        cfg.route_traffic_enabled = !cfg.route_traffic_enabled;
+                                        if cfg.route_traffic_enabled && cfg.google_maps_api_key.trim().is_empty() {
+                                            addr = "渋滞込み所要時間: Google APIキー未設定".into();
+                                        }
+                                    }
                                     _ => {}
                                 }
                             }
