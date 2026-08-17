@@ -74,61 +74,7 @@ pub(crate) fn dispatch(st: &mut UiState, k: KeyEvent, cx: &KeyCtx, out: &mut dyn
             KeyCode::Esc => { st.snd.play("back"); }
             other => { edit_line(&mut buf, &mut st.input_cur, other); st.focus = Focus::Search(buf); } // ←→/文字/BS/Del/Home/End
         },
-        Focus::SpotCatList => match k.code { // カテゴリ一覧(P)
-            KeyCode::Up | KeyCode::Char('w') => { st.snd.play("click"); st.cat_sel = st.cat_sel.saturating_sub(1); st.focus = Focus::SpotCatList; }
-            KeyCode::Down | KeyCode::Char('s') => { st.snd.play("click"); if st.cat_sel + 1 < st.spot_cats.len() { st.cat_sel += 1; } st.focus = Focus::SpotCatList; }
-            KeyCode::Char('n') => { st.input_cur = 0; st.focus = Focus::NewCat(String::new()); }
-            KeyCode::Char('[') => { // 選択カテゴリを上へ
-                if st.cat_sel > 0 && st.cat_sel < st.spot_cats.len() { st.spot_cats.swap(st.cat_sel, st.cat_sel - 1); st.cat_sel -= 1; let _ = save_all_cats(&st.spot_cats); }
-                st.focus = Focus::SpotCatList;
-            }
-            KeyCode::Char(']') => { // 選択カテゴリを下へ
-                if st.cat_sel + 1 < st.spot_cats.len() { st.spot_cats.swap(st.cat_sel, st.cat_sel + 1); st.cat_sel += 1; let _ = save_all_cats(&st.spot_cats); }
-                st.focus = Focus::SpotCatList;
-            }
-            KeyCode::Char('r') => { if let Some((n, _, _)) = st.spot_cats.get(st.cat_sel) { st.input_cur = n.chars().count(); st.focus = Focus::SpotRename(n.clone(), st.cat_sel); } else { st.focus = Focus::SpotCatList; } }
-            KeyCode::Char('c') => {
-                match st.spot_cats.get(st.cat_sel) {
-                    Some((_, ci, _)) => { st.color_sel = *ci; st.focus = Focus::ColorPick { cat: st.cat_sel }; }
-                    None => st.focus = Focus::SpotCatList,
-                }
-            }
-            KeyCode::Char('M') => { // 形状ピッカー(色 c とは独立に形を選ぶ)
-                match st.spot_cats.get(st.cat_sel) {
-                    Some((_, _, sh)) => { st.shape_sel = *sh; st.focus = Focus::ShapePick { cat: st.cat_sel }; }
-                    None => st.focus = Focus::SpotCatList,
-                }
-            }
-            KeyCode::Char('x') => {
-                if let Some((name, _, _)) = st.spot_cats.get(st.cat_sel).cloned() {
-                    if st.spots.iter().any(|s| s.cat == name) { st.addr = format!("使用中: {name}(先に空に)"); }
-                    else { st.spot_cats.remove(st.cat_sel); if st.cat_sel >= st.spot_cats.len() && st.cat_sel > 0 { st.cat_sel -= 1; } let _ = save_all_cats(&st.spot_cats); }
-                }
-                st.focus = Focus::SpotCatList;
-            }
-            KeyCode::Enter => {
-                let cat = st.spot_cats.get(st.cat_sel).map(|(c, _, _)| c.clone());
-                if let Some((la, lo, nm)) = st.pending_spot.take() {
-                    // 検索結果からの登録: 選択カテゴリに新規スポットとして保存
-                    if let Some(cat) = cat {
-                        st.snd.play("pop");
-                        let s = Spot { lat: la, lon: lo, cat: cat.clone(), name: spot_clean(&nm) };
-                        let _ = append_spot(&s);
-                        st.spots.push(s);
-                        st.show_spots = true;
-                        apply_spots(&mut st.spec, &st.spots, &st.spot_cats, st.show_spots);
-                        st.addr = format!("★登録: {} [{}]", if nm.is_empty() { "(無名)" } else { nm.as_str() }, cat);
-                    }
-                    st.focus = Focus::Map;
-                } else if let Some(cat) = cat {
-                    st.cur_cat = cat; st.sp_sel = 0; st.focus = Focus::SpotList;
-                } else { st.focus = Focus::SpotCatList; }
-            }
-            // 登録キャンセル時も保留を消す→Mapへ。左袖(カテゴリ一覧)の残像を残さないよう
-            // 全消去してから次フレームで再構築させる(Menu閉じる時と同じ理由)。
-            KeyCode::Esc => { st.snd.play("back"); st.pending_spot = None; st.focus = Focus::Map; let _ = write!(out, "\x1b[2J"); st.force_reemit = true; }
-            _ => st.focus = Focus::SpotCatList,
-        },
+        Focus::SpotCatList => ui_keys_spots::spot_cat_list(st, k, out),
         Focus::Settings => ui_keys_settings::settings(st, k, cx.nogos, out),
         Focus::SettingsEdit(idx, buf) => ui_keys_settings::settings_edit(st, k, idx, buf),
         Focus::RoadSearch(mut buf) => match k.code { // 道路名/ref で現在view内をルート化
@@ -182,123 +128,11 @@ pub(crate) fn dispatch(st: &mut UiState, k: KeyEvent, cx: &KeyCtx, out: &mut dyn
             KeyCode::Esc => { st.snd.play("back"); }
             other => { edit_line(&mut buf, &mut st.input_cur, other); st.focus = Focus::Recommend(buf); }
         },
-        Focus::SpotList => match k.code { // cur_cat のスポット一覧
-            KeyCode::Up | KeyCode::Char('w') => { st.snd.play("click"); st.sp_sel = st.sp_sel.saturating_sub(1); st.focus = Focus::SpotList; }
-            KeyCode::Down | KeyCode::Char('s') => { st.snd.play("click"); let n = st.spots.iter().filter(|s| s.cat == st.cur_cat).count(); if st.sp_sel + 1 < n { st.sp_sel += 1; } st.focus = Focus::SpotList; }
-            KeyCode::Char('n') => { st.input_cur = 0; st.focus = Focus::SpotForm { name: String::new(), url: String::new(), field: 0 }; } // 新規スポット登録フォーム
-            KeyCode::Char('[') => { // 選択スポットを同カテゴリ内で上へ
-                let idxs: Vec<usize> = st.spots.iter().enumerate().filter(|(_, s)| s.cat == st.cur_cat).map(|(i, _)| i).collect();
-                if st.sp_sel > 0 && st.sp_sel < idxs.len() { st.spots.swap(idxs[st.sp_sel], idxs[st.sp_sel - 1]); st.sp_sel -= 1; let _ = save_all_spots(&st.spots); }
-                st.focus = Focus::SpotList;
-            }
-            KeyCode::Char(']') => { // 選択スポットを同カテゴリ内で下へ
-                let idxs: Vec<usize> = st.spots.iter().enumerate().filter(|(_, s)| s.cat == st.cur_cat).map(|(i, _)| i).collect();
-                if st.sp_sel + 1 < idxs.len() { st.spots.swap(idxs[st.sp_sel], idxs[st.sp_sel + 1]); st.sp_sel += 1; let _ = save_all_spots(&st.spots); }
-                st.focus = Focus::SpotList;
-            }
-            KeyCode::Char('r') => { // 選択スポットを改名
-                let idxs: Vec<usize> = st.spots.iter().enumerate().filter(|(_, s)| s.cat == st.cur_cat).map(|(i, _)| i).collect();
-                match idxs.get(st.sp_sel) { Some(&gi) => { st.input_cur = st.spots[gi].name.chars().count(); st.focus = Focus::SpotEditName(st.spots[gi].name.clone(), gi); } None => st.focus = Focus::SpotList }
-            }
-            KeyCode::Char('m') => { // 選択スポットを現在の中心へ移動(破壊的なので確認待ちにするだけ)
-                let idxs: Vec<usize> = st.spots.iter().enumerate().filter(|(_, s)| s.cat == st.cur_cat).map(|(i, _)| i).collect();
-                if let Some(&gi) = idxs.get(st.sp_sel) { st.spot_move_confirm = Some(gi); }
-                st.focus = Focus::SpotList;
-            }
-            KeyCode::Enter => {
-                let idxs: Vec<usize> = st.spots.iter().enumerate().filter(|(_, s)| s.cat == st.cur_cat).map(|(i, _)| i).collect();
-                if let Some(&gi) = idxs.get(st.sp_sel) { let (nx, ny) = deg_to_pixel(st.spots[gi].lat, st.spots[gi].lon, st.z); st.cx = nx; st.cy = ny; }
-                st.focus = Focus::SpotList;
-            }
-            KeyCode::Char('x') => {
-                let idxs: Vec<usize> = st.spots.iter().enumerate().filter(|(_, s)| s.cat == st.cur_cat).map(|(i, _)| i).collect();
-                if let Some(&gi) = idxs.get(st.sp_sel) {
-                    st.spots.remove(gi);
-                    if st.sp_sel > 0 && st.sp_sel >= idxs.len() - 1 { st.sp_sel -= 1; }
-                    let _ = save_all_spots(&st.spots);
-                    apply_spots(&mut st.spec, &st.spots, &st.spot_cats, st.show_spots);
-                }
-                st.focus = Focus::SpotList;
-            }
-            KeyCode::Esc => { st.snd.play("back"); st.focus = Focus::SpotCatList; }
-            _ => st.focus = Focus::SpotList,
-        },
-        Focus::SpotEditName(mut buf, gi) => match k.code { // スポット改名
-            KeyCode::Enter => {
-                st.snd.play("confirm");
-                let new = spot_clean(buf.trim());
-                if let Some(s) = st.spots.get_mut(gi) { s.name = new; }
-                let _ = save_all_spots(&st.spots);
-                apply_spots(&mut st.spec, &st.spots, &st.spot_cats, st.show_spots);
-                st.focus = Focus::SpotList;
-            }
-            KeyCode::Esc => st.focus = Focus::SpotList,
-            other => { edit_line(&mut buf, &mut st.input_cur, other); st.focus = Focus::SpotEditName(buf, gi); }
-        },
-        Focus::NewCat(mut buf) => match k.code {
-            KeyCode::Enter => { let name = buf.trim().to_string(); if !name.is_empty() { st.snd.play("confirm"); let _ = ensure_spot_cat(&name, &mut st.spot_cats); } st.focus = Focus::SpotCatList; }
-            KeyCode::Esc => { st.snd.play("back"); st.focus = Focus::SpotCatList; }
-            other => { edit_line(&mut buf, &mut st.input_cur, other); st.focus = Focus::NewCat(buf); }
-        },
-        Focus::SpotRename(mut buf, idx) => match k.code {
-            KeyCode::Enter => {
-                let new = spot_clean(buf.trim());
-                if !new.is_empty() {
-                    if let Some(old) = st.spot_cats.get(idx).map(|(n, _, _)| n.clone()) {
-                        for s in st.spots.iter_mut() { if s.cat == old { s.cat = new.clone(); } }
-                        if let Some(e) = st.spot_cats.get_mut(idx) { e.0 = new; }
-                        let _ = save_all_spots(&st.spots);
-                        let _ = save_all_cats(&st.spot_cats);
-                        apply_spots(&mut st.spec, &st.spots, &st.spot_cats, st.show_spots);
-                    }
-                }
-                st.focus = Focus::SpotCatList;
-            }
-            KeyCode::Esc => st.focus = Focus::SpotCatList,
-            other => { edit_line(&mut buf, &mut st.input_cur, other); st.focus = Focus::SpotRename(buf, idx); }
-        },
-        Focus::SpotForm { mut name, mut url, mut field } => match k.code { // 新規スポット登録フォーム
-            KeyCode::Up | KeyCode::BackTab => { field = (field + 3) % 4; st.input_cur = form_cur(&name, &url, field); st.focus = Focus::SpotForm { name, url, field }; }
-            KeyCode::Down | KeyCode::Tab => { field = (field + 1) % 4; st.input_cur = form_cur(&name, &url, field); st.focus = Focus::SpotForm { name, url, field }; }
-            KeyCode::Esc => { st.snd.play("back"); st.focus = Focus::SpotList; } // 取消
-            KeyCode::Enter => match field {
-                0 => { field = 1; st.input_cur = url.chars().count(); st.focus = Focus::SpotForm { name, url, field }; } // 次のフィールドへ
-                1 => { field = 2; st.input_cur = 0; st.focus = Focus::SpotForm { name, url, field }; }
-                3 => st.focus = Focus::SpotList, // [戻る]
-                _ => { // 2 = [送信]
-                    let u = url.trim();
-                    let name_in = spot_clean(name.trim()); // 名称buf(整形済)
-                    // URL非空: parse_gmaps_placeで(lat,lon,店名)。空: 現在地(中心)+名称。両方空: 何もしない
-                    enum Act { Save(f64, f64, String), Err(String), Nop }
-                    let act = if u.is_empty() && name_in.is_empty() { Act::Nop }
-                        else if u.is_empty() { Act::Save(lat, lon, if name_in.is_empty() { "(無名)".into() } else { name_in.clone() }) }
-                        else if u.contains("goo.gl") || u.contains("maps.app") { Act::Err("短縮URLは不可。Googleマップの通常URL(…/@…/!3d…!4d…)を貼って".into()) }
-                        else if let Some((la, lo, nm)) = parse_gmaps_place(u) {
-                            let nm = spot_clean(&nm); // URLの名前
-                            let final_name = if !name_in.is_empty() { name_in.clone() } // 名称buf優先
-                                else if !nm.is_empty() { nm } else { "(無名)".into() };
-                            Act::Save(la, lo, final_name)
-                        } else { Act::Err("URLから位置を取得できません(GoogleマップのURLか確認)".into()) };
-                    match act {
-                        Act::Save(la, lo, nm) => {
-                            st.snd.play("confirm");
-                            let s = Spot { lat: la, lon: lo, cat: st.cur_cat.clone(), name: nm };
-                            let _ = ensure_spot_cat(&s.cat, &mut st.spot_cats);
-                            st.addr = match append_spot(&s) { Ok(_) => format!("スポット保存: {}", s.name), Err(e) => format!("({e})") };
-                            st.spots.push(s); st.show_spots = true; apply_spots(&mut st.spec, &st.spots, &st.spot_cats, st.show_spots);
-                            st.focus = Focus::SpotList;
-                        }
-                        Act::Err(msg) => { st.addr = msg; st.focus = Focus::SpotForm { name, url, field }; }
-                        Act::Nop => st.focus = Focus::SpotForm { name, url, field },
-                    }
-                }
-            },
-            other => { // ←→/文字/BS/Del/Home/End は選択中フィールドを編集(ボタン欄では無視)
-                if field == 0 { edit_line(&mut name, &mut st.input_cur, other); }
-                else if field == 1 { edit_line(&mut url, &mut st.input_cur, other); }
-                st.focus = Focus::SpotForm { name, url, field };
-            }
-        },
+        Focus::SpotList => ui_keys_spots::spot_list(st, k),
+        Focus::SpotEditName(buf, gi) => ui_keys_spots::spot_edit_name(st, k, buf, gi),
+        Focus::NewCat(buf) => ui_keys_spots::new_cat(st, k, buf),
+        Focus::SpotRename(buf, idx) => ui_keys_spots::spot_rename(st, k, buf, idx),
+        Focus::SpotForm { name, url, field } => ui_keys_spots::spot_form(st, k, name, url, field, cx.lat, cx.lon),
         Focus::PoiKindForm { mut label, mut tag, mut field } => match k.code { // 目的地カテゴリの新規追加フォーム
             KeyCode::Up | KeyCode::BackTab => { field = (field + 3) % 4; st.input_cur = form_cur(&label, &tag, field); st.focus = Focus::PoiKindForm { label, tag, field }; }
             KeyCode::Down | KeyCode::Tab => { field = (field + 1) % 4; st.input_cur = form_cur(&label, &tag, field); st.focus = Focus::PoiKindForm { label, tag, field }; }
@@ -600,33 +434,8 @@ pub(crate) fn dispatch(st: &mut UiState, k: KeyEvent, cx: &KeyCtx, out: &mut dyn
                 _ => st.focus = Focus::Menu(MenuLevel::Items(ci)),
             }
         }
-        // 色ピッカー: ←→でパレット選択、Enterで確定
-        Focus::ColorPick { cat } => {
-            let n = SPOT_PALETTE.len() as u8;
-            match k.code {
-                KeyCode::Left => { st.color_sel = (st.color_sel + n - 1) % n; st.focus = Focus::ColorPick { cat }; }
-                KeyCode::Right => { st.color_sel = (st.color_sel + 1) % n; st.focus = Focus::ColorPick { cat }; }
-                KeyCode::Enter => {
-                    if let Some(e) = st.spot_cats.get_mut(cat) { e.1 = st.color_sel; let _ = save_all_cats(&st.spot_cats); apply_spots(&mut st.spec, &st.spots, &st.spot_cats, st.show_spots); }
-                    st.focus = Focus::SpotCatList;
-                }
-                KeyCode::Esc => { st.snd.play("back"); st.focus = Focus::SpotCatList; }
-                _ => st.focus = Focus::ColorPick { cat },
-            }
-        }
-        Focus::ShapePick { cat } => { // 形状ピッカー(色とは独立に形を選ぶ)
-            let n = NUM_MARKER_SHAPES;
-            match k.code {
-                KeyCode::Left => { st.shape_sel = (st.shape_sel + n - 1) % n; st.focus = Focus::ShapePick { cat }; }
-                KeyCode::Right => { st.shape_sel = (st.shape_sel + 1) % n; st.focus = Focus::ShapePick { cat }; }
-                KeyCode::Enter => {
-                    if let Some(e) = st.spot_cats.get_mut(cat) { e.2 = st.shape_sel; let _ = save_all_cats(&st.spot_cats); apply_spots(&mut st.spec, &st.spots, &st.spot_cats, st.show_spots); }
-                    st.focus = Focus::SpotCatList;
-                }
-                KeyCode::Esc => { st.snd.play("back"); st.focus = Focus::SpotCatList; }
-                _ => st.focus = Focus::ShapePick { cat },
-            }
-        }
+        Focus::ColorPick { cat } => ui_keys_spots::color_pick(st, k, cat),
+        Focus::ShapePick { cat } => ui_keys_spots::shape_pick(st, k, cat),
         Focus::SettingsPick(idx) => ui_keys_settings::settings_pick(st, k, idx, cx.loader),
         // ルート一覧にフォーカス中: ↑↓で点/操作行を選択、Enterで実行。矢印はパンでなく選択。
         Focus::RoutePanel => {
