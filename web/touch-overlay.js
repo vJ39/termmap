@@ -55,7 +55,9 @@
 
   if (window.__termmapTouch) { return; } // 二重読み込み防止
 
-  var OVERLAY_VERSION = '1.4.0';
+  // 1.5.0: 端末セル比(CELL マーカー)の通知を追加。実写/道路カメラ写真が縦長端末で
+  //        歪む件の対策(docs/web-image-aspect-ratio-design.md §7.2 の経路2)。
+  var OVERLAY_VERSION = '1.5.0';
 
   // ── 調整パラメータ ───────────────────────────────────────────────
   var TAP_SLOP_PX      = 12;   // 移動量がこれ以下ならタップ(Enter)扱い
@@ -75,6 +77,10 @@
   // 軸モード要求のリトライ。bracketed paste が有効になる(=termmap起動)まで空振りする前提。
   var DRAG_MODE_PROBE_INTERVAL_MS = 500;
   var DRAG_MODE_PROBE_MAX_TRIES = 40;     // 約20秒
+  // セル寸法通知のリトライ。termmap の起動・OSC 9997 の受信・端末レイアウトの確定を待つ。
+  var CELL_SIZE_PROBE_INTERVAL_MS = 500;
+  var CELL_SIZE_PROBE_MAX_TRIES = 40;     // 約20秒
+  var CELL_SIZE_SETTLE_MS = 250;          // 回転/リサイズ後、fit addon が cols/rows を決め直すのを待つ時間
   var PINCH_PX_PER_STEP = 55;  // ピンチ: 指の間隔が何 px 変わるごとにズーム1段か(誤爆軽減でパンより粗め)
   // touchmove/慣性の1tickで送るキーの上限(暴走防止の保険)。速いスワイプほど1回の
   // touchmoveあたりの移動量(dx/dy)が大きくなるので、ここを大きめにしておかないと
@@ -545,6 +551,66 @@
       }
       sendMarkerPaste('DRAGMODE?');
     }, DRAG_MODE_PROBE_INTERVAL_MS);
+  }
+
+  // ── 端末セル比の通知(通路A: ブラウザ → termmap) ────────────────────────────
+  // 実画像モードの写真(実写/道路ライブカメラ)は、termmap 側が「1セルの縦横比」を知らないと
+  // 端末の形へ歪めずに収められない(docs/web-image-aspect-ratio-design.md §7.2)。ttyd は pty の
+  // ws_xpixel/ws_ypixel を埋めないため、termmap はネイティブ端末のように window_size() から
+  // 比を取れない。ここで .xterm-screen の実寸を term.cols/term.rows で割ってセル寸法を出し、
+  // 専用マーカー(SOH + "CELL" + SOH + cw + SOH + ch + SOH)で渡す。
+  //
+  // 内部APIの _renderService.dimensions は使わない(公開APIだけで足りる)。CSI 16 t の問い合わせを
+  // 使わないのは、xterm.js の応答が整数 CSS px へ丸められて比が最大7%ずれるため(設計書 §7.2)。
+  var SOH = String.fromCharCode(1); // マーカーの区切り。他のマーカーは同じ文字をリテラルで埋めている
+  var cellSizeLastSent = '';
+  var cellSizeProbeTimer = null;
+  var cellSizeSettleTimer = null;
+
+  // 送れた(または送る必要が無かった)ら true。まだ条件が整っていなければ false を返し、
+  // 呼び出し側のリトライに任せる。
+  function sendCellSize() {
+    // OSC 9997 を1度も受け取っていない相手には送らない。CELL を知らない古い termmap では
+    // 通常のペーストとして扱われ、検索欄への文字入力や設定画面のAPIキー行(貼り付けで即保存)の
+    // 上書きになるため(requestDragMode(force) と同じ理由)。送れないままでも termmap 側は
+    // 既定のセル比 2.0 で動くので、機能が落ちるだけで壊れはしない。
+    if (!dragModeSeen) { return false; }
+    if (!bracketedPasteReady()) { return false; }
+    var t = window.term;
+    if (!t || !t.cols || !t.rows) { return false; }
+    var size = terminalViewportSize();
+    if (!size.w || !size.h) { return false; } // 端末がまだ描画されていない
+    var cw = size.w / t.cols;
+    var ch = size.h / t.rows;
+    if (!(cw > 0) || !(ch > 0)) { return false; }
+    var payload = cw.toFixed(4) + SOH + ch.toFixed(4);
+    if (payload === cellSizeLastSent) { return true; } // 値が同じなら送らない(termmap 側も無視する)
+    cellSizeLastSent = payload;
+    sendMarkerPaste('CELL' + SOH + payload + SOH);
+    return true;
+  }
+
+  // 送れるようになるまで一定間隔で粘る(上限つき)。初期化直後は termmap の起動待ちで空振りする。
+  function probeCellSize() {
+    if (cellSizeProbeTimer) { return; }
+    if (sendCellSize()) { return; }
+    var tries = 0;
+    cellSizeProbeTimer = setInterval(function () {
+      if (sendCellSize() || ++tries > CELL_SIZE_PROBE_MAX_TRIES) {
+        clearInterval(cellSizeProbeTimer);
+        cellSizeProbeTimer = null;
+      }
+    }, CELL_SIZE_PROBE_INTERVAL_MS);
+  }
+
+  // 画面回転・URLバーの伸縮・ソフトキーボードの開閉でセル寸法は変わる。fit addon が
+  // cols/rows を決め直した後の値を読みたいので、少し置いてから送る(連続発火はまとめる)。
+  function scheduleCellSize() {
+    if (cellSizeSettleTimer) { clearTimeout(cellSizeSettleTimer); }
+    cellSizeSettleTimer = setTimeout(function () {
+      cellSizeSettleTimer = null;
+      probeCellSize();
+    }, CELL_SIZE_SETTLE_MS);
   }
 
   // ── キーイベント合成 ────────────────────────────────────────────
@@ -1059,10 +1125,17 @@
     // 軸モードを要求する。termmap は最初のフレームでも1回送ってくるが、そのフレームが
     // OSC ハンドラの登録より前だと取りこぼすため、受け取れるまで数回要求する。
     requestDragMode(false);
+    // 端末セル比を termmap へ渡す(実写/道路カメラ写真を歪めずに収めるのに要る)。
+    // dragModeSeen が立つまで空振りするので、requestDragMode と同じく粘る作りにしてある。
+    probeCellSize();
+    // 回転・URLバーの伸縮・ソフトキーボードの開閉でセル寸法が変わる。ttyd 側も window の
+    // resize で FitAddon.fit() を呼ぶので、その後の値を読み直して送り直す。
+    window.addEventListener('resize', scheduleCellSize);
+    window.addEventListener('orientationchange', scheduleCellSize);
     // タブを切り替えて戻ってきた/画面ロックから復帰したときも、状態が失われている可能性が
     // あるので取り直す(復帰時は既に見えている値が古いこともあるため強制で1回)。
     document.addEventListener('visibilitychange', function () {
-      if (document.visibilityState === 'visible') { requestDragMode(true); }
+      if (document.visibilityState === 'visible') { requestDragMode(true); scheduleCellSize(); }
     });
     refit();
   }
@@ -1101,6 +1174,19 @@
     requestDragMode: requestDragMode,
     terminalViewportSize: terminalViewportSize,
     bracketedPasteReady: bracketedPasteReady,
-    cancelPendingPan: cancelPendingPan
+    cancelPendingPan: cancelPendingPan,
+    // セル比の確認・手動送信(設計書 §9 の実機確認手順で使う)。
+    // 例: __termmapTouch.getCellSize() で cw/ch と比 r を見る、
+    //     __termmapTouch.sendCellSize() で今の値を termmap へ送り直す。
+    getCellSize: function () {
+      var t = window.term;
+      var size = terminalViewportSize();
+      if (!t || !t.cols || !t.rows || !size.w || !size.h) { return null; }
+      var cw = size.w / t.cols;
+      var ch = size.h / t.rows;
+      return { cols: t.cols, rows: t.rows, w: size.w, h: size.h, cw: cw, ch: ch, r: ch / cw, lastSent: cellSizeLastSent };
+    },
+    sendCellSize: sendCellSize,
+    probeCellSize: probeCellSize
   };
 })();

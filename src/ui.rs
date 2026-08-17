@@ -388,12 +388,21 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     // 値が変わっていなくても次フレームで1回送らせる。
     let mut prev_drag_axes: Option<(dragmode::Axis, dragmode::Axis)> = None;
     let mut drag_mode_req_pending = false;
+    // 端末1セルの縦横比(セル高/セル幅)。web版(ブラウザ)から CELL マーカーで届いた値を覚えておく
+    // (設計書 docs/web-image-aspect-ratio-design.md §7.2 の経路2)。ネイティブ端末は毎フレーム
+    // window_size() から取れるので保持しない。どちらも無ければ既定値 2.0 へ落ちる。
+    let mut cell_ratio_web: Option<f64> = None;
     let _ = write!(out, "\x1b[2J");
     loop {
         spin = spin.wrapping_add(1); // 通信中スピナーのアニメ用(毎フレーム進める)
         let (tc, tr) = crossterm::terminal::size().unwrap_or((100, 40));
         let cols = tc.max(20) as u32;
         let map_rows = (tr.max(3) - 1) as u32;
+        // このフレームで使う端末セル比。ネイティブ端末(window_size)→ブラウザ通知(CELLマーカー)→
+        // 既定 2.0 の順(設計書 §7.2)。フォントサイズ変更や画面回転に毎フレーム追随させたいので
+        // キャッシュせず都度引く(window_size は terminal::size と同じ ioctl 1回で、上の size()
+        // 呼び出しと同程度のコスト)。
+        let cell_ratio = cellratio::resolve_ratio(cellratio::detect_native_ratio(), cell_ratio_web);
         if help { // ヘルプ全画面。画面高に収まらなければページ送り(最終ページで任意キー→閉じる)
             let _ = write!(out, "\x1b[2J\x1b[H");
             for (i, (bold, (r, g, b), ln)) in LOGO.iter().enumerate() { // 先頭に緑ワードマーク
@@ -425,12 +434,17 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
         if street.is_some() { // 実写(Street View)全画面。←→で向き、Esc/qで戻る
             { // 描画(不変借用のスコープ)
                 let (img, heading, slat, slon) = street.as_ref().unwrap();
+                // 実写は 640x480(4:3)の写真で、地図と違って端末の形に合わせて生成していない。
+                // 端末全体のセル矩形へそのまま強制フィットすると、iPhone 縦持ちのような縦長端末
+                // では縦に約2.6倍伸びる(設計書 §4.1)。写真の縦横比を保ったまま黒帯付きの1枚へ
+                // 合成してから出す(設計書 §7.6)。実画像モードもAAフォールバックも同じ考え方。
+                let shown = cellratio::letterbox_photo(img, cols.max(10), map_rows, cell_ratio);
                 if cfg.image_mode && image_capable() {
                     // 実画像モード: 実写を全幅×map_rows のインライン画像で表示
                     let _ = write!(out, "\x1b[H");
-                    let _ = emit_iterm2_image(&mut out, img, cols, map_rows);
+                    let _ = emit_iterm2_image(&mut out, &shown, cols, map_rows);
                 } else {
-                    let rs = image::imageops::resize(img, cols.max(10), map_rows * 2, FilterType::Triangle);
+                    let rs = image::imageops::resize(&shown, cols.max(10), map_rows * 2, FilterType::Triangle);
                     let art = render_halfblock(&rs, truecolor_safe());
                     let sv_lines: Vec<&str> = art.split("\r\n").collect();
                     let _ = write!(out, "\x1b[H");
@@ -459,6 +473,12 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                         }
                     }
                 }
+            }
+            // この画面は下の match まで進まず continue するので、セル比の通知はここで取り込む。
+            // 取りこぼすと、写真を開いたまま文字サイズを変えたときだけ古い比のまま固定される
+            // (JS 側は同じ値を再送しないため、地図へ戻っても直らない)。
+            if let Event::Paste(s) = &ev {
+                if let Some(r) = cellratio::parse_cell_marker(s) { cell_ratio_web = Some(r); }
             }
             if let Event::Key(k) = ev {
                 match k.code {
@@ -512,11 +532,14 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             // 道路カメラは固定視点の1枚画像なのでstreetと違いパン/ズームは無い(Esc/qで戻るのみ)。
             { // 描画(不変借用のスコープ)
                 let (img, cam) = cam_view.as_ref().unwrap();
+                // 実写と同じく、写真の縦横比を保ったまま黒帯付きの1枚へ合成してから出す
+                // (設計書 §7.6)。カメラ画像は提供元により縦横比が違うので 4:3 決め打ちにしない。
+                let shown = cellratio::letterbox_photo(img, cols.max(10), map_rows, cell_ratio);
                 if cfg.image_mode && image_capable() {
                     let _ = write!(out, "\x1b[H");
-                    let _ = emit_iterm2_image(&mut out, img, cols, map_rows);
+                    let _ = emit_iterm2_image(&mut out, &shown, cols, map_rows);
                 } else {
-                    let rs = image::imageops::resize(img, cols.max(10), map_rows * 2, FilterType::Triangle);
+                    let rs = image::imageops::resize(&shown, cols.max(10), map_rows * 2, FilterType::Triangle);
                     let art = render_halfblock(&rs, truecolor_safe());
                     let cam_lines: Vec<&str> = art.split("\r\n").collect();
                     let _ = write!(out, "\x1b[H");
@@ -529,7 +552,12 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                 let _ = write!(out, "\x1b[{};1H\x1b[7m{st}\x1b[0m\x1b[K", tr);
                 let _ = out.flush();
             }
-            if let Event::Key(k) = event::read()? {
+            let ev = event::read()?;
+            // 実写画面と同じ理由でセル比の通知をここで取り込む(下の match まで進まないため)。
+            if let Event::Paste(s) = &ev {
+                if let Some(r) = cellratio::parse_cell_marker(s) { cell_ratio_web = Some(r); }
+            }
+            if let Event::Key(k) = ev {
                 match k.code {
                     KeyCode::Esc | KeyCode::Char('q') => cam_view = None,
                     KeyCode::Char('I') => { // 表示中も画像モードON/OFFを切替できるように(Map focusと同じキー)
@@ -2687,6 +2715,19 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             // だけで、実際の送出は次フレーム末の1か所に任せる。
             Some(Event::Paste(s)) if s.starts_with(dragmode::DRAG_MODE_REQUEST) => {
                 drag_mode_req_pending = true;
+            }
+            // ブラウザが実測したセル寸法(設計書 §7.2 の経路2)。ttyd は pty の ws_xpixel/ws_ypixel
+            // を埋めないため、web版ではここが唯一のセル比の入手経路になる。壊れた値・非現実的な
+            // 比は parse 側が捨て、その場合は既定値 2.0 のまま(=修正前と同じ)動く。
+            Some(Event::Paste(s)) if s.starts_with(cellratio::CELL_MARKER) => {
+                if let Some(r) = cellratio::parse_cell_marker(&s) {
+                    if cell_ratio_web != Some(r) {
+                        cell_ratio_web = Some(r);
+                        // 比が変わった=いま出ている画像の形が古い。次フレームで1枚描き直す。
+                        force_reemit = true;
+                        last_map_sig = None; // sig一致による再構築スキップに巻き込まれないように
+                    }
+                }
             }
             // パン量マーカーは上の合算ブロックで消費済みなので、通常ここへは来ない。念のための
             // 保険(合算ブロックを通らない経路が将来増えても、マーカーが検索欄へ文字として
