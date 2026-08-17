@@ -72,6 +72,27 @@ pub(crate) fn persist_full_state(cx: f64, cy: f64, z: u32, opts: &Args, wps: &[(
     let _ = config::save_config(cfg);
 }
 
+// ---- 再描画判定シグネチャの中心座標項(docs/web-pan-smoothness-design.md §5.2 対策B) ----
+
+// map_sig に混ぜる中心座標の値。実際に描画へ効く粒度(整数出力ピクセル)へ丸める。
+//
+// 生の f64(to_bits)を混ぜると、1出力ピクセルの1/100しか動かないパンでもシグネチャが変わり、
+// 絵が1ピクセルも変わらないのに全画面(halfblock 94x23 で 85.6KB)を再送してしまう
+// (設計 §2.3 の実測)。ゆっくり指を動かしているときほどこの無駄の割合が上がる。
+//
+// 丸めの基準は中心そのものではなく「窓の左上」にしてある。切り出しは tiles.rs の
+// crop_x = (left - tx_min*TILE) as u32 で整数化され、left = rcx - rw/2.0 なので、rw が奇数
+// (左袖なし・halfblock で端末幅が奇数のとき等)だと rcx の floor が同じでも left の floor が
+// 変わる = 実際の絵が変わる。設計と依頼は rcx.floor() と書いているが、それだとこの場合に
+// 再構築を取りこぼして地図が動かなくなるため、窓の左上を基準にした。
+// rw/rh 自体は map_sig 側で別途ハッシュしているので、中心の代わりに左上を混ぜても情報は落ちない。
+pub(crate) fn map_center_sig_key(rcx: f64, rcy: f64, rw: u32, rh: u32) -> (i64, i64) {
+    (
+        (rcx - rw as f64 / 2.0).floor() as i64,
+        (rcy - rh as f64 / 2.0).floor() as i64,
+    )
+}
+
 // ---- 規制原因アイコン(#規制原因アイコン、docs/regulation-cause-icons-design.md) ----
 
 // 規制ラインの中点(アイコンを置く座標)。空ならNone、1点のみならその点。
@@ -172,5 +193,63 @@ mod tests {
         let visible = vec![&a, &b];
         let cached = std::collections::HashMap::new();
         assert_eq!(next_closure_to_categorize(&visible, &cached), Some("a"));
+    }
+
+    // ---- map_center_sig_key(再描画判定の中心座標項・設計 §5.2 対策B) ----
+
+    // map_sig と同じ形でキーをハッシュしたもの。値が変わらない = need_build が立たない。
+    fn center_sig(rcx: f64, rcy: f64, rw: u32, rh: u32) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        map_center_sig_key(rcx, rcy, rw, rh).hash(&mut h);
+        h.finish()
+    }
+
+    // 同じ丸め値になる2つの中心座標では need_build が立たない(全画面の無駄な再送が消える)。
+    #[test]
+    fn map_center_sig_key_ignores_subpixel_moves() {
+        let (rw, rh) = (94u32, 44u32);
+        // 1出力ピクセルの1/100しか動かないパン(設計 §2.3 の再現条件)。
+        assert_eq!(center_sig(1000.0, 500.0, rw, rh), center_sig(1000.0001, 500.0001, rw, rh));
+        // 同じ整数ピクセル内であれば、小数部がどれだけ違っても同じ。
+        assert_eq!(center_sig(1000.2, 500.9, rw, rh), center_sig(1000.8, 500.1, rw, rh));
+    }
+
+    // 丸め値が1段変われば need_build が立つ(動くべきときに動かなくなる退行を防ぐ)。
+    #[test]
+    fn map_center_sig_key_changes_when_the_drawn_pixel_changes() {
+        let (rw, rh) = (94u32, 44u32);
+        assert_ne!(center_sig(1000.0, 500.0, rw, rh), center_sig(1001.0, 500.0, rw, rh));
+        assert_ne!(center_sig(1000.0, 500.0, rw, rh), center_sig(1000.0, 501.0, rw, rh));
+        // 整数の境界をまたぐケース(0.9 → 1.1)。
+        assert_ne!(center_sig(1000.9, 500.0, rw, rh), center_sig(1001.1, 500.0, rw, rh));
+    }
+
+    // 出力幅が奇数のときは left = rcx - rw/2.0 に .5 が乗る。中心を floor する実装だと
+    // この2つが同じキーになり、実際には1px違う絵なのに再構築されず地図が止まって見える。
+    #[test]
+    fn map_center_sig_key_follows_the_window_origin_for_odd_widths() {
+        let (rw, rh) = (93u32, 44u32); // 左袖なし・halfblock で端末幅が奇数のとき
+        assert_eq!(map_center_sig_key(1000.2, 500.0, rw, rh).0, 953); // 1000.2 - 46.5 = 953.7
+        assert_eq!(map_center_sig_key(1000.8, 500.0, rw, rh).0, 954); // 1000.8 - 46.5 = 954.3
+        assert_ne!(center_sig(1000.2, 500.0, rw, rh), center_sig(1000.8, 500.0, rw, rh));
+    }
+
+    // 出力寸法が変われば当然キーも変わる(map_sig 側でも rw/rh を混ぜているが二重に効かせる)。
+    #[test]
+    fn map_center_sig_key_depends_on_the_output_size() {
+        assert_ne!(map_center_sig_key(1000.0, 500.0, 94, 44), map_center_sig_key(1000.0, 500.0, 96, 44));
+        assert_ne!(map_center_sig_key(1000.0, 500.0, 94, 44), map_center_sig_key(1000.0, 500.0, 94, 48));
+    }
+
+    #[test]
+    fn map_center_sig_key_handles_negative_origin_and_broken_values() {
+        // 世界の西端付近では窓の左上が負になる。floor は負側でも下方向へ丸まる。
+        assert_eq!(map_center_sig_key(10.0, 500.0, 94, 44).0, -37);
+        assert_eq!(map_center_sig_key(-0.5, 500.0, 94, 44).0, -48);
+        // 壊れた値が来ても panic しない(as キャストは飽和し、NaN は 0 になる)。
+        let (kx, ky) = map_center_sig_key(f64::NAN, f64::INFINITY, 94, 44);
+        assert_eq!(kx, 0);
+        assert_eq!(ky, i64::MAX);
     }
 }

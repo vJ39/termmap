@@ -481,6 +481,40 @@ mod tests {
         assert!((dy - 80.0).abs() < 1e-9, "got {dy}");
     }
 
+    // 実画像モード相当(設計書 §5.5 対策E)。実際の描画解像度は rw/rh だが、表示している地理範囲は
+    // zoom z 換算で横 map_cols・縦 map_rows*2 ピクセルなので、ui.rs は rw/scale・rh/scale を渡す。
+    // braille フラグが立っていてもこの値は変わらないため、2倍にならない。
+    #[test]
+    fn pan_ratio_to_px_is_one_to_one_in_image_mode() {
+        // 94x23 端末・左袖なし(§2.5 の実測条件)。ow=map_cols, oh=map_rows*2。
+        let l = lay(94, 23, 94, 22, 94, 44);
+        let (dx, _) = pan_ratio_to_px(0.5, 0.0, &l);
+        assert!((dx - 47.0).abs() < 1e-9, "端末幅の半分=47出力px になること (got {dx})");
+        let (_, dy) = pan_ratio_to_px(0.0, 0.5, &l);
+        assert!((dy - 23.0).abs() < 1e-9, "端末高の半分=23出力px になること (got {dy})");
+
+        // 修正前は AA 用の ow/oh(braille なら map_cols*2 / map_rows*4)をそのまま渡していたため、
+        // braille + 実画像の組み合わせだけ両軸2倍になっていた(§2.5: 実測 94.4 / 45.9)。
+        let buggy = lay(94, 23, 94, 22, 188, 88);
+        let (bx, by) = pan_ratio_to_px(0.5, 0.5, &buggy);
+        assert!((bx - 94.0).abs() < 1e-9, "修正前の壊れた値を固定しておく (got {bx})");
+        assert!((by - 46.0).abs() < 1e-9, "同上 (got {by})");
+    }
+
+    // 実画像モードは解像度(image_res: low/mid/high = scale 1/2/4)を変えても換算は 1:1 のまま。
+    // ui.rs が rw/scale・rh/scale を渡す限り、渡る値は scale に依存しない。
+    #[test]
+    fn pan_ratio_to_px_is_independent_of_image_scale() {
+        let (map_cols, map_rows) = (94u32, 22u32);
+        for scale in [1u32, 2, 4] {
+            let (rw, rh) = (map_cols * scale, map_rows * 2 * scale);
+            let l = lay(94, 23, map_cols, map_rows, rw / scale, rh / scale);
+            let (dx, dy) = pan_ratio_to_px(0.5, 0.5, &l);
+            assert!((dx - 47.0).abs() < 1e-9, "scale={scale} で dx={dx}");
+            assert!((dy - 23.0).abs() < 1e-9, "scale={scale} で dy={dy}");
+        }
+    }
+
     #[test]
     fn pan_ratio_to_px_keeps_sign_and_is_linear() {
         let (dx1, dy1) = pan_ratio_to_px(0.1, -0.2, &lay(100, 40, 72, 39, 144, 156));
