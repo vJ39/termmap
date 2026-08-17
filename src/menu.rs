@@ -10,6 +10,7 @@ pub(crate) enum MenuAction {
     ManageSpots, ToggleSpots,                                                          // スポット
     ToggleElevation, StreetView, PlayRoute, ToggleGps, ToggleRadar, ViewCamera,        // ナビ・表示(ToggleRadar=雨雲レーダー/ViewCamera=道路ライブカメラ)
     TogglePopulation,                                                                  // ナビ・表示(500mメッシュ人口)
+    ToggleDisasterFill,                                                                // ナビ・表示(過去災害の塗り・コロプレス)
     SaveRoute, LoadRoute, SaveGpx, ShareQr,                                            // 保存・共有
     Settings, Help,                                                                    // 設定・ヘルプ
 }
@@ -46,6 +47,7 @@ pub(crate) const MENU_CATEGORIES: &[MenuCategory] = &[
         MenuItem { label: "雨雲レーダー",      key: 'C', action: MenuAction::ToggleRadar },
         MenuItem { label: "道路カメラを見る",  key: 'N', action: MenuAction::ViewCamera },
         MenuItem { label: "人口メッシュ",      key: 'U', action: MenuAction::TogglePopulation },
+        MenuItem { label: "過去災害の塗り",    key: 'F', action: MenuAction::ToggleDisasterFill },
     ]},
     MenuCategory { label: "保存・共有", items: &[
         MenuItem { label: "ルートを保存",      key: 'S', action: MenuAction::SaveRoute },
@@ -126,6 +128,18 @@ mod tests {
         let it = nav.items.iter().find(|i| i.action == MenuAction::TogglePopulation).expect("人口メッシュの項目");
         assert_eq!(it.key, 'U');
         assert!(matches!(menu_action_for_key('U'), Some(MenuAction::TogglePopulation)));
+    }
+
+    // 過去災害の塗り(コロプレス)は「ナビ・表示」カテゴリに F で載っている(地図の F キーと同じ
+    // アクション)。B は詳細パネル・U は人口メッシュで埋まっているため、空いている F(Fill)を割り当てる。
+    #[test]
+    fn toggle_disaster_fill_is_registered_under_navigation_with_key_f() {
+        let nav = MENU_CATEGORIES.iter().find(|c| c.label == "ナビ・表示").expect("ナビ・表示 カテゴリ");
+        let it = nav.items.iter().find(|i| i.action == MenuAction::ToggleDisasterFill).expect("過去災害の塗りの項目");
+        assert_eq!(it.key, 'F');
+        assert!(matches!(menu_action_for_key('F'), Some(MenuAction::ToggleDisasterFill)));
+        // 小文字 f(目的地を探す)とは別物であること
+        assert!(matches!(menu_action_for_key('f'), Some(MenuAction::SearchPoi)));
     }
 
     // 同じキーが2つの別アクションに割り当てられていないこと(直打ちで意図しない機能が動く事故を防ぐ)。

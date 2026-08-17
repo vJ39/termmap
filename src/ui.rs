@@ -321,6 +321,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
             }
             MenuAction::ToggleRadar => { radar_toggle!(); } // 雨雲レーダー(地図の C キーと同じ)
             MenuAction::TogglePopulation => { population_toggle!(); } // 500mメッシュ人口(地図の U キーと同じ)
+            MenuAction::ToggleDisasterFill => { disaster_fill_toggle!(); } // 過去災害の塗り(地図の F キーと同じ)
             MenuAction::ViewCamera => { // 道路ライブカメラ(地図の N キーと同じ)
                 if !cfg.camera_enabled { snd.play("error"); addr = "道路ライブカメラ: OFF(設定で有効化)".into(); }
                 else {
@@ -408,6 +409,24 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
     // (設計書 docs/web-image-aspect-ratio-design.md §7.2 の経路2)。ネイティブ端末は毎フレーム
     // window_size() から取れるので保持しない。どちらも無ければ既定値 2.0 へ落ちる。
     let mut cell_ratio_web: Option<f64> = None;
+
+    // 過去災害の塗り(コロプレス)の ON/OFF を反転する(Spaceメニュー・設定画面・地図での F キーの
+    // 3経路共通処理、population_toggle!と同じ構成)。ONにした直後だけ境界データの出典を1回出す。
+    // force_reemit を使うため、その宣言(上の let mut force_reemit)より後に置く必要がある
+    // (macro_rules! の自由識別子はマクロが定義された位置で見えている変数に解決されるため)。
+    macro_rules! disaster_fill_toggle { () => {
+        cfg.disaster_fill = !cfg.disaster_fill;
+        let _ = config::save_config(&cfg);
+        force_reemit = true; // 今表示している地図の見た目が変わる
+        addr = if cfg.disaster_fill && cfg.disaster_enabled {
+            "過去災害の塗り: 市区町村境界 気象庁".to_string()
+        } else if cfg.disaster_fill {
+            "過去災害の塗り: ON(「過去災害」もONにすると出る)".to_string()
+        } else {
+            "過去災害の塗り: OFF".to_string()
+        };
+    }; }
+
     let _ = write!(out, "\x1b[2J");
     loop {
         spin = spin.wrapping_add(1); // 通信中スピナーのアニメ用(毎フレーム進める)
@@ -1861,15 +1880,7 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                                             addr = "渋滞状況の色分け: Google APIキー未設定".into();
                                         }
                                     }
-                                    29 => { // 過去災害の塗り: ONにした直後だけ境界データの出典を1回出す
-                                        cfg.disaster_fill = !cfg.disaster_fill;
-                                        force_reemit = true; // 今表示している地図の見た目が変わる
-                                        if cfg.disaster_fill && cfg.disaster_enabled {
-                                            addr = "過去災害の塗り: 市区町村境界 気象庁".into();
-                                        } else if cfg.disaster_fill {
-                                            addr = "過去災害の塗り: ON(「過去災害」もONにすると出る)".into();
-                                        }
-                                    }
+                                    29 => { disaster_fill_toggle!(); } // 過去災害の塗り: Fキー・Spaceメニューと共通処理
                                     30 => { population_toggle!(); } // 人口メッシュ: Uキー・Spaceメニューと共通処理
                                     _ => {}
                                 }
@@ -2591,6 +2602,9 @@ pub(crate) fn interactive(mut cx: f64, mut cy: f64, mut z: u32, a: &Args) -> std
                             // 500mメッシュ人口(国土数値情報)の表示/非表示。Pはマイスポット・Cは雨雲で
                             // 埋まっているため、空いている U を割り当てている。
                             KeyCode::Char('U') => { population_toggle!(); }
+                            // 過去災害の塗り(コロプレス)の表示/非表示。Bは詳細パネル・Uは人口メッシュで
+                            // 埋まっているため、空いている F(Fill)を割り当てている。
+                            KeyCode::Char('F') => { disaster_fill_toggle!(); }
                             KeyCode::Char('>') => { // 表示時刻を未来へ1コマ(OFFなら発見しやすさのためONにする)
                                 if !radar_on {
                                     radar_turn_on!();
