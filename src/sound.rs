@@ -1,10 +1,7 @@
-//! 操作UIの効果音。macOS の Core Audio(AudioServicesPlaySystemSound)で鳴らす。
-//! crate依存追加なし(build.rsでAudioToolbox/CoreFoundationフレームワークをリンクするのみ)。
-//!
-//! 起動時に各WAVを一時ファイルへ書き出し、SystemSoundIDとして事前登録しておく(＝メモリに保持)。
-//! play()は登録済みIDを渡してAudioServicesPlaySystemSoundを呼ぶだけで、都度プロセスを起動する
-//! afplay方式と違って起動オーバーヘッドが無く低レイテンシ。呼び出しは即座に返り重複再生も自然に
-//! 許容される(前の音の再生完了を待たない)。
+//! 操作UIの効果音。macOS の Core Audio(AudioServicesPlaySystemSound)で鳴らす。crate依存追加なし
+//! (build.rsでAudioToolbox/CoreFoundationフレームワークをリンクするのみ)。起動時に各WAVを一時ファイルへ
+//! 書き出してSystemSoundIDとして事前登録しておくので、都度プロセスを起動するafplay方式より低レイテンシ。
+//! play()は即座に返り、前の音の再生完了を待たないので重複再生もできる。
 
 // 埋め込む効果音。名前 = play() で指定する識別子。tmp へ <name>.wav で書き出す。
 const SFX: &[(&str, &[u8])] = &[

@@ -1,14 +1,7 @@
-// 対話UI(ui.rs の interactive())が持つ状態をまとめた構造体。
-//
-// もともと interactive() のローカル変数として約110個並んでいたものをここへ移した。
-// 目的は「キー処理・ジョブ取り込みを関数へ切り出せるようにする」こと。裸のローカル変数だと
-// 引数が40個を超えて関数化できず、そのために macro_rules! を使うしかなかった。
-// 設計の経緯と分割の段取りは docs/ui-refactor-design.md を参照。
-//
-// 端末ハンドル(out)・タイルローダー(loader)・端末復元用の TermGuard はここに入れず、
-// interactive() のローカルのままにしてある(前者2つは Env として関数へ渡す)。
-// 理由は、この構造体を設定ファイルもネットワークも触らずに作れるようにして
-// テストから状態遷移を検証できる状態を保つため。
+// 対話UI(ui.rs の interactive())が持つ状態をまとめた構造体。キー処理・ジョブ取り込みを関数へ
+// 切り出せるようにするためのもの(経緯と分割の段取りは docs/ui-refactor-design.md を参照)。
+// 端末ハンドル(out)・タイルローダー(loader)・TermGuard は interactive() のローカルのまま(前者2つは
+// Env として関数へ渡す)。設定ファイルもネットワークも触らずに作り、テストで状態遷移を検証するため。
 
 use crate::focus::Focus;
 use crate::geo::*;
@@ -113,16 +106,14 @@ pub(crate) struct UiState {
     pub turn_points: Vec<route::TurnPoint>,
     pub turn_job: Option<route::TurnRx>,
     pub voice_guide: Option<voice::VoiceGuide>,
-    // 気象警報(#79・ルートベース)。turn_jobと同じ「ルート確定時」フックで作り直す。
+    // 気象警報(ルートベース)。turn_jobと同じ「ルート確定時」フックで作り直す。
     pub route_warnings: Vec<warning::ActiveWarning>,
     pub route_warning_job: Option<std::sync::mpsc::Receiver<Vec<warning::ActiveWarning>>>,
 
     // ---- 地図に重ねる7種のプロットデータ ----
-    // 取得単位(メッシュ/整備局/都道府県)・TTL・ズーム下限・ディスク永続化はすべて
-    // plotlayer/plotcache 側が持つ。ここは毎フレーム tick して結果を読むだけ。道路交通量は
-    // cfg.traffic_enabled、カメラは camera_enabled、規制は regulation_enabled、
-    // 過去災害は disaster_enabled、500mメッシュ人口は population_enabled で ON/OFFする。
-    // 主要道路(#73)は交通量の観測点をラインへスナップする下地なので交通量と連動する。
+    // 取得単位・TTL・ズーム下限・ディスク永続化は plotlayer/plotcache 側が持ち、ここは毎フレーム tick して
+    // 結果を読むだけ。ON/OFF は cfg.traffic_enabled・camera_enabled・regulation_enabled・disaster_enabled・
+    // population_enabled。主要道路は交通量の観測点をラインへスナップする下地なので交通量と連動する。
     pub traffic_layer: plotlayer::PlotLayer<traffic::TrafficPoint>,
     pub roads_layer: plotlayer::PlotLayer<plotlayer::RoadShape>,
     pub camera_layer: plotlayer::PlotLayer<camera::RoadCamera>,
@@ -147,14 +138,14 @@ pub(crate) struct UiState {
     // 通行規制の詳細(Tキー。なぜ通れないかの規制原因等)。disaster_viewと同じ「見出し+本文行」形。
     pub regulation_detail_view: Option<(String, Vec<String>)>,
     pub regulation_detail_job: Option<std::sync::mpsc::Receiver<Result<regulation::ClosureDetail, String>>>,
-    // 渋滞状況の色分け(#渋滞情報)。ルート成功のたびに、設定ONならGoogle Directionsへ別途確認する。
+    // 渋滞状況の色分け。ルート成功のたびに、設定ONならGoogle Directionsへ別途確認する。
     pub traffic_color_job: Option<route::TrafficColorRx>,
     // 規制原因アイコン(事故✕/工事)。表示中のClosedイベントについて1件ずつ規制原因を
     // バックグラウンドで取得し分類する(セッション内メモリのみ、無期限保持)。
     // 結果にdetail_idを添えて返す(ClosureDetail自体はidを持たないため紐付けに必要)。
     pub cause_cache: std::collections::HashMap<String, regulation::CauseCategory>,
     pub cause_job: Option<std::sync::mpsc::Receiver<(String, Result<regulation::ClosureDetail, String>)>>,
-    // 読み上げの声(#78)の試聴。SettingsPick(27)でSpace=試聴/Enter確定後の1回再生の両方で使う。
+    // 読み上げの声の試聴。SettingsPick(27)でSpace=試聴/Enter確定後の1回再生の両方で使う。
     pub voice_preview_job: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
     // ルート計算と同じ非同期パターンで、検索/周辺/実写/おすすめの通信もバックグラウンド化する。
     // 新規spawn時に古いrxはdropされる=最新のみ採用(generation ID不要)。
@@ -210,7 +201,7 @@ pub(crate) struct UiState {
     pub pan_streak: u32,
     pub last_pan_dir: Option<crossterm::event::KeyCode>,
     pub last_pan_at: std::time::Instant,
-    // web版(ブラウザ)のドラッグ軸モード通知(#87)。前回送った値を覚えておき、変わったフレーム
+    // web版(ブラウザ)のドラッグ軸モード通知。前回送った値を覚えておき、変わったフレーム
     // だけ OSC 9997 を送る。req_pending はブラウザからの再送要求(DRAGMODE?)を受けた印で、
     // 値が変わっていなくても次フレームで1回送らせる。
     pub prev_drag_axes: Option<(dragmode::Axis, dragmode::Axis)>,
@@ -484,11 +475,10 @@ impl UiState {
         }
     }
 
-    // 500mメッシュ人口の表示/非表示。雨雲と違い背景ポーラーを持たないので、設定を反転して
-    // 保存するだけでよい(次の tick が cfg.population_enabled を見てセルを取りに行く)。
-    // ONにした直後は出典と、取得が重いことを1回だけ知らせる(31MBが無言で落ちないように)。
-    // 設定の保存と分けてあるのは radar_view_turn_on と同じ理由で、ここをディスクに触らず
-    // テストできるようにするため(保存は cfg を書き換えた後なのでどちらの順でも結果は同じ)。
+    // 500mメッシュ人口の表示/非表示。雨雲と違い背景ポーラーを持たないので、設定を反転して保存するだけで
+    // よい(次の tick が cfg.population_enabled を見てセルを取りに行く)。ONにした直後は出典と、取得が
+    // 重いことを1回だけ知らせる(31MBが無言で落ちないように)。設定の保存と分けてあるのは radar_view_turn_on
+    // と同じ理由で、ここをディスクに触らずテストできるようにするため。
     fn population_toggle_view(&mut self) {
         self.cfg.population_enabled = !self.cfg.population_enabled;
         self.addr = if self.cfg.population_enabled {

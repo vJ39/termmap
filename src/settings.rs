@@ -1,10 +1,7 @@
-// Focus::Settings(設定画面)のうち「3択以上」の項目を、アコーディオン式(選択中の行の直下に
-// 候補をインデント展開し、他行を押し下げる)で直接選べるようにするための実装。
-// パネル描画自体はui.rs側の左袖一覧描画に統合されている(ここでは選択肢テーブル・現在値の
-// 算出・確定処理のみを持つ)。
-//
-// Focus enum 自体・対話ループ本体は ui.rs の interactive() 内ローカル状態(cx/cy/wps/cache 等)に
-// 強く依存しているためここには移せない。ここに切り出したのは、その状態を必要としない純粋な部分のみ。
+// 設定画面(Focus::Settings)のうち3択以上の項目を、アコーディオン式(選択中の行の直下に候補を
+// インデント展開し、他行を押し下げる)で直接選べるようにするための実装。パネル描画は ui.rs 側の
+// 左袖一覧描画に統合されており、ここに置くのは対話ループのローカル状態(cx/cy/wps/cache 等)を
+// 必要としない純粋な部分(選択肢テーブル・現在値の算出・確定処理)だけ。
 
 use crate::config::Config;
 use crate::render::image_capable;
@@ -53,11 +50,10 @@ pub(crate) fn population_year_labels() -> Vec<String> {
         .collect()
 }
 
-// 読み上げの声(idx=27)の候補一覧。他の項目と違い実行環境と現在値の両方に依存するため
-// CHOICESの静的テーブルには載せず、ここで組み立てる。戻り値は(保存値, 表示名)。
-// 先頭は常に"システム既定"(空文字)。cfg.voice_nameが列挙結果に無く、かつ列挙結果が
-// 空でない場合だけ末尾に"<表示名> (未検出)"を足す(音声をアンインストール/config手書き後に
-// 現在値が一覧から消えて黙って別の声に置き換わるのを防ぐ)。
+// 読み上げの声(idx=27)の候補一覧。戻り値は(保存値, 表示名)。実行環境と現在値の両方に依存するので
+// CHOICESの静的テーブルには載せずここで組み立てる。先頭は常に"システム既定"(空文字)。cfg.voice_nameが
+// 列挙結果に無く、列挙結果が空でないときだけ末尾に"<表示名> (未検出)"を足す(アンインストールや
+// config手書きで現在値が一覧から消え、黙って別の声に置き換わるのを防ぐ)。
 pub(crate) fn voice_choices(cfg: &Config) -> Vec<(String, String)> {
     let mut out = vec![("".to_string(), "システム既定".to_string())];
     let installed = crate::voice::japanese_voices();
@@ -175,14 +171,10 @@ pub(crate) fn setting_description(idx: usize) -> &'static str {
     }
 }
 
-// Focus::Settings描画時の左袖項目一覧(its)の組み立て。ui.rs側のonboarded_marker()(ファイルIO)や
-// set_sel/set_pick_sel(interactive()のローカル選択状態)は呼び出し側で評価/取得し、値(bool/usize)として
-// 渡す(この関数自体はopts/cfg/引数の値だけを見る純関数)。戻り値は(見出し, 項目一覧, 選択位置)で、
-// ui.rs側の他フォーカスの分岐が返す形と同じ。
-// - picking: Focus::SettingsPick(idx)ならSome(idx)(サイド一覧を展開表示中の項目)
-// - onboarded: オンボーディング済み(marker存在)ならtrue
-// - set_sel: 設定画面での選択中の行番号
-// - set_pick_sel: SettingsPick(一覧選択)展開中の候補選択位置
+// 設定画面の左袖項目一覧(its)を組み立てる純関数(opts/cfg/引数の値だけを見る)。戻り値は
+// (見出し, 項目一覧, 選択位置)で、ui.rs側の他フォーカスの分岐と同じ形。onboarded_marker()(ファイルIO)や
+// 選択状態は呼び出し側で値にして渡す: picking=SettingsPick(idx)で展開中ならSome(idx)、onboarded=
+// オンボーディング済み(marker存在)、set_sel=選択中の行番号、set_pick_sel=展開中の候補の選択位置。
 pub(crate) fn settings_rows(opts: &Args, cfg: &Config, picking: Option<usize>, onboarded: bool, set_sel: usize, set_pick_sel: usize) -> (String, Vec<String>, usize) {
     let onoff = |b: bool| if b { "ON" } else { "OFF" };
     let keyset = if cfg.google_maps_api_key.trim().is_empty() { "未設定" } else { "設定済" };

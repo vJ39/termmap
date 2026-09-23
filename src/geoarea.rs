@@ -1,19 +1,7 @@
-// geoarea: 気象庁の一次細分区域(class10s)境界データを使った点-in-領域判定。
-// std + serde_json のみに依存し、crate:: を参照しない(traffic.rs等と同じ方針・単体コンパイル可能)。
-// 座標は (f64, f64) = (lat, lon)。
-//
-// データはビルド時に静的埋め込み(include_str!)する。境界ポリゴンはユーザー操作と無関係に
-// 必要な基礎データで、ネットワーク障害時にこれが取れないと機能全体が動かなくなるのは
-// 過剰なため(traffic/camera/regulation/disasterのような都度取得+TTLではない)。
-//   - assets/jma-class10s.json: jma.go.jp/bosai/common/const/geojson/class10s.json (153件・289KB)
-//   - assets/jma-class10s-parent.json: area.json の class10s[code].parent だけを抜いた142件の対応表
-//     (所属する気象台コード。warning.json の取得先URLに使う。例: 130010→130000)
-// 2つのファイルのcode件数が食い違う(153 vs 142)ことは実測で確認済み。parentが引けない
-// regionは黙って読み込み対象から外す(警報取得先が分からないものは扱えないため)。
-//
-// GeoJSON MultiPolygonの穴(内側リング)は実測でこのデータセットには存在しない
-// (153件全部で各ポリゴンのリング数は1)。将来穴入りデータに変わった場合に備え、
-// 判定自体は外周のみを見る前提を明記しておく。
+// geoarea: 気象庁の一次細分区域(class10s)境界データを使った点-in-領域判定。std + serde_json のみに
+// 依存し、crate:: を参照しない(単体コンパイル可能)。座標は (lat, lon)。境界は取得失敗で機能ごと
+// 止まらないようビルド時に埋め込む。気象台コードの対応表(jma-class10s-parent.json。warning.json の
+// 取得先)でparentが引けないregionは外す。このデータには穴が無いので、判定は外周だけを見る前提。
 
 use std::sync::OnceLock;
 
@@ -191,10 +179,10 @@ mod tests {
     }
 
     // 実データ(assets/jma-class10s.json + assets/jma-class10s-parent.json)を使った確認。
-    // 実測(2026/08/17)通り153件のGeoJSON中142件だけがparentを解決できることを固定する。
+    // parentを解決できる件数を固定する。
     #[test]
     fn class10s_regions_loads_the_embedded_real_data() {
-        // 実測(2026/08/17): GeoJSON側153件のFeature中、"hoppo"(北方領土。特殊コードで
+        // GeoJSON側153件のFeature中、"hoppo"(北方領土。特殊コードで
         // parent対応表に無い)だけが解決できず152件になる(1コードが複数Featureに
         // 分かれて出てくることはあるが、それも別々のRegionとしてそのまま持つ)。
         let regions = class10s_regions();

@@ -76,7 +76,7 @@ pub(crate) struct StatusCtx<'a> {
     pub regulation: PlotStatus,
     pub disaster: PlotStatus,
     pub population: PopulationStatus,
-    /// ルート沿い気象警報(#79)。件数と、最初の1件の表示名(例:"濃霧注意報")だけを持つ
+    /// ルート沿い気象警報。件数と、最初の1件の表示名(例:"濃霧注意報")だけを持つ
     /// (件数だけでは「何に注意すべきか」が分からず、他レイヤと違い名称そのものに価値があるため)。
     pub weather_warning_count: usize,
     pub weather_warning_top_name: Option<&'a str>,
@@ -89,17 +89,10 @@ pub(crate) struct StatusCtx<'a> {
     pub next_turn: &'a Option<String>,
 }
 
-// プロットレイヤ1つぶんの表記を組む。
-//   fresh                → 🚗12地点
-//   stale(表示継続中)   → 🚗12地点(32分前)     ← 今の状態とは限らないことを示す
-//   stale + 再取得中     → 🚗12地点(32分前)…
-//   0件 + 取得中         → 🚗取得中…
-//   0件 + ズーム下限外   → 🚗広域では非表示     ← 取りに行っていないので「無し」とは言えない
-//   0件                  → 🚗観測点無し
-// fresh の間は経過時間を出さない(常時出すと情報量が増えるだけなので)。
-// area が付いているとき(過去災害で中心が塗られた市区町村の中にいるとき)だけは、件数の代わりに
-//   🌊野田市 89件(B)
-// と出す。地点数より「いま見ている土地に何件の記録があるか」の方が読み手の知りたいことに近い。
+// プロットレイヤ1つぶんの表記(例: 🚗12地点)を組む。stale の間だけ「(32分前)」を添えて今の状態とは
+// 限らないことを示し(fresh で出しても情報量が増えるだけ)、再取得中はさらに … を付ける。0件でズーム
+// 下限より広域なら、取りに行っていないので「無し」ではなく「広域では非表示」と出す。過去災害で中心が
+// 塗られた市区町村の中(area あり)では、地点数より知りたいことに近い「🌊野田市 89件(B)」の形で出す。
 fn plot_label(enabled: bool, icon: &str, unit: &str, suffix: &str, none_txt: &str, s: &PlotStatus) -> String {
     if !enabled {
         return String::new();
@@ -125,13 +118,10 @@ fn plot_label(enabled: bool, icon: &str, unit: &str, suffix: &str, none_txt: &st
     format!("{icon}{}{unit}{age}{suffix}{updating} ", s.count)
 }
 
-// 人口メッシュの表記。色分けだけだと階級の幅(1,000〜4,000等)しか読めないので、中心の
-// クロスヘアが指すメッシュの実数値を出す(設計 §7.6)。
-//   👥1,240人/km²        通常時
-//   👥北海道を取得中…    取得中(何を待っているかが分かる。1セルに数十秒かかるため)
-//   👥取得中…            取得中(まだどのセルか決まっていない)
-//   👥人口データ無し     索引に無い(海上・無人域)。原典にもデータが無いので「0」とは言わない
-//   👥広域では非表示     z11未満
+// 人口メッシュの表記。色分けだけでは階級の幅(1,000〜4,000等)しか読めないので、中心のクロスヘアが
+// 指すメッシュの実数値(👥1,240人/km²)を出す(設計 §7.6)。1セルに数十秒かかるので取得中は待っている
+// 都道府県名を出す。索引に無い場所(海上・無人域)は原典にもデータが無いので「0」とは言わず
+// 「人口データ無し」、z11未満は「広域では非表示」と出す。
 fn population_label(enabled: bool, s: &PopulationStatus) -> String {
     if !enabled {
         return String::new();
@@ -278,7 +268,7 @@ pub(crate) fn build_status_line(c: StatusCtx) -> String {
             let disaster_txt = plot_label(cfg.disaster_enabled, "🌊", "地点", "(B)", "記録無し", &disaster);
             // 500mメッシュ人口: 件数ではなく中心のメッシュの人口密度(人/km²)を出す。
             let population_txt = population_label(cfg.population_enabled, &population);
-            // ルート沿い気象警報(#79): ルート未確定なら何も出さない(判定対象が無いため)。
+            // ルート沿い気象警報: ルート未確定なら何も出さない(判定対象が無いため)。
             // 件数でなく最初の1件の名称を出す(「何に注意すべきか」が本文)。
             let weather_warning_txt = if !cfg.weather_warning_enabled || wps.is_empty() {
                 String::new()

@@ -1,11 +1,7 @@
 // 地図そのものと Space メニューのキー処理。ui_keys.rs の Focus 分岐から関心ごとに切り出した1つ。
-//
-// 地図(Focus::Map)はキーの数が一番多い画面で、パン・ズーム・各レイヤの表示切替・ルート編集の
-// 直打ちが並ぶ。メニュー(Focus::Menu)はその同じ操作をラベル付きで選べるようにしたもので、
-// 実処理はどちらも ui_action::run_action へ寄せてある。
-//
-// map() の戻り値は「対話ループを抜けるか(=アプリ終了)」。q だけが true を返す。ループを持って
-// いるのは ui.rs 側なので、break を関数の中に隠さずここから返す。
+// メニュー(Focus::Menu)は地図(Focus::Map)と同じ操作をラベル付きで選べるようにしたもので、
+// 実処理はどちらも ui_action::run_action へ寄せてある。map() の戻り値は「対話ループを抜けるか
+// (=アプリ終了)」で、q だけが true。ループは ui.rs 側にあるので break を関数に隠さずここから返す。
 
 use crate::focus::Focus;
 use crate::geo::*;
@@ -61,12 +57,10 @@ pub(crate) fn menu_items(st: &mut UiState, k: KeyEvent, ci: usize, kx: &KeyCtx) 
 pub(crate) fn map(st: &mut UiState, k: KeyEvent, kx: &KeyCtx, out: &mut dyn Write) -> bool {
     // 分岐の中身は ui.rs から動かしていないので、フレームの値はもとと同じ名前で受け取る。
     let KeyCtx { a, lat, lon, nogos: route_nogos, ow, oh, .. } = *kx;
-    // Shift+矢印/大文字HJKL=常に高速(固定)。無印(矢印/小文字hjkl)=既定は細かい1歩で、
-    // 同方向を短間隔(220ms以内)で押し続ける/連打するほど徐々に加速し、上限は高速の
-    // 手前まで。方向転換や間隔が空くと streak がリセットされ、また細かい1歩に戻る。
-    // hjklは矢印と全く同じ挙動モデル(大文字/小文字がShiftの有無に対応)。大文字は
-    // 修飾キーの拡張シーケンスに依存しない普通の文字なので、端末がShift+矢印の拡張
-    // CSIを送れない場合(iSH等)でも常時高速パンが確実に効く。
+    // Shift+矢印/大文字HJKL=常に高速。無印(矢印/小文字hjkl)=細かい1歩から、同方向を220ms以内で
+    // 押し続ける/連打するほど加速し(上限は高速の手前)、方向転換や間隔が空くと streak がリセットされる。
+    // 大文字は修飾キーの拡張シーケンスに依存しない普通の文字なので、端末がShift+矢印の拡張CSIを
+    // 送れない場合(iSH等)でも高速パンが効く。
     let is_pan = matches!(k.code, KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
         | KeyCode::Char('h') | KeyCode::Char('j') | KeyCode::Char('k') | KeyCode::Char('l')
         | KeyCode::Char('H') | KeyCode::Char('J') | KeyCode::Char('K') | KeyCode::Char('L'));
@@ -360,10 +354,9 @@ mod tests {
     fn code(c: KeyCode) -> KeyEvent { KeyEvent::new(c, KeyModifiers::NONE) }
 
     // ui_keys::dispatch は focus を Map へ倒してから呼ぶので、テストも同じ前提で始める。
-    //
-    // 通信・外部コマンド・ディスクへ行く分岐(a=住所/C・>=雨雲/G=現在地/N=カメラ/n・o の
-    // 2点以上でのルート再計算/@ をONにした場合/, の設定画面)は触らない。ここで確かめるのは
-    // キーの受け付け方・画面遷移・配列の書き換え・表示メッセージだけ。
+    // 通信・外部コマンド・ディスクへ行く分岐(a=住所/C・>=雨雲/G=現在地/N=カメラ/n・o の2点以上での
+    // ルート再計算/@ をONにした場合/, の設定画面)は触らず、キーの受け付け方・画面遷移・配列の
+    // 書き換え・表示メッセージだけを確かめる。
     fn base() -> UiState {
         let mut st = test_state();
         st.focus = Focus::Map;

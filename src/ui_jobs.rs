@@ -1,14 +1,7 @@
-// 走らせておいたバックグラウンドジョブの結果を毎フレーム取り込む部分。
-// もとは ui.rs の interactive() 内にべた書きされていた約280行で、UiState へ状態を集約した
-// ことでそのまま関数へ移せた。1フレームに1回だけ呼ぶ。
-//
-// try_recv の扱いは全ジョブ共通で Ok=結果を適用して job=None / Empty=次フレームへ持ち越し /
-// Disconnected=None(送信側が落ちた)。戻り値は「このフレームで何か適用したか」で、true なら
-// 呼び出し側は入力待ちでブロックせず即座に描き直す。
-//
-// lat/lon(画面中心)と nogos/nogos_truncated(通行止め回避の指定と件数上限で溢れたか)は
-// 毎フレーム計算し直す値なので引数で受け取る。loader はタイル取得の常駐スレッドで、
-// ルート確定時の周辺タイル先読みと、消えた雨雲コマの破棄で使う。
+// 走らせておいたバックグラウンドジョブの結果を取り込む。1フレームに1回だけ呼ぶ。try_recv の扱いは全ジョブ
+// 共通で Ok=結果を適用して job=None / Empty=次フレームへ持ち越し / Disconnected=None(送信側が落ちた)。
+// 戻り値が true(このフレームで何か適用した)なら、呼び出し側は入力待ちでブロックせず即座に描き直す。
+// lat/lon(画面中心)と nogos/nogos_truncated は毎フレーム計算し直す値なので引数で受け取る。
 
 use crate::focus::Focus;
 use crate::geo::*;
@@ -37,7 +30,7 @@ pub(crate) fn poll(st: &mut UiState, loader: &TileLoader, lat: f64, lon: f64, no
                     // move できない。すぐ代入するので中身は変わらない)。
                     st.route_note = st.route_note.take().map(|n| format!("{n} (通行止めの一部は回避対象外)"));
                 }
-                // 渋滞状況の色分け(#渋滞情報): ルートが変わるたびに問い合わせ直す。
+                // 渋滞状況の色分け: ルートが変わるたびに問い合わせ直す。
                 st.traffic_color_job = if st.cfg.route_traffic_enabled && !st.cfg.google_maps_api_key.trim().is_empty() && r.pts.len() >= 2 {
                     Some(route::trigger_traffic_coloring(&r.pts, &st.mode, &st.cfg.google_maps_api_key))
                 } else {
@@ -54,7 +47,7 @@ pub(crate) fn poll(st: &mut UiState, loader: &TileLoader, lat: f64, lon: f64, no
                 if st.cfg.voice_guide_enabled {
                     st.turn_job = Some(trigger_turn_points(&st.wps, &st.mode, 0, &r.pts, &nogos));
                 }
-                // 高速区間(#高速区間)の点列は r.pts をムーブする前に作る。ルート結果と
+                // 高速区間の点列は r.pts をムーブする前に作る。ルート結果と
                 // 同時に確定するので、渋滞の色分けのような非同期の受け取り口は要らない。
                 st.spec.expressway_segments = route::expressway_polylines(&r.pts, &r.hw_segments)
                     .into_iter()
@@ -72,7 +65,7 @@ pub(crate) fn poll(st: &mut UiState, loader: &TileLoader, lat: f64, lon: f64, no
         match st.turn_job.as_ref().unwrap().try_recv() {
             Ok(v) => {
                 st.turn_points = v; st.voice_guide = Some(voice::VoiceGuide::new(&st.turn_points)); st.turn_job = None;
-                // 気象警報(#79・ルートベース)。voice_guide作り直しと同じ「ルート確定時」フックで
+                // 気象警報(ルートベース)。voice_guide作り直しと同じ「ルート確定時」フックで
                 // ルート沿いの気象台コードを列挙し、まとめて背景取得する。
                 if st.cfg.weather_warning_enabled {
                     if let Some(pts) = st.spec.routes.last().map(|rt| rt.pts.clone()) {
@@ -108,11 +101,10 @@ pub(crate) fn poll(st: &mut UiState, loader: &TileLoader, lat: f64, lon: f64, no
             Err(TryRecvError::Disconnected) => { st.route_warning_job = None; }
         }
     }
-    // プロットデータ4種の取得。各レイヤが「視野を覆うセルのうち、fresh なものが手元に
-    // 無いぶん」だけを1本のジョブで取りに行き、ディスクの読み書きもそのジョブの中で行う
-    // (詳細は plotlayer.rs)。ここは毎フレーム tick して、セル表が変わったら即座に描き直す。
-    // OFFのレイヤも tick は呼ぶ(走っていたジョブを取りこぼさず畳むため)。
-    // 主要道路(#73)は交通量の観測点をラインへスナップする下地なので交通量と同じ条件で回す。
+    // プロットデータの取得。各レイヤが「視野を覆うセルのうち、fresh なものが手元に無いぶん」だけを
+    // 1本のジョブで取りに行き、ディスクの読み書きもその中で行う(詳細は plotlayer.rs)。毎フレーム tick し、
+    // OFFのレイヤも呼ぶ(走っていたジョブを取りこぼさず畳むため)。主要道路は交通量の観測点をラインへ
+    // スナップする下地なので交通量と同じ条件で回す。
     got_result |= st.traffic_layer.tick(st.cx, st.cy, st.z, st.cfg.traffic_enabled);
     got_result |= st.roads_layer.tick(st.cx, st.cy, st.z, st.cfg.traffic_enabled);
     got_result |= st.camera_layer.tick(st.cx, st.cy, st.z, st.cfg.camera_enabled);
@@ -140,7 +132,7 @@ pub(crate) fn poll(st: &mut UiState, loader: &TileLoader, lat: f64, lon: f64, no
             Err(TryRecvError::Disconnected) => { st.regulation_detail_job = None; }
         }
     }
-    if let Some(job) = &st.traffic_color_job { // 渋滞状況の色分け(#渋滞情報)の到着
+    if let Some(job) = &st.traffic_color_job { // 渋滞状況の色分けの到着
         match job.try_recv() {
             Ok(segs) => {
                 if !segs.is_empty() {
@@ -153,7 +145,7 @@ pub(crate) fn poll(st: &mut UiState, loader: &TileLoader, lat: f64, lon: f64, no
             Err(TryRecvError::Disconnected) => { st.traffic_color_job = None; }
         }
     }
-    if let Some(job) = &st.cause_job { // 規制原因アイコン(#規制原因アイコン)の分類結果到着
+    if let Some(job) = &st.cause_job { // 規制原因アイコンの分類結果到着
         match job.try_recv() {
             Ok((id, result)) => {
                 // 失敗時もOther相当でキャッシュする(でないと同じ1件を毎フレーム
@@ -166,7 +158,7 @@ pub(crate) fn poll(st: &mut UiState, loader: &TileLoader, lat: f64, lon: f64, no
             Err(TryRecvError::Disconnected) => { st.cause_job = None; }
         }
     }
-    if let Some(job) = &st.voice_preview_job { // 読み上げの声(#78)の試聴結果
+    if let Some(job) = &st.voice_preview_job { // 読み上げの声の試聴結果
         match job.try_recv() {
             Ok(Ok(())) => { st.voice_preview_job = None; got_result = true; }
             Ok(Err(e)) => { st.snd.play("error"); st.addr = e; st.voice_preview_job = None; got_result = true; }
@@ -422,11 +414,9 @@ mod tests {
         assert!(st.turn_job.is_none());
     }
 
-    // ---- 気象警報(#79・ルートベース)の配線 ----
-    //
-    // 以下は取得そのもの(warning::fetch_warnings)を走らせない経路だけを通す。
-    // 「設定ON かつ ルートあり かつ 気象台コードが1つ以上」が揃うとスレッドを起こして
-    // 気象庁へ問い合わせるので、その組み合わせは意図的に作らない。
+    // ---- 気象警報(ルートベース)の配線 ----
+    // 以下は取得そのもの(warning::fetch_warnings)を走らせない経路だけを通す。「設定ON かつ ルートあり
+    // かつ 気象台コードが1つ以上」が揃うと気象庁へ問い合わせるので、その組み合わせは意図的に作らない。
     // 塗り分けの計算そのもの(build_warning_segments)は ui_helpers.rs 側で試している。
 
     // 新宿駅付近(東京地方=130010)を通る短いルート。geoarea.rs の実データを引くので実在の座標。
@@ -519,7 +509,7 @@ mod tests {
 
     #[test]
     fn a_new_route_clears_what_belonged_to_the_old_one() {
-        // 高速区間(#高速区間)と気象警報(#79)はどちらもルートに紐づく付随情報なので、
+        // 高速区間と気象警報はどちらもルートに紐づく付随情報なので、
         // 新しいルートが確定した時点で古い分を捨てる(でないと別のルートの上に前の色が残る)。
         // pts を空にしているのは周辺タイルの先読み(loader経由の通信)を起こさないため。
         let mut st = test_state();

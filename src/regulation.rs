@@ -1,19 +1,7 @@
-// 通行規制情報(国土交通省「道路情報提供システム」road-info-prvs.mlit.go.jp)。
-// JARTICの交通量とは別の非公式システムで、認証・APIキー無しで叩ける(実測確認済み)。
-// 通行止め/車線規制/片側交互通行/チェーン規制/移動規制の実際の区間ライン(GeoJSON)を返す。
-// JARTICでは取れない「事故・災害・工事による通行止め」に近い情報がここにある
-// (原因コードの正確な文言対応表までは特定できていないが、規制区間そのものは実データ)。
-//
-// 実測で確認済みの注意点:
-//   - データの実体は "{JSON配信元}/TukoKisei/{1次メッシュコード}.json" にあるが、
-//     配信元パス(タイムスタンプ+ランダムハッシュ)は更新のたびに変わるため、
-//     まずpcTukokisei_81_1.htmlを取得してパスを都度発見する必要がある(2段階フェッチ)。
-//   - 1次メッシュコード(JIS X 0410、約80km四方)単位でファイルが分かれているため、
-//     表示範囲を覆う全メッシュコードを列挙して個別に取得する。
-//     bbox→メッシュコードの割り出しは mesh.rs が持ち、ここはメッシュ1枚を取る役に徹する
-//     (呼び出し側がセル単位でキャッシュするため、配信元パスの発見とメッシュ取得を分けてある)。
-// gpslive.rs/radar.rs/traffic.rsと同じ方針でstd+ureq+serde_jsonのみに依存し、
-// crate::を参照しない。
+// 通行規制情報(国土交通省「道路情報提供システム」。非公式で認証・APIキー不要)。JARTICでは取れない事故・
+// 災害・工事による通行止めに近い情報がある。データは "{JSON配信元}/TukoKisei/{1次メッシュコード}.json"
+// だが、配信元パスが更新のたびに変わるので先にpcTukokisei_81_1.htmlから見つける(2段階フェッチ)。
+// bbox→メッシュコードの割り出しはmesh.rsが持つ。std+ureq+serde_jsonのみに依存し、crate::を参照しない。
 
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -37,7 +25,7 @@ pub enum RegulationKind {
 
 impl RegulationKind {
     // kisei_naiyo_cd(規制内容CD、実測: "01"=通行止め/"04"=車線規制/"05"=片側交互通行/
-    // "06"=チェーン規制/"09"=移動規制)から分類する。"08"もTukokisei.js側で通行止け相当
+    // "06"=チェーン規制/"09"=移動規制)から分類する。"08"もTukokisei.js側で通行止め相当
     // として扱われていたため同様に扱う。未知の値は黙ってOtherへ。
     fn from_code(code: &str) -> Self {
         match code {
@@ -313,12 +301,9 @@ pub fn detail_panel_content(d: &ClosureDetail) -> (String, Vec<String>) {
     (title, lines)
 }
 
-// ---- 規制原因アイコン(#規制原因アイコン、docs/regulation-cause-icons-design.md) ----
-//
-// ClosureDetail.cause(自由記述文字列)をキーワード一致で分類し、事故✕/工事の
-// アイコンを出すための下ごしらえ。実データ調査(2026/08/17、60件サンプル)では
-// 「事故」は0件で災害・工事系が主だったが、将来別データ源が加わった時の受け皿として
-// Accidentも区分だけ用意する。
+// ---- 規制原因アイコン(docs/regulation-cause-icons-design.md) ----
+// ClosureDetail.cause(自由記述文字列)をキーワード一致で分類し、事故✕/工事のアイコンを出す。実データの
+// 調査では「事故」は0件だったが、将来別データ源が加わった時の受け皿としてAccidentも区分だけ用意する。
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum CauseCategory { Accident, Construction, Other }
@@ -398,7 +383,7 @@ mod tests {
 
     #[test]
     fn categorize_cause_unrelated_text_and_empty_are_other() {
-        // 実データ(2026/08/17調査)で観測された災害・損壊系はOther扱い。
+        // 実データで観測された災害・損壊系はOther扱い。
         assert_eq!(categorize_cause("道路損壊"), CauseCategory::Other);
         assert_eq!(categorize_cause("災害等"), CauseCategory::Other);
         assert_eq!(categorize_cause("土砂崩れ"), CauseCategory::Other);
@@ -425,7 +410,7 @@ mod tests {
         assert_eq!(RegulationKind::Closed.color(), [0, 0, 0]);
     }
 
-    // 実際のTukoKisei/5339.jsonの抜粋(2026/08/16 実測、1件)。
+    // 実際のTukoKisei/5339.jsonの抜粋(1件)。
     const SAMPLE: &str = r##"[
       {
         "kisei_kaishi_nichiji": "2026-08-03 09:00:00",
@@ -546,7 +531,7 @@ mod tests {
         assert!(!events.is_empty(), "実際に関東広域で0件は考えにくい");
     }
 
-    // 実際のpcTukokiseiDetail_*.htmlの抜粋(2026/08/17 実測、規制原因="道路陥没")。
+    // 実際のpcTukokiseiDetail_*.htmlの抜粋(規制原因="道路陥没")。
     // 実物はtableに囲まれ他の行も挟まるが、抽出対象のtd構造だけ再現すれば足りる。
     const DETAIL_SAMPLE: &str = r#"<div id="popUpTitle_green"><div class="noButtonWidth">通行止（国道）</div></div>
         <table class="tukoKiseiShosai"><tbody>

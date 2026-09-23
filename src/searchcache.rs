@@ -1,34 +1,7 @@
-//! Self-contained search-result cache for termmap.
-//!
-//! Standard library only, no external crates, no `crate::` references —
-//! this file is designed to be compiled and tested on its own with:
-//!
-//!     rustc --edition 2021 --test src/searchcache.rs -o /tmp/tm_cache && /tmp/tm_cache
-//!
-//! Purpose: cache geocode/search results keyed by (provider, language,
-//! keyword, position) so repeated searches near the same spot for the
-//! same query don't re-hit the API. The cache is persisted as a flat TSV
-//! file whose first line is a format-version header:
-//!
-//!     #termmap-search-cache v2
-//!     key\tlat\tlon\tname\tcreated_at\tlast_used_at
-//!
-//! One line per cached result. Multiple results for the same key share
-//! that key across multiple lines (they also share the same created_at /
-//! last_used_at). `key` itself is produced by [`make_key`] and contains
-//! embedded tab characters (it is
-//! `provider\tlang\tquery\t{lat:.2}\t{lon:.2}`), so parsing splits each
-//! line from the *right* (last_used_at, created_at, name, lon, lat, then
-//! "everything else" = key) — that keeps round-tripping correct
-//! regardless of what's inside `key`. `name` has any tab/newline
-//! characters replaced with spaces before being written, since each cache
-//! entry must stay on a single line.
-//!
-//! Version failover: if the header line does not match the current
-//! [`CACHE_VERSION`] (this includes older, header-less files), the whole
-//! file is ignored and an empty cache is returned — so a change in cache
-//! semantics automatically invalidates on-disk data instead of mixing
-//! incompatible formats.
+//! 検索結果のキャッシュ(同じ場所の近くで同じ語を検索し直したときに API を叩かないため)。
+//! std だけに依存し crate:: を参照しないので、単体でもテストできる
+//! (`rustc --edition 2021 --test src/searchcache.rs -o /tmp/tm_cache && /tmp/tm_cache`)。
+//! 保存先は先頭行が形式バージョンのヘッダの TSV で、キーがタブを含むため各行は右から分割して読む。
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -103,12 +76,10 @@ fn round2(x: f64) -> f64 {
     (x * 100.0).round() / 100.0
 }
 
-/// Builds a cache key from a provider tag, language, query string and a
-/// position. `provider` (例 "g"=Google / "n"=Nominatim) と `lang` (例 "ja")
-/// を先頭に織り込むので、検索元/言語が違えばキャッシュ空間が分かれる。The
-/// query is trimmed and lower-cased; the position is rounded to 2 decimal
-/// places (~1km grid cells) so nearby lookups for the same query share a
-/// cache entry. Format: `"{provider}\t{lang}\t{query}\t{lat:.2}\t{lon:.2}"`.
+/// キャッシュキー `"{provider}\t{lang}\t{query}\t{lat:.2}\t{lon:.2}"` を作る。`provider`(例 "g"=Google /
+/// "n"=Nominatim)と `lang`(例 "ja")を先頭に入れるので、検索元・言語が違えばキャッシュ空間が分かれる。
+/// 検索語は前後の空白を除いて小文字にし、位置は小数2桁(約1km四方)に丸めるので、近くで同じ語を引けば
+/// 同じキーになる。
 pub fn make_key(provider: &str, lang: &str, query: &str, lat: f64, lon: f64) -> String {
     let q = query.trim().to_lowercase();
     let rlat = round2(lat);
@@ -127,18 +98,10 @@ fn sanitize_name(name: &str) -> String {
         .collect()
 }
 
-/// Loads the cache from `path`. The first line must be the current version
-/// header (`#termmap-search-cache v2`); if it doesn't match — including
-/// older, header-less files — an empty cache is returned so incompatible
-/// on-disk data is discarded. Each remaining line is
-/// `key\tlat\tlon\tname\tcreated_at\tlast_used_at`, where `key` may itself
-/// contain tab characters (see module docs), so lines are parsed from the
-/// right: the last 5 tab-separated fields are last_used_at, created_at,
-/// name, lon, lat (in that order), and whatever remains at the start of
-/// the line — tabs and all — is the key. Lines that don't split into at
-/// least 6 parts this way, or whose numeric fields don't parse, are
-/// skipped. Entries older than [`TTL_SECS`] (by created_at) are dropped. A
-/// missing file yields an empty map.
+/// `path` からキャッシュを読む。先頭行が現行のヘッダ(`#termmap-search-cache v2`)でなければ、ヘッダ無しの
+/// 旧形式も含めて空を返す。各行は `key\tlat\tlon\tname\tcreated_at\tlast_used_at` で、`key` 自体がタブを
+/// 含むので右から5欄を切り出した残りを key とする。6欄に分けられない行・数値が読めない行は飛ばし、
+/// created_at から [`TTL_SECS`] を過ぎた項目は捨てる。ファイルが無ければ空を返す。
 pub fn load_from(path: &Path) -> HashMap<String, CacheEntry> {
     let mut map: HashMap<String, CacheEntry> = HashMap::new();
 
@@ -210,12 +173,9 @@ pub fn load_from(path: &Path) -> HashMap<String, CacheEntry> {
     map
 }
 
-/// Writes `map` to `path` as TSV, creating the parent directory if needed.
-/// The current version header is written first. `name` is sanitized (tabs
-/// and newlines become spaces) before writing so each entry stays on one
-/// line and round-trips cleanly through [`load_from`]. If more than
-/// [`MAX_CACHE_ENTRIES`] result lines would be written, keys are kept
-/// newest-first by `last_used_at` (LRU: oldest-used keys are dropped).
+/// `map` を TSV で `path` へ書く(親ディレクトリが無ければ作る)。先頭に現行のヘッダを書き、`name` の
+/// タブ・改行は空白にして1項目1行に保つ([`load_from`] でそのまま読み戻せるように)。結果の行が
+/// [`MAX_CACHE_ENTRIES`] を超えるときは、`last_used_at` が新しいキーから残す(LRU)。
 pub fn save_to(path: &Path, map: &HashMap<String, CacheEntry>) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {

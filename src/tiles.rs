@@ -59,12 +59,10 @@ const BASE_CACHE_CAP: usize = 256;
 // タイムラインを端から端までスクラブしても大半のコマがメモリに残る。
 const RADAR_CACHE_CAP: usize = 192;
 
-// タイルキャッシュ。上限超過時は最終アクセスが最古のものから捨てる簡易LRU。
-// 長時間パンし続けてもメモリが訪問範囲に比例して無制限に増えないようにする。
-// 値は RGBA で持つ(雨雲タイルの透過を落とさないため。地図タイルは alpha=255 で入る)。
-//
-// 予算(LRU)は取得元の種別ごとに分ける。1つのHashMapに混ぜると、雨雲のタイムラインを端から端まで
-// スクラブした瞬間に雨雲タイルが地図タイルを全部追い出し、地図が LOADING だらけになる。
+// タイルキャッシュ。上限超過時は最終アクセスが最古のものから捨てる簡易LRU。値は RGBA で持つ
+// (雨雲タイルの透過を落とさないため。地図タイルは alpha=255 で入る)。予算(LRU)は取得元の種別ごとに
+// 分ける。1つのHashMapに混ぜると、雨雲のタイムラインをスクラブした瞬間に雨雲タイルが地図タイルを
+// 全部追い出し、地図が LOADING だらけになる。
 pub struct Cache {
     base: HashMap<TileKey, (RgbaImage, u64)>,
     radar: HashMap<TileKey, (RgbaImage, u64)>,
@@ -140,15 +138,10 @@ fn tile_url(style: &str, z: u32, x: i64, y: i64) -> String {
         _         => format!("https://tile.openstreetmap.org/{z}/{x}/{y}.png"),
     }
 }
-// 気象庁の降水系タイルURL。背景透過PNGで、降水なしの領域は透明で返る。
-// 非公式エンドポイント(開発者向けAPIとして文書化されていない)なので、URL構築はここと
-// radar.rs の targetTimes 定数の2箇所だけに閉じる(壊れたら1箇所直せば済む)。
-// basetime/validtime は radar.rs 側で「ASCII数字のみ」の検証を通ったものだけが渡る。
-// どのz/x/yでもHTTP 200が返る(404は無い)。中身が入っているズームは限られるので、
-// 要求するズームの決定は radar_source_zoom が行う。
-// product で lv2/element が変わる(実測確認済み): ナウキャスト(hrpns)=nowc/hrpns、
-// 降水短時間予報(rasrf)=rasrf/rasrf。パレット(4bit索引色10色・tRNS)は両者で完全一致するため
-// デコード側は分岐不要。
+// 気象庁の降水系タイルURL(背景透過PNG・降水なしは透明)。非公式エンドポイントなので、URL構築はここと
+// radar.rs の targetTimes 定数の2箇所だけに閉じる。basetime/validtime は radar.rs 側で「ASCII数字のみ」の
+// 検証を通ったものだけが渡る。どのz/x/yでもHTTP 200が返るが中身のあるズームは限られるので、要求する
+// ズームは radar_source_zoom が決める。パレットは product によらず同じで、デコード側は分岐不要。
 fn radar_tile_url(basetime: &str, validtime: &str, product: crate::radar::RadarProduct, z: u32, x: i64, y: i64) -> String {
     match product {
         crate::radar::RadarProduct::Nowcast =>
@@ -231,20 +224,10 @@ fn window_tile_range(cx: f64, cy: f64, win_w: u32, win_h: u32) -> (i64, i64, i64
     (tx_min, tx_max, ty_min, ty_max, left, top)
 }
 
-// 窓の切り出し(docs/web-pan-smoothness-design.md §5.1 対策A)。
-//
-// 従来は left/top を整数へ切り捨てて切り出していた。X と Y が独立に切り捨てられるため、
-// 描かれる位置の誤差は X 成分と Y 成分が無関係に ±1ピクセル未満で揺れる。真横のドラッグでは
-// 進行方向と平行な速度のむらにしか見えないが、斜めのドラッグでは誤差に進行方向と直交する
-// 成分が乗り、地図が左右へ振れて軌跡が階段状に見える(設計 §3.1)。
-//
-// ここでは canvas 上の窓左上 (ox, oy) の小数部を捨てず、右下方向の隣接ピクセルとの
-// 2×2 バイリニアで win_w×win_h を作る。出力セルの色が連続的に変化するので、1セル未満の
-// 動きも色の遷移として見え、X と Y が同時に連続になって直交方向のブレが消える。
-//
-// 参照先は canvas の範囲内へクランプする。呼び出し側はバイリニアが右下へ1ピクセル余分に
-// 参照するぶんタイル範囲を広げてあるので通常はクランプに掛からないが、世界の端や壊れた値でも
-// 範囲外参照しないようにしてある。
+// 窓の切り出し(docs/web-pan-smoothness-design.md §5.1 対策A)。canvas 上の窓左上 (ox, oy) の小数部を
+// 捨てず、右下方向の隣接ピクセルとの 2×2 バイリニアで win_w×win_h を作る。整数へ切り捨てると X と Y の
+// 誤差が無関係に揺れ、斜めのドラッグで地図が左右へ振れて軌跡が階段状に見える(設計 §3.1)。バイリニアが
+// 右下へ1ピクセル余分に参照するぶんは呼び出し側がタイル範囲を広げてあり、世界の端や壊れた値はクランプする。
 fn crop_window_subpixel(canvas: &RgbImage, ox: f64, oy: f64, win_w: u32, win_h: u32) -> RgbImage {
     let (cw, ch) = canvas.dimensions();
     let mut out = RgbImage::new(win_w, win_h);
@@ -351,9 +334,8 @@ pub fn build_window(cx: f64, cy: f64, z: u32, win_w: u32, win_h: u32, style: &st
 
 // ---- 非ブロッキング・タイルローダー ----
 // あるタイル(tile_z/x/y)の中心が、現在view(view_z上の view_cx,view_cy)からどれだけ離れているか。
-// タイル中心をそのズームで緯度経度へ戻し view_z へ再投影して同一ズーム上のユークリッド距離にする。
-// これで「要求ズーム」と「実際に取得するタイルのズーム(topoオーバーズーム時はz17固定)」が食い違っても
-// 近さを一貫して比較でき、ワーカーが現在地に近いタイルから埋められる。
+// タイル中心を緯度経度へ戻して view_z へ再投影するので、要求ズームと実際に取得するタイルのズーム
+// (topoオーバーズーム時はz17固定)が食い違っても近さを一貫して比較できる。
 fn tile_distance_to_view(tile_z: u32, tile_x: i64, tile_y: i64, view_cx: f64, view_cy: f64, view_z: u32) -> f64 {
     let tf = TILE as f64;
     let (lat, lon) = pixel_to_deg((tile_x as f64 + 0.5) * tf, (tile_y as f64 + 0.5) * tf, tile_z);
@@ -367,7 +349,7 @@ fn tile_distance_to_view(tile_z: u32, tile_x: i64, tile_y: i64, view_cx: f64, vi
 struct ViewState { cx: f64, cy: f64, z: u32, style: String }
 // 取得依頼中のタイル集合。queued=未着手 / inflight=取得中 / failed=直近に失敗し再試行クールダウン中。
 // queued/inflightにもcacheにも無いものだけ新規登録して二重取得を防ぐ。failedはさらに、404等の恒久的
-// 失敗をクールダウン明けまで再登録しない(#56)ためのネガティブキャッシュ。
+// 失敗をクールダウン明けまで再登録しないためのネガティブキャッシュ。
 struct PendingSet { queued: HashSet<TileKey>, inflight: HashSet<TileKey>, failed: HashMap<TileKey, std::time::Instant> }
 
 // 失敗クールダウン期限。直近の失敗からこの時間未満は再登録しない(404等の恒久失敗を~20ms間隔で
@@ -415,7 +397,7 @@ impl TileLoader {
 
     // build_window_nowait から欠落タイルをまとめて積む(cacheロックは呼び出し側で解放済み)。
     // 既に queued/inflight にあるものは弾く=二重リクエスト防止。直近失敗してクールダウン中のものも
-    // 弾く(#56)。クールダウンを過ぎていればfailedから外して通常通り再試行する。
+    // 弾く。クールダウンを過ぎていればfailedから外して通常通り再試行する。
     fn request_tiles(&self, keys: Vec<TileKey>) {
         let mut p = self.pending.lock().unwrap();
         let now = std::time::Instant::now();
@@ -429,7 +411,7 @@ impl TileLoader {
         }
     }
 
-    // ルート確定時、その経路が通るタイルを先読み依頼として登録する(#34)。既存のrequest_tilesを
+    // ルート確定時、その経路が通るタイルを先読み依頼として登録する。既存のrequest_tilesを
     // そのまま使う=画面表示中のタイルの方が常にview距離で優先されるため、専用の優先度階層は不要。
     pub fn request_route_tiles(&self, style: &str, z: u32, tile_coords: &[(i64, i64)]) {
         let src = TileSource::Base(style.to_string());
@@ -508,7 +490,7 @@ fn worker_loop(shared: Arc<Mutex<Cache>>, view: Arc<Mutex<ViewState>>, pending: 
                         shared.lock().unwrap().insert(k.clone(), img);
                         generation.fetch_add(1, Ordering::Relaxed); // 届いた→次フレームで再描画させる
                     }
-                    // 失敗はfailedへ記録し、クールダウン明けまで再登録させない(#56)。cache未挿入のままなので
+                    // 失敗はfailedへ記録し、クールダウン明けまで再登録させない。cache未挿入のままなので
                     // クールダウンが明けて再登録されれば通常通りリトライされる(一時的な障害からは回復できる)。
                     Err(_) => { pending.lock().unwrap().failed.insert(k.clone(), std::time::Instant::now()); }
                 }
@@ -585,7 +567,6 @@ fn draw_loading_watermark(canvas: &mut RgbImage, ox: u32, oy: u32, ink: image::R
 
 // build_window の非ブロッキング版。未取得タイルはネットワークを待たずグレーのプレースホルダーで埋め、
 // ローダーへ取得依頼だけ出して即座に返す。届いたタイルは次フレームで cache から拾われ自動的に地図へ反映される。
-//
 // subpixel=true のとき、窓の切り出しに cx/cy の小数部を使う(crop_window_subpixel・設計 §5.1 対策A)。
 // false のときは従来どおり整数位置で切り出す。呼び出し側が描画モードで選ぶ。
 pub fn build_window_nowait(cx: f64, cy: f64, z: u32, win_w: u32, win_h: u32, style: &str, subpixel: bool, loader: &TileLoader) -> Result<RgbImage, String> {
@@ -664,13 +645,10 @@ pub fn build_window_nowait(cx: f64, cy: f64, z: u32, win_w: u32, win_h: u32, sty
 
 // ---- 雨雲レーダー(気象庁ナウキャスト)レイヤ ----
 
-// 降水ナウキャストのタイルは「偶数ズームの z4〜z10」にしか中身が無い。
-// 奇数ズーム(z5/z7/z9…)と z11 以上は HTTP 200 で返るが全透明の空PNG(334バイト)で、
-// これは実際に降っている場所でも同じ(2026/08/14 実測: 埼玉・ときがわ 8.0mm/10min の地点で
-// z6/z8/z10 は 2〜4KB、z5/z7/z9/z11/z12 はいずれも 334バイト。他2地点でも同じ並び)。
-// したがって要求ズームをそのまま投げると、ツーリングで常用する z11 以上では雨雲が一切出ない。
-// データのあるズームで取得し、表示ズームへ最近傍で拡大して重ねる(元が250mメッシュの粗い面
-// データなので、拡大でぼやけても情報は失われない)。
+// 降水ナウキャストのタイルは「偶数ズームの z4〜z10」にしか中身が無い。奇数ズームと z11 以上は
+// HTTP 200 で全透明の空PNGが返り、実際に降っている場所でも同じ。要求ズームをそのまま投げると
+// ツーリングで常用する z11 以上では雨雲が一切出ないので、データのあるズームで取得し、表示ズームへ
+// 最近傍で拡大して重ねる(元が250mメッシュの粗い面データなので、拡大でぼやけても情報は失われない)。
 const RADAR_DATA_MIN_Z: u32 = 4;
 const RADAR_DATA_MAX_Z: u32 = 10;
 
@@ -745,15 +723,10 @@ fn radar_layout(cx: f64, cy: f64, z: u32, win_w: u32, win_h: u32, frame: &crate:
     Some(RadarLayout { tiles, scale, left, top })
 }
 
-// 雨雲レイヤの窓を組む(非ブロッキング)。取得済みタイルだけを貼り、未取得タイルの領域は
-// 「全透明」のまま返す。グレーのプレースホルダーも LOADING 透かしも描かない: このレイヤの下には
-// 既に地図が描かれており、そこにグレーの箱や文字を重ねると地図が読めなくなるため。
-// 読込中であることはステータス行(radar_progress の枚数)で伝える。
-// 視野が日本国外/広域すぎる場合は None(1枚もリクエストしない)。
-//
-// データのあるズーム(偶数z4〜z10)で取得したタイルを、表示ズームへ最近傍で拡大しながら
-// 表示画素へ直接書く。中間の巨大キャンバスを作らないので、拡大率が大きくても
-// 確保するのは出力サイズぶんだけで済み、位置ズレも生じない。
+// 雨雲レイヤの窓を組む(非ブロッキング)。取得済みタイルだけを貼り、未取得の領域は全透明のまま返す。
+// プレースホルダーや LOADING 透かしは、下に描かれた地図が読めなくなるので描かない(読込中はステータス行の
+// radar_progress の枚数で伝える)。視野が日本国外/広域すぎる場合は None。タイルは表示ズームへ最近傍で
+// 拡大しながら表示画素へ直接書くので、中間の巨大キャンバスを作らず確保は出力サイズぶんだけで済む。
 pub fn build_radar_window_nowait(
     cx: f64, cy: f64, z: u32, win_w: u32, win_h: u32,
     frame: &crate::radar::Frame, loader: &TileLoader,
@@ -812,7 +785,7 @@ mod tests {
         assert!(is_tile_fresh(std::time::Duration::from_secs(0)));
     }
 
-    // 失敗クールダウン境界(#56): 30秒未満はクールダウン中(再登録しない)、30秒以上は明け(再試行してよい)。
+    // 失敗クールダウン境界: 30秒未満はクールダウン中(再登録しない)、30秒以上は明け(再試行してよい)。
     #[test]
     fn in_cooldown_boundary() {
         assert!(in_cooldown(std::time::Duration::from_secs(0)));

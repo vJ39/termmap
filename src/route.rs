@@ -11,15 +11,13 @@ use serde::Deserialize;
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct RouteResult { pub pts: Vec<(f64, f64)>, pub ele: Vec<f64>, pub dist_m: f64, pub time_s: f64, pub hw_m: f64, #[serde(default)] pub hw_segments: Vec<(usize, usize)>, pub ascend_m: f64, #[serde(default)] pub via_google: bool }
 
-// ---- 通行止め回避(#通行止めを推奨しない) ----
-//
-// BRouterのnogosパラメータ(lon,lat,半径m,weight|...)で、実施中の通行止め区間を
-// 絶対回避エリア(weight省略)として渡す。対象はRegulationKind::Closed かつ
-// ClosureEvent::active(kisei_jishi_jyokyo=="1")のみ。車線規制等は通れなくはないので
-// 対象外、予定段階(まだ始まっていない)の通行止めも対象外にする(過剰回避を避ける)。
+// ---- 通行止め回避 ----
+// BRouterのnogosパラメータ(lon,lat,半径m,weight|...)で、実施中の通行止め区間を絶対回避エリア
+// (weight省略)として渡す。対象はRegulationKind::Closed かつ ClosureEvent::active(kisei_jishi_jyokyo=="1")
+// のみ。車線規制等(通れなくはない)と予定段階(まだ始まっていない)の通行止めは、過剰回避を避けるため対象外。
 pub const NOGO_RADIUS_M: f64 = 100.0; // 道幅+GPS誤差を吸収しつつ、近くの別の道路まで塞がない程度
 const NOGO_SAMPLE_INTERVAL_M: f64 = 150.0; // 半径100mの円が隣同士で重なるよう、直径200mより狭い間隔でサンプリング
-pub const NOGO_MAX_COUNT: usize = 50; // BRouter watchdogタイムアウト対策の上限(実測: 60個=13s際どい/100個以上=400で失敗。安全マージンを取って200から引き下げ。2026/08/17)
+pub const NOGO_MAX_COUNT: usize = 50; // BRouter watchdogタイムアウト対策の上限(実測: 60個=13s際どい/100個以上=400で失敗。安全マージンを取って200から引き下げ)
 
 // 通行止めのラインを円の列へ変換する。center(経由地の中心等)に近い円を優先し、
 // 上限(NOGO_MAX_COUNT)を超えたら遠い分を切り捨てる。戻り値の bool は切り捨てが発生したか。
@@ -121,13 +119,10 @@ pub fn route_summary(mode: &str, r: &RouteResult) -> String {
     }
     s
 }
-// ---- 高速道路区間(#高速区間、docs/route-expressway-segment-design.md) ----
-//
+// ---- 高速道路区間(docs/route-expressway-segment-design.md) ----
 // BRouterの properties.messages は [[ヘッダ],[行..]] の文字列表で、各行は「直前の行の座標から、
-// その行の座標まで」の区間を表す。Longitude/Latitude は整数マイクロ度の文字列(139701812 =
-// 139.701812度)で、その座標は geometry.coordinates の頂点そのもの(=RouteResult.pts の頂点)と
-// インデックス昇順で一致する(3ルート424行で実測・未一致0)。よって座標の一致だけで pts の
-// インデックス範囲へ落とせ、距離を按分して位置を推定する必要はない。
+// その行の座標まで」の区間を表す。Longitude/Latitude は geometry.coordinates の頂点(=RouteResult.pts)と
+// インデックス昇順で一致するので、座標の一致だけで pts のインデックス範囲へ落とせる。
 
 // 高速区間の色。日本の道路案内標識(高速=緑・一般道=青)に合わせる。ルート本体はシアンのまま。
 pub const EXPRESSWAY_COLOR: [u8; 3] = [0, 230, 100];
@@ -142,11 +137,9 @@ fn to_micro_deg(d: f64) -> i64 { (d * 1e6).round() as i64 }
 // hw_m(料金概算)の集計と判定を揃えるために距離集計と区間抽出の両方からこの関数を呼ぶ。
 fn is_expressway_tags(waytags: &str) -> bool { waytags.contains("highway=motorway") }
 
-// BRouterの応答本文と、そこから作った pts から、(高速の合計メートル, pts のインデックス範囲)を
-// 求める。ネットワークに触れない純関数。
-//
-// 位置特定に一度でも失敗したら範囲は空で返し、距離だけ返す(色分けは出ないが距離と料金概算は
-// 従来通り出る)。距離の集計は行ごとに独立しているので、位置特定の成否に影響されない。
+// BRouterの応答本文と、そこから作った pts から、(高速の合計メートル, pts のインデックス範囲)を求める
+// (ネットワークに触れない純関数)。位置特定に一度でも失敗したら範囲は空で返し、距離だけ返す(色分けは
+// 出ないが距離と料金概算は出る)。距離の集計は行ごとに独立しているので、位置特定の成否に影響されない。
 pub fn expressway_segments(body: &str, pts: &[(f64, f64)]) -> (f64, Vec<(usize, usize)>) {
     let messages = match parse_brouter(body) {
         Some(r) => r.features.into_iter().find_map(|f| f.properties.map(|p| p.messages)).unwrap_or_default(),
@@ -251,13 +244,10 @@ fn parse_geojson_props(body: &str) -> (f64, f64, f64) {
         None => (0.0, 0.0, 0.0),
     }
 }
-// ルート結果のディスクキャッシュ先。キーは (profile, alt, 丸めたwps列, nogos) の FNV-1a ハッシュ。
-// profile で正規化するので 下道/surface/quiet 等は同一ルートを共有。プロット不変なら再起動後も再利用。
-// nogos をキーに含めるのは必須(#通行止め回避): 含めないと、新しい通行止めが出現した後も
-// 通行止めを無視した古いキャッシュ済みルートを出し続けてしまう。
+// ルート結果のディスクキャッシュ先。キーは (profile, alt, 丸めたwps列, nogos) の FNV-1a ハッシュで、
+// profile で正規化するので 下道/surface/quiet 等は同一ルートを共有する。nogos をキーに含めないと、新しい
+// 通行止めが出た後も通行止めを無視した古いルートを出し続ける。ルートキャッシュは期限を持たないので、
 // RouteResult の中身の作り方を変えたらこの値を上げる(古い保存分を読まないようにするため)。
-// v2: hw_segments(高速区間)を追加。ルートキャッシュは期限を持たないので、版を上げないと
-// 「hw_m > 0 なのに hw_segments が空=距離は出るのに色が出ない」保存分が消えずに残る。
 const ROUTE_CACHE_SCHEMA: &str = "v2";
 // キー文字列とファイル名は、HOME に依存しない純関数として切り出してある(スキーマ版を上げれば
 // 別のファイル名になることをテストで確かめられるようにするため)。
@@ -280,7 +270,7 @@ fn route_cache_path(wps: &[(f64, f64)], mode: &str, alt: u32, nogos: &str) -> Op
 // mode: "short"=最短(shortest) / それ以外=裏道(safety)。wps は (lat,lon) 列。
 // key: Google Maps APIキー。BRouterが最終的に失敗した時だけ Google Directions へフォールバックする(空なら試さない)。
 // nogos: BRouterのnogosパラメータ値(nogos_query_paramで組み立てた"lon,lat,半径|..."形式)。
-// 空文字なら付けない(#通行止め回避が無効、または周辺に対象が無い場合)。
+// 空文字なら付けない(通行止め回避が無効、または周辺に対象が無い場合)。
 pub fn fetch_route(wps: &[(f64, f64)], mode: &str, alt: u32, key: &str, nogos: &str) -> Result<RouteResult, String> {
     if wps.len() < 2 { return Err("--route は始点と終点(2点以上)が必要".into()); }
     let alt = alt.min(3); // BRouter の代替ルートは 0..=3
@@ -316,11 +306,8 @@ pub fn fetch_route(wps: &[(f64, f64)], mode: &str, alt: u32, key: &str, nogos: &
             Err(_) => return Err(e), // Googleも失敗→元のBRouterエラーを返す
         },
     };
-    // 成功時のみ保存(ベストエフォート)。Googleフォールバック結果はキャッシュしない
-    // (BRouterの一時的失敗(watchdogタイムアウト等)でGoogle経由の下道ルートが一度でも
-    // 生成されると、それがディスクに永続化されBRouter復旧後も古い下道ルートを出し
-    // 続けてしまう事故があったため。[高速]設定なのに[下道 (Google経由)]が固定表示され
-    // 続けた根本原因)。
+    // 成功時のみ保存(ベストエフォート)。Googleフォールバック結果はキャッシュしない(BRouterの一時的失敗で
+    // Google経由の下道ルートが一度でも保存されると、BRouter復旧後もそれを出し続けてしまうため)。
     if should_persist_route_cache(&result) {
         if let Some(p) = &cpath {
             if let Some(d) = p.parent() { let _ = std::fs::create_dir_all(d); }
@@ -360,13 +347,9 @@ fn fetch_route_once(wps: &[(f64, f64)], profile: &str, alt: u32, nogos: &str) ->
 }
 
 // ---- 曲がり角(ターンバイターン音声案内用) ----
-//
-// BRouterは format=geojson だと曲がり角情報を返さないが、format=gpx に
-// turnInstructionMode=3 を付けると <rtept> ごとに <turn>コード</turn>(TL/TR/TSLL/TSLR/
-// TSHL/TSHR/KL/KR/C/TU等)と <turn-angle> が入った出力になる(実測確認済み)。start/destination
-// にはturnタグが無く <desc>start</desc>/<desc>destination</desc> だけが入る。
-// 座標系はgeojson版と同じ経路なので、pts(既存取得済みのポリライン)へ最近傍投影して
-// 「ルート起点からの累積距離」を求め、音声案内側は距離だけで残り時間を判断できるようにする。
+// BRouterは format=geojson だと曲がり角情報を返さないが、format=gpx に turnInstructionMode=3 を付けると
+// <rtept> ごとに <turn>コード</turn> と <turn-angle> が入る(start/destination は <desc> だけ)。
+// geojson版と同じ経路なので pts へ最近傍投影して起点からの累積距離を求め、音声案内側は距離だけで判断する。
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TurnPoint {
     pub lat: f64,
@@ -562,12 +545,10 @@ fn fetch_google_route(wps: &[(f64, f64)], mode: &str, key: &str) -> Result<Route
     Ok(RouteResult { pts, ele: Vec::new(), dist_m, time_s, hw_m: 0.0, hw_segments: Vec::new(), ascend_m: 0.0, via_google: true })
 }
 
-// ---- 渋滞状況の色分け(#渋滞情報、docs/route-traffic-coloring-design.md) ----
-//
-// BRouterには渋滞データが無いため、確定したルート pts を距離ベースで区間分割し、
-// 区間境界を中間waypointとしてGoogle Directions(departure_time=now)へ1回問い合わせ、
-// 区間ごとのduration_in_trafficから緑/黄/赤の色分けを作る。道路網全体ではなく、
-// 表示中のルート線だけを塗り分ける(TrafficLayer相当の面データはGoogle側に取得手段が無い)。
+// ---- 渋滞状況の色分け(docs/route-traffic-coloring-design.md) ----
+// BRouterには渋滞データが無いため、確定したルート pts を距離ベースで区間分割し、区間境界を中間waypoint
+// としてGoogle Directions(departure_time=now)へ1回問い合わせ、区間ごとのduration_in_trafficから緑/黄/赤の
+// 色分けを作る。塗るのは表示中のルート線だけ(TrafficLayer相当の面データはGoogle側に取得手段が無い)。
 
 const TRAFFIC_SEGMENT_TARGET_M: f64 = 5_000.0; // 目標区間長。短いルートは実際の区間数がこれより少ない
 const TRAFFIC_MAX_WAYPOINTS: usize = 23; // Google Directions APIの中間waypoint上限
@@ -614,8 +595,7 @@ pub fn traffic_level_color(level: TrafficLevel) -> [u8; 3] {
 // legs((duration_s, duration_in_traffic_s))をptsに沿って色分けした(色, 点列)の列へ変換する。
 // Smooth(順調)区間はエントリを作らない(基調色の青のまま=何も上塗りしない)。
 // legs.len() != breakpoints_m.len()+1 なら空Vec(呼び出し側は基調色のままにフォールバックする)。
-// 出力されたエントリ同士は、間にSmooth区間を挟まない限り境界点を共有する
-// (線が途切れて見えないように)。
+// 出力されたエントリ同士は、間にSmooth区間を挟まない限り境界点を共有する(線が途切れて見えないように)。
 pub fn colorize_route_by_traffic(
     pts: &[(f64, f64)],
     breakpoints_m: &[f64],
@@ -863,11 +843,11 @@ mod tests {
         assert!((ele[1] - 10.0).abs() < 1e-9);
     }
 
-    // ---- 高速道路区間(#高速区間) ----
+    // ---- 高速道路区間 ----
 
     // BRouter format=geojson の properties.messages を組み立てるテスト用ヘルパ。
     // rows は (Longitude(マイクロ度), Latitude(マイクロ度), Distance(m), WayTags)。
-    // 列の並びは実測した応答(2026/08/17)と同じ。
+    // 列の並びは実測した応答と同じ。
     fn br_body(rows: &[(i64, i64, &str, &str)]) -> String {
         const HEAD: &str = r#"["Longitude","Latitude","Elevation","Distance","CostPerKm","ElevCost","TurnCost","NodeCost","InitialCost","WayTags","NodeTags","Time","Energy"]"#;
         let rows: Vec<String> = rows.iter()
@@ -1080,7 +1060,7 @@ mod tests {
     #[test]
     fn should_persist_route_cache_rejects_google_fallback_results() {
         // Googleフォールバック結果をキャッシュしてしまうと、BRouterの一時的失敗が
-        // 永久に固定表示され続ける事故になる(2026/08/17)。
+        // 永久に固定表示され続ける事故になる。
         assert!(!should_persist_route_cache(&rr(1.0, 1.0, 0.0, vec![], true)));
         assert!(should_persist_route_cache(&rr(1.0, 1.0, 0.0, vec![], false)));
     }
@@ -1121,7 +1101,7 @@ mod tests {
 
     // ---- 曲がり角(ターンバイターン) ----
 
-    // 実際の BRouter format=gpx&turnInstructionMode=3 応答の抜粋(2026/08/16 実測、要約)。
+    // 実際の BRouter format=gpx&turnInstructionMode=3 応答の抜粋(実測、要約)。
     const GPX_TURNS_SAMPLE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <gpx>
 <rte>

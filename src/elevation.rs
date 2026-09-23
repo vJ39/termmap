@@ -102,8 +102,7 @@ fn haversine_m(a: (f64, f64), b: (f64, f64)) -> f64 {
     2.0 * r * h.sqrt().asin()
 }
 
-/// pts(緯度経度列)の各点までの累積距離(m)。先頭は常に0.0、長さはptsと同じ。
-/// ptsが空ならNoneを返す(呼び出し側で「距離不明」を区別できるように)。
+/// pts(緯度経度列)の各点までの累積距離(m)。先頭は常に0.0、長さはptsと同じ(空なら空)。
 pub fn cumulative_distances(pts: &[(f64, f64)]) -> Vec<f64> {
     if pts.is_empty() {
         return Vec::new();
@@ -118,10 +117,9 @@ pub fn cumulative_distances(pts: &[(f64, f64)]) -> Vec<f64> {
     out
 }
 
-/// ele(各点の標高。cum_distと同数を想定)を、距離基準で均等な n_samples 点へ線形補間で
-/// 再サンプルする。ルート点はBRouterの都合で間隔が不均一(直線区間は疎・複雑な区間は密)なため、
-/// 単純にインデックスでビン化すると横軸が実距離とズレる(プロファイルの形も現在地カーソルも)。
-/// 一度これで距離一様な配列に直してからelevation_chartへ渡せば、その後の単純なインデックス
+/// ele(各点の標高。cum_distと同数を想定)を、距離基準で均等な n_samples 点へ線形補間で再サンプルする。
+/// ルート点はBRouterの都合で間隔が不均一(直線区間は疎・複雑な区間は密)なので、インデックスでビン化
+/// すると横軸が実距離とズレる。これで距離一様な配列に直してからelevation_chartへ渡せば、その後の
 /// ビン化(bin_values)がそのまま距離一様として正しく機能する。
 pub fn resample_by_distance(ele: &[f64], cum_dist: &[f64], n_samples: usize) -> Vec<f64> {
     if ele.is_empty() || cum_dist.is_empty() || n_samples == 0 {

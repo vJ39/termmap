@@ -1,24 +1,7 @@
-// 気象警報・注意報(気象庁防災情報API)。ルート沿いのclass10s領域(geoarea.rs)に対応する
-// 気象台コードごとにwarning.jsonを取得し、現在発表中の警報/注意報を返す。
-// gpslive.rs/radar.rs/traffic.rs等と同じ方針でstd+ureq+serde_jsonのみに依存し、
-// crate::を参照しない。
-//
-// 実測で確認済みの構造(2026/08/17、東京都130000):
-//   {"areaTypes":[{"areas":[
-//     {"code":"130010","warnings":[{"status":"発表警報・注意報はなし"}]},
-//     {"code":"130020","warnings":[{"code":"14","status":"継続"},{"code":"20","status":"継続"}]}
-//   ]}, ...]}
-// warningsの各要素は、発表中のものだけ"code"キーを持つ(codeが無い場合はstatusのみで
-// 「発表なし」を意味する)。statusが"解除"のものは現在は効力が無いはずだが、実データで
-// "解除"直後の扱いを確認できていないため、安全側でstatusが"継続"または"発表"のものだけを
-// 「現在有効」として扱う(未知のstatusは有効扱いしない)。
-//
-// 警報コードの名称対応表はWeb上の複数の一致する情報源で確認したもので、気象庁一次資料での
-// 確認はできていない(docs/weather-warning-overlay-design.md §2に記載の通り)。表に無い
-// コードは「気象情報」(特別警報/警報/注意報のいずれの文字列も含まない無難な表示)へ
-// フォールバックする。
-// 色分けは正確なコード対応より名称文字列(特別警報/警報/注意報)によるseverityを優先する
-// (コード対応表の精度が不確かでも、名称の文字列パターンは安定しているため)。
+// 気象警報・注意報(気象庁防災情報API)。ルート沿いのclass10s領域(geoarea.rs)の気象台コードごとに
+// warning.jsonを取得し、現在発表中のものを返す。std+ureq+serde_jsonのみに依存しcrate::を参照しない。
+// "解除"直後の扱いが実データで未確認なので、statusが"継続"/"発表"のものだけを有効とする。警報コードの
+// 名称対応表は一次資料で未確認(docs/weather-warning-overlay-design.md §2)なので、色は名称文字列で決める。
 
 use serde::Deserialize;
 use std::time::Duration;
@@ -165,7 +148,7 @@ pub fn fetch_warnings(office_code: &str) -> Result<Vec<ActiveWarning>, String> {
 mod tests {
     use super::*;
 
-    // 実際のwarning/data/warning/130000.jsonの抜粋(2026/08/17実測)。
+    // 実際のwarning/data/warning/130000.jsonの抜粋。
     const SAMPLE: &str = r#"{"areaTypes":[{"areas":[
         {"code":"130010","warnings":[{"status":"発表警報・注意報はなし"}]},
         {"code":"130020","warnings":[{"code":"14","status":"継続"},{"code":"20","status":"継続"}]}

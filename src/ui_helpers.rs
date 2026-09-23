@@ -42,7 +42,7 @@ pub(crate) fn population_opacity_value(cfg: &config::Config) -> f64 {
 // targetTimes(フレーム時刻一覧)の再取得間隔(秒)の既定。ナウキャスト自体が5分更新なので、
 // これより短くしても新しい情報は無い。設定 [radar] refresh_sec で変えられる。
 pub(crate) const RADAR_REFRESH_SECS: u64 = 300;
-// 無操作が続いた時の状態保存(#69)の間隔。強制終了/クラッシュ対策なので長すぎず短すぎず。
+// 無操作が続いた時の状態保存の間隔。強制終了/クラッシュ対策なので長すぎず短すぎず。
 pub(crate) const IDLE_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 // 設定の再取得間隔(秒・f64)を RadarClock に渡す u64 へ。壊れた値なら既定値へ落として必ず動かす。
@@ -69,7 +69,7 @@ pub(crate) fn maybe_speak_turn(cfg: &config::Config, spec: &render::OverlaySpec,
     }
 }
 
-// 気象警報(#79・ルートベース)。ルートのポリラインを2km間隔でサンプリングし、通過する
+// 気象警報(ルートベース)。ルートのポリラインを2km間隔でサンプリングし、通過する
 // class10s領域(geoarea.rs)の気象台コードを重複無しで列挙する。2kmはclass10s領域が概ね
 // 数十km規模のため、粒度を上げても得られる精度は限定的という判断(粗くても良い)。
 pub(crate) fn route_warning_office_codes(pts: &[(f64, f64)]) -> Vec<String> {
@@ -149,42 +149,25 @@ pub(crate) fn persist_full_state(cx: f64, cy: f64, z: u32, opts: &Args, wps: &[(
 
 // ---- サブピクセル描画と再描画判定(docs/web-pan-smoothness-design.md §5.1/§5.2 対策A・B) ----
 
-// 1出力ピクセルを何段に割るか(設計 §5.1 対策A・§5.2)。
-// 対策A で切り出しが小数位置になったため、描画に効く粒度が「整数ピクセル」から
-// 「1/SUBPIXEL_STEPS ピクセル」へ細かくなった。設計は 8 か 16 を想定と書いている。
-// 8 を選んだのは、halfblock の横1出力ピクセル(=1文字セル・iPhone の xterm.js でおおむね
-// 9 CSS px)を約1.1 CSS px 刻みで動かせて、指の動きの粒度としてはこれで十分細かい一方、
-// 16 にすると同じ絵に見える差でも再構築が走る回数が倍になり、対策B(同じ絵なら送らない)で
-// 削ったバイト数を食い潰すため。偶数なので、窓の左上(中心 - rw/2.0)も必ず同じ格子に載る。
+// 1出力ピクセルを何段に割るか(設計 §5.1 対策A・§5.2。設計の想定は 8 か 16)。8 なら halfblock の
+// 横1出力ピクセル(iPhone の xterm.js でおおむね 9 CSS px)を約1.1 CSS px 刻みで動かせて十分細かい。
+// 16 だと同じ絵に見える差でも再構築が倍走り、対策B(同じ絵なら送らない)で削ったバイト数を食い潰す。
+// 偶数なので、窓の左上(中心 - rw/2.0)も必ず同じ格子に載る。
 pub(crate) const SUBPIXEL_STEPS: f64 = 8.0;
 
-// 描画へ渡す中心座標をサブピクセル格子へ吸着させる。
-//
-// 描画に使う位置と map_sig の位置がずれていると、絵が変わったのにシグネチャが変わらない
-// 取りこぼし(=地図が止まって見える)が起きる。両者を必ず同じ値から導くため、丸めは
-// ここ1箇所に閉じてある(設計 §5.2)。論理座標 cx/cy は連続のまま保持し、丸めるのは
-// 描画へ渡す直前だけにする。
-//
-// steps=1.0 なら整数ピクセルへの吸着になり、対策A を使わない描画モード(braille/edge)で
-// そのまま使える。
+// 描画へ渡す中心座標をサブピクセル格子へ吸着させる。描画の位置と map_sig の位置がずれると、
+// 絵が変わったのにシグネチャが変わらず地図が止まって見えるので、丸めはここ1箇所に閉じてある
+// (設計 §5.2)。論理座標 cx/cy は連続のまま保持し、丸めるのは描画へ渡す直前だけにする。
+// steps=1.0 なら整数ピクセルへの吸着になり、対策A を使わない描画モード(braille/edge)でそのまま使える。
 pub(crate) fn snap_center_to_grid(rcx: f64, rcy: f64, steps: f64) -> (f64, f64) {
     let snap = |v: f64| if v.is_finite() { (v * steps).round() / steps } else { v };
     (snap(rcx), snap(rcy))
 }
 
-// サブピクセル切り出しを使うか(設計 §5.1 の注意・§11 のリスク)。
-//
-// braille / edge は輝度の閾値でドットの on/off を決める(render.rs)ので、バイリニアで作った
-// 中間色が閾値をまたぐ瞬間にドットが入れ替わる。実質ディザになるため、階段は消える代わりに
-// ちらつきが増える可能性がある。halfblock と実画像では素直に効く。
-//
-// 設計は「braille は実機で確認して、悪ければ braille だけ従来の整数切り出しに戻せるように
-// しておく」としている。既定は全モードで有効にし、環境変数 TERMMAP_SUBPIXEL で上書きできる。
-//   0 / false / off / no        … 全モードで従来の整数切り出し
-//   1 / true / on / yes         … 全モードで対策A を使う
-//   halfblock / no-braille      … braille/edge だけ従来の整数切り出し(halfblock と実画像は対策A)
-// 実機で braille のちらつきが問題だと分かったら、環境変数を毎回付けずに済むよう
-// SUBPIXEL_EXCEPT_BRAILLE を true にする。
+// サブピクセル切り出しを使うか(設計 §5.1 の注意・§11 のリスク)。braille / edge は輝度の閾値で
+// ドットの on/off を決める(render.rs)ので、バイリニアの中間色が閾値をまたぐとドットが入れ替わり、
+// 階段は消える代わりにちらつきが増える可能性がある。既定は全モードで有効。環境変数 TERMMAP_SUBPIXEL で
+// 上書きでき、halfblock / no-braille なら braille/edge だけ従来の整数切り出しにする。
 pub(crate) fn use_subpixel_window(braille: bool, edge: bool, env: Option<&str>) -> bool {
     let dots = braille || edge; // 輝度の閾値でドットの on/off を決めるモード
     match env.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
@@ -195,30 +178,16 @@ pub(crate) fn use_subpixel_window(braille: bool, edge: bool, env: Option<&str>) 
     }
 }
 
-// 既定で braille/edge を対策A から外すか。実機で braille のちらつきが許容できないと
-// 分かったら、ここを true にするだけで既定が「braille/edge は従来の整数切り出し」になる
-// (halfblock と実画像は対策A のまま)。
-//
-// 手元の PTY 実測では、braille のインク量のコマ間の揺れは対策A で 0.39% → 0.50% と
-// 1.28 倍になるものの絶対量は小さく(約1400セル中1コマ7セル)、1コマのバイト数はむしろ
-// 14% 減った。数字の上では有効のままでよさそうだが、ちらつきの見え方は実機でしか
-// 判断できないので false のままにしてある。
+// 既定で braille/edge を対策A から外すか。実機で braille のちらつきが許容できないと分かったら、
+// ここを true にするだけで既定が「braille/edge は従来の整数切り出し」になる(halfblock と実画像は
+// 対策A のまま)。PTY 実測の数字では有効のままでよさそうだが、ちらつきの見え方は実機でしか判断
+// できないので false のままにしてある。
 pub(crate) const SUBPIXEL_EXCEPT_BRAILLE: bool = false;
 
-// map_sig に混ぜる中心座標の値。実際に描画へ効く粒度へ丸める。
-//
-// 生の f64(to_bits)を混ぜると、1出力ピクセルの1/100しか動かないパンでもシグネチャが変わり、
-// 絵が1ピクセルも変わらないのに全画面(halfblock 94x23 で 85.6KB)を再送してしまう
-// (設計 §2.3 の実測)。ゆっくり指を動かしているときほどこの無駄の割合が上がる。
-//
-// 丸めの基準は中心そのものではなく「窓の左上」にしてある。切り出しは tiles.rs で
-// left = rcx - rw/2.0 を基準に行われ、rw が奇数(左袖なし・halfblock で端末幅が奇数のとき等)
-// だと rcx の丸めが同じでも left の丸めが変わる = 実際の絵が変わる。設計と依頼は rcx を
-// 直接丸めると書いているが、それだとこの場合に再構築を取りこぼして地図が動かなくなる。
-// rw/rh 自体は map_sig 側で別途ハッシュしているので、中心の代わりに左上を混ぜても情報は落ちない。
-//
-// steps は描画側の粒度と必ず揃える。対策A(サブピクセル切り出し)を使う描画モードでは
-// SUBPIXEL_STEPS、従来の整数切り出しでは 1.0 を渡す(設計 §5.2 の「対策A を入れる場合」)。
+// map_sig に混ぜる中心座標の値。生の f64 では絵が変わらない微小なパンでも全画面を再送するので
+// (設計 §2.3)、描画に効く粒度へ丸める。基準は中心でなく窓の左上(tiles.rs の left = rcx - rw/2.0)。
+// rw が奇数だと rcx の丸めが同じでも絵が変わり、設計どおり rcx を丸めると再構築を取りこぼす(rw/rh は
+// 別途ハッシュ済み)。steps は描画側と必ず揃える(対策A は SUBPIXEL_STEPS、従来は 1.0。設計 §5.2)。
 pub(crate) fn map_center_sig_key(rcx: f64, rcy: f64, rw: u32, rh: u32, steps: f64) -> (i64, i64) {
     (
         ((rcx - rw as f64 / 2.0) * steps).floor() as i64,
@@ -226,7 +195,7 @@ pub(crate) fn map_center_sig_key(rcx: f64, rcy: f64, rw: u32, rh: u32, steps: f6
     )
 }
 
-// ---- 規制原因アイコン(#規制原因アイコン、docs/regulation-cause-icons-design.md) ----
+// ---- 規制原因アイコン(docs/regulation-cause-icons-design.md) ----
 
 // 規制ラインの中点(アイコンを置く座標)。空ならNone、1点のみならその点。
 // regulation.rsはcrate::に依存しない方針のため、roadtrace側を使うここに置く。

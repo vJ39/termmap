@@ -9,10 +9,8 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 // CoreLocationCLI の stdout をパースし、最初に現れる妥当な (lat, lon) を返す。
-// 想定フォーマット例:
-//   "35.681 139.767"
-//   "latitude: 35.681 longitude: 139.767"
-// トークンを前から順に走査し、lat候補(-90..=90)の直後に続くlon候補(-180..=180)を採用する。
+// 想定フォーマット例: "35.681 139.767" / "latitude: 35.681 longitude: 139.767"。
+// lat候補(-90..=90)の直後に続くlon候補(-180..=180)を採用する。
 pub fn parse_location(out: &str) -> Option<(f64, f64)> {
     // 数値らしきトークンだけを抜き出す（ラベル文字列やカンマ等は無視）。
     let nums: Vec<f64> = out

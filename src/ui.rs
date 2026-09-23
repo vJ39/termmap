@@ -119,7 +119,7 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
                 let _ = out.flush();
             }
             let (hd_c, slat_c, slon_c) = { let (_, h, la, lo) = st.street.as_ref().unwrap(); (*h, *la, *lo) };
-            // 押しっぱなし/連打で溜まった同種キーは最新の1個へ間引く(#4のMap focusと同じ理由)。
+            // 押しっぱなし/連打で溜まった同種キーは最新の1個へ間引く(Map focus 時と同じ理由)。
             // Esc/q等の別系統キーが混ざっていたら間引きを止めてそちらを即座に優先する。
             let is_sv_key = |c: KeyCode| matches!(c, KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down | KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Char('-') | KeyCode::Char('_'));
             let mut ev = event::read()?;
@@ -258,12 +258,10 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
             }
         }
         let img_inline = st.cfg.image_mode && image_capable(); // 実画像モード(iTerm2系端末のみ)。play処理より先に要る
-        // 雨雲の合成方式は描画モードで2系統に分かれる(設計 §2.1)。どのモードでも表示はできる。
-        //   実画像 / halfblock … 地図へ直接アルファ合成(下の地図が透ける)
-        //   classify         … recolor()で6色へ量子化した「後」に合成(先に混ぜると淡い青の降水が湖に化ける)
-        //   braille / edge   … 背景色の概念が無いので OverlayLayer へディザ間引きしたインクとして焼く
-        // mono は単体では描画経路を変えない(render_braille の色を落とすだけ)ので、braille/edge が
-        // 立っていなければ halfblock と同じアルファ合成になる。
+        // 雨雲の合成方式は描画モードで2系統に分かれる(設計 §2.1)。実画像/halfblock は地図へ直接
+        // アルファ合成、classify は recolor() で6色へ量子化した「後」に合成(先に混ぜると淡い青の降水が
+        // 湖に化ける)、braille/edge は背景色の概念が無いので OverlayLayer へディザ間引きしたインク
+        // として焼く。mono は単体では描画経路を変えない(render_braille の色を落とすだけ)。
         let radar_ink = !img_inline && (st.opts.braille || st.opts.edge);
         if st.play.is_some() { // ルート再生: 実時間ベースで位置を進めて自動パン(想定巡航速度×play_speed倍率)
             // 実画像モードは先読みスレッドが返した画像をベース地図に使う。オーバーレイ(ルート線/
@@ -323,7 +321,7 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
             st.roads_layer.items(plot_view).into_iter().map(|r| r.pts.as_slice()).collect();
         let camera_points = st.camera_layer.items(plot_view);
         let regulation_events = st.regulation_layer.items(plot_view);
-        // 規制原因アイコン(#規制原因アイコン): 表示中のClosedイベントから未分類の1件を選び、
+        // 規制原因アイコン: 表示中のClosedイベントから未分類の1件を選び、
         // 他にジョブが走っていなければバックグラウンドで規制原因を取得する
         // (同時に1件だけ=道路情報提供システムへの負荷を抑えるレート制限)。
         if st.cfg.regulation_enabled && st.cause_job.is_none() {
@@ -373,7 +371,7 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
                 .and_then(|m| population::density(m, population_year_idx))
         });
 
-        // 通行止めルート回避(#通行止めを推奨しない)。表示中の視野(plot_view)ではなく、
+        // 通行止めルート回避。表示中の視野(plot_view)ではなく、
         // 経由地全体を覆うbboxで実施中の通行止めを見て、BRouterのnogosへ変換する。
         // 通行規制の設定(cfg.regulation_enabled)と連動させる: OFFなら外部へ問い合わせず
         // regulation_layerにデータ自体が無いため、ここでも自然に空になる。
@@ -391,13 +389,10 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
             (String::new(), false)
         };
 
-        // 移動検知(解像度非依存): 直近に描画したフレームと(cx,cy,z)が違えば「動いた」。
-        // 動いた直後〜350ms は低解像度(delta=0)で速く描き、動きが止まって350ms経ったら
-        // 設定解像度(高/中/低)へ上げる。GPS追従(gps_rx)のように断続的に動くケースは
-        // 自然に低解像度のまま張り付く(=負荷とメモリを抑える)。
-        // ただしルート再生(play)中は毎フレーム動き続けるため、この判定に従うと恒久的に
-        // 低解像度画像が高頻度で切り替わり続けてちらついて見える。プレビューは見た目重視の
-        // 機能なので、再生中は「動いている」扱いにせず常に設定解像度を使う。
+        // 移動検知(解像度非依存): 直近に描画したフレームと(cx,cy,z)が違えば「動いた」とみなし、
+        // 動いてから350msは低解像度で速く描き、止まって350ms経ったら設定解像度へ上げる(GPS追従のように
+        // 断続的に動くと低解像度のまま張り付き、負荷とメモリを抑える)。ルート再生中は毎フレーム動くので
+        // この判定だとちらつき続ける。見た目重視の機能なので、再生中は常に設定解像度を使う。
         if st.prev_render_cxyz != Some((st.cx, st.cy, st.z)) { st.moved_at = Some(std::time::Instant::now()); }
         st.prev_render_cxyz = Some((st.cx, st.cy, st.z));
         let settling = img_inline && st.cfg.image_settle_low_res && st.play.is_none() && st.moved_at.map_or(false, |t| t.elapsed() < std::time::Duration::from_millis(350));
@@ -477,25 +472,16 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
         }
 
         // 再描画判定シグネチャ。地図に効く状態(中心/ズーム/寸法/配置/オーバーレイ)が前回emit時と
-        // 同じなら描き直さない。以前は実画像モード限定だったが、AAモードも同じ判定に乗せることで
-        // タイル非同期ロード中(#35)にloader.generation()だけが変わり続けて毎ポーリング(80ms毎)
-        // 無条件に全画面書き込みが発生する問題を解消する(macOS標準Terminal.appでの描画崩れの原因)。
-        // このフレームの再描画判定に使うgeneration値をここで固定する。ローダーのワーカーは
-        // 「cacheへinsert→generation加算→pending.inflightから除去」の順で動くため、この直後に
-        // is_busy()を見る時点までの間に最後の1枚がちょうど着地すると、is_busy()はfalse(もう待たない)
-        // だが今フレームの再構築には間に合っていない、という取りこぼしが起き得る(#53)。
-        // その場合pollingがfalseになりevent::read()でブロックしてしまい、実際は届いているのに
-        // 次のキー入力までLOADING表示が残り続ける。スナップショットして後段で比較し、その間に
-        // 進んでいたら強制的にポーリング継続させることでこの1フレーム分の取りこぼしを防ぐ。
+        // 同じなら描き直さない。AAモードも対象にするのは、タイル非同期ロード中に毎ポーリング全画面を
+        // 書き込むと macOS標準Terminal.app の描画が崩れるため。generation はここで固定し後段で比較する
+        // (ワーカーは insert→generation加算→inflight除去の順。is_busy() だけでは最後の1枚が漏れうる)。
         let loader_gen_snapshot = loader.generation();
         let map_sig: Option<u64> = {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
             // 中心座標は生の f64 ではなく、実際に描画へ効く粒度へ丸めて混ぜる(設計 §5.2 対策B)。
-            // これより細かい差はどうせ同じ絵になる。粒度は描画側と揃える必要があるので、
-            // rcx/rcy を吸着させたときと同じ sub_steps を渡す(サブピクセル切り出しなら
-            // 1/SUBPIXEL_STEPS ピクセル・従来の整数切り出しなら1ピクセル)。
-            // rcx/rcy は既に同じ格子へ吸着済みなので、描画とシグネチャの位置は必ず一致する。
+            // 粒度は描画側と揃える必要があるので、rcx/rcy を吸着させたときと同じ sub_steps を渡す
+            // (rcx/rcy は既に同じ格子へ吸着済みなので、描画とシグネチャの位置は必ず一致する)。
             map_center_sig_key(rcx, rcy, rw, rh, sub_steps).hash(&mut h);
             // 切り出し方が変わると同じ中心でも絵が変わるので、モードそのものも混ぜる。
             subpixel.hash(&mut h);
@@ -660,13 +646,9 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
                     }
                     if st.cfg.traffic_enabled { // 道路交通量(混雑度の目安。事故情報・渋滞度そのものではない)
                         // 観測点を最寄りの主要道路(major_roads)へスナップし、前後
-                        // TRAFFIC_SNAP_RADIUS個ぶんの区間をラインとして色分け表示する。
-                        // OSMのway分割は実測でかなり細かい(2026-08-16 東京都内サンプル:
-                        // ノード間隔中央値約20m・90%タイル74m、1way平均7ノード≒100〜150m)。
-                        // wayを跨いで延長する処理は入れていないため、線の長さはway次第で
-                        // ばらつく(短いwayなら前後にはみ出さずクランプされる)。
-                        // major_roadsが空(未取得中・取得失敗直後)の間は、従来通り観測点を
-                        // 丸で表示するフォールバックにする。
+                        // TRAFFIC_SNAP_RADIUS個ぶんの区間をラインとして色分け表示する。wayを跨いで
+                        // 延長しないので、線の長さはway次第でばらつく(OSMのway分割はかなり細かい)。
+                        // major_roadsが空の間は観測点を丸で表示するフォールバックにする。
                         const TRAFFIC_SNAP_RADIUS: usize = 15;
                         // 周囲に主要道路データが無い観測点を無関係な遠い道へ誤ってスナップしない
                         // ための上限。500m以内に主要道路の頂点が無ければ点表示のフォールバックへ回る。
@@ -707,7 +689,7 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
                                 ((gx - (rcx - rw as f64 / 2.0)).floor() as i32, (gy - (rcy - rh as f64 / 2.0)).floor() as i32)
                             }).collect();
                             for w in pts.windows(2) { draw_line(&mut ov, w[0].0, w[0].1, w[1].0, w[1].1, ev.kind.color(), 3); }
-                            // 規制原因アイコン(#規制原因アイコン): 事故✕/工事のみ、区間の中点に重ね描き。
+                            // 規制原因アイコン: 事故✕/工事のみ、区間の中点に重ね描き。
                             if let Some(category) = st.cause_cache.get(&ev.detail_id) {
                                 if let Some((color, shape)) = regulation::cause_icon(*category) {
                                     if let Some((la, lo)) = closure_icon_position(&ev.line) {
@@ -721,12 +703,10 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
                         }
                     }
                     if st.cfg.disaster_enabled && disaster_markers { // 過去災害(Bでその地点の事例一覧)
-                        // 座標が市区町村の代表点で1点に何十件も重なるため、事例1件=1マーカーには
-                        // しない。1座標=1マーカーにして、件数を外周リングの半径、最も多い種別を
-                        // 色で表す。外周を細くするのは地図と他レイヤを覆い隠さないため
-                        // (中心の塊があるので細くても位置は読める)。
-                        // 塗り(コロプレス)が出ているズーム帯では件数の役目が塗りへ移るので、
-                        // 外周リングは出さず中心の小さな塊だけを残す(Bキーの対象を示すため)。
+                        // 座標が市区町村の代表点で1点に何十件も重なるので、1座標=1マーカーにして
+                        // 件数を外周リングの半径、最も多い種別を色で表す(外周は地図と他レイヤを覆わない
+                        // よう細くする)。塗りが出ているズーム帯では件数の役目が塗りへ移るので、外周
+                        // リングは出さず中心の小さな塊だけを残す(Bキーの対象を示すため)。
                         for s in &disaster_sites {
                             let (gx, gy) = deg_to_pixel(s.lat, s.lon, rz);
                             let ix = (gx - (rcx - rw as f64 / 2.0)).floor() as i32;
@@ -908,11 +888,9 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
                 | Focus::SpotRename(..) | Focus::SpotEditName(..) | Focus::ColorPick { .. } | Focus::ShapePick { .. } | Focus::SettingsEdit(..) | Focus::PoiKindForm { .. } | Focus::WanderForm { .. });
         if st.prev_map_covered && !map_covered { st.force_reemit = true; }
         st.prev_map_covered = map_covered;
-        // web版(ブラウザ)へ現在のドラッグ軸モードを通知する(#87 設計書 §5.2)。Focus は
-        // interactive() 内の30か所以上で書き換わり、非同期ジョブの完了で勝手に変わる箇所も
-        // ある(例: 周辺検索の結果適用で Map → PoiList)。変更箇所ごとに通知を足すのではなく
-        // フレーム末で前回値と比較する方式にして、呼び出しをこの1か所に閉じている。
-        // 認識しない端末(通常のターミナル)では無視されるだけなので、web以外でも害は無い。
+        // web版(ブラウザ)へ現在のドラッグ軸モードを通知する(設計書 §5.2)。Focus は interactive() 内の
+        // 30か所以上や非同期ジョブの完了で変わるので、変更箇所ごとに通知せず、フレーム末で前回値と
+        // 比べるこの1か所に閉じている。認識しない端末では無視されるだけなので web 以外でも害は無い。
         let cur_drag_axes = dragmode::axes(&st.focus);
         if st.prev_drag_axes != Some(cur_drag_axes) || st.drag_mode_req_pending {
             dragmode::emit_web_drag_mode(cur_drag_axes);
@@ -925,21 +903,16 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
         // 何か適用できたフレームは入力待ちでブロックせず即座に描き直す。
         let got_result = ui_jobs::poll(&mut st, &loader, lat, lon, &route_nogos, route_nogos_truncated);
 
-        // 入力待ち。結果適用直後は即再描画(None)。ジョブ/GPS/再生/移動settling中はポーリング。
-        // settling中は短間隔(60ms)で見に行き、動きが止まったフレームで高解像度に上げ直す。
-        // ローダーがまだ未取得タイルを抱えている間もポーリング側に倒す(read()でブロックすると
-        // 無入力時に届いたタイルが画面へ反映されないため)。
-        // is_busy()に加えgenerationのスナップショット比較も見る(#53): このフレームの再構築後、
-        // is_busy()を読むまでの間に最後の1枚がちょうど着地しinflightが空になっていた場合、
-        // is_busy()だけではその1枚の反映漏れを検知できずread()でブロックしてしまうため。
+        // 入力待ち。結果適用直後は即再描画(None)。ジョブ/GPS/再生/移動settling中はポーリングし、
+        // settling中は60ms間隔で見て、止まったフレームで高解像度に上げ直す。ローダーが未取得タイルを
+        // 抱えている間もポーリングに倒す(read()でブロックすると無入力時に届いたタイルが反映されない)。
+        // generation のスナップショットとも比べて、再構築後に着地した最後の1枚の反映漏れを防ぐ。
         let polling = st.jobs_active() || st.voice_preview_job.is_some()
             || st.gps_rx.is_some() || st.play.is_some() || settling || loader.is_busy() || loader.generation() != loader_gen_snapshot
             || st.radar_clock.is_some() // 雨雲: 背景ポーラーからの時刻一覧を取りこぼさない
-            // 道路交通量/主要道路/ライブカメラ/通行規制の背景取得完了を、キー入力無しでも
-            // 取りこぼさない(結果が最大60秒(IDLE_SAVE_INTERVAL)反映されない事故を防ぐ)。
-            // 主要道路は以前この条件から漏れていたが、4レイヤとも同じ扱いにする。
-            // 人口メッシュは1セルの取得に数十秒かかるため、ここから漏れると
-            // 「取得中…」の表示すら出ないまま画面が固まって見える(PTY実機で確認済み)。
+            // 道路交通量/主要道路/ライブカメラ/通行規制の背景取得完了を、キー入力無しでも取りこぼさない
+            // (漏れると結果が最大60秒(IDLE_SAVE_INTERVAL)反映されない)。人口メッシュは1セルの取得に
+            // 数十秒かかるので、漏れると「取得中…」の表示すら出ないまま画面が固まって見える。
             || st.traffic_layer.job_active() || st.roads_layer.job_active()
             || st.camera_layer.job_active() || st.regulation_layer.job_active() || st.disaster_layer.job_active()
             || st.boundary_layer.job_active() || st.population_layer.job_active()
@@ -953,7 +926,7 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
             Some(event::read()?)
         } else {
             // 無操作がIDLE_SAVE_INTERVALだけ続いた。read()で無限ブロックする代わりにpollで
-            // 区切り、強制終了/クラッシュに備えて状態を保存する(#69)。キー入力があれば
+            // 区切り、強制終了/クラッシュに備えて状態を保存する。キー入力があれば
             // pollは即trueを返すため応答性への影響は無い。
             persist_full_state(st.cx, st.cy, st.z, &st.opts, &st.wps, &st.mode, &mut st.cfg, st.radar_on, st.show_spots);
             // ついでにプロットキャッシュの掃除もここで起こす。プロットデータは取得のたびに
@@ -983,12 +956,10 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
                 }
             }
         }
-        // web版(ブラウザ)からのパン量マーカー(#87 設計書 §6.3)。上のキー間引きは「溜まった分を
-        // 最新1個で上書き」=捨てる方式だが、パン量は相対値なので足し合わせれば取りこぼしがゼロに
-        // なる。描画が遅れて数フレーム分溜まっても、指を離した時点の位置に必ず追いつく。
-        // ev を別イベントで上書きしても合算値はこの変数に残るので、途中で別のキーが割り込んでも
-        // 移動分は失われない。Focus::Map 以外(PoiList の横パン等)でも効かせるためキー間引きの
-        // 内側には置かない。
+        // web版(ブラウザ)からのパン量マーカー(設計書 §6.3)。上のキー間引きは溜まった分を捨てるが、
+        // パン量は相対値なので足し合わせる(描画が遅れても指を離した時点の位置に追いつく)。合算値は
+        // この変数に残るので、ev が別イベントで上書きされても移動分は失われない。Focus::Map 以外
+        // (PoiList の横パン等)でも効かせるため、キー間引きの内側には置かない。
         let mut pan_fx = 0.0f64;
         let mut pan_fy = 0.0f64;
         let mut got_pan = false;
@@ -1007,13 +978,10 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
                 }
             }
         }
-        // 軸ゲート・向きの反転・座標の正規化は dragmode::apply_pan に閉じてある
-        // (ここに直書きするとテストが書けないため。設計書 §6.2 の適用条件)。
-        // 実画像モードでは実際に描かれる解像度は ow/oh ではなく rw/rh(zoom rz のピクセル)。
-        // 表示している地理範囲は zoom z 換算で常に横 map_cols・縦 map_rows*2 ピクセルなので、
-        // rw/scale・rh/scale へ戻して渡す(設計 §5.5 対策E)。AA 用に計算された ow/oh を
-        // そのまま渡すと、braille(または --edge)と実画像を同時に有効にしたときだけ
-        // ow=map_cols*2 / oh=map_rows*4 となり、両軸とも指の2倍地図が動く(§2.5 の実測)。
+        // 軸ゲート・向きの反転・座標の正規化は、テストを書けるよう dragmode::apply_pan に閉じてある
+        // (設計書 §6.2 の適用条件)。実画像モードの描画解像度は rw/rh(zoom rz)だが、写る地理範囲は
+        // zoom z 換算で横 map_cols・縦 map_rows*2 px なので rw/scale・rh/scale を渡す(設計 §5.5 対策E)。
+        // AA 用の ow/oh だと、braille/edge と実画像の併用時だけ両軸とも指の2倍地図が動く(§2.5)。
         let (pan_ow, pan_oh) = if img_inline { (rw / scale, rh / scale) } else { (ow, oh) };
         let lay = dragmode::Layout { cols, rows: tr as u32, map_cols, map_rows, ow: pan_ow, oh: pan_oh };
         // ネイティブ端末のマウス(設計 docs/mouse-click-drag-design.md)。ドラッグは上の PAN マーカーと
@@ -1147,7 +1115,7 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
                     }
                 }
             }
-            // 軸モードの再送要求(#87 設計書 §5.3)。ブラウザを再読み込みするとJS側の状態は
+            // 軸モードの再送要求(設計書 §5.3)。ブラウザを再読み込みするとJS側の状態は
             // 消えるが termmap 側の Focus は変わらないので通知が飛ばない。ここでは印を立てる
             // だけで、実際の送出は次フレーム末の1か所に任せる。
             Some(Event::Paste(s)) if s.starts_with(dragmode::DRAG_MODE_REQUEST) => {

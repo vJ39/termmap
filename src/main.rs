@@ -1,10 +1,7 @@
-// termmap — mapscii 風の端末地図レンダラ
-//   引数なし   : 前回終了位置から対話起動(保存が無ければ東京中心)。対話が既定。
-//   halfblock (既定): ▀ + truecolor / braille: 点字ドット(--mono でプレーン)
-//   --classify : 地物カテゴリ(水域/緑地/幹線道路/線路?/建物)を色分け(ラスタ色からの推定)
-//   --place    : 日本語住所などをジオコーディング(Nominatim)して中心に
-//   --interactive(-i): 対話モードのエイリアス(対話は既定なので付けても付けなくても同じ)
-//   --png PATH : カテゴリ色PNGを書き出す(確認用)  --image PNG : 既存画像を描画
+// termmap — mapscii 風の端末地図レンダラ。対話が既定で、引数なしなら前回終了位置から開く(保存が無ければ
+//   東京中心)。-i/--interactive はそのエイリアス。描画は halfblock(既定。▀ + truecolor)か braille(点字)。
+//   --classify は地物カテゴリをラスタ色から推定して色分けし、--png PATH はカテゴリ色PNGを書き出す(確認用)。
+//   --place は日本語住所などをジオコーディング(Nominatim)して中心に、--image PNG は既存画像を描画する。
 
 mod fsutil;
 mod geo;
@@ -60,8 +57,8 @@ mod camera; // 道路ライブカメラ(road-info-prvs.mlit.go.jp)。Nキーで�
 mod disaster; // 過去災害の発生履歴(NIED 災害事例データベース)。Bキーで中心近くの地点の事例一覧を表示
 mod geopoly; // 多角形の純粋な幾何(even-odd の内外判定・外接矩形)
 mod muni; // 市区町村の境界(気象庁 class20s)。過去災害の塗り分けの下地
-mod geoarea; // 一次細分区域(気象庁 class10s)の境界データと点-in-領域判定。気象警報(#79)の下地
-mod warning; // 気象警報・注意報(気象庁防災情報API)(#79)
+mod geoarea; // 一次細分区域(気象庁 class10s)の境界データと点-in-領域判定。気象警報の下地
+mod warning; // 気象警報・注意報(気象庁防災情報API)
 mod choropleth; // 過去災害のコロプレス(市区町村を記録の多さで塗り分ける層の組み立て)
 mod mesh; // JIS X 0410 地域メッシュ(プロットデータのキャッシュ単位)
 mod population; // 500mメッシュ別推計人口(国土数値情報)。都道府県単位の静的ファイル
@@ -245,12 +242,10 @@ fn attach_route(spec: &mut OverlaySpec, a: &Args) -> Result<Option<String>, Stri
     Ok(Some(summary))
 }
 
-// blends は地図の上へアルファ合成する半透明レイヤ群 (層, 濃さ) で、**配列の順序がそのまま
-// 重ね順**(先頭が最背面)。呼び出し側は [コロプレス, 人口, 雨雲] を渡す(雨は今の話・災害履歴と
-// 人口は土地の話なので、今の情報が上に来る)。
-// braille/edge はドットしか無くアルファ合成では読めないので使わない(呼び出し側が OverlayLayer
-// へインクとして焼いてから ov に入れて渡す)。classify では recolor() の「後」に合成する:
-// 先に混ぜると classify() が淡い青の降水を Cat::Water(湖)と誤判定して雨が湖に化ける。
+// blends は地図の上へアルファ合成する半透明レイヤ群 (層, 濃さ) で、**配列の順序がそのまま重ね順**
+// (先頭が最背面)。呼び出し側は [コロプレス, 人口, 雨雲] を渡す(今の話である雨を上にする)。braille/edge は
+// アルファ合成では読めないので使わない(呼び出し側がインクとして焼いて ov で渡す)。classify では
+// recolor() の「後」に合成する(先に混ぜると淡い青の降水を classify() が Cat::Water(湖)と誤判定する)。
 fn render(img: &RgbImage, a: &Args, ov: Option<&OverlayLayer>, blends: &[(&RgbaImage, f64)]) -> String {
     let th = a.threshold.unwrap_or(if a.edge { 45 } else { 195 });
     let truecolor = truecolor_safe();
@@ -378,8 +373,7 @@ fn wander_route(origin: (f64, f64), dist_km: f64, shape: &str) -> Result<Vec<(f6
     let mut rng = rng_seed();
     let k = ((dist_km / 20.0).round() as usize).clamp(2, 6);
     // 隣接waypointがほぼ同一地点(≒100m未満)だとBRouterがルーティングできず、ルート線が
-    // 描画されないまま点だけプロットされる(#27の非同期化前から潜んでいた既存バグ)。
-    // 始点との重複/選択済み点同士の重複をここで弾く。
+    // 描画されないまま点だけプロットされる。始点との重複/選択済み点同士の重複をここで弾く。
     const MIN_SEP_DEG: f64 = 0.001; // 緯度経度で約111m
     let near = |a: (f64, f64), b: (f64, f64)| (a.0 - b.0).abs() < MIN_SEP_DEG && (a.1 - b.1).abs() < MIN_SEP_DEG;
     let mut wps = vec![origin];

@@ -139,10 +139,9 @@ pub fn render_braille(img: &RgbImage, mono: bool, classify_on: bool, threshold: 
 }
 
 // ---- QRコード画像描画 ----
-// dark[y*width+x] (true=QRの黒モジュール) の正方格子を、1モジュール=module_px四方のソリッド正方形
-// として実ピクセル画像に焼く(qrcodeクレートに依存しない純関数)。文字セル密度の制約を受けないため、
-// iTerm2等のインライン画像で表示すれば、セル数(見た目の大きさ)をモジュール数と切り離して自由に
-// 小さくできる。quiet_modulesはQR仕様の静穏領域(四辺に確保、既定4モジュール)。
+// dark[y*width+x] (true=QRの黒モジュール) の正方格子を、1モジュール=module_px四方の正方形として画像に焼く
+// (qrcodeクレートに依存しない純関数)。インライン画像で出せば文字セルの密度に縛られず、見た目の大きさを
+// モジュール数と切り離して小さくできる。quiet_modulesはQR仕様の静穏領域(四辺に確保、既定4モジュール)。
 pub fn render_qr_image(dark: &[bool], width: usize, module_px: u32, quiet_modules: u32) -> RgbImage {
     let side_mod = width as u32 + quiet_modules * 2;
     let side_px = (side_mod * module_px).max(1);
@@ -179,17 +178,10 @@ fn poi_color(c: PoiCat) -> [u8; 3] {
 pub struct Poi { pub lat: f64, pub lon: f64, pub cat: PoiCat }
 pub struct Route { pub pts: Vec<(f64, f64)>, pub color: [u8; 3], pub thickness: u32 }
 pub struct Ring { pub lat: f64, pub lon: f64, pub radii_km: Vec<f64>, pub color: [u8; 3], pub thickness: u32 }
-// roads は道路名検索(r)で追加した道路の「塊」を保持する別レイヤ。routes(BRouterルート)とは
-// 独立で、trigger_route の routes.clear() では消えない。個別追加・個別削除できる。
-// traffic_segments は渋滞状況の色分け(#渋滞情報)用の別レイヤ。routes[0]と同じ経路を区間ごとに
-// 塗り直した色付きの線を保持する(routesの中身自体は差し替えない)。GPX保存・標高表示・
-// 次の曲がり案内は routes.last() を「ルート全体」として参照しているため、そちらを壊さないよう
-// 独立フィールドにしている。
-// expressway_segments は高速道路を通る区間(#高速区間)用の別レイヤ。routes[0]と同じ経路のうち
-// 高速の部分だけを緑で上塗りする。traffic_segments と同じ理由で独立フィールドにしている。
-// warning_segments は気象警報(#79・ルートベース)用の別レイヤ。ルートのうち、警報が
-// 有効なclass10s領域を通る区間だけをseverityの色で上塗りする。他の*_segmentsと同じ理由で
-// 独立フィールドにしている。
+// roads は道路名検索(r)で追加した道路の「塊」で、routes(BRouterルート)とは独立(trigger_route の
+// routes.clear() では消えない)。traffic_segments は渋滞の色分け、expressway_segments は高速区間(緑)、
+// warning_segments は警報が有効なclass10s領域を通る区間(severityの色)の上塗り。GPX保存・標高表示・次の
+// 曲がり案内が routes.last() を「ルート全体」として参照するので、routes は差し替えず独立フィールドで持つ。
 pub struct OverlaySpec { pub pois: Vec<Poi>, pub routes: Vec<Route>, pub expressway_segments: Vec<Route>, pub roads: Vec<Route>, pub traffic_segments: Vec<Route>, pub warning_segments: Vec<Route>, pub rings: Vec<Ring>, pub spots: Vec<(f64, f64, [u8; 3], u8)> }
 impl OverlaySpec {
     pub fn is_empty(&self) -> bool { self.pois.is_empty() && self.routes.is_empty() && self.expressway_segments.is_empty() && self.roads.is_empty() && self.traffic_segments.is_empty() && self.warning_segments.is_empty() && self.rings.is_empty() && self.spots.is_empty() }
@@ -305,7 +297,7 @@ pub fn build_overlay(spec: &OverlaySpec, cx: f64, cy: f64, z: u32, win_w: u32, w
         let pts: Vec<(i32, i32)> = tr.pts.iter().map(|&(la, lo)| to_img(la, lo)).collect();
         draw_polyline(&mut ov, &pts, tr.color, tr.thickness);
     }
-    for wr in &spec.warning_segments { // 気象警報(#79・最前面。ルート上の全上塗りより優先して目立たせる)
+    for wr in &spec.warning_segments { // 気象警報(最前面。ルート上の全上塗りより優先して目立たせる)
         let pts: Vec<(i32, i32)> = wr.pts.iter().map(|&(la, lo)| to_img(la, lo)).collect();
         draw_polyline(&mut ov, &pts, wr.color, wr.thickness);
     }
@@ -418,15 +410,10 @@ const RADAR_INK_MIN_ALPHA: u8 = 32;
 // 1.0 で全塗りになる(設計 §7.3 の 薄い/標準/濃い をそのまま密度で表現できる)。
 const BAYER4: [[u8; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
 
-// braille/edge 用。値のある領域を OverlayLayer の「インク」として置く。
-// これらのモードは「ドットが立つか立たないか」しかなく背景色の概念が無いため、アルファ合成では
-// 降水として読めない(braille)/降水の境界が全部輪郭になって線画が壊れる(edge)。
-// alpha が min_alpha 以上の画素のみ対象。さらに density(0.0..=1.0)でディザ間引きして
-// スクリーンドア状に下の地図を透かす(全画素塗ると不透明インクなので地図が完全に隠れる)。
-// 間引きの密度は画素のアルファで変調する。雨雲はアルファが0か255の2値なので従来と同じ挙動に
-// なるが、人口メッシュは階級ごとにアルファが違う(薄い階級=まばら)ので、その濃淡が
-// braille でもドットの密度として読めるようになる(設計 §7.3)。
-// インクの色はレイヤの色(雨雲なら降水強度の気象庁配色)をそのまま使うので、色でも強弱が読める。
+// braille/edge 用。値のある画素を OverlayLayer のインクとして置く(ドットの有無しか無いので、アルファ合成
+// すると braille は降水として読めず、edge は降水の境界が全部輪郭になる)。alpha が min_alpha 以上の画素を
+// density でディザ間引きして下の地図を透かす。密度は画素のアルファで変調し、人口メッシュの階級の濃淡も
+// ドットの密度として読めるようにする(設計 §7.3)。色はレイヤの色をそのまま使うので、色でも強弱が読める。
 pub fn ink_radar_into_overlay(ov: &mut OverlayLayer, layer: &RgbaImage, min_alpha: u8, density: f64) {
     let d = density.clamp(0.0, 1.0);
     if d <= 0.0 { return; }
@@ -448,14 +435,10 @@ pub fn ink_radar_into_overlay(ov: &mut OverlayLayer, layer: &RgbaImage, min_alph
 // 疎な点描でインクを置くときの「不透明」の下限。完全透明(何も無い)だけを弾く。
 const STIPPLE_MIN_ALPHA: u8 = 1;
 
-// 層のアルファ(コロプレスなら件数の5段)を点描の間隔へ落とす。base が最も濃い階級の間隔で、
-// 薄い階級ほど広げる(設計 docs/disaster-choropleth-wide-zoom-design.md §3.2)。
-//
-// 5段(70/120/170/215/255)をそのまま5種類の間隔にはしない。**braille の1セルは横2×縦4画素**
-// なので、間隔の差が2画素未満だと見た目が変わらない。密(base)/中(base×1.5)/疎(base×2・base×3)
-// の3〜4段へ丸めた方が、実際に読める差になる。
-// 判定は段の中間値(95/145/193/235)で切る。縁取り(choropleth の OUTLINE_ALPHA=210)は
-// 最も濃い側に入るので、薄い区域の中でも間引かれずに輪郭として残る。
+// 層のアルファ(コロプレスなら件数の5段)を点描の間隔へ落とす。base が最も濃い階級の間隔で、薄い階級ほど
+// 広げる(設計 docs/disaster-choropleth-wide-zoom-design.md §3.2)。**braille の1セルは横2×縦4画素**で、
+// 間隔の差が2画素未満だと見た目が変わらないので、5段を密/中/疎の3〜4段へ丸める。縁取り(choropleth の
+// OUTLINE_ALPHA=210)は最も濃い側に入るので、薄い区域の中でも間引かれずに輪郭として残る。
 fn stipple_spacing_for(alpha: u8, base: u32) -> u32 {
     let b = base.max(1);
     match alpha {
@@ -466,23 +449,10 @@ fn stipple_spacing_for(alpha: u8, base: u32) -> u32 {
     }
 }
 
-// braille/edge へ「大きな面」を乗せるための疎な点描。ブロックごとに1点だけ置く。
-//
-// **面塗りに BAYER4 のディザ(ink_radar_into_overlay)をそのまま使ってはいけない**。
-// render_braille は「そのセル(2x4画素)にオーバーレイのインクが1つでもあれば、セル全体の文字色を
-// インク色にする」実装(`else if ovn > 0` の分岐が地図側の色を捨てる)で、BAYER4 は4x4周期なので
-// braille の1セルはそのタイルのちょうど半分を覆う。最も薄い density=0.35 でも、どの位相でも
-// 必ず3画素にインクが乗る = 全セルが塗り色に化ける。雨雲は降っている場所だけなので実害が無いが、
-// 市区町村の塗りは画面の大半を覆うため線画が丸ごと単色になってしまう。
-//
-// ブロックの大きさを固定にせず、そのブロックで最も濃いアルファから決めるのが「階級対応」の要点。
-// 固定間隔だと **アルファの値がまったく効かず、件数の情報が落ちて色相しか残らない**
-// (実データの9割近くが風水害なので、画面全体が同じ密度の青い粒になる)。
-// 間隔ごとに1周ずつ回し、そのブロックの階級が自分の間隔と一致するときだけ点を置く。
-// 1つのブロックはただ1つの階級に属するので、同じ場所へ二重に置かれることはない。
-//
-// ブロック内で最初に見つかった不透明画素の位置へ置く(ブロックの原点を固定で見ない)のは、
-// 面だけでなく1px幅の縁取りも点として残すため。原点固定だと縁取りがほぼ全部間引かれて消える。
+// braille/edge へ「大きな面」を乗せる疎な点描。**面塗りに BAYER4 のディザは使えない**(render_braille は
+// インクが1つでもあるセルを丸ごとインク色にするので、面が全部塗り色に化ける)。間隔はブロック内で最も
+// 濃いアルファの階級で決め(固定だと件数の情報が落ちる)、間隔ごとに1周回して階級が一致するブロックに1点だけ
+// 置く(1ブロックは1階級なので二重に置かない)。位置は最初の不透明画素にする(1px幅の縁取りを残すため)。
 pub fn stipple_rgba_into_overlay_graded(ov: &mut OverlayLayer, layer: &RgbaImage, base: u32) {
     let b = base.max(1); // 0 を渡されても 1 側へ倒す。0除算・無限ループを作らない
     let (lw, lh) = layer.dimensions();
@@ -545,13 +515,10 @@ fn rings_px_bbox(rings: &[Vec<(i32, i32)>]) -> Option<(i32, i32, i32, i32)> {
     seen.then_some(b)
 }
 
-// 画面座標のリング列(外周+穴+離島)を even-odd 規則で塗る。リングは閉じている必要はない
-// (末尾と先頭を暗黙に結ぶ)。外接矩形と画像の重なりだけを走査するので、画面外のポリゴンは即座に返る。
-//
-// even-odd を選ぶのは、穴(飛地に囲まれた区域)と多重ポリゴン(離島)を1回の走査で同時に処理
-// できるから。外周と穴を区別して持つ必要がなく、GeoJSON の Polygon/MultiPolygon のリングを
-// 全部同じ配列に並べるだけで正しく塗れる(class20s はリングの巻き方向が不統一なので、
-// 向きに依存する nonzero winding は使えない)。
+// 画面座標のリング列(外周+穴+離島)を even-odd 規則で塗る。リングは閉じている必要はない(末尾と先頭を
+// 暗黙に結ぶ)。外接矩形と画像の重なりだけを走査するので、画面外のポリゴンは即座に返る。even-odd なら
+// 外周と穴を区別せず全リングを同じ配列に並べるだけで、穴も離島も1回の走査で塗れる(class20s は巻き方向が
+// 不統一なので、向きに依存する nonzero winding は使えない)。
 pub fn fill_rings_rgba(img: &mut RgbaImage, rings: &[Vec<(i32, i32)>], color: [u8; 4]) {
     let (w, h) = img.dimensions();
     if w == 0 || h == 0 { return; }
@@ -638,11 +605,10 @@ pub fn image_capable() -> bool {
     std::env::var_os("ITERM_SESSION_ID").is_some()
 }
 
-// halfblock/braille描画(1文字ごとにtruecolorのSGRを2〜3個発行する高密度な出力)を、24bit色の
-// まま出しても安定して描画できるか。macOS標準Terminal.app(TERM_PROGRAM=Apple_Terminal)は
-// COLORTERM=truecolorを名乗るが、実際にはこの密度のtruecolorシーケンスを捌ききれず、色の
-// 状態を見失って帯状に色がにじむ表示崩れを起こすことを確認済み(termmap/aquaterm両方で再現)。
-// 個別に除外し、それ以外はCOLORTERM=truecolor/24bitの申告を信用する(不明な端末は256色側)。
+// halfblock/braille描画(1文字ごとにtruecolorのSGRを2〜3個発行する高密度な出力)を24bit色のまま出しても
+// 安定して描画できるか。macOS標準Terminal.app(TERM_PROGRAM=Apple_Terminal)はCOLORTERM=truecolorを名乗るが、
+// この密度だと色の状態を見失って帯状ににじむので個別に除外し、それ以外はCOLORTERM=truecolor/24bitの
+// 申告を信用する(不明な端末は256色側)。
 pub fn truecolor_safe() -> bool {
     if std::env::var("TERM_PROGRAM").ok().as_deref() == Some("Apple_Terminal") { return false; }
     matches!(std::env::var("COLORTERM").ok().as_deref(), Some("truecolor") | Some("24bit"))
@@ -807,11 +773,9 @@ mod tests {
         let layer = RgbaImage::from_pixel(4, 4, image::Rgba([0, 65, 255, 31]));
         ink_radar_into_overlay(&mut ov, &layer, 32, 1.0);
         assert_eq!(ink_count(&ov), 0);
-        // 閾値ちょうどは対象(「min_alpha 以上」)。
-        // アルファ変調(設計 §7.3)を入れたので、閾値ぎりぎりのアルファ32では density=1.0 でも
-        // 全塗り(16)にはならず、まばらに置かれる。ここで見たいのは「置くか置かないか」の
-        // 境界なので、点数そのものではなく 0 でないことを見る。
-        // (全塗りになることは ink_density_bounds が全画素アルファ255で押さえている)
+        // 閾値ちょうどは対象(「min_alpha 以上」)。アルファ変調(設計 §7.3)があるので、アルファ32では
+        // density=1.0 でも全塗り(16)にならない。見たいのは置くか置かないかの境界なので 0 でないことを見る
+        // (全塗りになることは ink_density_bounds が全画素アルファ255で押さえている)。
         let mut ov2 = OverlayLayer::new(4, 4);
         let layer2 = RgbaImage::from_pixel(4, 4, image::Rgba([0, 65, 255, 32]));
         ink_radar_into_overlay(&mut ov2, &layer2, 32, 1.0);
@@ -908,7 +872,7 @@ mod tests {
         assert_eq!(ink_count(&ov3), 0);
     }
 
-    // 高速区間(#高速区間)はルート本体の上・渋滞の色分けの下に描く。高速区間が渋滞していれば
+    // 高速区間はルート本体の上・渋滞の色分けの下に描く。高速区間が渋滞していれば
     // 渋滞の色が上に乗る(今の混み具合の方が優先度が高い)。
     #[test]
     fn build_overlay_draws_expressway_over_route_and_under_traffic() {

@@ -1,68 +1,26 @@
 /* termmap タッチ操作オーバーレイ
  *
- * ttyd(xterm.js)のページへ後付けして、キーボードの無い端末(iPhone等)から
- * termmap を操作できるようにする。ttyd の既定ページの body 終了タグ直前へ
- * script 要素として埋め込まれる前提(scripts/build-web-index.sh が生成する)。
+ * ttyd(xterm.js)のページへ後付けし、キーボードの無い端末(iPhone等)から termmap を操作できるようにする。
+ * ttyd 既定ページの body 終了タグ直前へ埋め込まれる前提(scripts/build-web-index.sh が生成する)。
  *
- * termmap 本体(Rust)には一切手を入れない。ここでやることは
- * 「タッチ操作 → xterm.js が理解するキーイベント」の変換だけで、
- * その先(xterm.js → ttyd → WebSocket → pty → termmap)は既存経路をそのまま使う。
+ * KEYS の mode はキーの送出経路を表す(ttyd 1.7.7 同梱の xterm.js を読んで確認した挙動):
+ *   'down'  … keydown だけで送られる。矢印/Enter/Esc は keyCode の switch で、'+' '-' '<' '>' '?' は
+ *             keyCode >= 48 の1文字として既定の分岐で解決する。keypress も送ると二重入力になる。
+ *   'press' … keypress でしか送られない。keydown は大文字 A-Z を送らずに返し、空白(keyCode 32)は
+ *             どの分岐にも当たらないので、charCode 付きの keypress で送る。
+ * 同梱版は ev.isTrusted を検査しないので、合成したイベントも実キー入力と同じ経路に乗る。
  *
- * ── xterm.js のキー処理をどう通すか(ttyd 1.7.7 同梱版のコードを実際に読んで確認した) ──
- *
- * xterm.js は隠し要素 .xterm-helper-textarea に keydown / keypress を張っている。
- * keydown 側(_keyDown → evaluateKeyboardEvent)の挙動は次の通り:
- *
- *   1. switch(ev.keyCode) に case 13(Enter) / 27(Esc) / 37-40(矢印) がある
- *      → ここで解決したキーは keydown の中で端末へ送られる。
- *   2. 上記に当たらない文字キーは既定の分岐
- *        ev.key && !ctrl && !alt && !meta && ev.keyCode >= 48 && ev.key.length === 1
- *      でのみ解決される。
- *   3. ただし _keyDown の戻り値で
- *        ev.key が A-Z(charCode 65..90)の1文字なら「送らずに true を返す」
- *      という分岐があり、大文字はここで keydown からは送られない。
- *   4. keydown で解決できなかったものは keypress(_keyPress)側が
- *      ev.charCode / ev.which を見て String.fromCharCode() して送る。
- *
- * この結果、送出経路はキーごとに次のように分かれる。KEYS の mode はこれを表す:
- *
- *   mode:'down'  … keydown だけで送られる
- *                  矢印(37-40) / Enter(13) / Escape(27) は 1. で解決。
- *                  '+' '-' '<' '>' '?' は keyCode が 187/189/188/190/191 で
- *                  いずれも >= 48 のため 2. で解決し、A-Z ではないので 3. に
- *                  引っかからずそのまま送られる。
- *                  → keypress を足すと二重入力になるので送らない。
- *
- *   mode:'press' … keypress でしか送られない
- *                  'C' は大文字なので 3. に該当して keydown からは出ない。
- *                  ' '(空白)は keyCode 32 で、case 32 が無く 2. の keyCode >= 48 も
- *                  満たさないため keydown では未解決のまま落ちる。
- *                  → この2つは keypress(charCode 付き)で送る必要がある。
- *
- * なお ttyd 1.7.7 同梱の xterm.js には ev.isTrusted の検査が一切無いため、
- * スクリプトから合成したイベントでも実キー入力と同じ経路に乗る(確認済み)。
- *
- * ── フォーカスについて ──
- * 「.xterm-helper-textarea を focus してから発火する」方式は採らない。
- * iOS はユーザー操作起因で文字入力欄に focus が当たるとソフトキーボードを
- * せり上げるため、キーボード無しで使うという本来の目的と真正面からぶつかる。
- * イベントリスナは textarea 自身に張られているので、focus していなくても
- * dispatchEvent すれば発火する(送信経路 triggerDataEvent は focus 非依存)。
- * 副作用としてカーソルが非フォーカス表示(中抜き)になるが実害は無い。
+ * .xterm-helper-textarea は focus しない(iOS はソフトキーボードをせり上げてしまう)。リスナは textarea
+ * 自身に張られているので、focus しなくても dispatchEvent で発火する(カーソルが中抜き表示になるだけ)。
  */
 (function () {
   'use strict';
 
   if (window.__termmapTouch) { return; } // 二重読み込み防止
 
-  // 1.5.0: 端末セル比(CELL マーカー)の通知を追加。実写/道路カメラ写真が縦長端末で
-  //        歪む件の対策(docs/web-image-aspect-ratio-design.md §7.2 の経路2)。
-  // 1.6.0: パンの滑らかさ対策(docs/web-pan-smoothness-design.md §7 Step2)。
-  //        term.write を包んで未処理バイト数を数え、詰まっている間はパン量を送らない背圧
-  //        (対策D §5.4)。フラッシュと慣性を setTimeout から requestAnimationFrame へ移し、
-  //        慣性の減衰を経過時間ベースにした。ビューポート寸法をキャッシュして touchmove 中の
-  //        同期レイアウトをやめ、ドラッグ開始のスロップ分を送らないようにした(対策F §5.6)。
-  //        実機計測用に __termmapTouch.stats() を追加(§10)。
+  // 1.5.0: 端末セル比(CELL マーカー)の通知を追加(docs/web-image-aspect-ratio-design.md §7.2 の経路2)。
+  // 1.6.0: パンの滑らかさ対策(docs/web-pan-smoothness-design.md §7 Step2)。背圧・フラッシュと慣性の
+  //        rAF 化・ビューポート寸法のキャッシュ・開始スロップの破棄、実機計測用の stats() を追加。
   var OVERLAY_VERSION = '1.6.0';
 
   // ── 調整パラメータ ───────────────────────────────────────────────
@@ -88,21 +46,17 @@
   var CELL_SIZE_PROBE_MAX_TRIES = 40;     // 約20秒
   var CELL_SIZE_SETTLE_MS = 250;          // 回転/リサイズ後、fit addon が cols/rows を決め直すのを待つ時間
   var PINCH_PX_PER_STEP = 55;  // ピンチ: 指の間隔が何 px 変わるごとにズーム1段か(誤爆軽減でパンより粗め)
-  // touchmove/慣性の1tickで送るキーの上限(暴走防止の保険)。速いスワイプほど1回の
-  // touchmoveあたりの移動量(dx/dy)が大きくなるので、ここを大きめにしておかないと
-  // 「速く払っても遅く払っても同じ」に頭打ちされ、スピード感が出ない。
-  // 効くのはキーを送る経路(ピンチ・'c'軸・フォールバック)だけ。'p'軸は通路Aで連続量を
-  // 送るようになったのでこの上限は掛からない(そもそも1回の送信で全量が伝わる)。
+  // touchmove/慣性の1tickで送るキーの上限(暴走防止の保険)。小さいと速いスワイプが頭打ちになって
+  // スピード感が出ないので大きめにしてある。効くのはキーを送る経路(ピンチ・'c'軸・フォールバック)
+  // だけで、'p'軸は通路Aで1回に全量を送るのでこの上限は掛からない。
   var MAX_STEPS_PER_TICK = 20;
   var STEP_INTERVAL_MS = 16;   // sendKeyBurst(ピンチの多段ジャンプ用)の連続発火間隔。termmap 側は
                                // 同方向220ms以内の連続入力でpan_streakが伸びて加速する(Rust側既存実装)
   var GLIDE_TICK_MS   = 60;    // requestAnimationFrame が使えない環境でのフォールバック tick 間隔
   var GLIDE_DECAY     = 0.75;  // GLIDE_DECAY_REF_MS ごとにこの倍率で速度を減衰させる(小さいほど早く止まる)
-  // 減衰率の基準時間。rAF 化(設計 §5.6)で1フレームの長さが端末任せ(60Hz なら 16.7ms・
-  // ProMotion なら 8.3ms・負荷時はもっと長い)になるため、減衰を tick 回数ベースから
-  // 経過時間ベース(v *= pow(GLIDE_DECAY, dt / GLIDE_DECAY_REF_MS))へ変えた。基準を rAF の
-  // 1フレームではなく従来の tick 間隔(60ms)にしてあるのは、減速カーブを従来と同じ体感に
-  // 保つため。ここを 16.7 にすると同じ GLIDE_DECAY でも約3.6倍速く止まる。
+  // 減衰率の基準時間。rAF(設計 §5.6)では1フレームの長さが端末任せなので、減衰は経過時間ベースで
+  // 掛ける(v *= pow(GLIDE_DECAY, dt / GLIDE_DECAY_REF_MS))。基準を従来の tick 間隔(60ms)にして
+  // 減速カーブの体感を保っている(16.7 にすると同じ GLIDE_DECAY でも約3.6倍速く止まる)。
   var GLIDE_DECAY_REF_MS = 60;
   var GLIDE_MIN_SPEED = 0.05;  // px/ms。これ未満まで減衰したら慣性を止める
   var GLIDE_MAX_MS    = 960;   // 保険の上限(だいたい1秒で必ず止まる。従来の 60ms×16tick 相当)
@@ -120,21 +74,14 @@
   // 設計 §5.4 の「1フレーム分の目安バイト数×2程度」。実機の stats() を見て詰める。
   var BACKPRESSURE_FRAMES = 2;
   // 背圧が連続してこの時間を超えたら、未処理バイト数の勘定が壊れているとみなして 0 へ戻す。
-  // outstanding は term.write の callback でしか減らないため、xterm.js が何らかの理由で
-  // callback を1回でも返さないと、その分がずっと残って背圧が二度と解けない
-  // (=スワイプしても地図が動かないままリロードするしかない)。実際にその状況を作ると
-  // 復帰しないことを確認したので、時間で必ず抜ける逃げ道を置く。詰まりが本物なら
-  // 次のフレームでまた背圧が掛かるだけなので、通常時の効き方は変わらない。
+  // outstanding は term.write の callback でしか減らず、callback が1回でも返らないと背圧が二度と
+  // 解けない(地図が動かなくなる)ため。詰まりが本物なら次のフレームでまた背圧が掛かるだけ。
   var BACKPRESSURE_STUCK_MS = 1500;
 
   // ── ドラッグの軸モード(termmap から OSC 9997 で通知される) ────────────────────
-  // X軸/Y軸それぞれが今どういう意味を持つかを1文字で表す(docs/web-touch-drag-design.md §3.2)。
-  //   'p' … pan。ビューポート(地図)が動く。極性を反転して、指と同じ向きに地図を流す。
-  //         移動量は通路A(パン量マーカー)で連続量として送る=指に1:1で追従する。
-  //   'c' … cursor。カーソル/値が動く。極性はそのままで矢印キーを送る
-  //         (指を下へ動かす→カーソルも下、が直感どおり。地図とは逆の極性になる)。
-  //   'n' … none。その軸の操作は無効。何も送らない。
-  // 初期値は地図(両軸パン)。通知が届く前でも地図では正しく動く。
+  // X軸/Y軸それぞれの意味を1文字で表す(docs/web-touch-drag-design.md §3.2)。'p'(pan)は地図を指と
+  // 同じ向きに流し(極性反転)、移動量を通路Aで連続量として送る。'c'(cursor)は極性そのままで矢印キーを
+  // 送る(指を下へ→カーソルも下)。'n'(none)は何も送らない。初期値は両軸パン(通知前も地図で正しく動く)。
   var dragAxes = { x: 'p', y: 'p' };
   // OSC 9997 を1回でも受け取ったか。受け取るまでは通路A(パン量マーカー)を使わず、
   // 従来のキー変換方式のまま動く。「新しい overlay + 古い termmap」の組み合わせで、
@@ -167,11 +114,9 @@
   };
 
   // ── サウンド(Rust側 termmap が鳴らすUI効果音を、ブラウザでも鳴らす) ──────────────
-  // termmap(src/sound.rs)はmacOSではCoreAudioでネイティブに鳴らすが、ブラウザ経由では
-  // 当然聞こえない。termmap側はsnd.play()のたびに無害なOSCエスケープシーケンス
-  // (ESC ] 9999 ; <名前> BEL)を常時stdoutへ書いており、これをxterm.jsのOSCハンドラで
-  // フックして同じ効果音をブラウザ側でも鳴らす。音源はRustが埋め込んでいるのと同じ
-  // WAVファイル(assets/sfx/*.wav)をbase64化したもの(6個・生データ計約64KB)。
+  // termmap(src/sound.rs)は snd.play() のたびに無害な OSC(ESC ] 9999 ; <名前> BEL)を stdout へ
+  // 書くので、xterm.js の OSC ハンドラで拾って同じ効果音をブラウザでも鳴らす。音源は Rust が
+  // 埋め込んでいるのと同じ WAV(assets/sfx/*.wav)を base64 化したもの。
   var SFX_DATA = {
     pop: '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',
     blip: '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',
@@ -189,17 +134,9 @@
   }
 
   // ── 出力の背圧と計測(設計 §5.4 対策D / §10 の計測窓)──────────────────────
-  // 端末のストリームには「古いフレームを捨てて最新だけ描く」という概念が無いので、
-  // ブラウザが遅れていても termmap が送ったフレームは全部順に描かれる。したがって
-  // 送り続けると「指を離した後も地図が動き続ける」状態になる(設計 §3.2)。
-  // xterm.js が処理し切れていないバイト数を数え、詰まっている間はパン量を送らずに
-  // panPending へ溜めたままにする。溜めた分は失われないので 1:1 は維持され、コマだけが落ちる。
-  //
-  // ttyd 1.7.7 同梱の xterm.js は write(data, callback) の callback を持ち、WriteBuffer が
-  // パース完了時に消化することを実物のバンドルで確認済み(設計 §11 のリスク項目)。
-  // ただし ttyd を更新して callback を持たない版になった場合に備え、callback が1度でも
-  // 呼ばれるまでは背圧を効かせない(writeCbSeen)。呼ばれないままなら outstanding は
-  // 統計値としてしか使われず、送信間隔は従来どおり rAF と最小間隔だけで決まる。
+  // 端末は古いフレームも全部順に描くので、送り続けると指を離した後も地図が動き続ける(設計 §3.2)。
+  // xterm.js が処理し切れていないバイト数を数え、詰まっている間はパン量を panPending に溜めて送らない。
+  // write の callback が無い版に備え、1度呼ばれるまで背圧は効かせない(writeCbSeen・設計 §11)。
   var outstanding = 0;      // term.write へ渡したが、まだパースし切れていないバイト数
   var writeCbSeen = false;  // write の callback が1度でも呼ばれたか(=背圧を信用してよいか)
   var byteWindow = [];      // 直近1秒に term.write へ来た { t, n }
@@ -272,16 +209,10 @@
     });
   }
 
-  // ルート音声案内(Rust側 voice.rs の speak_web)。OSC 9998 の payload は base64(UTF-8の日本語文)。
-  // Web Speech API で読み上げる。非対応環境(speechSynthesis無し等)は無害に無視する。
-  //
-  // iOS Safari等は「ユーザー操作のコールスタック外」からspeechSynthesis.speak()を初めて呼ぶと、
-  // キューに積まれるだけで実際には発声されない(無音)既知の制約がある。OSCハンドラ経由の呼び出しは
-  // タップの直接のコールスタックではないため、これに引っかかりうる。最初のタッチ/クリックのタイミングで
-  // 無音(volume=0)の発話を1回投げてロックを解いておく。
-  // iOS(Safari/Chrome/Firefox問わずWebKitベース。AppleのポリシーでiOS上の全ブラウザは
-  // WebKitエンジンを使う)かどうかの判定。iPadOSのSafariはUAでMacと偽装するため、
-  // タッチ対応(maxTouchPoints>1)のMacIntelもiPadとして扱う。
+  // ルート音声案内(Rust側 voice.rs の speak_web)。OSC 9998 の base64(UTF-8の日本語文)を
+  // Web Speech API で読み上げる。iOS Safari 等はユーザー操作の外で初めて speak() すると発声されない
+  // ので、最初のタッチ/クリックで無音の発話を1回投げてロックを解く。isIOS は iOS の判定(ブラウザは
+  // すべて WebKit)で、UA で Mac を名乗る iPadOS の Safari のためタッチ対応の MacIntel も含める。
   var isIOS = /iP(hone|ad|od)/.test(navigator.userAgent)
     || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 
@@ -296,7 +227,7 @@
     } catch (e) { /* 非対応環境は無視 */ }
   }
 
-  // 読み上げの声(#78)。日本語ボイスを確定してu.voiceへ明示指定する(#86対策候補F)。
+  // 読み上げの声。日本語ボイスを確定してu.voiceへ明示指定する。
   // getVoices()は初回に空配列を返す実装(iOS Safari含む)があるため、voiceschangedと
   // タイマーの両方で確定を試みる(bindSoundOsc/bindVoiceGuideOscと同じ粘り方)。
   var jaVoices = null;    // 確定済みのjaボイス配列(null=未確定)
@@ -350,7 +281,7 @@
     } catch (e) { /* 非対応環境は無視 */ }
   }
 
-  // #86の実機切り分け用診断入口。Safari Webインスペクタから叩く。
+  // 実機での切り分け用の診断入口。Safari Webインスペクタから叩く。
   function getVoiceInfo() {
     var toInfo = function (v) { return v && { name: v.name, lang: v.lang, localService: v.localService, default: v.default }; };
     var override = null;
@@ -420,7 +351,7 @@
   }
 
   // 効果音(9999)・音声案内(9998)の bind は数回試して諦める作りだが、こちらは諦めると
-  // #87 の追従改善が丸ごと無効(常に従来のキー変換)になり、しかも見た目は「前と同じ」で
+  // 追従改善が丸ごと無効(常に従来のキー変換)になり、しかも見た目は「前と同じ」で
   // 気づけない。回線やマシンが遅くて window.term の出現が 1.5 秒に間に合わない場合に
   // 備え、束縛できるまで一定間隔で粘る(上限つき)。
   function bindDragModeOsc() {
@@ -445,11 +376,9 @@
     timer = setInterval(attempt, OSC_BIND_INTERVAL_MS);
   }
 
-  // termmapの実画像モード(iTerm2インラインイメージ・OSC 1337)をブラウザでも描画する。
-  // ttyd同梱のxterm.jsには本家 @xterm/addon-image のコード自体は入っているが、ttyd側の
-  // 初期化スクリプトがloadAddon()していないため何もしない状態だった。web/vendor/配下に
-  // 同じ公式アドオンを別途vendorし(build-web-index.shがtouch-overlay.jsより前に埋め込む)、
-  // こちらから明示的にロードする。sixelはtermmapが使わないので無効化しておく。
+  // termmapの実画像モード(iTerm2インラインイメージ・OSC 1337)をブラウザでも描画する。ttyd の初期化は
+  // @xterm/addon-image を loadAddon() しないので、web/vendor/ の同じ公式アドオン(build-web-index.sh が
+  // このファイルより前に埋め込む)をここでロードする。sixel は termmap が使わないので無効にする。
   function bindImageAddon() {
     [0, 100, 300, 700, 1500].forEach(function (ms) {
       setTimeout(function () {
@@ -479,23 +408,17 @@
   }
 
   // ── ライブ現在地(ブラウザのGeolocation APIをtermmapへ送る) ──────────────────────
-  // termmap側の G キーは Mac 本体の CoreLocationCLI しか読めず、Web からアクセスしている
-  // スマホの位置は取れない。window.term.paste() で SOH()区切りの専用マーカーを
-  // 「貼り付け」として送り、termmap 側の Event::Paste ハンドラで検出・解釈させる
-  // (bracketed paste モードなので任意の制御文字を含んでいても1つのテキストとして届く。
-  // 通常のペースト内容とは衝突しない制御文字を区切りに選んでいる)。GキーのCoreLocationCLI
-  // 経路とは完全に独立しており、送るだけならこちらの操作でMac側のGPSは一切起動しない。
+  // G キーは Mac 本体の CoreLocationCLI しか読めないので、スマホの位置は専用マーカーとして
+  // window.term.paste() で送り、termmap 側の Event::Paste ハンドラで解釈させる。区切りの SOH は通常の
+  // ペーストと衝突せず、bracketed paste なので1つのテキストとして届く。Mac 側の GPS は起動しない。
   var GPS_WATCH_ID = null;
   var GPS_MIN_INTERVAL_MS = 3000; // 送信間隔の下限(pty/描画を圧迫しないよう間引く)
   var gpsLastSentAt = 0;
 
-  // bracketed paste が有効かどうか。無効のまま term.paste() すると、xterm.js は
-  // ESC[200~ で包まずテキストをそのまま pty へ流す(同梱版の paste 実装で確認)。
-  // するとマーカーの制御文字が「生のキー入力」として termmap に解釈され、
-  // DRAGMODE? が Ctrl-A(住所取得のブロッキングHTTP)・A(ルート再生)・
-  // ?(ヘルプ)等の誤発火になる。termmap は起動時に EnableBracketedPaste を出すので、
-  // これが立つまでは「termmap がまだ起動しきっていない」とみなして送らない。
-  // modes を持たない実装では判定できないので、その場合は従来どおり送る。
+  // bracketed paste が有効か。無効のまま term.paste() すると xterm.js は ESC[200~ で包まず pty へ
+  // 流すので、マーカーが生のキー入力になり SOH+DRAGMODE?+SOH が Ctrl-A(住所取得のブロッキングHTTP)・
+  // A(ルート再生)・?(ヘルプ)等の誤発火になる。termmap は起動時に EnableBracketedPaste を出すので、
+  // 立つまでは送らない。modes を持たない実装では判定できないので従来どおり送る。
   function bracketedPasteReady() {
     var t = window.term;
     if (!t) { return false; }
@@ -556,25 +479,18 @@
   }
 
   // ── パン量の転送(通路A: ブラウザ → termmap) ──────────────────────────────────
-  // 'p' 軸のドラッグは矢印キーに量子化せず、指の移動量を「端末ビューポートの幅/高さで
-  // 割った比」として専用マーカーで送る。termmap 側(src/dragmode.rs::pan_ratio_to_px)が
-  // 地図領域の出力ピクセルへ換算するので、指が画面の1/4を横切れば地図も表示範囲の1/4動く。
-  // 比で送るのは、xterm.js の内部APIからセル寸法を取りに行かずに済み、DPR・フォントサイズ・
-  // 画面回転に影響されないため。符号は指の移動方向そのもの(右/下が正)で、反転は termmap 側。
+  // 'p' 軸のドラッグは量子化せず、指の移動量を端末ビューポートの幅/高さに対する比で送る(地図の
+  // ピクセルへの換算は src/dragmode.rs::pan_ratio_to_px)。比にするのはセル寸法を内部APIで取らずに済み、
+  // DPR・フォントサイズ・画面回転に左右されないため。符号は指の向き(右/下が正)で、反転は termmap 側。
   var panPending = { x: 0, y: 0 }; // まだ送っていない移動量[CSS px](間引き分・丸めの端数)
   var panLastSentAt = 0;
   var panFlushTimer = null;
   var panFlushRaf = null;
 
-  // 比の分母になる寸法。回転やURLバーの伸縮で変わるが、フラッシュのたびに
-  // getBoundingClientRect() を呼ぶと touchmove 中に毎回同期レイアウトが走る(設計 §3.5)。
-  // 一度取れた値をキャッシュし、寸法が変わり得るイベント(resize / orientationchange /
-  // タブ復帰)でだけ捨てる。
-  // 分母は「実際に cols×rows のセルが占めている矩形」でなければならない。
-  // #terminal-container の矩形には、fit addon が切り捨てた1セル未満の余り・padding・
-  // スクロールバー幅が含まれるぶん余分があり、そのまま使うと比が小さく出て地図が指より
-  // わずかに遅れる。.xterm-screen は幅=cols*cellWidth・高さ=rows*cellHeight に一致するので
-  // そちらを優先し、取れない場合だけコンテナへフォールバックする。
+  // 比の分母になる寸法。フラッシュのたびに getBoundingClientRect() を呼ぶと touchmove 中に毎回同期
+  // レイアウトが走る(設計 §3.5)ので、キャッシュして resize / orientationchange / タブ復帰でだけ捨てる。
+  // #terminal-container は1セル未満の余り・padding・スクロールバー幅を含み、比が小さく出て地図が指より
+  // 遅れるので、cols×rows のセルに一致する .xterm-screen を優先し、取れないときだけコンテナを使う。
   var viewportCache = null;
   function terminalViewportSize() {
     if (viewportCache) { return viewportCache; }
@@ -658,17 +574,10 @@
     panFlushRaf = null;
   }
 
-  // 軸モードの再送要求(設計書 §5.3)。ページを再読み込みすると JS 側の状態は消えるが、
-  // termmap 側の Focus は変わらないので OSC 9997 が飛んでこない。
-  //
-  // 初期化時(force=false): 受け取れるまで粘る。termmap の最初のフレームが OSC ハンドラの
-  //   登録より前だと取りこぼし、そのままでは従来のキー変換方式に固定されてしまうため。
-  //   bracketed paste が有効になるまでは sendMarkerPaste 側で握り潰されるので、その間の
-  //   試行は空振りする。空振り前提で間隔を空けて繰り返す。
-  // 復帰時(force=true): 一度でも軸モードを受け取れている相手("DRAGMODE? を解釈できる
-  //   termmap"と確認済み)のときだけ送る。未確認の相手へ送ると、このマーカーを知らない
-  //   古い termmap では通常のペーストとして扱われ、検索欄への文字入力や、設定画面の
-  //   APIキー行(貼り付けで即保存される)の上書きになるため。
+  // 軸モードの再送要求(設計書 §5.3)。再読み込みで JS 側の状態が消えても termmap 側の Focus は変わらず、
+  // OSC 9997 が来ないため。初期化時(force=false)は、取りこぼすと従来のキー変換に固定されるので
+  // 受け取れるまで粘る(bracketed paste が有効になるまでは空振りする)。復帰時(force=true)は軸モードを
+  // 受け取れた相手にだけ送る(古い termmap ではただのペーストになり、APIキー行等を上書きしうるため)。
   var dragModeProbeTimer = null;
   function requestDragMode(force) {
     if (force) {
@@ -689,14 +598,10 @@
   }
 
   // ── 端末セル比の通知(通路A: ブラウザ → termmap) ────────────────────────────
-  // 実画像モードの写真(実写/道路ライブカメラ)は、termmap 側が「1セルの縦横比」を知らないと
-  // 端末の形へ歪めずに収められない(docs/web-image-aspect-ratio-design.md §7.2)。ttyd は pty の
-  // ws_xpixel/ws_ypixel を埋めないため、termmap はネイティブ端末のように window_size() から
-  // 比を取れない。ここで .xterm-screen の実寸を term.cols/term.rows で割ってセル寸法を出し、
-  // 専用マーカー(SOH + "CELL" + SOH + cw + SOH + ch + SOH)で渡す。
-  //
-  // 内部APIの _renderService.dimensions は使わない(公開APIだけで足りる)。CSI 16 t の問い合わせを
-  // 使わないのは、xterm.js の応答が整数 CSS px へ丸められて比が最大7%ずれるため(設計書 §7.2)。
+  // 写真を歪めずに収めるには1セルの縦横比が要る(docs/web-image-aspect-ratio-design.md §7.2)が、
+  // ttyd は pty の ws_xpixel/ws_ypixel を埋めないので termmap 側では取れない。そこで .xterm-screen の
+  // 実寸を cols/rows で割ったセル寸法を専用マーカー(SOH + "CELL" + SOH + cw + SOH + ch + SOH)で渡す。
+  // CSI 16 t は応答が整数 CSS px に丸められて比が最大7%ずれるので使わない。
   var SOH = String.fromCharCode(1); // マーカーの区切り。他のマーカーは同じ文字をリテラルで埋めている
   var cellSizeLastSent = '';
   var cellSizeProbeTimer = null;
@@ -794,15 +699,10 @@
     return document.querySelector('.xterm-helper-textarea');
   }
 
-  // xterm.js の同梱コードを実際に読むと、_keyDown ハンドラは(特定の修飾キーを除く)
-  // ほぼ全てのキーで this.focus() → this.textarea.focus(...) を呼んでいる
-  // (カーソル/IME状態を合わせるための内部処理と見られる)。つまり sendKey() が合成の
-  // keydown を投げるたびに毎回 textarea が実フォーカスされ、iOS のソフトキーボードが
-  // せり上がってしまう(地図側のタッチ伝播を止めるだけでは防げない)。
-  // 対策: textarea 自身の focus() を、実フォーカスの代わりに合成 focus イベントを
-  // 発火するだけの関数に差し替える。xterm.js 側は addEventListener('focus', ...) で
-  // _isFocused 等の内部状態を更新しているだけなので、このイベントさえ受け取れれば
-  // 実際にDOMフォーカスを移さなくても内部状態は壊れない。1つのtextareaにつき1回だけ適用する。
+  // 同梱 xterm.js の _keyDown はほぼ全てのキーで textarea.focus() を呼ぶので、合成 keydown のたびに
+  // iOS のソフトキーボードがせり上がる(地図側のタッチ伝播を止めても防げない)。そこで textarea ごとに
+  // 1回、focus() を合成 focus イベントを出すだけの関数に差し替える。xterm.js は focus イベントで
+  // _isFocused 等を更新するだけなので、実際に DOM フォーカスを移さなくても内部状態は壊れない。
   var FOCUS_PATCHED = '__termmapFocusPatched';
   function neutralizeFocus(ta) {
     if (!ta || ta[FOCUS_PATCHED]) { return; }
@@ -811,11 +711,9 @@
     ta.focus = function () { ta.dispatchEvent(new Event('focus')); };
   }
 
-  // 住所検索(`/`)やスポット名の入力等、文字入力がしたい時だけ本物のフォーカスを呼ぶボタン用。
-  // sendKey() 経由の合成keydownでは無効化した focus() を、ここでは意図的に本物のまま呼び出す
-  // (ユーザーの実タップの中で同期的に呼ぶので、iOSのソフトキーボードは正常にせり上がる)。
-  // 既にソフトキーボードが出ている(=textareaが本当にフォーカスされている)時は逆に blur() で
-  // 閉じる、というトグル動作にする。blur() は上書きしていないので本物のまま効く。
+  // 住所検索(`/`)やスポット名の入力等、文字入力がしたい時だけ本物の focus() を呼ぶボタン用。
+  // 実タップの中で同期的に呼ぶので iOS のソフトキーボードは正常にせり上がる。既にフォーカスされて
+  // いれば blur() で閉じるトグル動作(blur() は上書きしていないので本物のまま効く)。
   function toggleKeyboard() {
     var ta = findTextarea();
     if (!ta) { return; }
@@ -857,11 +755,9 @@
     return !!node.closest(TERMINAL_SELECTOR);
   }
 
-  // X軸/Y軸それぞれ独立に「押すべき矢印キー」を決める(斜めスワイプでは両方使う)。
-  // mode 'p'(pan) は極性を反転する: 指を右へ払う → 地図が右へ流れる → 見えるのは西側 →
-  //   ArrowLeft(termmap 側で cx -= step)。地図を指でつかんで動かす向き。
-  // mode 'c'(cursor) は極性そのまま: 指を下へ動かす → カーソルも下 → ArrowDown。
-  //   「見た目の追従感を揃える」ためには、地図とは逆のキーを送る必要がある(設計書 §3.1)。
+  // X軸/Y軸それぞれ独立に押すべき矢印キーを決める(斜めスワイプでは両方使う)。'p'(pan) は極性を
+  // 反転する(指を右へ払う → 地図が右へ流れ西側が見える → ArrowLeft)。'c'(cursor) は極性そのまま
+  // (指を下へ → ArrowDown)。追従感を揃えるには地図とは逆のキーを送る必要がある(設計書 §3.1)。
   function xKey(dx, mode) {
     return mode === 'p' ? (dx > 0 ? 'ArrowLeft' : 'ArrowRight') : (dx > 0 ? 'ArrowRight' : 'ArrowLeft');
   }
@@ -879,14 +775,10 @@
     return (steps > 0 ? n : -n) * pxPerStep;
   }
 
-  // dx/dy ぶんの移動を、軸モードに応じた経路で termmap へ送る(X軸・Y軸は独立=斜め移動に対応)。
-  //   'p' … パン量マーカー(通路A)へ積む。量子化も加速も挟まないので指に1:1で追従する。
-  //   'c' … 矢印キーへ量子化して送る(CURSOR_PX_PER_STEP ごとに1回)。
-  //   'n' … 何も送らない(無効な矢印で termmap 側の再描画だけ走る無駄も消える)。
-  // OSC 9997 を1度も受け取っていない間は、従来どおり全軸を矢印キーへ変換する(§5.4)。
-  // 戻り値は実際に消費した px。呼び出し側はこれを引いた残りを次回へ繰り越す。'p'/'n' 軸は
-  // 全量を消費する('p' は端数を panPending 側で繰り越すため。'n' は溜めておくと軸モードが
-  // 変わった瞬間に溜まった分が一気に出てしまうため)。
+  // dx/dy を軸モードに応じた経路で送る。'p' はパン量マーカー(通路A)へ積み、'c' は CURSOR_PX_PER_STEP
+  // ごとの矢印キーへ量子化し、'n' は何も送らない(軸モード未受信の間は全軸を矢印キーへ変換する。§5.4)。
+  // 戻り値は消費した px で、呼び出し側が残りを繰り越す。'p'/'n' は全量を消費扱いにする('p' の端数は
+  // panPending が繰り越し、'n' は溜めると軸モードが変わった瞬間に一気に出るため)。
   function sendPanDelta(dx, dy) {
     if (!dragModeSeen) {
       return {
@@ -1009,16 +901,10 @@
     startGlide(estimateVelocity());
   }
 
-  // タップのブレで地図がずれないようにするデッドゾーン。'p' 軸は量子化をやめたので、
-  // これまで PX_PER_STEP(24px)の量子化が吸収していた「タップ時の十数pxのブレ」が
-  // そのままパン量として送られ、タップのたびに地図が少しずつずれて戻らなくなる。
-  // ジェスチャー開始点から TAP_SLOP_PX を超えるまでは送らない。
-  // 閾値はタップ判定(onGestureEnd)と同じものを使う。
-  //
-  // 超えた時点でスロップ分(12px超)は捨てる(設計 §5.6 対策F)。以前は panLast を開始点の
-  // ままにしていたため、超えた瞬間に溜まっていた 12px 超がまとめて1回で送られ、指を動かし
-  // 始めた瞬間に地図が飛んでいた。ここで panLast を今の指の位置まで進めると、指と地図の間に
-  // TAP_SLOP_PX ぶんの固定ずれが残る代わりに開始時の飛びが消える(一般的な地図アプリと同じ挙動)。
+  // タップのブレで地図がずれないようにするデッドゾーン。'p' 軸は量子化しないので、タップ時の十数pxの
+  // ブレがそのまま送られ、地図が少しずつずれてしまう。開始点から TAP_SLOP_PX(タップ判定と同じ閾値)を
+  // 超えるまでは送らず、超えた時点でスロップ分は捨てる(設計 §5.6 対策F)。panLast を今の指の位置へ
+  // 進めるので、指と地図に TAP_SLOP_PX ぶんの固定ずれが残る代わりに動かし始めに地図が飛ばない。
   function passedTapSlop(x, y) {
     if (!gesture || gesture.moved) { return true; }
     var ddx = x - gesture.x, ddy = y - gesture.y;
@@ -1037,11 +923,10 @@
     // タッチ(本番: iPhone等)。1本指=ドラッグでその場から地図が追従、2本指=ピンチでズーム。
     document.addEventListener('touchstart', function (e) {
       if (!inTerminal(e.target)) { return; }
-      // ブラウザ既定のスクロール/ダブルタップ拡大/フォーカス移動を止める「だけ」では不十分:
-      // preventDefault はブラウザの既定動作を止めるだけで、ttyd 同梱 xterm.js が端末要素に
-      // 直接張っている touchstart/mousedown ハンドラ(タップで .xterm-helper-textarea を
-      // focus してソフトキーボードをせり上げる処理)までは止められない。document の capture
-      // フェーズで stopPropagation して、そのハンドラにイベントを届かせないようにする。
+      // preventDefault はブラウザ既定のスクロール/ダブルタップ拡大/フォーカス移動を止めるだけで、
+      // xterm.js が端末要素に張った touchstart/mousedown ハンドラ(タップで .xterm-helper-textarea を
+      // focus してソフトキーボードを出す)は止められない。document の capture フェーズで
+      // stopPropagation して、そのハンドラに届かせない。
       e.preventDefault();
       e.stopPropagation();
       sawTouch = true;
@@ -1122,10 +1007,8 @@
   }
 
   // ── 画面下部のボタンバー ────────────────────────────────────────
-  // q(終了)は意図的に置いていない。誤タップでセッションごと落ちる方が損失が大きいため、
-  // 離脱はブラウザのタブを閉じる操作に任せる。
-  // ▲▼はメニュー(Space)を開いている時のカーソル移動(項目選択)に主に使う。
-  // 地図がフォーカスの時は普通にパン(1段)になる。
+  // q(終了)は誤タップでセッションごと落ちる方が損失が大きいので置かない(離脱はタブを閉じて行う)。
+  // ▲▼は主にメニュー(Space)を開いている時の項目選択用で、地図がフォーカスの時は普通にパン(1段)。
   // ボタン定義のaction指定を実行する(action無しなら通常どおりキー送信)。
   function runButtonAction(def) {
     if (def.action === 'keyboard') { toggleKeyboard(); }
@@ -1154,14 +1037,10 @@
     { label: '☰',    key: 'R',           title: 'ルート一覧(左袖)の表示/非表示。ルート自体は消えない' }
   ];
 
-  // レイアウトの考え方:
-  // ボタンバーを position:fixed で端末の上に浮かせると、見た目の占有分だけ地図の行が
-  // 隠れるうえ、ttyd(FitAddon/ResizeObserver)が見ている #terminal-container の実寸は
-  // 縮まないままなので、端末の桁数/行数と実際に見えている領域がズレる。
-  // そこで body を flex 縦積みにして、バーを通常フローの要素として最後に置き、
-  // #terminal-container を flex:1 で「残り全部」にする。こうすると端末の箱そのものが
-  // バーの分だけ小さくなるので、画面回転時も ResizeObserver → PTY リサイズが
-  // 正しい寸法で走り、バーが地図に被らない。
+  // レイアウト: バーを position:fixed で浮かせると地図の行が隠れ、ttyd(FitAddon/ResizeObserver)が
+  // 見る #terminal-container の実寸も縮まないので、端末の桁数/行数と見えている領域がずれる。そこで
+  // body を flex 縦積みにしてバーを通常フローの最後に置き、#terminal-container を flex:1 で残り全部に
+  // する。端末の箱がバーの分だけ小さくなるので、画面回転時も PTY リサイズが正しい寸法で走る。
   var CSS = [
     'html { height: 100%; }',
     'body {',
@@ -1360,13 +1239,10 @@
     },
     sendCellSize: sendCellSize,
     probeCellSize: probeCellSize,
-    // 実機計測窓(設計 §10)。Safari の開発者ツールから __termmapTouch.stats() を叩いて、
-    // スワイプ中の bytesPerSec と outstandingBytes を読む。
-    //   dragModeSeen が false … #87 の追従改善が丸ごと効いていない(従来のキー変換のまま)
-    //   writeCbSeen が false  … term.write の callback が呼ばれておらず背圧が働いていない
-    //   outstandingBytes が backpressureLimit 付近に張り付く … ブラウザ側が詰まっている
-    // 地図フレーム数(framesPerSec)は termmap 側がフレーム末にマーカーを出さないと数えられない
-    // ため、ここでは term.write の呼び出し回数(writesPerSec)で代用している。
+    // 実機計測窓(設計 §10)。Safari の開発者ツールからスワイプ中に叩き、dragModeSeen が false なら
+    // 追従改善が効いていない、writeCbSeen が false なら背圧が働いていない、outstandingBytes が
+    // backpressureLimit 付近に張り付くならブラウザ側が詰まっている。地図のフレーム数は termmap 側の
+    // マーカーが無いと数えられないので、term.write の呼び出し回数(writesPerSec)で代用している。
     stats: function () {
       trimWindow(byteWindow, true);
       trimWindow(panWindow, false);

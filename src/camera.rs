@@ -1,22 +1,7 @@
-// 道路ライブカメラ(国土交通省「道路情報提供システム」road-info-prvs.mlit.go.jp)。
-// regulation.rsと同じ非公式システムで、認証・APIキー無しで叩ける(実測確認済み)。
-//
-// 実測で確認済みの構造:
-//   - カメラ一覧は地方整備局CD(81=北海道開発局〜90=沖縄総合事務局)ごとのページ
-//     pcImage_{整備局CD}_1.html に、input#kokudoJson の value 属性(シングルクォート)として
-//     直接JSONが埋め込まれている(regulation.rsのTukoKiseiと違い、別ファイルへの2段階フェッチは不要)。
-//     この属性値はHTMLエンティティエスケープされておらず生JSONそのもの(実測確認済み)。
-//   - JSON構造: {"路線コード&路線名": [ {"R_路線コード": {カメラ本体}} , ... ], ...}
-//   - カメラ本体には gis_point(lon,lat の文字列2要素)・image_name(地点名)・
-//     fileList(直近の撮影一覧、新しい順。各要素 get_datetime/file)を含む。
-//   - 画像本体は https://www.road-info-prvs.mlit.go.jp/roadinfo/img/doro_gazo/pc/{fileList[].file}
-//     で直接取得できる(実測確認済み・200 OK)。file名が"s_"始まりならサムネイル(148x98)、
-//     それを外すとフル画像(720x480)になる(pcImageDetail_{id}.htmlの<img>タグから特定)。
-//   - 整備局は10局しかなく管轄境界の正確なポリゴンは持っていないため、bboxの中心に一番近い
-//     局のカメラだけを取得する簡易割当にする(局境界付近のカメラを取りこぼす可能性はあるが、
-//     termmapの表示範囲は通常1局の管轄より十分小さいため実用上問題ない)。
-// gpslive.rs/radar.rs/traffic.rs/regulation.rsと同じ方針でstd+ureq+serde_jsonのみに依存し、
-// crate::を参照しない。
+// 道路ライブカメラ(国土交通省「道路情報提供システム」)。regulation.rsと同じ非公式システムで認証不要。
+// std+ureq+serde_jsonのみに依存し、crate::を参照しない。一覧は整備局ごとのページに生JSONで入っている。
+// gis_point は lon,lat の順、fileList は新しい順で、file名が"s_"始まりならサムネイル(外すとフル画像)。
+// 取得は bbox の中心に一番近い局だけ(局境界付近は取りこぼしうるが、表示範囲は通常1局の管轄より狭い)。
 
 use serde::{Deserialize, Serialize};
 use std::io::Read;
@@ -180,7 +165,7 @@ mod tests {
         assert!(extract_kokudo_json("<html>no camera data here</html>").is_none());
     }
 
-    // 実際のpcImage_81_1.html kokudoJsonの抜粋(2026/08/16 実測、1カメラぶん)。
+    // 実際のpcImage_81_1.html kokudoJsonの抜粋(実測、1カメラぶん)。
     const SAMPLE_HTML: &str = r##"<input type="hidden" id="kokudoJson"    value='{"30005&国道5号":[{"R_30005":{"doro_gazo_joho_kanri_id":"811C200101","seibikyoku_cd":"81","gis_point":["140.364438390416","42.4982926115278"],"image_name":"長万部町大浜情報板","fileList":[{"get_datetime":"2026-08-16 16:00:36","kiki_jotai_cd":1,"file":"20260816160000/s_811C200101.jpeg"},{"get_datetime":"2026-08-16 15:45:37","kiki_jotai_cd":1,"file":"20260816154500/s_811C200101.jpeg"}]}}]}' />"##;
 
     #[test]

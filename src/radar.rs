@@ -1,9 +1,6 @@
 // 気象庁ナウキャスト(降水)のフレーム時刻管理。タイル画像の取得そのものは tiles.rs が行う。
-// gpslive.rs と同じ方針で std + ureq + serde_json のみに依存し、crate:: を参照しない
-// (このモジュール単体でコンパイル/テストできる)。
-//
-// 非公式エンドポイント(開発者向けAPIとして文書化されていない)を使うため、URL は
-// このファイルの定数と tiles.rs の TileSource::url() の2箇所だけに閉じる。
+// std + ureq + serde_json のみに依存し、crate:: を参照しない(単体でコンパイル/テストできる)。
+// 非公式エンドポイントなので、URL はこのファイルの定数と tiles.rs の TileSource::url() だけに閉じる。
 // 出典表示「出典: 気象庁ナウキャスト」は呼び出し側(ステータス行・ヘルプ・README)の責務。
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,11 +16,9 @@ pub const TARGET_TIMES_N1_URL: &str =
 pub const TARGET_TIMES_N2_URL: &str =
     "https://www.jma.go.jp/bosai/jmatile/data/nowc/targetTimes_N2.json";
 // 降水短時間予報(rasrf)の時刻一覧。ナウキャスト(N1/N2)は気象庁API自体の仕様で+60分が上限のため、
-// それより先(+1〜+15時間・1時間刻み)を見るための延長データソース。同じファイルに
-// rasrf(タイル)/rasrf_point/rasrf_nd(マスク)/sjfcstmap(無関係な週間予報)が同居しているため、
-// 取り出す側(parse_rasrf_target_times)で elements に "rasrf" を含む行だけに絞る。
-// タイル自体のパレット(色→降水強度の対応)は実測でhrpnsと完全一致(4bit索引色10色・tRNSも同一)
-// のため、既存のhrpns用デコード経路をそのまま使い回せる。
+// それより先(+1〜+15時間・1時間刻み)を見るための延長データソース。同じファイルに別の要素も同居するので
+// 取り出す側(parse_rasrf_target_times)で elements に "rasrf" を含む行だけに絞る。タイルのパレット
+// (色→降水強度の対応)は hrpns と完全一致するため、hrpns用のデコード経路をそのまま使い回せる。
 pub const TARGET_TIMES_RASRF_URL: &str =
     "https://www.jma.go.jp/bosai/jmatile/data/rasrf/targetTimes.json";
 
@@ -85,14 +80,10 @@ impl Timeline {
         self.frames.get(idx)
     }
 
-    // 新しい frames を受け取ったときの再アンカー。
-    // targetTimes は5分ごとに更新され basetime が動くため、index を素朴に保持していると
-    // 表示時刻が勝手にずれる/消えたフレームを指す。同一性の基準は index ではなく validtime 文字列。
-    //
-    // 戻り値は (新しい index, 新しい follow, 利用者に伝える調整メッセージ)。
-    //   follow == true  … 常に最新の実況(now_idx)へ追従する
-    //   follow == false … prev_validtime と同じ時刻を新しい frames から探す。
-    //                     消えていれば最も近い時刻へクランプし、その旨のメッセージを返す。
+    // 新しい frames を受け取ったときの再アンカー。targetTimes は5分ごとに更新され basetime が動くため、
+    // 同一性は index ではなく validtime 文字列で判定する。戻り値は (index, follow, 調整メッセージ)。
+    // follow == true なら常に最新の実況(now_idx)へ追従する。false なら prev_validtime と同じ時刻を
+    // 新しい frames から探し、消えていれば最も近い時刻へクランプしてその旨のメッセージを返す。
     pub fn reanchor(
         &self,
         prev_validtime: Option<&str>,
@@ -189,19 +180,10 @@ fn fetch_body(url: &str) -> Result<String, String> {
         .map_err(|e| e.to_string())
 }
 
-// JSON本文 → Vec<Frame>。ネットワークに触れない純関数。
-//
-// 想定する本文(実測。ISO8601風のT区切り/Z終端ではなく14桁の数字列):
-//   [ {"basetime":"20260814125500","validtime":"20260814125500","elements":[...]}, ... ]
-//
-// 方針:
-//  - パース不能・配列でない・フィールド欠如は「その要素を捨てる」だけでパニックしない。
-//    JSON形式が変わっても空 Vec が返るだけで、地図表示には一切影響しない。
-//  - basetime/validtime は URL のパス要素にそのまま埋め込むため、ASCII数字のみを受け付ける。
-//    想定外の応答に "../" 等が混ざってもURLを組み替えられないようにするための入力検証。
-//    桁数は固定しない(将来 JMA が桁を変えても、時刻表示が諦められるだけで取得は動く)。
-//  - kind は kind_hint を既定にしつつ、validtime > basetime のものは無条件に予報とみなす
-//    (どちらのファイルから来たかより、時刻の前後関係の方が確かな情報のため)。
+// JSON本文 → Vec<Frame>。ネットワークに触れない純関数。時刻は ISO8601 風ではなく14桁の数字列で来る。
+// 壊れた要素は捨てるだけでパニックしない。basetime/validtime は URL のパス要素にそのまま埋め込むため、
+// ASCII数字のみを受け付ける("../" 等への入力検証)。桁数は固定しない(変わっても取得は動くように)。
+// kind は既定で kind_hint、validtime > basetime なら予報とする(由来のファイルより時刻の前後関係が確か)。
 pub fn parse_target_times(body: &str, kind_hint: FrameKind) -> Vec<Frame> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
         return Vec::new();
@@ -310,9 +292,7 @@ fn kind_rank(k: FrameKind) -> u8 {
 
 // ---- 表示用の時刻整形(日時crate非依存・純関数) ----
 
-// "20260814060000"(14桁・UTC) → "15:00"(JST・時分のみ)。
-// JMA が返すのは UTC(実測: UTC 12:56 時点の最新 basetime が 20260814125500 と一致し、
-// JST 21:56 とは一致しなかった)。+9時間して JST の時分だけを返す。
+// "20260814060000"(14桁・UTC) → "15:00"(JST・時分のみ)。JMA が返すのは UTC なので +9時間する。
 // 日付跨ぎは (hh + 9) % 24 で正しく出る。時分しか出さないので日付の繰り上がり表示は不要。
 // 桁数・範囲が想定外の文字列は None を返す(呼び出し側は生の文字列等へフォールバックする)。
 pub fn jst_hhmm(utc_compact: &str) -> Option<String> {
@@ -354,11 +334,10 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146097 + doe - 719468
 }
 
-// 表示中フレームの人間向けラベル。
+// 表示中フレームの人間向けラベル。今からの距離が読み取れるよう now_idx との差を併記する(§8.8)。
 //   "15:00 実況"          … 「現在」ちょうど
 //   "15:30 予報 +30分"    … 未来
 //   "14:40 実況 -20分"    … 過去へスクラブ中
-// 絶対時刻だけだと今からの距離が読み取りにくいので、now_idx との差を併記する(§8.8)。
 pub fn frame_label(tl: &Timeline, idx: usize) -> String {
     let Some(f) = tl.get(idx) else {
         return "時刻不明".to_string();
@@ -460,21 +439,21 @@ pub fn start_clock(interval_secs: u64) -> RadarClock {
 mod tests {
     use super::*;
 
-    // 実際の targetTimes_N1.json の応答形(2026/08/14 実測)。
+    // 実際の targetTimes_N1.json の応答形(実測)。
     const N1_SAMPLE: &str = r#"[
   {"basetime": "20260814125500", "validtime": "20260814125500", "elements": ["hrpns", "hrpns_nd"]}
  ,{"basetime": "20260814125000", "validtime": "20260814125000", "elements": ["hrpns", "hrpns_nd"]}
  ,{"basetime": "20260814124500", "validtime": "20260814124500", "elements": ["hrpns", "hrpns_nd"]}
 ]"#;
 
-    // 実際の targetTimes_N2.json の応答形(2026/08/14 実測)。basetime は最新実況で固定。
+    // 実際の targetTimes_N2.json の応答形(実測)。basetime は最新実況で固定。
     const N2_SAMPLE: &str = r#"[
   {"basetime": "20260814125500", "validtime": "20260814131000", "elements": ["hrpns", "hrpns_nd"]}
  ,{"basetime": "20260814125500", "validtime": "20260814130500", "elements": ["hrpns", "hrpns_nd"]}
  ,{"basetime": "20260814125500", "validtime": "20260814130000", "elements": ["hrpns", "hrpns_nd"]}
 ]"#;
 
-    // 実際の targetTimes_rasrf.json の応答形(2026/08/16 実測)を要約したもの。同じファイルに
+    // 実際の targetTimes_rasrf.json の応答形(実測)を要約したもの。同じファイルに
     // rasrf(タイル)/rasrf_point/rasrf_nd(マスク)/sjfcstmap(無関係な週間予報)が同居し、かつ
     // rasrf は過去の解析値(basetime==validtime)と予報(validtime>basetime)の両方を含む。
     const RASRF_SAMPLE: &str = r#"[

@@ -1,27 +1,15 @@
-// 過去災害の発生履歴(防災科学技術研究所(NIED)「災害事例データベース」)。
-// 豪雨・地震・台風・斜面災害等が「この土地で過去に何回記録されてきたか」を地図へ重ねる。
-// 現在の危険度ではなく履歴なので、ツーリングの計画中に「ここは水害が繰り返されている」
-// 「この一帯は斜面災害が多い」を読むためのレイヤになる。
-// 調査は docs/disaster-history-data-investigation.md、設計は docs/disaster-history-overlay-design.md。
-//
-// 実測で確認済みの構造(2026/08/16):
-//   - ArcGIS Server REST。認証・APIキー不要。1リクエストの上限(maxRecordCount)は2000件。
-//   - 座標は市区町村の代表点で、1点に何十件も重なる(1次メッシュ5339で座標118種・最大166件)。
-//     そのため生レコードではなく groupByFieldsForStatistics で「座標×種別ごとの件数」を取る。
-//     1次メッシュ1枚が236行・25KB以下に収まり、ページングが要らない(§2.3)。
-//   - グループ化キーに SAIGAI_YEAR を足すと2000行で打ち切られるので、年は where で絞る。
-//     取得側と被覆側で同じしきい値を使う必要があり、キーに年を含める(plotlayer.rs)。
-//   - 集計クエリは f=geojson を受け付けない(実測 "Requested format is not supported.")ので f=json。
-//     座標は幾何ではなく fX/fY フィールドから取る(GeoJSON経由の再投影で乗る丸めを含まない生値)。
-//   - SAIGAI_SYUBETSU_1 は数値ではなく文字列("3" 等)。値の対応表はレイヤ定義の codedValue から採取。
-//   - 被害統計(SHIBOU_SU 等)と発生月日には、実数と符号付きコードと null が混ざる(DamageValue/format_date)。
-//   - グループ化キーに CHIDAN_CODE(地方公共団体コード)を足しても行数は増えない(2026/08/17 実測で
-//     203行→203行・打ち切り無し・座標と1対1)。市区町村の境界ポリゴンへ件数を割り当てるのに使う
-//     (代表点の内外判定ではなくコードで直接結合する。docs/disaster-choropleth-design.md §1.1)。
-//   - resultOffset は集計クエリでは黙って無視される(offset を変えても同一レスポンスが返る)。
-//     この機能はページングしないので影響しないが、将来足すときは二重計上事故に注意。
-// traffic.rs/regulation.rs/camera.rs と同じ方針で std + ureq + serde_json のみに依存し、
-// crate:: を参照しない(ネットワークに触れない部分だけで単体テストが完結する)。
+// 過去災害の発生履歴(NIED「災害事例データベース」)。現在の危険度ではなく、この土地で過去に
+// 何回記録されてきたかを重ねる。調査は docs/disaster-history-data-investigation.md、設計は
+// docs/disaster-history-overlay-design.md。実測で確認した API(ArcGIS Server REST・認証不要)の前提:
+//   - 座標は市区町村の代表点で1点に何十件も重なるので、groupByFieldsForStatistics で座標×種別ごとの
+//     件数を取る。1リクエスト2000件までだが、集計なら1次メッシュ1枚が収まりページング不要(§2.3)。
+//   - SAIGAI_YEAR をグループ化キーに足すと2000行で打ち切られるので年は where で絞る。取得側と被覆側で
+//     同じしきい値を使う必要があり、キーに年を含める(plotlayer.rs)。
+//   - 集計クエリは f=geojson 不可なので f=json。座標は fX/fY の生値、SAIGAI_SYUBETSU_1 は文字列。
+//   - 市区町村の塗りへは CHIDAN_CODE で直接結合する(docs/disaster-choropleth-design.md §1.1)。
+//   - resultOffset は集計クエリでは黙って無視される。将来ページングを足すときは二重計上に注意。
+// traffic.rs/regulation.rs/camera.rs と同じ方針で std + ureq + serde_json のみに依存し、crate:: を
+// 参照しない(ネットワークに触れない部分だけで単体テストが完結する)。
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -150,14 +138,10 @@ pub struct KindCount {
 pub struct DisasterSite {
     pub lat: f64,
     pub lon: f64,
-    /// 全国地方公共団体コード5桁(CHIDAN_CODE "JP12208" から "JP" を外したもの)。
-    /// 市区町村の境界ポリゴン(muni.rs)へ件数を割り当てる結合キー。読めなかった行は空文字で、
-    /// その場合は塗られずマーカーだけになる。
-    ///
-    /// **このフィールドを足したことで、既存のディスクキャッシュは1回だけ読めなくなる**
-    /// (plotcache::load の serde_json::from_str が失敗して None になり、全セルが取り直しになる)。
-    /// #[serde(default)] で古いキャッシュを読めるようにはしない。コードが空のセルは塗れず、
-    /// 原因の分からない虫食いになるため、取り直させた方が素直。
+    /// 全国地方公共団体コード5桁(CHIDAN_CODE "JP12208" から "JP" を外したもの)。市区町村の境界
+    /// ポリゴン(muni.rs)へ件数を割り当てる結合キーで、読めなかった行は空文字(塗られずマーカーだけ)。
+    /// #[serde(default)] は付けない: このフィールドの無い古いキャッシュは plotcache::load で読めずに
+    /// 全セル取り直しになるが、コードが空のセルは原因の分からない虫食いになるので取り直させた方が素直。
     pub muni_code: String,
     pub kinds: Vec<KindCount>,
 }
@@ -207,11 +191,9 @@ pub fn marker_radius(total: u32) -> i32 {
 }
 
 /// コロプレス(市区町村の塗り)のアルファ(件数5段)。実測(1地点あたり中央値18件・最大166件)に
-/// 合わせて刻む。この値にさらに濃さ設定(既定 0.45)が掛かって地図へ合成される。
-///
-/// 段階は固定値で、画面内の分布に合わせた相対配色(分位数)にはしない。相対にすると同じ
-/// 市区町村がパンするたびに色を変え、「濃い=記録が多い」が場所によって別の意味になって
-/// ハザードマップとして読めなくなるため。
+/// 合わせて刻み、さらに濃さ設定(既定 0.45)が掛かって地図へ合成される。段階は固定値にし、画面内の
+/// 分布に合わせた相対配色(分位数)にはしない。相対だとパンのたびに同じ市区町村の色が変わり、
+/// 「濃い=記録が多い」が場所によって別の意味になってハザードマップとして読めなくなるため。
 pub fn fill_alpha(total: u32) -> u8 {
     match total {
         0..=4 => 70,
@@ -632,8 +614,7 @@ fn urlencode(s: &str) -> String {
 mod tests {
     use super::*;
 
-    // 実際の集計応答の抜粋(2026/08/16 実測、1次メッシュ5339・1926年以降。CHIDAN_CODE は
-    // 同じ座標について 2026/08/17 に実測した値)。
+    // 実際の集計応答の抜粋(1次メッシュ5339・1926年以降。CHIDAN_CODE は同じ座標について別途実測した値)。
     // 1行目と4行目は同じ座標で種別だけが違う(=1つの DisasterSite へ畳まれる)。
     const SITES_SAMPLE: &str = r#"{"displayFieldName":"","fieldAliases":{"fX":"経度"},
       "fields":[{"name":"fX","type":"esriFieldTypeDouble"}],
@@ -644,7 +625,7 @@ mod tests {
         {"attributes":{"fX":139.87482800000001,"fY":35.955106000000001,"CHIDAN_CODE":"JP12208","SAIGAI_SYUBETSU_1":"9","N":10,"YMIN":1929,"YMAX":1996}}
       ]}"#;
 
-    // 実際の事例一覧応答の抜粋(2026/08/16 実測、千葉県野田市の地点)。
+    // 実際の事例一覧応答の抜粋(千葉県野田市の地点)。
     // 3件目は SAIGAI_MEISYO が null で SAIGAI_MEISYO_JMA だけがある実在の形。
     const EVENTS_SAMPLE: &str = r#"{"displayFieldName":"JIREI_BANGO","features":[
         {"attributes":{"JIREI_BANGO":"2019-09-xx_NJM068_Rxxxxx_JP12208-061366-19","SAIGAI_MEISYO":"令和元年台風第15号|台風15号","SAIGAI_MEISYO_JMA":"令和元年房総半島台風","SAIGAI_YEAR":2019,"SAIGAI_MONTH":9,"SAIGAI_DAY":null,"SAIGAI_SYUBETSU_1":"3","BASHO_KEN":"千葉県","BASHO_SHI":"野田市","ACCURACY":"A","SHIBOU_SU":null,"YUKUEHUMEI_SU":null,"ZENKAI":null,"YUKAUESHINSUI":null}},

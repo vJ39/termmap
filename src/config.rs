@@ -1,30 +1,7 @@
-//! Self-contained configuration module for termmap.
-//!
-//! Standard library only, no external crates, no `crate::` references —
-//! this file is designed to be compiled and tested on its own with:
-//!
-//!     rustc --edition 2021 --test src/config.rs -o /tmp/tm_config_test && /tmp/tm_config_test
-//!
-//! Config file format is a minimal, hand-rolled TOML subset (no `toml`
-//! crate dependency):
-//!
-//!     [llm]
-//!     recommend_enabled = true
-//!     model = "claude-sonnet-5"
-//!     command = "claude"
-//!
-//!     [route]
-//!     profile = "car-fast"
-//!     sample_interval_m = 800.0
-//!
-//!     [display]
-//!     style = "osm"
-//!     show_spots = true
-//!
-//! Values are plain `true`/`false`, bare numbers, or `"quoted strings"`.
-//! Unknown lines/sections/keys are ignored. A missing or unreadable file
-//! yields `Config::default()`; a partially malformed file keeps whichever
-//! keys parsed successfully and leaves the rest at their default values.
+//! termmap の設定モジュール。toml crate などの外部 crate を使わず、最小限の TOML サブセット
+//! (`[セクション]` と `key = value`。値は `true`/`false`・数値・`"文字列"`)を自前で読み書きする。
+//! ファイルが無い/読めないときは `Config::default()`。未知の行・セクション・キーは無視し、一部が
+//! 壊れていても読めたキーだけを反映して、残りは既定値のままにする。
 
 use std::path::{Path, PathBuf};
 
@@ -37,18 +14,9 @@ pub const POPULATION_YEARS: [u16; 11] =
 
 /// `image_settle_low_res` が有効なとき、地図の移動中に許す解像度の上限(zoom の上乗せ段数)。
 /// 0 = scale1(横 map_cols / 縦 map_rows*2 px)まで落とす / 1 = mid 相当で止める。
-///
-/// docs/web-pan-smoothness-design.md §5.3 C-3 の見直し結果。設計は「1段だけ下げる
-/// (high→mid、mid→mid)」つまりここを 1 にする案を挙げているが、0 のままにしてある。
-/// 理由は2つ:
-///   - 実画像モードは PNG エンコードが重く、設計 §2.2 の実測で 30 回のパンに対し 7 コマ程度しか
-///     生成できない。mid は 1 コマ 75,747 B あり、移動中の解像度を上げるとコマ数がさらに落ちる。
-///     既定は mid なので、1 にすると既定の利用者にとって image_settle_low_res が何もしない設定になる。
-///   - 設計 §5.1 の対策A(サブピクセル切り出し)を入れたことで、移動中の scale1 でも 1/8 出力
-///     ピクセル単位で滑らかに動くようになった。§3.4 が問題にしていた「滑らかさが要る瞬間に
-///     一番粗い状態になる」は、解像度ではなく切り出しの側で解けている。
-/// 設計 §5.3 の結び「実画像モードは静止して見る用と位置づけ、ドラッグの滑らかさは AA モード側で
-/// 解くのが素直」に沿う判断。実機で移動中の粗さが気になるようなら 1 へ上げて比べる。
+/// 設計(docs/web-pan-smoothness-design.md §5.3 C-3)の案は 1 だが 0 にしてある。既定の mid で 1 にすると
+/// image_settle_low_res が何もしなくなり、PNG エンコードが重いので移動中のコマ数も落ちる。滑らかさは
+/// サブピクセル切り出し(設計 §5.1 対策A)で得ている。移動中の粗さが気になるようなら 1 へ上げて比べる。
 pub const IMAGE_SETTLE_DELTA_CAP: u32 = 0;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -474,11 +442,10 @@ fn parse_string(v: &str) -> Option<String> {
     }
 }
 
-// sayに渡す音声名として安全な値か。以下を弾く(弾いた場合は既定値のまま黙って無視)。
+// sayに渡す音声名として安全な値か。以下を弾く(弾いたら既定値のまま黙って無視)。空文字は有効(OS既定)。
 // - "-"始まり: Command::new("say").arg(name)がsayのオプションとして解釈されうる
 // - '"'を含む: save_config_toが素のformat!でvoice_name = "{}"と書き出すため、次回のパースが壊れる
 // - 制御文字を含む: 1行1キーの前提が崩れる
-// 空文字自体は有効(-vを付けずOS既定を使う、という意味を持つ)。
 fn valid_voice_name(s: &str) -> bool {
     !s.starts_with('-') && !s.contains('"') && !s.chars().any(|c| c.is_control())
 }
@@ -996,11 +963,8 @@ profile = "custom-profile"
 
     #[test]
     fn load_config_falls_back_to_default_when_home_unset() {
-        // load_config() itself is exercised indirectly via config_path();
-        // here we just confirm the None-path of load_config mirrors
-        // Config::default() by construction (config_path -> None => default).
-        // We can't safely unset $HOME for the whole process in a shared
-        // test binary, so this test documents the contract via direct call.
+        // 共有のテストバイナリでは $HOME を安全に外せないので、load_config() の「パスが決まらなければ
+        // Config::default()」という契約を直接呼び出しで確かめる。
         let cfg = match config_path() {
             Some(p) => load_config_from(&p.with_file_name("this_file_almost_certainly_does_not_exist_termmap.toml")),
             None => Config::default(),

@@ -62,9 +62,8 @@ struct RoadResp { #[serde(default)] elements: Vec<RoadElement> }
 
 /// Overpassの `out geom` 応答
 /// (`{"elements":[{"geometry":[{"lat":..,"lon":..},...],"tags":{"oneway":"yes",...}},...]}`)
-/// から、道路断片ごとの点列(lat,lon)とonewayフラグを取り出す。serde_json でデシリアライズする。
-/// 壊れたJSON・elementsキー無し・空配列はすべて空Vecを返す(panicしない)。
-/// geometryキーが無い/点が1つも無い要素はスキップする。
+/// から、道路断片ごとの点列(lat,lon)とonewayフラグを取り出す。壊れたJSON・elementsキー無し・空配列は
+/// すべて空Vecを返し(panicしない)、geometryキーが無い/点が1つも無い要素はスキップする。
 pub fn parse_road_fragments(overpass_json: &str) -> Vec<(Vec<(f64, f64)>, bool)> {
     let resp: RoadResp = match serde_json::from_str(overpass_json) {
         Ok(r) => r,

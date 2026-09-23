@@ -1,26 +1,12 @@
 // termmap web auth proxy — ttyd の手前に置く Cookie 認証リバースプロキシ。
-//
-// ttyd の -c (Basic認証) は、iOS Safari が最初のページ読み込みで通した資格情報を
-// 裏で動く /token の fetch や WebSocket ハンドシェイクへ再利用できないため、
-// Cloudflare Tunnel 経由だと認証が通らずリロード地獄になる。
-// Cookie なら背景 fetch にも WebSocket ハンドシェイクにも自動で付くので、
-// 認証を Cookie 方式に移してこの問題を避ける。設計は docs/web-auth-proxy-design.md。
-//
-// 構成:
-//   ブラウザ ⇄ (HTTPS) Cloudflare Tunnel ⇄ (HTTP) このプロキシ:7681 ⇄ ttyd:17681 ⇄ termmap
-//
-// 環境変数:
-//   TERMMAP_WEB_USER / TERMMAP_WEB_PASS  ログイン資格情報(必須。既定値は持たない)
-//   WEBAUTH_PROXY_PORT                   公開ポート(既定 7681)
-//   WEBAUTH_PROXY_UPSTREAM_PORT          転送先 ttyd のポート(既定 17681)
-//
-// 割り切り(設計書「明示的にやらないこと」):
-//   - Cookie 署名(HMAC等)なし。トークンはサーバー生成の32byte乱数のみで、
-//     推測不可能性はここに依存する
-//   - セッションの永続化なし(プロセス再起動でログインし直し)
-//   - HTTP/1.1 の厳密なパース(chunked encoding 等)はしない。ttyd のページが実際に送る
-//     GET(ボディ無し)と、ログインフォームの POST(Content-Length 付き)だけを想定
-//   - レート制限・アカウントロックアウト・複数ユーザー管理はしない
+// ttyd の -c (Basic認証) は、iOS Safari が資格情報を /token の fetch や WebSocket ハンドシェイクへ
+// 再利用できず Cloudflare Tunnel 経由では通らない。どちらにも自動で付く Cookie 方式で認証する。
+// 構成: ブラウザ ⇄ (HTTPS) Cloudflare Tunnel ⇄ (HTTP) このプロキシ:7681 ⇄ ttyd:17681 ⇄ termmap
+// 環境変数: TERMMAP_WEB_USER / TERMMAP_WEB_PASS(必須・既定値なし)、WEBAUTH_PROXY_PORT(既定 7681)、
+//   WEBAUTH_PROXY_UPSTREAM_PORT(転送先 ttyd・既定 17681)。設計は docs/web-auth-proxy-design.md。
+// 割り切り(設計書「明示的にやらないこと」): Cookie 署名なし(推測不可能性は32byte乱数トークンだけに
+//   依存)・セッション非永続・HTTP/1.1 は ttyd のページの GET(ボディ無し)とログインの
+//   POST(Content-Length 付き)だけを想定・レート制限・アカウントロックアウト・複数ユーザー管理なし
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};

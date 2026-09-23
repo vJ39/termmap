@@ -215,9 +215,8 @@ impl<'a> Parser<'a> {
 
 /// Claude CLI の出力を寛容にパースし、おすすめスポットの一覧を返す。
 ///
-/// 前後に説明文が付いていたり ```json コードフェンスで囲まれていても、
-/// 文字列中の最初の `[` から始まる JSON 配列を探して解釈する。
-/// 配列が見つからない・空・要素がオブジェクトでない等の場合は Err を返す。
+/// 前後に説明文が付いていたり ```json コードフェンスで囲まれていても、最初の `[` から始まる
+/// JSON 配列を探して解釈する。配列が見つからない・空・要素がオブジェクトでない等は Err を返す。
 pub fn parse_rec_json(s: &str) -> Result<Vec<Rec>, String> {
     let chars: Vec<char> = s.chars().collect();
     let start = chars

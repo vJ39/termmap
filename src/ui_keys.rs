@@ -1,12 +1,7 @@
-// Focus(いまどの画面を触っているか)ごとのキー処理の入口。もとは ui.rs の interactive() 内に
-// べた書きされていた28分岐の match で、状態を UiState へ集約したことでそのまま関数へ移せた。
-// 分岐の中身は画面の関心ごとに ui_keys_map / ui_keys_route / ui_keys_poi / ui_keys_spots /
-// ui_keys_settings へ分けてあり、このファイルは「どの Focus をどれに渡すか」だけを持つ。
-//
-// 端末ハンドル out とタイルローダー loader は UiState に持たせていない(uistate.rs を通信も
-// ディスクも触らない素のデータに保つため)ので、引数で受け取る。
-// 戻り値は「対話ループを抜けるか(=アプリ終了)」。q キーだけが true を返す。ループを持って
-// いるのは ui.rs 側なので、break を関数の中に隠さずここから返す。
+// Focus(いまどの画面を触っているか)ごとのキー処理の入口。分岐の中身は ui_keys_map / ui_keys_route /
+// ui_keys_poi / ui_keys_spots / ui_keys_settings にあり、ここは「どの Focus をどれに渡すか」だけを持つ。
+// out と loader は UiState に置かず引数で受け取る。uistate.rs を通信もディスクも触らない素のデータに
+// 保つため。戻り値は対話ループを抜ける(=アプリ終了)かで、true を返すのは q キーだけ(ループは ui.rs 側)。
 
 use crate::focus::Focus;
 use crate::menu::MenuLevel;
