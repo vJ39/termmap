@@ -402,6 +402,51 @@ impl UiState {
         }
     }
 
+    // マウスのクリック/ホイールを適用する(ドラッグのパンは PAN マーカーと同じ経路で ui.rs が適用)。
+    // 任意キーで閉じるパネルはクリックでも閉じ、y/n 確認中は何もしない。地図の操作は Focus::Map のときだけ。
+    pub(crate) fn apply_mouse(&mut self, act: crate::mouse::MouseAction, gut: u32, lay: &crate::dragmode::Layout) {
+        use crate::mouse::{recenter, zoom_at, MouseAction};
+        let dismissable = self.onboard || self.qr_view.is_some() || self.popup.is_some()
+            || self.disaster_view.is_some() || self.regulation_detail_view.is_some();
+        if dismissable {
+            if matches!(act, MouseAction::Click { .. }) {
+                self.onboard = false;
+                self.qr_view = None;
+                self.popup = None;
+                self.disaster_view = None;
+                self.regulation_detail_view = None;
+                self.force_reemit = true;
+                self.last_map_sig = None;
+            }
+            return;
+        }
+        let confirming = self.quit_confirm || self.spot_move_confirm.is_some()
+            || self.save_confirm.is_some() || self.clear_route_confirm;
+        if confirming || !matches!(self.focus, Focus::Map) {
+            return;
+        }
+        match act {
+            MouseAction::Click { col, row } => {
+                let (nx, ny) = recenter(self.cx, self.cy, self.z, col, row, gut, lay);
+                self.cx = nx;
+                self.cy = ny;
+                self.addr.clear();
+                self.pan_streak = 0;
+                self.last_pan_dir = None;
+            }
+            MouseAction::Zoom { zoom_in, col, row } => {
+                if let Some((nx, ny, nz)) = zoom_at(self.cx, self.cy, self.z, zoom_in, col, row, gut, lay) {
+                    self.cx = nx;
+                    self.cy = ny;
+                    self.z = nz;
+                    self.addr.clear();
+                    self.restart_prefetch_on_zoom();
+                }
+            }
+            MouseAction::Pan { .. } | MouseAction::None => {}
+        }
+    }
+
     // 雨雲レーダーONの表示状態だけを作る(コマ位置は必ず最新の実況 now_idx から始める。
     // 一覧が未着なら idx=0 のまま「時刻取得中…」になる)。
     // 時刻ポーラーの起動と分けてあるのは、ここをネットワークに触らずテストできるようにするため。
@@ -706,6 +751,81 @@ mod tests {
         st.disaster_fill_toggle_view();
         assert!(st.cfg.disaster_fill);
         assert_eq!(st.addr, "過去災害の塗り: 市区町村境界 気象庁");
+    }
+
+    // ---- apply_mouse(設計 docs/mouse-click-drag-design.md §1) ----
+    fn mouse_lay() -> crate::dragmode::Layout {
+        crate::dragmode::Layout { cols: 100, rows: 41, map_cols: 100, map_rows: 40, ow: 100, oh: 80 }
+    }
+
+    #[test]
+    fn mouse_click_on_the_map_recenters_and_clears_the_address() {
+        use crate::mouse::MouseAction;
+        let mut st = test_state();
+        st.focus = Focus::Map;
+        st.addr = "住所".into();
+        (st.cx, st.cy) = deg_to_pixel(35.68, 139.77, st.z); // 端のクランプに掛からない位置
+        let (cx, cy) = (st.cx, st.cy);
+        st.apply_mouse(MouseAction::Click { col: 80, row: 10 }, 0, &mouse_lay());
+        assert!((st.cx - (cx + 30.5)).abs() < 1e-9, "右へ30.5セル=30.5px");
+        assert!((st.cy - (cy - 19.0)).abs() < 1e-9, "上へ9.5セル=19px");
+        assert!(st.addr.is_empty());
+    }
+
+    #[test]
+    fn mouse_wheel_zooms_the_map_and_stops_at_the_limit() {
+        use crate::mouse::MouseAction;
+        let mut st = test_state();
+        st.focus = Focus::Map;
+        let z = st.z;
+        st.apply_mouse(MouseAction::Zoom { zoom_in: true, col: 50, row: 20 }, 0, &mouse_lay());
+        assert_eq!(st.z, z + 1);
+        st.apply_mouse(MouseAction::Zoom { zoom_in: false, col: 50, row: 20 }, 0, &mouse_lay());
+        assert_eq!(st.z, z);
+        st.z = 19;
+        st.apply_mouse(MouseAction::Zoom { zoom_in: true, col: 50, row: 20 }, 0, &mouse_lay());
+        assert_eq!(st.z, 19, "上限を超えない");
+    }
+
+    #[test]
+    fn mouse_click_closes_a_dismissable_panel_without_moving_the_map() {
+        use crate::mouse::MouseAction;
+        let mut st = test_state();
+        st.focus = Focus::Map;
+        st.popup = Some("名前".into());
+        st.disaster_view = Some(("見出し".into(), vec![]));
+        st.force_reemit = false;
+        let (cx, cy) = (st.cx, st.cy);
+        st.apply_mouse(MouseAction::Click { col: 80, row: 10 }, 0, &mouse_lay());
+        assert!(st.popup.is_none() && st.disaster_view.is_none());
+        assert!(st.force_reemit, "残像を消すため再emitする");
+        assert_eq!((st.cx, st.cy), (cx, cy), "閉じるだけで地図は動かさない");
+        // パネル表示中のホイールは何もしない(閉じもしない)。
+        st.onboard = true;
+        let z = st.z;
+        st.apply_mouse(MouseAction::Zoom { zoom_in: true, col: 50, row: 20 }, 0, &mouse_lay());
+        assert!(st.onboard);
+        assert_eq!(st.z, z);
+    }
+
+    #[test]
+    fn mouse_is_ignored_while_confirming_or_outside_the_map_focus() {
+        use crate::mouse::MouseAction;
+        let click = MouseAction::Click { col: 80, row: 10 };
+        let mut st = test_state();
+        st.focus = Focus::Map;
+        st.quit_confirm = true;
+        let (cx, cy, z) = (st.cx, st.cy, st.z);
+        st.apply_mouse(click, 0, &mouse_lay());
+        st.apply_mouse(MouseAction::Zoom { zoom_in: true, col: 50, row: 20 }, 0, &mouse_lay());
+        assert_eq!((st.cx, st.cy, st.z), (cx, cy, z), "終了確認中");
+        assert!(st.quit_confirm, "クリックで確認を取り消さない(yでしか終了しない)");
+
+        let mut st = test_state();
+        st.focus = Focus::Settings;
+        let (cx, cy) = (st.cx, st.cy);
+        st.apply_mouse(click, 0, &mouse_lay());
+        assert_eq!((st.cx, st.cy), (cx, cy), "設定画面では地図を動かさない");
     }
 
     #[test]

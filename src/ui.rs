@@ -37,7 +37,7 @@ use crate::focus::Focus;
 
 pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result<()> {
     use crossterm::event::{self, Event, KeyCode, KeyModifiers};
-    let _guard = TermGuard::enter()?; // Drop で必ず端末復元
+    let mut guard = TermGuard::enter()?; // Drop で必ず端末復元
     // タイルキャッシュは常駐ローダーとメイン描画で共有する(Arc<Mutex>)。未取得タイルはメインが
     // グレーで即描画し、ローダーが現在viewに近い順で裏取得→cacheへ→次フレームで自動反映される。
     let cache = std::sync::Arc::new(std::sync::Mutex::new(Cache::new()));
@@ -48,6 +48,8 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
     // (UiState を設定ファイルもネットワークも触らずに作れる素のデータに保ち、
     // 状態遷移をテストできる状態にしておくため)。経緯は docs/ui-refactor-design.md。
     let mut st = uistate::UiState::new(a, cx, cy, z);
+    if crate::mouse::capture_wanted(st.cfg.mouse, std::env::var_os("TERMMAP_NO_MOUSE").is_some()) { guard.enable_mouse(); }
+    let mut mouse = crate::mouse::MouseTracker::default();
 
     let _ = write!(out, "\x1b[2J");
     loop {
@@ -1005,16 +1007,33 @@ pub(crate) fn interactive(cx: f64, cy: f64, z: u32, a: &Args) -> std::io::Result
                 }
             }
         }
+        // 軸ゲート・向きの反転・座標の正規化は dragmode::apply_pan に閉じてある
+        // (ここに直書きするとテストが書けないため。設計書 §6.2 の適用条件)。
+        // 実画像モードでは実際に描かれる解像度は ow/oh ではなく rw/rh(zoom rz のピクセル)。
+        // 表示している地理範囲は zoom z 換算で常に横 map_cols・縦 map_rows*2 ピクセルなので、
+        // rw/scale・rh/scale へ戻して渡す(設計 §5.5 対策E)。AA 用に計算された ow/oh を
+        // そのまま渡すと、braille(または --edge)と実画像を同時に有効にしたときだけ
+        // ow=map_cols*2 / oh=map_rows*4 となり、両軸とも指の2倍地図が動く(§2.5 の実測)。
+        let (pan_ow, pan_oh) = if img_inline { (rw / scale, rh / scale) } else { (ow, oh) };
+        let lay = dragmode::Layout { cols, rows: tr as u32, map_cols, map_rows, ow: pan_ow, oh: pan_oh };
+        // ネイティブ端末のマウス(設計 docs/mouse-click-drag-design.md)。ドラッグは上の PAN マーカーと
+        // 同じ比に変換して pan_fx/pan_fy へ合算し、連続する分は1フレームにまとめる。
+        let mut mouse_acts: Vec<crate::mouse::MouseAction> = Vec::new();
+        while let Some(Event::Mouse(m)) = &ev {
+            let act = mouse.feed(m, gut, &lay);
+            ev = None;
+            if let crate::mouse::MouseAction::Pan { fx, fy } = act {
+                pan_fx += fx;
+                pan_fy += fy;
+                got_pan = true;
+            } else if act != crate::mouse::MouseAction::None {
+                mouse_acts.push(act);
+                break;
+            }
+            if let Ok(true) = event::poll(std::time::Duration::from_millis(0)) { ev = Some(event::read()?); } else { break; }
+        }
+        for act in mouse_acts { st.apply_mouse(act, gut, &lay); }
         if got_pan {
-            // 軸ゲート・向きの反転・座標の正規化は dragmode::apply_pan に閉じてある
-            // (ここに直書きするとテストが書けないため。設計書 §6.2 の適用条件)。
-            // 実画像モードでは実際に描かれる解像度は ow/oh ではなく rw/rh(zoom rz のピクセル)。
-            // 表示している地理範囲は zoom z 換算で常に横 map_cols・縦 map_rows*2 ピクセルなので、
-            // rw/scale・rh/scale へ戻して渡す(設計 §5.5 対策E)。AA 用に計算された ow/oh を
-            // そのまま渡すと、braille(または --edge)と実画像を同時に有効にしたときだけ
-            // ow=map_cols*2 / oh=map_rows*4 となり、両軸とも指の2倍地図が動く(§2.5 の実測)。
-            let (pan_ow, pan_oh) = if img_inline { (rw / scale, rh / scale) } else { (ow, oh) };
-            let lay = dragmode::Layout { cols, rows: tr as u32, map_cols, map_rows, ow: pan_ow, oh: pan_oh };
             let (ncx, ncy, moved) = dragmode::apply_pan(st.cx, st.cy, st.z, dragmode::axes(&st.focus), pan_fx, pan_fy, &lay);
             if moved {
                 st.cx = ncx;

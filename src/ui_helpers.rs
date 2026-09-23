@@ -250,17 +250,33 @@ pub(crate) fn next_closure_to_categorize<'a>(
 }
 
 // 端末状態を RAII で復元する。パニック/早期return でも Drop で raw mode と代替スクリーンを必ず戻す。
-pub(crate) struct TermGuard;
+// マウス報告は設定を読んだ後に enable_mouse() で有効化し、有効化したときだけ Drop で戻す。
+const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
+pub(crate) struct TermGuard { mouse: bool }
 impl TermGuard {
     pub(crate) fn enter() -> std::io::Result<Self> {
         crossterm::terminal::enable_raw_mode()?;
         crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen,
             crossterm::cursor::Hide, crossterm::event::EnableBracketedPaste)?;
-        Ok(Self)
+        Ok(Self { mouse: false })
+    }
+    // crossterm の EnableMouseCapture は全移動報告(?1003)まで有効にし、ボタンを押していない
+    // カーソル移動のたびにイベントが来るので使わない。押下/ドラッグ(?1000/?1002)と SGR 形式(?1006)だけ。
+    pub(crate) fn enable_mouse(&mut self) {
+        use std::io::Write;
+        let mut o = std::io::stdout();
+        if !self.mouse && o.write_all(MOUSE_ON.as_bytes()).and_then(|_| o.flush()).is_ok() {
+            self.mouse = true;
+        }
     }
 }
 impl Drop for TermGuard {
     fn drop(&mut self) {
+        if self.mouse {
+            use std::io::Write;
+            let _ = std::io::stdout().write_all(MOUSE_OFF.as_bytes());
+        }
         let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste,
             crossterm::cursor::Show, crossterm::terminal::LeaveAlternateScreen);
         let _ = crossterm::terminal::disable_raw_mode();

@@ -62,6 +62,9 @@ echo "公開する場合は別ターミナルで: cloudflared tunnel --url http:
 # LC_TERMINAL/ITERM_SESSION_ID は不要なので渡さない(TERM_PROGRAMだけで判定は満たせる)。
 # 実際に実画像を使うかは cfg.image_mode(既定OFF・`I`キーか設定画面で切替)の方で決まる。
 CHILD_ENV=(env -u LC_TERMINAL -u ITERM_SESSION_ID TERM_PROGRAM=iTerm.app)
+# web版のマウス/タッチは web/touch-overlay.js が PAN マーカーで送るので、termmap 側のマウス報告は
+# 切る(有効のままだと xterm.js のマウス報告と二重にパンする。docs/mouse-click-drag-design.md §3)。
+CHILD_ENV+=(TERMMAP_NO_MOUSE=1)
 
 # web 版の既定描画モードは braille にする(docs/web-pan-smoothness-design.md §5.3 C-2)。
 # 1フレームの出力が halfblock の約3分の1(94×23 の実測で 24KB 対 75KB)で、地図が動ける

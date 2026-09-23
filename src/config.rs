@@ -68,6 +68,7 @@ pub struct Config {
     pub classify: bool,
     pub edge: bool,
     pub mono: bool,
+    pub mouse: bool,                 // マウス操作(ドラッグでパン・クリックで中心移動・ホイールでズーム)。既定true。端末のテキスト選択を使いたいならOFF
     pub image_mode: bool,            // インライン画像(iTerm2 OSC1337)で実画像を描画。既定OFF(AA描画)
     pub image_res: String,           // 実画像モードの解像度: "high"(scale4)/"mid"(scale2)/"low"(scale1)。既定mid
     pub image_settle_low_res: bool,  // 実画像モードで地図移動中は低解像度に落とすか。既定true(OFFなら常に設定解像度を維持。落とす先は IMAGE_SETTLE_DELTA_CAP)
@@ -109,6 +110,7 @@ impl Default for Config {
             classify: false,
             edge: false,
             mono: false,
+            mouse: true,
             image_mode: false,
             image_res: "mid".to_string(),
             image_settle_low_res: true,
@@ -231,6 +233,7 @@ pub fn load_config_from(path: &Path) -> Config {
             ("display", "classify") => { if let Some(b) = parse_bool(value) { cfg.classify = b; } }
             ("display", "edge") => { if let Some(b) = parse_bool(value) { cfg.edge = b; } }
             ("display", "mono") => { if let Some(b) = parse_bool(value) { cfg.mono = b; } }
+            ("display", "mouse") => { if let Some(b) = parse_bool(value) { cfg.mouse = b; } }
             ("display", "image_mode") => { if let Some(b) = parse_bool(value) { cfg.image_mode = b; } }
             ("display", "image_res") => {
                 if let Some(s) = parse_string(value) {
@@ -341,6 +344,7 @@ pub fn save_config_to(path: &Path, c: &Config) -> Result<(), String> {
          classify = {}\n\
          edge = {}\n\
          mono = {}\n\
+         mouse = {}\n\
          image_mode = {}\n\
          image_res = \"{}\"\n\
          image_settle_low_res = {}\n\
@@ -399,6 +403,7 @@ pub fn save_config_to(path: &Path, c: &Config) -> Result<(), String> {
         c.classify,
         c.edge,
         c.mono,
+        c.mouse,
         c.image_mode,
         c.image_res,
         c.image_settle_low_res,
@@ -517,6 +522,7 @@ mod tests {
         assert_eq!(c.sample_interval_m, 800.0);
         assert_eq!(c.style, "osm");
         assert_eq!(c.show_spots, true);
+        assert_eq!(c.mouse, true, "マウス操作は既定ON");
     }
 
     #[test]
@@ -570,6 +576,7 @@ mod tests {
             classify: false,
             edge: true,
             mono: false,
+            mouse: true,
             image_mode: true,
             image_res: "low".to_string(),
             image_settle_low_res: false,
@@ -1024,6 +1031,7 @@ profile = "custom-profile"
             classify: true,
             edge: false,
             mono: true,
+            mouse: false,
             image_mode: false,
             image_res: "high".to_string(),
             image_settle_low_res: true,
