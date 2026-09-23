@@ -692,4 +692,43 @@ mod tests {
         assert_eq!(its[34], "    2025年(推計)");
         assert_eq!(sel, 35); // 33(先頭候補) + set_pick_sel(2)
     }
+
+    #[test]
+    fn pick_current_and_apply_pick_roundtrip_image_res_and_llm_model() {
+        let mut cfg = Config::default();
+        let mut style = "osm".to_string();
+        let eff = apply_pick(12, 2, &mut cfg, &mut style);
+        assert_eq!(cfg.image_res, "low");
+        assert!(eff.force_reemit, "解像度が変わるので描き直す");
+        assert_eq!(pick_current(12, &cfg, &style), 2);
+        let eff = apply_pick(9, 1, &mut cfg, &mut style);
+        assert_eq!(cfg.llm_model, "claude-haiku-4-5");
+        assert!(!eff.force_reemit && !eff.cache_clear, "モデルは地図の見た目に関係しない");
+        assert_eq!(pick_current(9, &cfg, &style), 1);
+    }
+
+    #[test]
+    fn pick_current_wraps_a_cross_color_index_beyond_the_palette() {
+        let cfg = Config { cross_color_idx: 12, ..Config::default() };
+        assert_eq!(pick_current(16, &cfg, "osm"), 2);
+    }
+
+    #[test]
+    fn rows_that_are_not_pickers_are_left_untouched() {
+        let mut cfg = Config::default();
+        let mut style = "osm".to_string();
+        assert_eq!(pick_current(0, &cfg, &style), 0);
+        assert_eq!(pick_current(99, &cfg, &style), 0);
+        let eff = apply_pick(0, 1, &mut cfg, &mut style);
+        assert_eq!(cfg, Config::default(), "一覧選択でない行では何も書き換えない");
+        assert_eq!(style, "osm");
+        assert!(!eff.force_reemit && !eff.cache_clear);
+        assert!(pick_labels(0, &cfg).is_empty());
+    }
+
+    #[test]
+    fn pick_labels_for_the_voice_row_start_with_the_system_default() {
+        let labels = pick_labels(27, &Config::default());
+        assert_eq!(labels.first().map(String::as_str), Some("システム既定"));
+    }
 }

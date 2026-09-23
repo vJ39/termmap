@@ -346,4 +346,103 @@ mod tests {
         assert!(parse_rec_json("[not valid json at all]").is_err());
         assert!(parse_rec_json("[]").is_err());
     }
+
+    fn one(input: &str) -> Rec {
+        let mut v = parse_rec_json(input).unwrap_or_else(|e| panic!("{input} がパースできない: {e}"));
+        assert_eq!(v.len(), 1);
+        v.remove(0)
+    }
+
+    #[test]
+    fn string_escapes_are_decoded() {
+        let r = one(r#"[{"name":"a\"b\\c\/d\ne\tf\rg\bh\fi"}]"#);
+        assert_eq!(r.name, "a\"b\\c/d\ne\tf\rg\u{0008}h\u{000C}i");
+        let unicode = format!(r#"[{{"name":"{b}u5ce0{b}u3042"}}]"#, b = '\\'); // 峠=U+5CE0・あ=U+3042
+        assert_eq!(one(&unicode).name, "峠あ", "4桁の16進エスケープを文字へ戻す");
+        assert_eq!(one(r#"[{"name":"\q"}]"#).name, "q", "未知のエスケープは文字そのまま");
+    }
+
+    // name/area 以外のフィールドが混じっても崩れない(この寛容パーサの目的)。
+    #[test]
+    fn extra_fields_of_every_json_type_are_tolerated() {
+        let r = one(r#"[{"rank":1,"score":-1.5e+3,"ok":true,"ng":false,"note":null,
+                        "tags":["峠",{"x":[]}],"meta":{},"name":"ヤビツ峠","area":"神奈川"}]"#);
+        assert_eq!(r, Rec { name: "ヤビツ峠".to_string(), area: "神奈川".to_string() });
+    }
+
+    #[test]
+    fn non_string_name_or_area_becomes_empty() {
+        assert_eq!(one(r#"[{"name":123,"area":null}]"#), Rec { name: String::new(), area: String::new() });
+        assert_eq!(one("[{}]"), Rec { name: String::new(), area: String::new() }, "空オブジェクトも1件として扱う");
+    }
+
+    #[test]
+    fn array_elements_must_be_objects() {
+        assert!(parse_rec_json(r#"["ヤビツ峠"]"#).is_err());
+        assert!(parse_rec_json(r#"[{"name":"a"}, 1]"#).is_err(), "1つでも非オブジェクトなら失敗");
+    }
+
+    #[test]
+    fn malformed_json_is_err_without_panicking() {
+        for bad in [
+            r#"[{"name":"途中で切れた"#,          // 文字列が終端しない
+            r#"[{"name":"a\"#,                    // エスケープの途中で終端
+            r#"[{"name":"\u12"}]"#,               // \u の桁が足りない(閉じ引用符まで食う)
+            r#"[{"name":"\uZZZZ"}]"#,             // \u が16進でない
+            r#"[{name:"a"}]"#,                    // キーが文字列でない
+            r#"[{"name" "a"}]"#,                  // ':' が無い
+            r#"[{"name":"a" "area":"b"}]"#,       // ',' が無い
+            r#"[{"name":"a"} {"name":"b"}]"#,     // 配列要素の区切りが無い
+            r#"[{"name":"a","ok":tru}]"#,         // 真偽値が壊れている
+            r#"[{"name":"a","v":nul}]"#,          // null が壊れている
+            r#"[{"name":@}]"#,                    // 値として予期しない文字
+            r#"[{"name":"#,                       // 値の前で終端
+            r#"[{"ok":t"#,                        // 真偽値の途中で終端
+            r#"[{"name":"\u12"#,                  // \u の途中で終端
+            "[",
+        ] {
+            assert!(parse_rec_json(bad).is_err(), "{bad} は Err になるべき");
+        }
+    }
+
+    // 文字にできない \u(対になっていないサロゲート)があっても全体は失敗させない。
+    #[test]
+    fn an_unpaired_surrogate_escape_does_not_fail_the_whole_answer() {
+        let r = one(r#"[{"name":"a\ud800b","area":"静岡"}]"#);
+        assert!(r.name.starts_with('a') && r.name.ends_with('b'), "{:?}", r.name);
+        assert_eq!(r.area, "静岡");
+    }
+
+    #[test]
+    fn claude_available_is_false_for_a_missing_command() {
+        assert!(!claude_available("termmap-no-such-command-for-test"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_available_is_true_for_a_runnable_command() {
+        assert!(claude_available("sh"));
+    }
+
+    #[test]
+    fn recommend_reports_a_command_that_cannot_start() {
+        let err = recommend("termmap-no-such-command-for-test", "m", "峠").unwrap_err();
+        assert!(err.starts_with("Claude CLI の起動に失敗しました"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recommend_reports_a_non_zero_exit() {
+        let err = recommend("false", "m", "峠").unwrap_err();
+        assert!(err.starts_with("Claude CLI がエラー終了しました"), "{err}");
+    }
+
+    // 標準出力をそのまま寛容パーサへ渡す。echo は受け取った引数(プロンプト)を出すので、
+    // 方向性に JSON 配列を入れると、それが1件目として読める。
+    #[cfg(unix)]
+    #[test]
+    fn recommend_parses_the_standard_output_of_the_command() {
+        let got = recommend("echo", "m", r#"[{"name":"椿ライン","area":"静岡"}]"#).unwrap();
+        assert_eq!(got, vec![Rec { name: "椿ライン".to_string(), area: "静岡".to_string() }]);
+    }
 }

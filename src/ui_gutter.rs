@@ -383,6 +383,76 @@ mod tests {
         assert!(plain(&gl[2]).starts_with(">呼び出し"));
     }
 
+    #[test]
+    fn category_list_shows_only_the_names() {
+        let (focus, opts, cfg) = (Focus::SpotCatList, test_args(), Config::default());
+        let cats = vec![("温泉".to_string(), 0u8, 0u8), ("峠".to_string(), 3u8, 5u8)];
+        let mut c = base_ctx(&focus, &opts, &cfg);
+        c.show_catlist = true;
+        c.spot_cats = &cats;
+        c.cat_sel = 1;
+        let mut off = 0usize;
+        let gl = build_gutter_lines(&c, &mut off);
+        assert!(plain(&gl[0]).starts_with("[カテゴリ 2]"));
+        assert!(plain(&gl[1]).starts_with(" 温泉 "), "色・形の番号は出さない: {}", plain(&gl[1]));
+        assert!(plain(&gl[2]).starts_with(">峠 "));
+    }
+
+    #[test]
+    fn poi_menu_lists_the_kinds_then_the_keyword_search_row() {
+        let (focus, opts, cfg) = (Focus::PoiMenu, test_args(), Config::default());
+        let kinds = crate::poi::poi_kind_defaults();
+        let mut c = base_ctx(&focus, &opts, &cfg);
+        c.show_poimenu = true;
+        c.poi_kinds = &kinds[..2];
+        c.poimenu_sel = 2;
+        let mut off = 0usize;
+        let gl = build_gutter_lines(&c, &mut off);
+        assert_eq!(gl.len(), 4);
+        assert!(plain(&gl[1]).starts_with(" 1 ガソスタ"));
+        assert!(plain(&gl[2]).starts_with(" 2 カフェ"));
+        assert!(plain(&gl[3]).starts_with(">キーワードで周辺検索"), "最終行はキーワード検索");
+    }
+
+    #[test]
+    fn favorite_route_list_shows_the_saved_names() {
+        let (focus, opts, cfg) = (Focus::RouteList, test_args(), Config::default());
+        let names = vec!["伊豆".to_string(), "箱根".to_string()];
+        let mut c = base_ctx(&focus, &opts, &cfg);
+        c.show_routes = true;
+        c.route_names = &names;
+        c.rn_sel = 1;
+        let mut off = 0usize;
+        let gl = build_gutter_lines(&c, &mut off);
+        assert!(plain(&gl[0]).starts_with("[← お気に入りルート 2]"));
+        assert!(plain(&gl[2]).starts_with(">箱根"));
+    }
+
+    // 中身は settings::settings_rows と同じ(行数だけ見る。オンボーディング行は実HOMEの状態で変わる)。
+    #[test]
+    fn settings_panel_lists_every_setting_row() {
+        let (focus, opts, cfg) = (Focus::Settings, test_args(), Config::default());
+        let mut c = base_ctx(&focus, &opts, &cfg);
+        c.show_settings = true;
+        c.map_rows = settings::SETTINGS_ROW_COUNT as u32 + 1;
+        let mut off = 0usize;
+        let gl = build_gutter_lines(&c, &mut off);
+        assert_eq!(gl.len(), 1 + settings::SETTINGS_ROW_COUNT);
+        assert!(plain(&gl[0]).starts_with(&format!("[設定 {}]", settings::SETTINGS_ROW_COUNT)));
+    }
+
+    // メニュー表示中なのに Focus がメニューでない(遷移の途中)ときは空の一覧にする。
+    #[test]
+    fn menu_flag_without_a_menu_focus_shows_an_empty_menu() {
+        let (focus, opts, cfg) = (Focus::Map, test_args(), Config::default());
+        let mut c = base_ctx(&focus, &opts, &cfg);
+        c.show_menu = true;
+        let mut off = 0usize;
+        let gl = build_gutter_lines(&c, &mut off);
+        assert_eq!(gl.len(), 1);
+        assert!(plain(&gl[0]).starts_with("[メニュー 0]"));
+    }
+
     // show_* の優先順位(先に判定される方が勝つ)は元のif-elseチェーンのまま。
     #[test]
     fn menu_takes_precedence_over_other_lists() {

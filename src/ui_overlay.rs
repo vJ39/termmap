@@ -546,4 +546,278 @@ mod tests {
         assert!(row.contains(&sgr_fg(r, g, b, false)));
         assert!(!row.contains("38;2;"), "truecolor無効なら24bitコードを使わない");
     }
+
+    // ---- 各パネルの描画(小さい端末・長い文字列でも落ちないこと + 見た目の要点) ----
+
+    // 書き出しを (行, 列, 見える文字列) に分ける。カーソル移動(\x1b[行;列H)ごとに1要素。
+    // それ以外のCSI(色・行末消去)は取り除き、OSC(\x1b]...\x07 = インライン画像)は丸ごと捨てる。
+    fn screen(out: &[u8]) -> Vec<(u32, u32, String)> {
+        let s = String::from_utf8_lossy(out);
+        let mut rows: Vec<(u32, u32, String)> = Vec::new();
+        let mut it = s.chars();
+        while let Some(c) = it.next() {
+            if c != '\u{1b}' {
+                if let Some(last) = rows.last_mut() { last.2.push(c); }
+                continue;
+            }
+            match it.next() {
+                Some('[') => {
+                    let mut params = String::new();
+                    for n in it.by_ref() {
+                        if ('\u{40}'..='\u{7e}').contains(&n) {
+                            if n == 'H' {
+                                let mut p = params.split(';').map(|x| x.parse::<u32>().unwrap_or(1));
+                                let r = p.next().unwrap_or(1);
+                                rows.push((r, p.next().unwrap_or(1), String::new()));
+                            }
+                            break;
+                        }
+                        params.push(n);
+                    }
+                }
+                Some(']') => { for n in it.by_ref() { if n == '\u{7}' { break; } } }
+                _ => {}
+            }
+        }
+        rows
+    }
+
+    fn texts(out: &[u8]) -> Vec<String> {
+        screen(out).into_iter().map(|r| r.2).collect()
+    }
+
+    fn at_least_top_left(out: &[u8]) -> bool {
+        screen(out).iter().all(|&(r, c, _)| r >= 1 && c >= 1)
+    }
+
+    fn empty_spec() -> OverlaySpec {
+        OverlaySpec { pois: Vec::new(), routes: Vec::new(), expressway_segments: Vec::new(), roads: Vec::new(),
+                      traffic_segments: Vec::new(), warning_segments: Vec::new(), rings: Vec::new(), spots: Vec::new() }
+    }
+
+    #[test]
+    fn quit_confirm_and_popup_are_centered_and_never_leave_the_screen() {
+        let mut out = Vec::new();
+        draw_quit_confirm(&mut out, 80, 24);
+        let rows = screen(&out);
+        assert_eq!(rows.len(), 3);
+        assert!(rows[1].2.contains("termmapを終了しますか？ (y/n)"));
+        assert_eq!(rows[0].0, 12, "縦中央");
+        assert_eq!(rows[1].1, (80 - rows[1].2.chars().count() as u32) / 2, "横中央(文字数基準)");
+        let mut tiny = Vec::new();
+        draw_quit_confirm(&mut tiny, 5, 0);
+        assert!(at_least_top_left(&tiny), "狭い端末でも1行1列より外へ出さない");
+        let mut pop = Vec::new();
+        draw_popup(&mut pop, 10, 1, &"長い名前".repeat(20));
+        assert!(texts(&pop)[1].contains("長い名前長い名前"));
+        assert!(at_least_top_left(&pop));
+    }
+
+    #[test]
+    fn qr_text_is_wrapped_in_a_quiet_zone_with_the_close_hint_at_the_bottom() {
+        let mut out = Vec::new();
+        draw_qr_text(&mut out, 40, 20, 21, "▀▄▀\n▄▀▄");
+        let rows = screen(&out);
+        assert_eq!(rows.len(), 2 + 2 + 2 + 1, "上下2行の余白 + QR2行 + 案内");
+        assert_eq!(rows[2].2, "  ▀▄▀  ", "左右2セルの余白");
+        let hint = rows.last().unwrap();
+        assert!(hint.2.contains("任意のキーで閉じる"));
+        assert_eq!(hint.0, 21, "案内は最下段");
+        let mut empty = Vec::new();
+        draw_qr_text(&mut empty, 0, 0, 1, "");
+        assert!(at_least_top_left(&empty));
+    }
+
+    #[test]
+    fn qr_image_emits_one_inline_image_and_the_close_hint() {
+        let mut out = Vec::new();
+        draw_qr_image(&mut out, 80, 24, 24, &RgbImage::from_pixel(8, 8, image::Rgb([255, 255, 255])));
+        let s = String::from_utf8_lossy(&out);
+        assert_eq!(s.matches("\x1b]1337;File=inline=1").count(), 1);
+        assert!(s.contains("width=20;height=10"), "モジュール数に関係なく一定のセル数");
+        assert!(s.contains("任意のキーで閉じる"));
+        let mut tiny = Vec::new();
+        draw_qr_image(&mut tiny, 3, 2, 2, &RgbImage::new(0, 0)); // 空画像・狭い端末でも落ちない
+        assert!(at_least_top_left(&tiny));
+    }
+
+    #[test]
+    fn spot_form_highlights_only_the_selected_field() {
+        const SEL: &str = "\x1b[97;40m";
+        for field in 0..4usize {
+            let mut out = Vec::new();
+            draw_spot_form(&mut out, 80, 24, "満州軒", "https://g.co/x", field, 1, "ラーメン");
+            let raw = String::from_utf8_lossy(&out).into_owned();
+            let rows = texts(&out);
+            assert_eq!(rows.len(), 8);
+            assert!(rows.iter().all(|t| disp_width(t) == 60), "全行が箱の幅(60)に揃う: {rows:?}");
+            assert!(rows[1].contains("新規スポット [ラーメン]"));
+            let highlighted = [format!("{SEL}  名称: 満\u{2588}州軒"), format!("{SEL}  GoogleマップURL(任意): h\u{2588}ttps"),
+                               format!("{SEL}[送信]"), format!("{SEL}[戻る]")];
+            for (i, h) in highlighted.iter().enumerate() {
+                assert_eq!(raw.contains(h.as_str()), i == field, "field={field} で {h:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn forms_keep_their_minimum_width_on_a_tiny_terminal_with_long_input() {
+        let long = "とても長い店名".repeat(30);
+        let mut out = Vec::new();
+        draw_spot_form(&mut out, 10, 3, &long, &long, 1, 999, "");
+        assert!(texts(&out).iter().all(|t| disp_width(t) == 24), "箱は最小幅24で切り詰める");
+        assert!(at_least_top_left(&out));
+        let mut out = Vec::new();
+        draw_poi_kind_form(&mut out, 10, 3, &long, &long, 0, 999);
+        assert!(texts(&out).iter().all(|t| disp_width(t) == 24));
+        assert!(at_least_top_left(&out));
+    }
+
+    #[test]
+    fn poi_kind_form_highlights_the_add_button() {
+        let mut out = Vec::new();
+        draw_poi_kind_form(&mut out, 80, 24, "パン屋", "shop=bakery", 2, 0);
+        let raw = String::from_utf8_lossy(&out).into_owned();
+        assert!(raw.contains("\x1b[97;40m[追加]"));
+        assert!(!raw.contains('\u{2588}'), "ボタン選択中は入力欄にカーソルを出さない");
+        assert!(texts(&out)[1].contains("新しい目的地カテゴリ"));
+    }
+
+    #[test]
+    fn wander_form_gauge_fills_in_proportion_to_the_distance() {
+        let gauge = |d: f64| {
+            let mut out = Vec::new();
+            draw_wander_form(&mut out, 80, 24, d);
+            let rows = texts(&out);
+            (rows[6].matches('█').count(), rows[6].matches('░').count()) // 本文6行の後にゲージを上書きする
+        };
+        assert_eq!(gauge(10.0), (0, 56), "下限10kmは空");
+        assert_eq!(gauge(105.0), (28, 28), "中間は半分");
+        assert_eq!(gauge(200.0), (56, 0), "上限200kmは満杯");
+        assert_eq!(gauge(-50.0), (0, 56), "範囲外は端へ寄せる");
+        assert_eq!(gauge(999.0), (56, 0));
+        assert_eq!(gauge(f64::NAN).0 + gauge(f64::NAN).1, 56, "壊れた値でも落ちない");
+    }
+
+    #[test]
+    fn text_input_panel_is_drawn_only_for_text_focuses() {
+        let draw = |f: &Focus| {
+            let mut out = Vec::new();
+            draw_text_input(&mut out, 80, 24, f, 1);
+            String::from_utf8_lossy(&out).into_owned()
+        };
+        assert!(draw(&Focus::Map).is_empty(), "入力欄の無い画面では何も書かない");
+        let s = draw(&Focus::Search("東京".to_string()));
+        assert!(s.contains("地名・住所で検索") && s.contains("東\u{2588}京"));
+        assert!(draw(&Focus::SettingsEdit(6, "800".into())).contains("道路の点間隔(m)"));
+        assert!(draw(&Focus::SettingsEdit(17, String::new())).contains("Google APIキー"));
+        for f in [Focus::SaveName(String::new()), Focus::NearSearch(String::new()), Focus::NewCat(String::new()),
+                  Focus::RoadSearch(String::new()), Focus::Recommend(String::new()),
+                  Focus::SpotRename(String::new(), 0), Focus::SpotEditName(String::new(), 0)] {
+            assert!(!draw(&f).is_empty());
+        }
+    }
+
+    #[test]
+    fn pickers_bracket_only_the_selected_item() {
+        for sel in [0u8, 9] {
+            let mut out = Vec::new();
+            draw_color_pick(&mut out, 80, 24, sel);
+            let sw = &texts(&out)[2];
+            assert_eq!((sw.matches('[').count(), sw.matches(']').count()), (1, 1), "{sw:?}");
+            assert_eq!(sw.find('['), Some(2 + 4 * sel as usize), "左余白2 + 1色4セル");
+        }
+        let mut out = Vec::new();
+        draw_color_pick(&mut out, 80, 24, 99);
+        assert!(!texts(&out)[2].contains('['), "範囲外の選択は囲まない");
+
+        let mut out = Vec::new();
+        draw_shape_pick(&mut out, 80, 24, 6);
+        let sw = &texts(&out)[2];
+        assert_eq!((sw.matches('[').count(), sw.matches(']').count()), (1, 1));
+        assert!(sw.contains("[✕]"));
+        for g in ["■", "▲", "●", "◆", "＋", "✦", "✕"] {
+            assert!(sw.contains(g), "{g} が並んでいない");
+        }
+        let mut tiny = Vec::new();
+        draw_shape_pick(&mut tiny, 1, 1, 0);
+        assert!(at_least_top_left(&tiny));
+    }
+
+    #[test]
+    fn disaster_panel_folds_the_overflow_and_notes_a_truncated_count() {
+        let lines: Vec<String> = (0..50).map(|i| format!("{i}件目")).collect();
+        let (cols, map_rows) = (80u32, 20u32);
+        let iw = 74; // (80-6).clamp(24, 96)
+        let shown = map_rows as usize - (9 + wrap_legend(iw - 1).len());
+        let mut out = Vec::new();
+        draw_disaster_panel(&mut out, cols, map_rows, "野田市 ─ 記録 50件", &lines, true);
+        let rows = texts(&out);
+        assert!(rows.iter().any(|t| t.contains(&format!("…ほか{}件(画面に収まらない)", 50 - shown))), "{rows:?}");
+        assert!(rows.iter().any(|t| t.contains("※取得上限で打ち切られた集計がある")));
+        assert!(rows.iter().all(|t| disp_width(t) == iw), "凡例の色付き行も含めて幅が揃う");
+        let mut out = Vec::new();
+        draw_disaster_panel(&mut out, cols, map_rows, "t", &lines[..2], false);
+        let rows = texts(&out);
+        assert!(!rows.iter().any(|t| t.contains("…ほか") || t.contains("※取得上限")), "収まれば畳まない・打ち切り無しなら注記しない");
+        let mut tiny = Vec::new();
+        draw_disaster_panel(&mut tiny, 0, 0, &"長".repeat(200), &lines, false);
+        assert!(texts(&tiny).iter().any(|t| t.contains("0件目")), "狭くても本文を最低1行出す");
+        assert!(at_least_top_left(&tiny));
+    }
+
+    #[test]
+    fn regulation_panel_folds_lines_that_do_not_fit() {
+        let lines: Vec<String> = (0..30).map(|i| format!("行{i}")).collect();
+        let mut out = Vec::new();
+        draw_regulation_detail_panel(&mut out, 80, 17, "国道418号", &lines);
+        let rows = texts(&out);
+        assert!(rows.iter().any(|t| t.contains("…ほか20行(画面に収まらない)")), "本文は 17-7=10 行まで: {rows:?}");
+        assert!(rows.iter().any(|t| t.contains("国土交通省")));
+        assert!(rows.iter().all(|t| disp_width(t) == 74));
+        let mut tiny = Vec::new();
+        draw_regulation_detail_panel(&mut tiny, 0, 0, "", &[]);
+        assert!(at_least_top_left(&tiny));
+    }
+
+    // オンボーディングのワードマークはヘルプ画面(keymap::LOGO)と同じ見た目を保つ(別々に持っているため)。
+    #[test]
+    fn onboarding_wordmark_matches_the_help_screen_logo() {
+        let mut out = Vec::new();
+        draw_onboarding(&mut out, 80, 24);
+        let raw = String::from_utf8_lossy(&out).into_owned();
+        for (bold, (r, g, b), ln) in crate::keymap::LOGO {
+            let style = format!("{}{}", if bold { "\x1b[1m" } else { "" }, sgr_fg(r, g, b, truecolor_safe()));
+            assert!(raw.contains(&format!("{style}{ln}")), "{ln:?} の文字か色がヘルプと違う");
+        }
+        let mut tiny = Vec::new();
+        draw_onboarding(&mut tiny, 0, 0);
+        assert!(at_least_top_left(&tiny));
+    }
+
+    #[test]
+    fn elevation_band_draws_the_label_the_chart_and_the_position_cursor() {
+        let mut spec = empty_spec();
+        spec.routes.push(Route { pts: vec![(35.0, 139.0), (35.01, 139.0), (35.02, 139.0)], color: [0, 220, 255], thickness: 2 });
+        let mut out = Vec::new();
+        draw_elevation_band(&mut out, 40, 20, 4, &[100.0, 300.0, 200.0], 200.0, &spec, 35.01, 139.0);
+        let rows = screen(&out);
+        assert_eq!(rows[0].0, 21, "ラベルは地図の直下");
+        assert!(rows[0].2.contains("標高 ↑200m  最高300m 最低100m"), "{:?}", rows[0]);
+        assert!(rows[1].2.contains("300m"), "最上段の目盛りは最高値");
+        let cursors: Vec<_> = rows.iter().filter(|r| r.2 == "|").collect();
+        assert_eq!(cursors.len(), 4, "標高帯の行数ぶんの縦カーソル");
+        // 真ん中の点にいる → グラフ幅33列の中央(16)+1 + 目盛り7列
+        assert!(cursors.iter().all(|c| c.1 == 24), "{cursors:?}");
+    }
+
+    #[test]
+    fn elevation_band_without_a_route_or_rows_draws_only_the_label() {
+        let mut out = Vec::new();
+        draw_elevation_band(&mut out, 0, 0, 0, &[], 0.0, &empty_spec(), 0.0, 0.0);
+        assert_eq!(screen(&out).len(), 1);
+        let mut out = Vec::new();
+        draw_elevation_band(&mut out, 40, 20, 3, &[], 0.0, &empty_spec(), 0.0, 0.0); // 標高データ無し
+        assert!(!screen(&out).iter().any(|r| r.2 == "|"), "ルートが無ければカーソルを出さない");
+    }
 }

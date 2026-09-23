@@ -620,6 +620,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    #[test]
+    fn every_layer_has_its_own_directory_and_consistent_limits() {
+        let mut dirs: Vec<&str> = ALL_LAYERS.iter().map(|l| l.dir_name()).collect();
+        dirs.sort_unstable();
+        dirs.dedup();
+        assert_eq!(dirs.len(), ALL_LAYERS.len(), "同じディレクトリを共有すると gc と読込で種別が混ざる");
+        for l in ALL_LAYERS {
+            assert!(l.fresh_ttl() >= Duration::from_secs(5 * MINUTE), "{l:?}: TTLが短すぎると外部サービスを叩き続ける(最短は交通量の5分)");
+            if let Some(limit) = l.stale_limit() {
+                assert!(limit > l.fresh_ttl(), "{l:?}: stale上限がfresh以下だと取り直し中に表示が消える");
+            }
+            assert!(l.max_entries() > 0 && l.max_bytes() > 0, "{l:?}: 上限0だと保存した端から消える");
+        }
+    }
+
+    // 種別ディレクトリの中の子ディレクトリは数えも消しもしない(対象はファイルだけ)。
+    #[test]
+    fn gc_leaves_subdirectories_inside_a_layer_alone() {
+        let root = temp_root("gcsubdir");
+        let sub = root.join(VERSION_DIR).join(Layer::Camera.dir_name()).join("keep");
+        std::fs::create_dir_all(&sub).unwrap();
+        gc_in(&root, now_secs());
+        assert!(sub.is_dir());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     // mtime を任意時刻へ寄せる(gcの並び順テスト用)。外部crateを足さずに済ませるため、
     // unix では utimes(2) を直接呼ぶ。他OSでは何もしない(そのテストは書いた順=mtime順になる)。
     #[cfg(unix)]

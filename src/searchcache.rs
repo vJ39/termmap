@@ -549,4 +549,38 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
     }
+
+    // 数値の列が1つでも壊れた行は読み飛ばし、同じファイルの正しい行は活かす。
+    #[test]
+    fn load_skips_lines_whose_numbers_do_not_parse() {
+        let path = unique_temp_path("brokennums");
+        let now = now_secs();
+        let key = "g\tja\tx\t35.00\t139.00";
+        let body = format!(
+            "{HEADER_PREFIX} {CACHE_VERSION}\n\
+             {key}\t35.0\t139.0\t最終利用が壊れた行\t{now}\tabc\n\
+             {key}\t35.0\t139.0\t作成時刻が壊れた行\tabc\t{now}\n\
+             {key}\t35.0\tabc\t経度が壊れた行\t{now}\t{now}\n\
+             {key}\tabc\t139.0\t緯度が壊れた行\t{now}\t{now}\n\
+             {key}\t35.5\t139.5\t正しい行\t{now}\t{now}\n"
+        );
+        std::fs::write(&path, body).unwrap();
+        let map = load_from(&path);
+        cleanup(&path);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map[key].results, vec![(35.5, 139.5, "正しい行".to_string())]);
+    }
+
+    #[test]
+    fn save_to_a_directory_path_fails_without_leaving_a_temp_file() {
+        let dir = unique_temp_path("isdir");
+        std::fs::create_dir_all(dir.join("child")).unwrap();
+        let err = save_to(&dir, &HashMap::new()).unwrap_err();
+        assert!(err.starts_with("failed to write cache"), "{err}");
+        let tmp = dir.parent().unwrap()
+            .join(format!(".{}.{}.tmp", dir.file_name().unwrap().to_string_lossy(), std::process::id()));
+        assert!(!tmp.exists(), "失敗時に一時ファイルが残っている");
+        assert!(dir.join("child").is_dir(), "置き換え先が壊れた");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -409,4 +409,92 @@ mod tests {
         assert_eq!(items[0].display_name, "ラーメン\"横綱\"");
         assert_eq!(items[0].lat, "35.68");
     }
+
+    #[test]
+    fn api_error_messages_distinguish_the_three_failures() {
+        assert_eq!(ApiError::Transport("timeout".into()).to_string(), "通信失敗: timeout");
+        assert_eq!(ApiError::Http(503).to_string(), "サーバ応答エラー(503)");
+        assert_eq!(ApiError::Decode("eof".into()).to_string(), "応答解析失敗: eof");
+    }
+
+    #[test]
+    fn urlencode_keeps_unreserved_characters_and_encodes_the_rest() {
+        assert_eq!(urlencode("Az09-_.~"), "Az09-_.~");
+        assert_eq!(urlencode("a b&c=d/e"), "a%20b%26c%3Dd%2Fe");
+        assert_eq!(urlencode("東"), "%E6%9D%B1", "UTF-8のバイト単位で符号化");
+        assert_eq!(urlencode(""), "");
+    }
+
+    #[test]
+    fn overpass_name_pattern_allows_separators_and_escapes_the_query() {
+        let sep = "[-ー・‐ 　]?";
+        assert_eq!(overpass_name_pattern("セブン"), format!("セ{sep}ブ{sep}ン"));
+        assert_eq!(overpass_name_pattern(" a b　c "), format!("a{sep}b{sep}c"), "半角/全角空白は捨てる");
+        assert_eq!(overpass_name_pattern("A.B*"), format!("A{sep}\\.{sep}B{sep}\\*"), "正規表現のメタ文字はエスケープ");
+        assert_eq!(overpass_name_pattern("\"x"), format!("\\\"{sep}x"), "引用符でクエリを閉じさせない");
+        assert_eq!(overpass_name_pattern("   "), "");
+    }
+
+    #[test]
+    fn default_poi_kinds_have_unique_keys_and_include_the_wander_spots() {
+        let v = poi_kind_defaults();
+        assert_eq!(v.len(), 8);
+        let mut keys: Vec<char> = v.iter().map(|k| k.key).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(keys.len(), 8, "キーが重複しない");
+        assert!(v.iter().all(|k| k.key != 'n' && k.key != 'x'), "予約キー(n/x)を使わない");
+        // 走りまくり(main.rs の wander_route)はこの2つをラベルで探す
+        assert!(v.iter().any(|k| k.label == "峠道") && v.iter().any(|k| k.label == "展望"));
+        assert!(v.iter().all(|k| k.filter.starts_with("nwr[")));
+    }
+
+    #[test]
+    fn every_poi_category_round_trips_through_its_saved_name() {
+        for c in [PoiCat::Home, PoiCat::Food, PoiCat::Fuel, PoiCat::Shop, PoiCat::Danger, PoiCat::Waypoint, PoiCat::Other] {
+            let s = poi_cat_to_str(c);
+            assert_eq!(poi_cat_to_str(poi_cat_from_str(s)), s);
+        }
+        assert!(matches!(poi_cat_from_str("知らない値"), PoiCat::Other), "未知の値はOther");
+    }
+
+    #[test]
+    fn poi_kind_clean_removes_tabs_and_newlines() {
+        assert_eq!(poi_kind_clean("  パン\t屋\n "), "パン 屋", "保存形式(タブ区切り・1行1件)を壊さない");
+    }
+
+    #[test]
+    fn next_free_key_prefers_digits_then_letters_and_marks_a_full_menu() {
+        let kind = |key| PoiKind { key, label: "a".into(), filter: "f".into(), cat: PoiCat::Other };
+        assert_eq!(next_free_key(&[]), '1');
+        let digits: Vec<PoiKind> = "1234567890".chars().map(kind).collect();
+        assert_eq!(next_free_key(&digits), 'a', "数字が埋まったら英小文字");
+        let all: Vec<PoiKind> = "1234567890abcdefghijklmopqrstuvwyz".chars().map(kind).collect();
+        assert_eq!(next_free_key(&all), '?', "全部埋まったら目印を返す");
+    }
+
+    #[test]
+    fn broken_poi_kind_lines_are_skipped() {
+        let text = "壊れた行\n1\tカフェ\tnwr[\"amenity\"=\"cafe\"]\n\tキー空\tf\tfood\n2\tパン\tnwr[\"shop\"=\"bakery\"]\tfood\n";
+        let v = parse_poi_kinds_text(text);
+        assert_eq!(v.len(), 1, "4列そろってキーのある行だけ読む");
+        assert_eq!((v[0].key, v[0].label.as_str()), ('2', "パン"));
+        assert!(matches!(v[0].cat, PoiCat::Food));
+    }
+
+    // HOME を一時ディレクトリにした子プロセスで実行する(実HOMEには触れない)。
+    #[test]
+    fn poi_kinds_fall_back_to_the_defaults_until_saved() {
+        if !crate::fsutil::testing::reexec_in_temp_home(module_path!(), "poi_kinds_fall_back_to_the_defaults_until_saved", &[]) { return; }
+        let labels = |v: &[PoiKind]| v.iter().map(|k| k.label.clone()).collect::<Vec<_>>();
+        let defaults = labels(&poi_kind_defaults());
+        assert_eq!(labels(&load_poi_kinds()), defaults, "ファイルが無ければ既定");
+        let mine = vec![PoiKind { key: 'b', label: "パン屋".into(), filter: "nwr[\"shop\"=\"bakery\"]".into(), cat: PoiCat::Food }];
+        save_poi_kinds(&mine).unwrap();
+        let back = load_poi_kinds();
+        assert_eq!(labels(&back), vec!["パン屋".to_string()]);
+        assert_eq!(back[0].key, 'b');
+        std::fs::write(poi_kinds_path().unwrap(), "読めない行だけ\n").unwrap();
+        assert_eq!(labels(&load_poi_kinds()), defaults, "1行も読めなければ既定へ戻す");
+    }
 }

@@ -490,6 +490,7 @@ fn parse_number(v: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fsutil::testing::reexec_in_temp_home;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// Generates a unique path under the OS temp dir so tests never touch
@@ -1057,5 +1058,33 @@ profile = "custom-profile"
         let loaded = load_config_from(&path);
         assert_eq!(loaded, cfg);
         cleanup(&path);
+    }
+
+    // 以下は HOME を一時ディレクトリにした子プロセスで実行する(実HOMEの config.toml には触れない)。
+
+    // 環境変数 TERMMAP_GOOGLE_API_KEY は config.toml のキーより優先する(前後の空白は落とす)。
+    #[test]
+    fn google_api_key_from_the_environment_overrides_the_config_file() {
+        let test = "google_api_key_from_the_environment_overrides_the_config_file";
+        if !reexec_in_temp_home(module_path!(), test, &[("TERMMAP_GOOGLE_API_KEY", "  AIza-env  ")]) { return; }
+        assert_eq!(load_config().google_maps_api_key, "AIza-env", "ファイルが無くても環境変数から");
+        save_config(&Config { google_maps_api_key: "AIza-file".to_string(), ..Config::default() }).unwrap();
+        assert_eq!(load_config().google_maps_api_key, "AIza-env", "ファイルのキーより優先");
+    }
+
+    #[test]
+    fn saved_config_is_used_when_the_environment_key_is_blank() {
+        let test = "saved_config_is_used_when_the_environment_key_is_blank";
+        if !reexec_in_temp_home(module_path!(), test, &[("TERMMAP_GOOGLE_API_KEY", "   ")]) { return; }
+        assert_eq!(load_config(), Config::default(), "ファイルが無ければ既定");
+        let saved = Config { google_maps_api_key: "AIza-file".to_string(), style: "dark".to_string(), ..Config::default() };
+        save_config(&saved).unwrap();
+        assert_eq!(load_config(), saved, "空白だけの環境変数では上書きしない");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(config_path().unwrap()).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "APIキーを含むので本人だけが読める");
+        }
     }
 }

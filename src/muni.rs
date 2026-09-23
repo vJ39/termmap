@@ -313,6 +313,20 @@ mod tests {
         assert!(parse_areas(r#"{"features":[{"properties":{"code":123}}]}"#).is_empty());
     }
 
+    // 数値でない頂点・形の崩れた頂点は捨て、残りで面になれば区域として使う。
+    #[test]
+    fn parse_areas_skips_malformed_vertices_inside_a_ring() {
+        let body = r#"{"features":[{"geometry":{"type":"MultiPolygon","coordinates":[[[
+            [139.0,35.0],["x",35.0],[139.1],"点ではない",[139.1,35.0],[139.1,35.1]]]]},
+            "properties":{"code":"1310100","name":"千代田区"}}]}"#;
+        let got = parse_areas(body);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].rings[0], vec![(35.0, 139.0), (35.0, 139.1), (35.1, 139.1)]);
+        let too_few = r#"{"features":[{"geometry":{"type":"Polygon","coordinates":[[[139.0,35.0],["x","y"],[139.1,35.1]]]},
+            "properties":{"code":"1310100","name":"千代田区"}}]}"#;
+        assert!(parse_areas(too_few).is_empty(), "捨てた結果3点未満なら面にならない");
+    }
+
     #[test]
     fn parse_areas_also_accepts_a_plain_polygon() {
         let body = r#"{"features":[{"geometry":{"type":"Polygon","coordinates":[[[139.0,35.0],[139.1,35.0],[139.1,35.1]]]},"properties":{"code":"1310100","name":"千代田区"}}]}"#;

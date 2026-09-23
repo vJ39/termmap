@@ -331,4 +331,13 @@ mod tests {
         assert!(zoom_at(100.0, 100.0, MAX_Z, false, 40, 10, GUT, &l).is_some());
         assert!(zoom_at(100.0, 100.0, MIN_Z, true, 40, 10, GUT, &l).is_some());
     }
+
+    // 端末寸法が0だと比を出せないのでパンにしない(0除算の無限大を地図へ渡さない)。
+    #[test]
+    fn drag_with_a_zero_sized_terminal_does_not_pan() {
+        let l = Layout { cols: 0, rows: 0, map_cols: 72, map_rows: 40, ow: 72, oh: 80 };
+        let mut t = MouseTracker::default();
+        t.feed(&down(40, 10), GUT, &l);
+        assert_eq!(t.feed(&drag(45, 12), GUT, &l), MouseAction::None);
+    }
 }

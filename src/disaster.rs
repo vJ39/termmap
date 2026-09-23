@@ -933,6 +933,28 @@ mod tests {
     }
 
     #[test]
+    fn damage_value_labels_for_the_unknown_and_major_codes() {
+        assert_eq!(DamageValue::from_raw(Some(-1)).label("名"), "不明");
+        assert_eq!(DamageValue::from_raw(Some(-7)).label("棟"), "大規模被害");
+        assert_eq!(DamageValue::from_raw(Some(-99)).label("名"), "不明", "未知のコードも数値として出さない");
+    }
+
+    // 同数なら未知コード(Unknown)より既知の種別の色を採る。
+    #[test]
+    fn dominant_prefers_a_known_kind_over_unknown_on_a_tie() {
+        let site = DisasterSite {
+            lat: 35.0,
+            lon: 139.0,
+            muni_code: String::new(),
+            kinds: vec![
+                KindCount { kind: DisasterKind::Unknown, count: 4, year_min: 1950, year_max: 1990 },
+                KindCount { kind: DisasterKind::OtherWeather, count: 4, year_min: 1950, year_max: 1990 },
+            ],
+        };
+        assert_eq!(site.dominant(), DisasterKind::OtherWeather);
+    }
+
+    #[test]
     fn only_a_blank_damage_value_is_left_out_of_the_panel() {
         assert!(!DamageValue::NotRecorded.is_recorded());
         for v in [

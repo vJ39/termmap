@@ -568,4 +568,20 @@ mod tests {
         assert_eq!(owned_result, borrowed_result);
         assert_eq!(owned_result.len(), 3);
     }
+
+    // 先頭側につながる断片は前へ連結する(向きが逆なら反転)。結合点の重複は1点にする。
+    #[test]
+    fn assemble_polyline_prepends_fragments_that_join_the_front() {
+        let (a, b, c) = ((35.0, 139.0), (35.01, 139.0), (35.02, 139.0));
+        let head = RoadFrag { pts: vec![b, c], oneway: false };
+        let forward = RoadFrag { pts: vec![a, b], oneway: false }; // 末尾が先頭につながる
+        assert_eq!(assemble_polyline(&[head.clone(), forward]), vec![a, b, c]);
+        let backward = RoadFrag { pts: vec![b, a], oneway: false }; // 先頭同士がつながる
+        assert_eq!(assemble_polyline(&[head, backward]), vec![a, b, c]);
+    }
+
+    #[test]
+    fn point_at_on_an_empty_polyline_is_the_origin() {
+        assert_eq!(point_at(&[], 100.0), (0.0, 0.0));
+    }
 }

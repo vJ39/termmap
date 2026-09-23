@@ -542,4 +542,20 @@ mod tests {
             assert_eq!((out.width(), out.height()), (640, 480));
         }
     }
+
+    // 極端に細長いセル矩形でも切り出しは最低1px残す(0pxの画像は作れない)。
+    #[test]
+    fn crop_never_shrinks_below_one_pixel() {
+        assert_eq!(crop_photo_to_cells(1000, 1, 1, 1000, 4.0), PhotoCrop { crop_x: 499, crop_y: 0, crop_w: 1, crop_h: 1 });
+        assert_eq!(crop_photo_to_cells(1, 1000, 1000, 1, 1.0), PhotoCrop { crop_x: 0, crop_y: 499, crop_w: 1, crop_h: 1 });
+    }
+
+    #[test]
+    fn round_at_least_one_clamps_small_and_broken_values() {
+        assert_eq!(round_at_least_one(2.6), 3);
+        assert_eq!(round_at_least_one(0.4), 1);
+        assert_eq!(round_at_least_one(-5.0), 1);
+        assert_eq!(round_at_least_one(f64::NAN), 1);
+        assert_eq!(round_at_least_one(1e20), u32::MAX);
+    }
 }

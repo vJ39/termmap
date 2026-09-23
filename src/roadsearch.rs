@@ -226,6 +226,39 @@ mod tests {
         assert!(!frags[1].1);
     }
 
+    #[test]
+    fn parse_road_fragments_skips_elements_with_an_empty_geometry() {
+        let body = r#"{"elements":[{"geometry":[]},{"geometry":[{"lat":1.0,"lon":2.0}]}]}"#;
+        assert_eq!(parse_road_fragments(body), vec![(vec![(1.0, 2.0)], false)]);
+    }
+
+    #[test]
+    fn urlencode_keeps_unreserved_characters_and_encodes_the_rest() {
+        assert_eq!(urlencode("Az09-_.~"), "Az09-_.~");
+        assert_eq!(urlencode("[out:json];"), "%5Bout%3Ajson%5D%3B");
+        assert_eq!(urlencode("国"), "%E5%9B%BD", "UTF-8のバイト単位で符号化");
+    }
+
+    // ref の完全一致値。引用符とバックスラッシュだけを逃がし、それ以外(正規表現記号も)はそのまま。
+    #[test]
+    fn escape_ql_only_escapes_quotes_and_backslashes() {
+        assert_eq!(escape_ql(r#"E20"];out;"#), r#"E20\"];out;"#, "引用符で文字列リテラルを閉じさせない");
+        assert_eq!(escape_ql(r"a\b"), r"a\\b");
+        assert_eq!(escape_ql("国道1.*"), "国道1.*");
+    }
+
+    // name の部分一致パターン。正規表現記号も全部逃がして、入力そのままの部分一致にする。
+    #[test]
+    fn escape_regex_escapes_every_regex_metacharacter() {
+        assert_eq!(escape_regex(r#"\".*+?()[]{}|^$"#), r#"\\\"\.\*\+\?\(\)\[\]\{\}\|\^\$"#);
+        assert_eq!(escape_regex("国道16号"), "国道16号");
+    }
+
+    #[test]
+    fn fetch_refuses_a_blank_query_without_touching_the_network() {
+        assert_eq!(fetch("  ", 35.0, 139.0, 36.0, 140.0).unwrap_err(), "道路名/refが空です");
+    }
+
     // 実ネットワークを叩く手動確認用(CIでは走らない)。`cargo test --release -- --ignored`で実行。
     #[test]
     #[ignore]

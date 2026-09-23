@@ -1392,6 +1392,113 @@ mod tests {
         assert!(parse_directions_legs("not json").is_err());
     }
 
+    #[test]
+    fn parse_directions_legs_rejects_an_empty_legs_array_and_reports_the_api_message() {
+        assert!(parse_directions_legs(r#"{"status":"OK","routes":[{"legs":[]}]}"#).is_err());
+        let err = parse_directions_legs(r#"{"status":"REQUEST_DENIED","error_message":"The provided API key is invalid."}"#).unwrap_err();
+        assert!(err.contains("The provided API key is invalid."), "{err}");
+    }
+
+    #[test]
+    fn route_profile_passes_unknown_names_through() {
+        assert_eq!(route_profile("car-eco"), "car-eco", "BRouterのプロファイル名はそのまま渡す");
+        assert_eq!(route_profile("下道"), "moped");
+        assert_eq!(route_profile("高速"), "car-fast");
+        assert_eq!(route_profile("shortest"), "shortest");
+    }
+
+    // 以下3つは通信の前に返る入口の検査(ネットワークには出ない)。
+    #[test]
+    fn fetch_route_needs_two_points() {
+        assert!(fetch_route(&[], "surface", 0, "", "").is_err());
+        assert!(fetch_route(&[(35.0, 139.0)], "surface", 0, "", "").is_err());
+    }
+
+    #[test]
+    fn fetch_turn_points_is_empty_without_a_route_or_its_points() {
+        assert!(fetch_turn_points(&[(35.0, 139.0)], "surface", 0, &[(35.0, 139.0)], "").is_empty());
+        assert!(fetch_turn_points(&[(35.0, 139.0), (35.1, 139.1)], "surface", 0, &[], "").is_empty());
+    }
+
+    #[test]
+    fn google_fallback_needs_a_key() {
+        let err = fetch_google_route(&[(35.0, 139.0), (35.1, 139.1)], "surface", "  ").err();
+        assert_eq!(err.as_deref(), Some("Google APIキー未設定"));
+    }
+
+    #[test]
+    fn progress_along_route_is_the_distance_to_the_nearest_vertex() {
+        let pts = [(35.0, 139.0), (35.01, 139.0), (35.02, 139.0)];
+        let cum = cumulative_distances_m(&pts);
+        assert_eq!(progress_along_route((35.0, 139.0), &[]), None);
+        assert_eq!(progress_along_route((35.0, 139.0), &pts), Some(0.0));
+        assert_eq!(progress_along_route((35.02, 139.0), &pts), Some(cum[2]));
+        assert_eq!(progress_along_route((35.0101, 139.003), &pts), Some(cum[1]), "経路から外れた位置は最寄りの頂点へ投影");
+    }
+
+    #[test]
+    fn directions_params_carry_the_ends_the_vias_and_the_highway_avoidance() {
+        let two = [(35.0, 139.0), (36.0, 140.0)];
+        assert_eq!(directions_common_params(&two, "highway", "K"), "origin=35,139&destination=36,140&key=K");
+        let three = [(35.0, 139.0), (35.5, 139.5), (36.0, 140.0)];
+        assert_eq!(directions_common_params(&three, "surface", "K"),
+                   "origin=35,139&destination=36,140&key=K&waypoints=35.5,139.5&avoid=highways", "下道は高速を避ける");
+        let four = [(35.0, 139.0), (35.2, 139.2), (35.4, 139.4), (36.0, 140.0)];
+        assert!(directions_common_params(&four, "short", "K").ends_with("&waypoints=35.2,139.2|35.4,139.4"),
+                "最短はGoogleに等価な指定が無いので付けない");
+    }
+
+    #[test]
+    fn write_gpx_writes_the_track_points_in_order() {
+        let path = std::env::temp_dir().join(format!("termmap_route_gpx_{}.gpx", std::process::id()));
+        write_gpx(path.to_str().unwrap(), &[(35.5, 139.25), (36.0, 140.0)]).unwrap();
+        let s = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(s.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"));
+        let a = s.find("<trkpt lat=\"35.5\" lon=\"139.25\"></trkpt>").expect("1点目");
+        let b = s.find("<trkpt lat=\"36\" lon=\"140\"></trkpt>").expect("2点目");
+        assert!(a < b, "点の順序を保つ");
+        assert!(s.trim_end().ends_with("</gpx>"));
+    }
+
+    #[test]
+    fn write_gpx_reports_an_unwritable_path() {
+        let dir = std::env::temp_dir().join(format!("termmap_route_gpx_dir_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = write_gpx(dir.to_str().unwrap(), &[(35.0, 139.0)]).unwrap_err();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(err.starts_with("gpx write"), "{err}");
+    }
+
+    #[test]
+    fn turn_points_without_a_turn_code_are_skipped() {
+        let gpx = r#"<rtept lat="35.0" lon="139.0"><desc>left</desc></rtept>
+                     <rtept lat="35.01" lon="139.0"><desc>destination</desc></rtept>"#;
+        let got = turn_points_from_gpx(gpx, &[(35.0, 139.0), (35.01, 139.0)]);
+        assert_eq!(got.len(), 1, "コードの無い曲がり角は案内しない");
+        assert_eq!(got[0].turn, "ARRIVE");
+    }
+
+    // 座標列が整数マイクロ度で読めない応答でも、距離(料金概算の元)は捨てない。
+    #[test]
+    fn expressway_segments_keeps_the_distance_when_coordinates_are_not_integers() {
+        let body = r#"{"features":[{"properties":{"messages":[["Longitude","Latitude","Distance","WayTags"],["139.702","35.690","120","highway=motorway"]]}}]}"#;
+        let (m, segs) = expressway_segments(body, &sample_pts());
+        assert!((m - 120.0).abs() < 1e-9);
+        assert!(segs.is_empty(), "位置が特定できなければ色分けはしない");
+        // 行が途中で切れていて座標のセルが無い場合も同じ
+        let short_row = r#"{"features":[{"properties":{"messages":[["Distance","WayTags","Longitude","Latitude"],["80","highway=motorway"]]}}]}"#;
+        let (m, segs) = expressway_segments(short_row, &sample_pts());
+        assert!((m - 80.0).abs() < 1e-9);
+        assert!(segs.is_empty());
+    }
+
+    #[test]
+    fn parse_geojson_ele_is_empty_for_a_broken_body() {
+        assert!(parse_geojson_ele("not json").is_empty());
+        assert!(parse_geojson_ele(r#"{"features":[]}"#).is_empty());
+    }
+
     // 実ネットワークを叩く手動確認用(CIでは走らない)。事故調査(新宿→釈迦堂PA、長距離ルートで
     // nogosが多すぎてBRouterのwatchdogに殺され、通行止め回避が意図せずGoogleフォールバックへ
     // 落ちた件)の再現・検証用。`cargo test --release -- --ignored --nocapture`で実行。

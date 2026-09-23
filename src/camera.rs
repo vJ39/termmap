@@ -217,6 +217,24 @@ mod tests {
         assert!(parse_cameras(html).is_empty());
     }
 
+    // 写真が無い(ファイル名が空・fileList自体が無い)カメラも位置は地図に出す。URLだけ持たない。
+    #[test]
+    fn parse_cameras_keeps_cameras_that_have_no_photo_yet() {
+        let html = r#"<input id="kokudoJson" value='{"r":[{
+            "A":{"doro_gazo_joho_kanri_id":"A1","gis_point":["139.1","35.1"],"fileList":[{"get_datetime":"2026-08-16 16:00:36","file":""}]},
+            "B":{"doro_gazo_joho_kanri_id":"B1","gis_point":["139.2","35.2"],"image_name":"名前だけ"}
+        }]}' />"#;
+        let mut got = parse_cameras(html);
+        got.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!(got.len(), 2);
+        assert_eq!((got[0].id.as_str(), got[0].thumb_url.as_deref(), got[0].full_url.as_deref()), ("A1", None, None));
+        assert_eq!(got[0].taken_at, "2026-08-16 16:00:36", "撮影時刻は残す");
+        assert_eq!((got[1].id.as_str(), got[1].thumb_url.as_deref(), got[1].full_url.as_deref()), ("B1", None, None));
+        assert_eq!(got[1].taken_at, "");
+        assert_eq!(got[1].name, "名前だけ");
+        assert_eq!((got[1].lat, got[1].lon), (35.2, 139.2));
+    }
+
     // 位置だけを保存し、撮影時刻つきURLは保存しない(読み戻すと None / 空文字になる)。
     #[test]
     fn serde_keeps_the_position_and_drops_the_expiring_photo_urls() {

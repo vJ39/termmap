@@ -82,3 +82,46 @@ pub fn fetch(lat: f64, lon: f64, heading: i32, w: u32, h: u32, fov: f64, key: &s
         .to_rgb8();
     Ok(img)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ONE_DEG_M: f64 = 6_371_000.0 * std::f64::consts::PI / 180.0; // 地球半径6371kmでの1度ぶんの弧長
+
+    #[test]
+    fn available_requires_a_non_blank_key() {
+        assert!(available("AIza-test"));
+        assert!(!available(""));
+        assert!(!available("   "), "空白だけのキーは未設定扱い");
+    }
+
+    #[test]
+    fn fetch_without_a_key_fails_before_any_request() {
+        let err = fetch(35.0, 139.0, 0, 640, 480, 90.0, " ").unwrap_err();
+        assert_eq!(err, "APIキー未設定");
+    }
+
+    #[test]
+    fn status_of_extracts_the_status_for_the_error_message() {
+        assert_eq!(status_of(r#"{"error_message":"denied","status":"REQUEST_DENIED"}"#), "status=REQUEST_DENIED");
+        assert_eq!(status_of(r#"{"foo":1}"#), "取得エラー", "statusが無ければ汎用メッセージ");
+        assert_eq!(status_of(r#"{"status":"OK"#), "取得エラー", "閉じ引用符が無ければ汎用メッセージ");
+    }
+
+    #[test]
+    fn step_moves_by_the_distance_in_the_heading_direction() {
+        let (la, lo) = step(35.0, 139.0, 0.0, ONE_DEG_M);
+        assert!((la - 36.0).abs() < 1e-9 && (lo - 139.0).abs() < 1e-9, "北へ1度: {la},{lo}");
+        let (la, lo) = step(35.0, 139.0, 180.0, ONE_DEG_M);
+        assert!((la - 34.0).abs() < 1e-9 && (lo - 139.0).abs() < 1e-9, "南へ1度: {la},{lo}");
+        let (la, lo) = step(0.0, 0.0, 90.0, ONE_DEG_M);
+        assert!(la.abs() < 1e-9 && (lo - 1.0).abs() < 1e-9, "赤道上を東へ1度: {la},{lo}");
+    }
+
+    #[test]
+    fn step_with_zero_distance_stays_in_place() {
+        let (la, lo) = step(35.681, 139.767, 123.0, 0.0);
+        assert!((la - 35.681).abs() < 1e-12 && (lo - 139.767).abs() < 1e-12);
+    }
+}

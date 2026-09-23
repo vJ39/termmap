@@ -633,6 +633,33 @@ mod tests {
         assert_eq!(lines[0], "原因: 不明");
     }
 
+    #[test]
+    fn detail_panel_content_shows_the_detour_and_the_note_unless_they_are_placeholders() {
+        let mut d = parse_detail(DETAIL_SAMPLE).unwrap();
+        d.detour = "県道66号".to_string();
+        d.note = "夜間のみ".to_string();
+        let (_, lines) = detail_panel_content(&d);
+        assert!(lines.contains(&"う回路: 県道66号".to_string()), "{lines:?}");
+        assert!(lines.contains(&"備考: 夜間のみ".to_string()), "{lines:?}");
+        d.note = "-".to_string();
+        let (_, lines) = detail_panel_content(&d);
+        assert!(!lines.iter().any(|l| l.starts_with("備考")), "\"-\" は行を出さない");
+    }
+
+    // 地図の線の色だけで種別を読むので、種別どうしで色が重ならない。
+    #[test]
+    fn every_regulation_kind_has_its_own_color_and_label() {
+        let kinds = [RegulationKind::Closed, RegulationKind::LaneRestriction, RegulationKind::AlternatingOneLane,
+                     RegulationKind::ChainRequired, RegulationKind::MovementRestriction, RegulationKind::Other];
+        for (i, a) in kinds.iter().enumerate() {
+            for b in &kinds[i + 1..] {
+                assert_ne!(a.color(), b.color(), "{a:?} と {b:?} が同じ色");
+                assert_ne!(a.label(), b.label(), "{a:?} と {b:?} が同じ表記");
+            }
+        }
+        assert_eq!(RegulationKind::from_code("08").label(), "通行止め", "08 も通行止めとして表記する");
+    }
+
     // 実ネットワークを叩く手動確認用(CIでは走らない)。`cargo test --release -- --ignored`で実行。
     #[test]
     #[ignore]

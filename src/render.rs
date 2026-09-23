@@ -1804,6 +1804,216 @@ mod tests {
         assert_eq!(ov.get(0, 0), Some([0, 65, 255]), "後から渡した雨雲が人口を上書きする");
     }
 
+    // ---- 地物カテゴリの推定(classify)とその配色 ----
+
+    #[test]
+    fn recolor_maps_each_category_to_its_palette_color() {
+        let cases: [([u8; 3], [u8; 3]); 8] = [
+            ([170, 210, 225], [86, 170, 222]),  // 水域
+            ([180, 220, 180], [110, 190, 110]), // 緑地
+            ([250, 210, 150], [240, 200, 70]),  // 幹線道路
+            ([90, 90, 90], [180, 95, 200]),     // 線路(暗く彩度が低い)
+            ([220, 210, 195], [200, 172, 148]), // 建物
+            ([160, 160, 160], [150, 150, 150]), // その他(灰)
+            ([245, 245, 245], [245, 245, 245]), // 明るい地は背景のまま
+            ([200, 100, 150], [245, 245, 245]), // どれにも当たらない色も背景のまま
+        ];
+        for (src, want) in cases {
+            let img = RgbImage::from_pixel(1, 1, image::Rgb(src));
+            assert_eq!(recolor(&img).get_pixel(0, 0).0, want, "入力 {src:?}");
+        }
+    }
+
+    #[test]
+    fn braille_classify_colors_a_cell_by_its_majority_category() {
+        let mut img = RgbImage::from_pixel(2, 4, image::Rgb([170, 210, 225])); // 水域
+        img.put_pixel(0, 0, image::Rgb([180, 220, 180])); // 緑地が1画素だけ混ざる
+        let out = render_braille(&img, false, true, 128, false, None, true);
+        assert!(out.contains("\x1b[38;2;86;170;222m\u{28FF}"), "全ドットが立ち、多数派(水域)の色になる: {out:?}");
+    }
+
+    // braille では、インクの載った画素はドットを立て、セルの色はインクの平均色になる(地図の色は捨てる)。
+    #[test]
+    fn braille_cell_with_overlay_ink_takes_the_ink_color() {
+        let img = RgbImage::from_pixel(2, 4, image::Rgb([255, 255, 255])); // 明るい地=インクが無ければドット無し
+        let mut ov = OverlayLayer::new(2, 4);
+        ov.put(0, 0, [10, 20, 30]);
+        ov.put(1, 3, [30, 40, 50]);
+        let out = render_braille(&img, false, false, 128, false, Some(&ov), true);
+        assert!(out.contains("\x1b[38;2;20;30;40m\u{2881}"), "左上と右下の2ドット・2色の平均: {out:?}");
+    }
+
+    // 始点/経由/終点(route::set_markers が Waypoint/Food/Home を使う)を含め、種別ごとに色で見分けられる。
+    #[test]
+    fn every_poi_category_has_its_own_marker_color() {
+        let cats = [PoiCat::Home, PoiCat::Food, PoiCat::Fuel, PoiCat::Shop, PoiCat::Danger, PoiCat::Waypoint, PoiCat::Other];
+        for (i, a) in cats.iter().enumerate() {
+            for b in &cats[i + 1..] {
+                assert_ne!(poi_color(*a), poi_color(*b));
+            }
+        }
+    }
+
+    // ---- オーバーレイの描画プリミティブ ----
+
+    fn empty_spec() -> OverlaySpec {
+        OverlaySpec { pois: Vec::new(), routes: Vec::new(), expressway_segments: Vec::new(), roads: Vec::new(),
+                      traffic_segments: Vec::new(), warning_segments: Vec::new(), rings: Vec::new(), spots: Vec::new() }
+    }
+
+    // インクの置かれた画素(行→列の順)。
+    fn inked(ov: &OverlayLayer) -> Vec<(u32, u32)> {
+        let mut v = Vec::new();
+        for y in 0..ov.h { for x in 0..ov.w { if ov.get(x, y).is_some() { v.push((x, y)); } } }
+        v
+    }
+
+    #[test]
+    fn overlay_spec_is_empty_only_when_every_layer_is_empty() {
+        assert!(empty_spec().is_empty());
+        let fills: [fn(&mut OverlaySpec); 8] = [
+            |s| s.pois.push(Poi { lat: 35.0, lon: 139.0, cat: PoiCat::Food }),
+            |s| s.routes.push(Route { pts: Vec::new(), color: [0; 3], thickness: 1 }),
+            |s| s.expressway_segments.push(Route { pts: Vec::new(), color: [0; 3], thickness: 1 }),
+            |s| s.roads.push(Route { pts: Vec::new(), color: [0; 3], thickness: 1 }),
+            |s| s.traffic_segments.push(Route { pts: Vec::new(), color: [0; 3], thickness: 1 }),
+            |s| s.warning_segments.push(Route { pts: Vec::new(), color: [0; 3], thickness: 1 }),
+            |s| s.rings.push(Ring { lat: 35.0, lon: 139.0, radii_km: vec![1.0], color: [0; 3], thickness: 1 }),
+            |s| s.spots.push((35.0, 139.0, [0; 3], 0)),
+        ];
+        for (i, fill) in fills.iter().enumerate() {
+            let mut s = empty_spec();
+            fill(&mut s);
+            assert!(!s.is_empty(), "{i}番目の層だけが入っていても空ではない");
+        }
+    }
+
+    // 形状ごとの内側判定(half=2 の 5x5 マスで見る)。
+    #[test]
+    fn marker_shapes_cover_their_designed_cells() {
+        let inside = |shape: u8, dx: i32, dy: i32| marker_inside(dx, dy, 2, shape);
+        assert!(inside(0, 2, 2) && inside(0, -2, -2), "四角は角まで");
+        assert!(inside(1, 0, -2) && !inside(1, 1, -2) && inside(1, -2, 2) && inside(1, 2, 2), "三角は上端が頂点・下端が全幅");
+        assert!(inside(2, 2, 0) && inside(2, 0, -2) && !inside(2, 2, 2), "丸は角を塗らない");
+        assert!(inside(3, 2, 0) && inside(3, 1, 1) && !inside(3, 2, 1), "菱形");
+        assert!(inside(4, 0, 2) && inside(4, -2, 0) && !inside(4, 1, 1), "十字は軸上だけ");
+        assert!(inside(5, 0, 2) && inside(5, 2, 2) && !inside(5, 1, 2), "星は軸と対角線");
+        assert!(inside(6, 2, -2) && inside(6, 0, 0) && !inside(6, 0, 2), "✕は対角線だけ");
+        assert!(inside(NUM_MARKER_SHAPES, 2, 2), "範囲外の形状番号は四角へ倒す");
+    }
+
+    #[test]
+    fn draw_line_fills_every_pixel_between_the_ends() {
+        let c = [9, 9, 9];
+        let mut ov = OverlayLayer::new(8, 8);
+        draw_line(&mut ov, 1, 2, 5, 2, c, 1);
+        assert_eq!(inked(&ov), (1..=5).map(|x| (x, 2)).collect::<Vec<_>>(), "水平線");
+        let mut rev = OverlayLayer::new(8, 8);
+        draw_line(&mut rev, 5, 2, 1, 2, c, 1);
+        assert_eq!(inked(&rev), inked(&ov), "向きを逆にしても同じ線");
+        let mut diag = OverlayLayer::new(8, 8);
+        draw_line(&mut diag, 0, 0, 3, 3, c, 1);
+        assert_eq!(inked(&diag), vec![(0, 0), (1, 1), (2, 2), (3, 3)], "45度");
+        let mut steep = OverlayLayer::new(8, 8);
+        draw_line(&mut steep, 2, 0, 3, 6, c, 1);
+        let pts = inked(&steep);
+        assert_eq!(pts.len(), 7, "急な線は1行に1画素で切れ目が無い: {pts:?}");
+        assert!(pts.iter().all(|&(x, _)| x == 2 || x == 3));
+    }
+
+    #[test]
+    fn draw_line_thickness_grows_right_and_down_and_clips_at_the_edge() {
+        let c = [9, 9, 9];
+        let mut ov = OverlayLayer::new(8, 8);
+        draw_line(&mut ov, 1, 1, 3, 1, c, 2);
+        assert_eq!(inked(&ov), vec![(1, 1), (2, 1), (3, 1), (4, 1), (1, 2), (2, 2), (3, 2), (4, 2)]);
+        let mut clip = OverlayLayer::new(4, 4);
+        draw_line(&mut clip, -10, 2, 20, 2, c, 1);
+        assert_eq!(inked(&clip), vec![(0, 2), (1, 2), (2, 2), (3, 2)], "画面外にはみ出す線は見える範囲だけ");
+        let mut thin = OverlayLayer::new(4, 4);
+        draw_line(&mut thin, 1, 1, 1, 1, c, 0);
+        assert_eq!(inked(&thin), vec![(1, 1)], "太さ0は1として扱う");
+    }
+
+    #[test]
+    fn draw_ring_paints_a_symmetric_circle_of_the_given_radius() {
+        let c = [5, 6, 7];
+        let mut ov = OverlayLayer::new(21, 21);
+        draw_ring(&mut ov, 10, 10, 6, c, 1);
+        let pts = inked(&ov);
+        assert!(!pts.is_empty());
+        for &(x, y) in &pts {
+            let d = ((x as f64 - 10.0).powi(2) + (y as f64 - 10.0).powi(2)).sqrt();
+            assert!((d - 6.0).abs() < 1.0, "({x},{y}) が半径6から外れている: {d}");
+            assert!(ov.get(20 - x, y).is_some() && ov.get(x, 20 - y).is_some(), "左右・上下対称");
+        }
+        for (x, y) in [(16, 10), (4, 10), (10, 16), (10, 4)] {
+            assert_eq!(ov.get(x, y), Some(c), "軸上の4点 ({x},{y})");
+        }
+        assert!(ov.get(10, 10).is_none(), "中は塗らない");
+    }
+
+    #[test]
+    fn draw_ring_skips_non_positive_radii_and_thickens_outward() {
+        let c = [5, 6, 7];
+        let mut ov = OverlayLayer::new(9, 9);
+        draw_ring(&mut ov, 4, 4, 0, c, 3);
+        draw_ring(&mut ov, 4, 4, -2, c, 3);
+        assert!(inked(&ov).is_empty(), "半径0以下は描かない");
+        let mut thick = OverlayLayer::new(21, 21);
+        draw_ring(&mut thick, 10, 10, 5, c, 2);
+        assert!(thick.get(15, 10).is_some() && thick.get(16, 10).is_some(), "太さぶん外側へ広がる");
+        assert!(thick.get(14, 10).is_none(), "内側へは広がらない");
+        let mut edge = OverlayLayer::new(4, 4);
+        draw_ring(&mut edge, 0, 0, 10, c, 1); // 大半が画面外でも落ちない
+    }
+
+    #[test]
+    fn build_overlay_draws_roads_rings_and_poi_markers() {
+        let (lat, lon, z) = (35.0, 139.0, 10u32);
+        let (cx, cy) = deg_to_pixel(lat, lon, z);
+        let build = |spec: &OverlaySpec| build_overlay(spec, cx, cy, z, 16, 16, 1.0, 1.0, 16, 16, &[]);
+
+        let mut spec = empty_spec();
+        spec.roads = vec![Route { pts: vec![(lat, lon), (lat, lon)], color: [180, 80, 255], thickness: 1 }];
+        assert_eq!(build(&spec).get(8, 8), Some([180, 80, 255]), "道路の塊");
+
+        let mut spec = empty_spec();
+        let five_px_km = 5.0 * meters_per_pixel(lat, z) / 1000.0;
+        spec.rings = vec![Ring { lat, lon, radii_km: vec![five_px_km], color: [255, 90, 90], thickness: 1 }];
+        let ov = build(&spec);
+        assert_eq!(ov.get(13, 8), Some([255, 90, 90]), "km を画素へ換算した半径で描く");
+        assert_eq!(ov.get(8, 8), None);
+
+        let mut spec = empty_spec();
+        spec.pois = vec![Poi { lat, lon, cat: PoiCat::Fuel }];
+        let ov = build(&spec);
+        assert_eq!(ov.get(8, 8), Some(poi_color(PoiCat::Fuel)), "POIはカテゴリ色");
+        assert_eq!(ov.get(10, 8), Some([20, 20, 20]), "外周1pxは暗いハロー");
+        assert_eq!(ov.get(11, 8), None);
+
+        spec.pois = vec![Poi { lat: lat + 1.0, lon, cat: PoiCat::Fuel }];
+        assert_eq!(ink_count(&build(&spec)), 0, "画面から大きく外れたPOIは描かない");
+    }
+
+    #[test]
+    fn composite_paints_only_the_inked_pixels() {
+        let mut ov = OverlayLayer::new(3, 2);
+        ov.put(2, 1, [9, 8, 7]);
+        let mut img = RgbImage::from_pixel(3, 2, image::Rgb([1, 1, 1]));
+        composite(&mut img, &ov);
+        assert_eq!(img.get_pixel(2, 1).0, [9, 8, 7]);
+        assert_eq!(img.get_pixel(0, 0).0, [1, 1, 1], "インクの無い画素は地図のまま");
+        // 寸法が違っても重なる範囲だけ処理する(落ちない)
+        let mut small = RgbImage::from_pixel(1, 1, image::Rgb([1, 1, 1]));
+        composite(&mut small, &ov);
+        assert_eq!(small.get_pixel(0, 0).0, [1, 1, 1]);
+        let mut big = RgbImage::from_pixel(5, 5, image::Rgb([1, 1, 1]));
+        composite(&mut big, &ov);
+        assert_eq!(big.get_pixel(2, 1).0, [9, 8, 7]);
+        assert_eq!(big.get_pixel(4, 4).0, [1, 1, 1]);
+    }
+
     // 実データを通した端から端までの確認(設計 §12「実データが要る確認」)。
     // 取得 → 展開 → 解析 → 矩形の復元 → 塗り まで、実際に画面へ出るものを1本で辿る。
     // 実行: cargo test --release -- --ignored --nocapture render::tests::live_

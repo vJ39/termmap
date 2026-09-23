@@ -765,6 +765,26 @@ mod tests {
         assert!(find_geojson_entry(b"not a zip at all").is_err());
     }
 
+    // ローカルエントリの後ろに中央ディレクトリが来たら、そこで探すのをやめる。
+    #[test]
+    fn the_scan_stops_at_the_central_directory() {
+        let mut zip = zip_entry_bytes("KS-META-x.xml", 8, 0, &deflate(b"<xml/>"), 6);
+        zip.extend_from_slice(&0x0201_4b50u32.to_le_bytes()); // 中央ディレクトリの署名
+        zip.extend_from_slice(&[0u8; 42]);
+        zip.extend_from_slice(b"x.geojson"); // 中央ディレクトリ内の名前はローカルエントリではない
+        assert!(find_geojson_entry(&zip).unwrap_err().contains(".geojson が見つからない"));
+    }
+
+    #[test]
+    fn a_null_shicode_reads_as_zero() {
+        let json = r#"{"type":"FeatureCollection","features":[
+            {"type":"Feature","properties":{"MESH_ID":"523351151","SHICODE":null,"PTN_2025":1.0},"geometry":null}]}"#;
+        let zip = zip_entry_bytes("x.geojson", 8, 0, &deflate(json.as_bytes()), json.len() as u32);
+        let recs = read_records(&zip).unwrap();
+        assert_eq!(recs[0].shicode, 0);
+        assert_eq!(recs[0].mesh.mesh, 523351151);
+    }
+
     #[test]
     fn a_truncated_zip_is_an_error_not_a_panic() {
         let body = deflate(b"{}");

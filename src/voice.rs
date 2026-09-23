@@ -401,6 +401,11 @@ mod tests {
     }
 
     #[test]
+    fn parse_say_voices_skips_a_line_that_has_only_a_locale() {
+        assert!(parse_say_voices("   ja_JP    # 名前の無い行\n").is_empty());
+    }
+
+    #[test]
     fn parse_say_voices_dedupes_by_name_keeping_first_occurrence_and_order() {
         let stdout = "Kyoko               ja_JP    # 1回目\n\
                        Otoya               ja_JP    # 別の声\n\

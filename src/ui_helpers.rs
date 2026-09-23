@@ -584,4 +584,107 @@ mod tests {
         assert!(use_subpixel_window(false, false, Some("maybe")));
         assert!(use_subpixel_window(false, false, Some("")));
     }
+
+    #[test]
+    fn opacity_settings_map_to_their_values_and_unknown_is_standard() {
+        let mut cfg = config::Config::default();
+        for (name, want) in [("light", 0.35), ("mid", 0.55), ("strong", 0.75), ("壊れた値", 0.55)] {
+            cfg.radar_opacity = name.to_string();
+            cfg.population_opacity = name.to_string();
+            assert_eq!(radar_opacity_value(&cfg), want, "雨雲 {name}");
+            assert_eq!(population_opacity_value(&cfg), want, "人口 {name}");
+        }
+    }
+
+    #[test]
+    fn radar_refresh_secs_falls_back_to_the_default_for_broken_values() {
+        let with = |s: f64| radar_refresh_secs(&config::Config { radar_refresh_sec: s, ..config::Config::default() });
+        assert_eq!(with(600.0), 600);
+        assert_eq!(with(1.0), 1);
+        assert_eq!(with(90.9), 90, "小数は切り捨て");
+        for bad in [0.0, 0.5, -30.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(with(bad), RADAR_REFRESH_SECS, "{bad}");
+        }
+    }
+
+    #[test]
+    fn qr_view_draws_text_unless_the_image_style_is_supported() {
+        let code = qrcode::QrCode::new(b"https://www.google.com/maps/dir/35.0,139.0/35.1,139.1").unwrap();
+        match build_qr_view(&code, "dense") {
+            QrView::Text(t) => assert!(t.lines().count() >= code.width() / 2, "上下2モジュールを1行に詰める"),
+            QrView::Image(_) => panic!("dense なら文字描画"),
+        }
+        match build_qr_view(&code, "image") {
+            QrView::Image(img) => {
+                assert!(image_capable());
+                assert_eq!(img.width(), (code.width() as u32 + 8) * 8, "静穏領域4モジュール×2・1モジュール8px");
+            }
+            QrView::Text(_) => assert!(!image_capable(), "非対応端末では文字描画へ戻す"),
+        }
+    }
+
+    // 東京地方(tokyo_route)とは別の一次細分区域(神奈川県東部)を通る2点。
+    fn yokohama() -> Vec<(f64, f64)> {
+        vec![(35.4437, 139.6380), (35.4450, 139.6400)]
+    }
+
+    fn alert(area: &str, severity: warning::Severity) -> warning::ActiveWarning {
+        warning::ActiveWarning { area_code: area.to_string(), name: "テスト".to_string(), severity }
+    }
+
+    fn area_of(p: (f64, f64)) -> String {
+        geoarea::region_at(p).expect("実データの区域内の点").code.clone()
+    }
+
+    // 区域をまたぐルートは、区域ごとの警報の色で区間を分ける。警報の無い区域は上塗りしない。
+    #[test]
+    fn build_warning_segments_splits_the_route_where_the_area_changes() {
+        let (tokyo, kanagawa) = (area_of(tokyo_route()[0]), area_of(yokohama()[0]));
+        assert_ne!(tokyo, kanagawa, "前提: 別の区域の点");
+        let pts: Vec<(f64, f64)> = tokyo_route().into_iter().chain(yokohama()).collect();
+        let both = [alert(&tokyo, warning::Severity::Warning), alert(&kanagawa, warning::Severity::Advisory)];
+        let segs = build_warning_segments(&pts, &both);
+        assert_eq!(segs.len(), 2);
+        assert_eq!((segs[0].color, segs[0].pts.clone()), (warning::Severity::Warning.color(), tokyo_route()));
+        assert_eq!((segs[1].color, segs[1].pts.clone()), (warning::Severity::Advisory.color(), yokohama()));
+        let segs = build_warning_segments(&pts, &[alert(&tokyo, warning::Severity::Warning)]);
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].pts, tokyo_route());
+    }
+
+    // 警報のある区域を1点しか通らない区間は線にならないので作らない。
+    #[test]
+    fn build_warning_segments_drops_a_run_of_a_single_point() {
+        let tokyo = area_of(tokyo_route()[0]);
+        let pts = vec![tokyo_route()[0], yokohama()[0], yokohama()[1]];
+        assert!(build_warning_segments(&pts, &[alert(&tokyo, warning::Severity::Special)]).is_empty());
+    }
+
+    #[test]
+    fn build_warning_segments_prefers_an_advisory_over_other_notices() {
+        let tokyo = area_of(tokyo_route()[0]);
+        let ws = [alert(&tokyo, warning::Severity::Other), alert(&tokyo, warning::Severity::Advisory)];
+        assert_eq!(build_warning_segments(&tokyo_route(), &ws)[0].color, warning::Severity::Advisory.color());
+    }
+
+    // 終了時・無操作時の保存。位置とルートは last.txt、直接キーで変えた表示設定は config.toml へ。
+    // HOME を一時ディレクトリにした子プロセスで実行する(実HOMEには触れない)。
+    #[test]
+    fn persist_full_state_saves_the_position_and_the_display_settings() {
+        let test = "persist_full_state_saves_the_position_and_the_display_settings";
+        if !crate::fsutil::testing::reexec_in_temp_home(module_path!(), test, &[("TERMMAP_GOOGLE_API_KEY", "")]) { return; }
+        let mut opts = crate::uistate::testing::test_args();
+        opts.braille = true;
+        opts.style = "dark".to_string();
+        let mut cfg = crate::uistate::testing::test_cfg();
+        let (cx, cy) = deg_to_pixel(35.5, 139.5, 12);
+        let wps = [(35.0, 139.0), (35.1, 139.1)];
+        persist_full_state(cx, cy, 12, &opts, &wps, "highway", &mut cfg, true, false);
+        assert!(cfg.braille && cfg.style == "dark" && cfg.radar_enabled && !cfg.show_spots, "cfg へ反映する");
+        let (lat, lon, z, style) = crate::load_state().expect("last.txt");
+        assert!((lat - 35.5).abs() < 1e-9 && (lon - 139.5).abs() < 1e-9, "{lat},{lon}");
+        assert_eq!((z, style.as_str()), (12, "dark"));
+        assert_eq!(crate::load_route(), Some((wps.to_vec(), "highway".to_string())));
+        assert_eq!(config::load_config(), cfg, "保存した設定がそのまま読み戻せる");
+    }
 }

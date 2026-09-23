@@ -924,6 +924,12 @@ mod tests {
         }
     }
 
+    #[test]
+    fn glyph_bits_of_a_letter_without_a_glyph_is_blank() {
+        assert_eq!(glyph_bits('Z'), [0; 7]);
+        assert_eq!(glyph_bits('あ'), [0; 7]);
+    }
+
     // find_fallback_tile: (a)同一styleは候補にしない (b)他styleがあれば返す (c)どこにも無ければNone。
     #[test]
     fn find_fallback_tile_behaviors() {

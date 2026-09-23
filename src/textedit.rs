@@ -214,6 +214,30 @@ mod tests {
         assert_eq!(render_with_cursor("ab", 9), "ab\u{2588}"); // 範囲外は末尾
     }
 
+    #[test]
+    fn input_panel_shows_the_title_the_cursor_and_the_hint_in_a_centered_box() {
+        let mut out = Vec::new();
+        draw_input_panel(&mut out, 80, 24, "地名・住所で検索", "Enter=検索", "東京駅", 2);
+        let raw = String::from_utf8_lossy(&out).into_owned();
+        assert!(raw.contains("  地名・住所で検索") && raw.contains("  ▸ 東京\u{2588}駅") && raw.contains("  Enter=検索"));
+        assert_eq!(raw.matches("\x1b[30;47m").count(), 7, "上下の余白を含めて7行");
+        // 箱の幅は (80-6) を 64 で頭打ち。行 (24-7)/2=8・列 (80-64)/2=8 から描く。
+        assert!(raw.starts_with(&format!("\x1b[8;8H\x1b[30;47m{}\x1b[0m", " ".repeat(64))), "{raw:?}");
+    }
+
+    #[test]
+    fn input_panel_truncates_long_input_and_survives_a_tiny_terminal() {
+        let mut out = Vec::new();
+        draw_input_panel(&mut out, 5, 0, &"見出し".repeat(40), "", &"長い入力".repeat(50), 9999);
+        let raw = String::from_utf8_lossy(&out).into_owned();
+        for seg in raw.split("\x1b[30;47m").skip(1) {
+            let visible = seg.split("\x1b[0m").next().unwrap_or("");
+            let w: usize = visible.chars().map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0)).sum();
+            assert_eq!(w, 24, "狭い端末では最小幅24に切り詰める: {visible:?}");
+        }
+        assert!(raw.contains("\x1b[1;1H"), "左上より外へは出さない");
+    }
+
     // SpotForm フィールド切替時のカーソル位置
     #[test]
     fn form_cur_by_field() {

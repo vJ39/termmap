@@ -534,6 +534,20 @@ mod tests {
         assert!(parse_rasrf_target_times("{}").is_empty());
     }
 
+    // 時刻はタイルURLのパスへそのまま入るので、欠けた行・数字以外を含む行は捨てる。
+    #[test]
+    fn parse_rasrf_drops_rows_without_times_or_with_unsafe_tokens() {
+        let body = r#"[
+          {"basetime":"20260816050000","elements":["rasrf"]},
+          {"basetime":"20260816050000","validtime":"../../x","elements":["rasrf"]},
+          {"basetime":"2026081605000Z","validtime":"20260816060000","elements":["rasrf"]},
+          {"basetime":"20260816050000","validtime":"20260816060000","elements":["rasrf"]}
+        ]"#;
+        let got = parse_rasrf_target_times(body);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].validtime, "20260816060000");
+    }
+
     // 60分より先(rasrf由来)を合成した全体タイムラインで、frame_labelが時刻の差分を正しく出す
     // (5分刻み/1時間刻みが混ざっていても epoch_minutes ベースの差分計算は変わらず動く)。
     #[test]

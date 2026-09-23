@@ -341,6 +341,8 @@ mod tests {
         radar_tl: radar::Timeline,
         radar_idx: usize,
         radar_follow: bool,
+        rcx: f64, // 雨雲の読込枚数を数える表示中心(既定は世界の左上端=日本の外)
+        rcy: f64,
         cfg: Config,
         traffic: PlotStatus,
         camera: PlotStatus,
@@ -366,6 +368,7 @@ mod tests {
                 route_note: None, clear_route_confirm: false, jobs_active: false, spin: 0,
                 gps_live: false, web_gps_active: false, play: None, play_speed: 1.0,
                 radar_on: false, radar_tl: radar::Timeline::default(), radar_idx: 0, radar_follow: true,
+                rcx: 0.0, rcy: 0.0,
                 cfg: Config::default(),
                 traffic: idle_plot(), camera: idle_plot(), regulation: idle_plot(), disaster: idle_plot(),
                 population: idle_population(),
@@ -384,7 +387,7 @@ mod tests {
                 play: self.play, play_speed: self.play_speed,
                 radar_on: self.radar_on, radar_tl: &self.radar_tl, radar_idx: self.radar_idx,
                 radar_follow: self.radar_follow,
-                loader: shared_loader(), rcx: 0.0, rcy: 0.0, rz: 10, rw: 300, rh: 200,
+                loader: shared_loader(), rcx: self.rcx, rcy: self.rcy, rz: 10, rw: 300, rh: 200,
                 cfg: &self.cfg,
                 traffic: clone_plot(&self.traffic),
                 camera: clone_plot(&self.camera),
@@ -871,6 +874,73 @@ mod tests {
         assert!(line.contains("🚗7地点"), "{line}");
         assert!(line.contains("🌊4地点(B)"), "{line}");
         assert!(line.contains("👥320人/km²"), "{line}");
+    }
+
+    #[test]
+    fn form_and_list_focuses_show_their_own_key_hints() {
+        let cases = [
+            (Focus::SpotForm { name: String::new(), url: String::new(), field: 0 }, "新規スポット:"),
+            (Focus::PoiKindForm { label: String::new(), tag: String::new(), field: 0 }, "新規カテゴリ:"),
+            (Focus::WanderForm { dist_km: 40.0 }, "おまかせ周回:"),
+            (Focus::PoiMenu, "目的地カテゴリ:"),
+            (Focus::RouteList, "お気に入り:"),
+            (Focus::RouteFavMenu { sel: 0 }, "お気に入りルート:"),
+            (Focus::RoadList, "道路:"),
+            (Focus::WaypointList, "並べ替え:"),
+            (Focus::ColorPick { cat: 0 }, "色を選択:"),
+            (Focus::ShapePick { cat: 0 }, "形を選択:"),
+            (Focus::SettingsPick(4), "候補を選択:"),
+        ];
+        for (focus, want) in cases {
+            let s = Fixture::new(focus).line();
+            assert!(s.starts_with(&format!(" {want}")), "{s}");
+        }
+    }
+
+    // 声の一覧(設定27行目)だけは Space で試聴できる。番号がずれると案内が別の行に出るので行の中身も見る。
+    #[test]
+    fn only_the_voice_picker_advertises_the_preview_key() {
+        assert!(Fixture::new(Focus::SettingsPick(27)).line().contains("Space=試聴"));
+        for idx in [4usize, 16, 32] {
+            assert!(!Fixture::new(Focus::SettingsPick(idx)).line().contains("試聴"), "idx={idx}");
+        }
+        let (_, rows, _) = settings::settings_rows(&crate::uistate::testing::test_args(), &Config::default(), None, false, 0, 0);
+        assert!(rows[27].contains("読み上げの声"), "{}", rows[27]);
+    }
+
+    fn one_frame(validtime: &str) -> radar::Timeline {
+        let f = radar::Frame { basetime: validtime.to_string(), validtime: validtime.to_string(),
+                               kind: radar::FrameKind::Observed, product: radar::RadarProduct::Nowcast };
+        radar::merge_timeline(vec![f], Vec::new())
+    }
+
+    // 日本の外を見ているときは雨雲を1枚も取りに行かないので「範囲外」と出す。
+    #[test]
+    fn radar_label_says_out_of_range_outside_japan() {
+        let mut f = Fixture::new(Focus::Map);
+        f.radar_on = true;
+        f.radar_tl = one_frame("20260814060000");
+        assert!(f.line().contains("☂範囲外 "), "{}", f.line());
+    }
+
+    // 日本の中では表示中のコマの時刻(JST)と読込枚数を出す。
+    #[test]
+    fn radar_label_shows_the_frame_time_and_the_loading_progress_over_japan() {
+        let mut f = Fixture::new(Focus::Map);
+        f.radar_on = true;
+        f.radar_tl = one_frame("20260814060100"); // 他のテストとタイルを共有しない時刻
+        (f.rcx, f.rcy) = crate::geo::deg_to_pixel(35.68, 139.77, 10);
+        let s = f.line();
+        assert!(s.contains("☂15:01 実況 読込0/"), "{s}");
+    }
+
+    #[test]
+    fn weather_warning_label_falls_back_to_the_count_without_a_name() {
+        let mut f = Fixture::new(Focus::Map);
+        f.cfg.weather_warning_enabled = true;
+        f.wps = vec![(35.0, 139.0), (35.1, 139.1)];
+        f.weather_warning_count = 2;
+        assert!(f.line().contains("🌂2件 "), "{}", f.line());
     }
 
     #[test]

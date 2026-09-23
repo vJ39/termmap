@@ -133,4 +133,27 @@ mod tests {
         let got = parse_location("50.0 300.0 35.681 139.767");
         assert_eq!(got, Some((35.681, 139.767)));
     }
+
+    #[test]
+    fn available_is_false_for_a_missing_command() {
+        assert!(!available("termmap-no-such-gps-command"));
+    }
+
+    // 位置を出すコマンドを叩いて届け、drop すれば待たされずに止まる(測位は偽のスクリプトで代用)。
+    #[cfg(unix)]
+    #[test]
+    fn poller_delivers_the_parsed_location_and_stops_on_drop() {
+        use std::os::unix::fs::PermissionsExt;
+        let script = std::env::temp_dir().join(format!("termmap_gps_{}.sh", std::process::id()));
+        std::fs::write(&script, "#!/bin/sh\necho '35.681 139.767'\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let poller = start_poller(script.to_string_lossy().into_owned(), 1);
+        let got = poller.rx.recv_timeout(Duration::from_secs(10));
+        let t = std::time::Instant::now();
+        drop(poller);
+        let stopped_in = t.elapsed();
+        let _ = std::fs::remove_file(&script);
+        assert_eq!(got, Ok((35.681, 139.767)));
+        assert!(stopped_in < Duration::from_secs(2), "drop に {stopped_in:?} かかった");
+    }
 }

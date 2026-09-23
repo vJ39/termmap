@@ -597,6 +597,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fsutil::testing::reexec_in_temp_home;
 
     #[test]
     fn sanitize_and_fit() {
@@ -731,5 +732,100 @@ mod tests {
         assert!(parse_point("35,139,extra").is_err());   // 要素過多
         assert!(parse_point("88.0,139.0").is_err());      // 緯度がWeb Mercator範囲外
         assert!(parse_point("35.0,200.0").is_err());      // 経度範囲外
+    }
+
+    #[test]
+    fn lcg_is_deterministic_and_advances_its_state() {
+        let (mut a, mut b) = (42u64, 42u64);
+        let first = lcg(&mut a);
+        assert_eq!(first, lcg(&mut b), "同じ種なら同じ値");
+        assert_eq!(a, b);
+        assert_ne!(a, 42, "状態が進む");
+        assert_ne!(lcg(&mut a), first, "続けて引くと別の値");
+        assert_ne!(lcg(&mut 1u64), lcg(&mut 2u64), "種が違えば別の値");
+        let mut s = 7u64;
+        let v = lcg(&mut s);
+        assert_eq!(v, s >> 16, "更新後の状態の上位ビットを返す");
+    }
+
+    #[test]
+    fn rng_seed_is_never_zero() {
+        assert_eq!(rng_seed() & 1, 1, "最下位ビットを立てるので0にならない");
+    }
+
+    #[test]
+    fn build_spec_puts_range_rings_on_home_or_the_center() {
+        let mut a = args_for(false, false, false);
+        assert!(build_spec(&a, 35.0, 139.0).is_empty(), "--range 無しなら何も重ねない");
+        a.range = vec![10.0, 20.0];
+        let s = build_spec(&a, 35.0, 139.0);
+        assert_eq!(s.rings.len(), 1);
+        assert_eq!((s.rings[0].lat, s.rings[0].lon), (35.0, 139.0), "--home 無しは中心");
+        assert_eq!(s.rings[0].radii_km, vec![10.0, 20.0]);
+        a.home = Some((36.0, 140.0));
+        let s = build_spec(&a, 35.0, 139.0);
+        assert_eq!((s.rings[0].lat, s.rings[0].lon), (36.0, 140.0), "--home があればそちらが基準");
+    }
+
+    #[test]
+    fn attach_route_without_a_route_leaves_the_spec_alone() {
+        let a = args_for(false, false, false);
+        let mut spec = build_spec(&a, 35.0, 139.0);
+        assert_eq!(attach_route(&mut spec, &a).unwrap(), None);
+        assert!(spec.is_empty());
+    }
+
+    // 以下は HOME を一時ディレクトリにした子プロセスで実行する(実HOMEには触れない)。
+
+    // 引数なし起動で復元する last.txt(位置・ズーム・スタイルとルート)の往復。
+    #[test]
+    fn last_state_round_trips_through_last_txt() {
+        if !reexec_in_temp_home(module_path!(), "last_state_round_trips_through_last_txt", &[]) { return; }
+        assert_eq!(load_state(), None, "保存が無ければ None");
+        assert_eq!(load_route(), None);
+        let wps = [(35.0, 139.0), (35.5, 139.5), (36.0, 140.0)];
+        save_state(35.681, 139.767, 12, "dark", &wps, "highway");
+        assert_eq!(load_state(), Some((35.681, 139.767, 12, "dark".to_string())));
+        assert_eq!(load_route(), Some((wps.to_vec(), "highway".to_string())));
+        save_state(35.0, 139.0, 10, "osm", &wps[..1], "surface");
+        assert_eq!(load_state(), Some((35.0, 139.0, 10, "osm".to_string())));
+        assert_eq!(load_route(), None, "1点だけのルートは保存しない");
+    }
+
+    // 手で壊した last.txt でも起動は止めない(読めない部分だけ諦める)。
+    #[test]
+    fn broken_last_txt_is_ignored_part_by_part() {
+        if !reexec_in_temp_home(module_path!(), "broken_last_txt_is_ignored_part_by_part", &[]) { return; }
+        let p = state_file().unwrap();
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, "35.0 139.0 12\n").unwrap();
+        assert_eq!(load_state(), Some((35.0, 139.0, 12, "osm".to_string())), "スタイル欠落はosm");
+        std::fs::write(&p, "35.0 abc 12 osm\nroute surface 35,139;35.1,139.1\n").unwrap();
+        assert_eq!(load_state(), None, "数値が壊れていれば位置は復元しない");
+        assert_eq!(load_route(), Some((vec![(35.0, 139.0), (35.1, 139.1)], "surface".to_string())), "ルート行は別に読める");
+        std::fs::write(&p, "35.0 139.0 12 osm\nroute surface 35,139;壊れた点\n").unwrap();
+        assert_eq!(load_route(), None, "有効な点が2つ未満ならルートにしない");
+    }
+
+    // お気に入りルート: 名前付き保存・呼び出し・一覧(.txt だけを名前順に)。
+    #[test]
+    fn named_routes_round_trip_and_list_in_name_order() {
+        if !reexec_in_temp_home(module_path!(), "named_routes_round_trip_and_list_in_name_order", &[]) { return; }
+        assert!(list_named_routes().is_empty(), "保存前は空");
+        assert!(save_named_route("1点だけ", "surface", &[(35.0, 139.0)]).is_err(), "2点未満は保存しない");
+        let a = [(35.0, 139.0), (35.1, 139.1)];
+        let b = [(36.0, 140.0), (36.1, 140.1), (36.2, 140.2)];
+        save_named_route("箱根", "highway", &a).unwrap();
+        save_named_route("伊豆/西", "surface", &b).unwrap();
+        assert_eq!(load_named_route("箱根"), Some((a.to_vec(), "highway".to_string())));
+        assert_eq!(load_named_route("伊豆/西"), Some((b.to_vec(), "surface".to_string())), "パス区切りを含む名前でも同じ名前で呼べる");
+        assert_eq!(load_named_route("無い名前"), None);
+        let dir = routes_dir().unwrap();
+        std::fs::write(dir.join("メモ.md"), "x").unwrap();
+        assert_eq!(list_named_routes(), vec!["伊豆_西".to_string(), "箱根".to_string()], ".txt以外は出さない");
+        save_named_route("箱根", "short", &b).unwrap();
+        assert_eq!(load_named_route("箱根"), Some((b.to_vec(), "short".to_string())), "同名は上書き");
+        std::fs::write(dir.join("壊れた.txt"), "surface\n35,139\n不正な行\n").unwrap();
+        assert_eq!(load_named_route("壊れた"), None, "有効な点が2つ未満なら呼び出さない");
     }
 }

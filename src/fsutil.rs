@@ -90,4 +90,69 @@ mod tests {
         assert!(!tmp.exists());
         let _ = std::fs::remove_file(&path);
     }
+
+    // rename が失敗しても一時ファイルを残さず、置き換え先も壊さない。
+    #[test]
+    fn failed_rename_removes_the_tmp_file_and_keeps_the_target() {
+        let base = tmp_path("renamefail");
+        let _ = std::fs::remove_dir_all(&base);
+        let target = base.join("dir_in_the_way");
+        std::fs::create_dir_all(target.join("child")).unwrap(); // ディレクトリへは rename できない
+        assert!(write_atomic(&target, b"data", None).is_err());
+        let tmp = base.join(format!(".dir_in_the_way.{}.tmp", std::process::id()));
+        assert!(!tmp.exists(), "失敗時に一時ファイルが残っている");
+        assert!(target.join("child").is_dir(), "置き換え先が壊れた");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+// HOME 依存の保存/読込を実HOMEに触れずに試すためのテスト補助(他モジュールのテストからも使う)。
+// 同じプロセス内で HOME を書き換えると並列に走る他のテストまで一時HOMEを見てしまうので、
+// HOME を一時ディレクトリにした子プロセスでそのテスト1本だけを走らせ直す。
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::path::Path;
+
+    const MARK: &str = "TERMMAP_TEST_TEMP_HOME";
+
+    // 子プロセスの中(HOME が親の用意した一時ディレクトリ)か。
+    fn in_temp_home() -> bool {
+        match (std::env::var_os(MARK), std::env::var_os("HOME")) {
+            (Some(m), Some(h)) => m == h && Path::new(&h).starts_with(std::env::temp_dir()),
+            _ => false,
+        }
+    }
+
+    // 子プロセスの中なら true を返す(呼び出し側はそのまま本体を実行する)。
+    // 親では子プロセスでこのテストを実行し、通ったことを確かめて false を返す。
+    // module には module_path!()、test にはテスト関数名を渡す。env は子プロセスへ足す環境変数。
+    pub(crate) fn reexec_in_temp_home(module: &str, test: &str, env: &[(&str, &str)]) -> bool {
+        if in_temp_home() {
+            return true;
+        }
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let home = std::env::temp_dir().join(format!("termmap_home_{}_{}", std::process::id(), n));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        // libtest のテスト名はクレート名を含まない("termmap::spots::tests" → "spots::tests")。
+        let module = module.split_once("::").map_or(module, |(_, m)| m);
+        let name = format!("{module}::{test}");
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args([name.as_str(), "--exact", "--test-threads=1"]).env("HOME", &home).env(MARK, &home);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().unwrap();
+        let _ = std::fs::remove_dir_all(&home);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // 名前の打ち間違いで0件実行になっても成功扱いにしない。
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "子プロセスのテスト {name} が通らない:\n{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        false
+    }
 }

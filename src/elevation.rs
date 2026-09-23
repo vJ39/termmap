@@ -377,4 +377,32 @@ mod tests {
         assert_eq!(axis_label(0, 4, 50.0, 50.0).as_deref(), Some("   50m"));
         assert_eq!(axis_label(2, 4, 50.0, 50.0).as_deref(), Some("   50m")); // 中間値も同じ
     }
+
+    #[test]
+    fn bin_values_averages_when_shrinking_and_repeats_when_stretching() {
+        assert_eq!(bin_values(&[1.0, 3.0, 5.0, 7.0], 2), vec![2.0, 6.0], "区間の平均");
+        assert_eq!(bin_values(&[1.0, 5.0], 4), vec![1.0, 1.0, 5.0, 5.0], "点より列が多ければ最寄りの点を繰り返す");
+        assert!(bin_values(&[1.0, 2.0], 0).is_empty());
+    }
+
+    #[test]
+    fn bin_values_of_empty_input_falls_back_to_zero() {
+        assert_eq!(bin_values(&[], 3), vec![0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn resample_by_distance_repeats_the_first_value_when_the_route_has_no_length() {
+        assert_eq!(resample_by_distance(&[7.0, 9.0], &[0.0, 0.0], 3), vec![7.0, 7.0, 7.0]);
+    }
+
+    // 終点の目標距離が浮動小数の丸めで総延長をわずかに超えても、範囲外を読まず末尾の標高を使う。
+    #[test]
+    fn resample_by_distance_ends_on_the_last_value_even_when_rounding_overshoots() {
+        let total = 0.1;
+        assert!(total * 3.0 / 3.0 > total, "前提: この組み合わせは丸めで総延長を超える");
+        let got = resample_by_distance(&[10.0, 20.0], &[0.0, total], 4);
+        assert_eq!(got.len(), 4);
+        assert_eq!(got[0], 10.0);
+        assert_eq!(got[3], 20.0);
+    }
 }
