@@ -4,7 +4,9 @@ fn urldecode(s: &str) -> String {
     let mut out = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
+        // 16進2桁(ASCII)を確かめてから切り出す。確かめずに切ると、%の直後の多バイト文字の途中で
+        // 文字境界を割ってパニックする。
+        if bytes[i] == b'%' && i + 2 < bytes.len() && bytes[i + 1].is_ascii_hexdigit() && bytes[i + 2].is_ascii_hexdigit() {
             if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) { out.push(b); i += 3; continue; }
         }
         if bytes[i] == b'+' { out.push(b' '); } else { out.push(bytes[i]); }
@@ -75,5 +77,36 @@ mod tests {
         // 非URL/座標無しは None
         assert!(parse_gmaps_place("ただの文字列").is_none());
         assert_eq!(urldecode("%E7%8E%8B%E5%AD%90"), "王子");
+    }
+
+    #[test]
+    fn urldecode_turns_plus_into_space_and_keeps_broken_escapes_as_is() {
+        assert_eq!(urldecode("New+York"), "New York");
+        assert_eq!(urldecode("abc-123"), "abc-123", "ふつうの文字はそのまま");
+        assert_eq!(urldecode("100%zz"), "100%zz", "16進でない%はそのまま残す");
+        assert_eq!(urldecode("末尾%"), "末尾%", "途中で切れた%で落ちない");
+    }
+
+    // %の直後が16進2桁でなければデコードしない。多バイト文字が続いても文字境界で落ちない。
+    #[test]
+    fn urldecode_keeps_a_percent_followed_by_a_multibyte_character() {
+        assert_eq!(urldecode("100%チョコ"), "100%チョコ");
+        assert_eq!(urldecode("%aあ"), "%aあ");
+        assert_eq!(urldecode("%+1"), "% 1", "符号付きの数は16進として読まない");
+        assert_eq!(urldecode("%e3%81%82"), "あ", "小文字の16進も読む");
+    }
+
+    #[test]
+    fn gmaps_place_with_a_percent_in_the_shop_name_does_not_panic() {
+        let (_, _, name) = parse_gmaps_place("https://www.google.com/maps/place/100%チョコ/@35.1,139.1,15z/data=!3d35.2!4d139.3").unwrap();
+        assert_eq!(name, "100%チョコ");
+    }
+
+    // 地点ピンは !3d と !4d の両方があるときだけ使い、片方だけなら表示中心(@)へ戻る。
+    #[test]
+    fn gmaps_place_needs_both_pin_coordinates_or_falls_back_to_the_view_center() {
+        let (la, lo, _) = parse_gmaps_place("https://www.google.com/maps/place/x/@35.1,139.1,15z/data=!3d35.9").unwrap();
+        assert_eq!((la, lo), (35.1, 139.1));
+        assert!(parse_gmaps_place("https://www.google.com/maps/@abc,def,15z").is_none(), "座標が数値でなければ None");
     }
 }
