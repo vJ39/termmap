@@ -1,15 +1,7 @@
 // 地図に重ねるプロットデータ(道路交通量・主要道路・道路ライブカメラ・通行規制・過去災害・
-// 市区町村境界・500mメッシュ人口)の取得段取り。ui.rs にほぼ同一の取得ブロックが4つ並んでいた
-// ものを1つにまとめたもの。
-// 設計は docs/plot-data-disk-cache-design.md §6.3/§7。
-//
-// 旧実装との違いは3点。
-//   1. 取得単位が「視野中心±900pxのbbox」から「取得元が持つ自然な単位のセル」
-//      (1次/2次メッシュ・地方整備局)に変わった。bboxを生でキーにすると1pxパンで別キーになり
-//      ディスクキャッシュがヒットしないため。
-//   2. 再取得の判定が「90秒経過 or 中心がbboxの外」から「そのセルが fresh TTL 以内か」に変わった。
-//   3. ディスクの読み書きを全部ワーカースレッド側に置いた。UIスレッドは mpsc から受け取るだけで、
-//      受信コードの形(try_recv + Disconnected で畳む)は旧実装と同じ。
+// 市区町村境界・500mメッシュ人口)の取得段取り。設計は docs/plot-data-disk-cache-design.md §6.3/§7。
+// 取得は取得元が持つ自然な単位のセル(1次/2次メッシュ・地方整備局)ごと(bboxをキーにすると1pxパンでキャッシュが外れるため)。
+// 再取得はセルが fresh TTL を過ぎたときだけ。ディスクの読み書きはワーカースレッド側で行い、UIスレッドは mpsc から受け取るだけ。
 
 use crate::plotcache::{self, Cached, Layer};
 use crate::{camera, disaster, mesh, muni, population, regulation, roadsearch, traffic};
@@ -436,7 +428,7 @@ pub fn disaster_since() -> i32 {
 
 /// しきい値年を変える。**変えたらレイヤを作り直すこと**(古いキーのセルがセル表に残り、
 /// items() が全セルを舐めるため、作り直さないと別の年代のデータが混ざる)。
-/// 現状は設定に出していないので呼び出し元は無い(#75 Stage2 で設定行を足すときに使う)。
+/// 現状は設定に出していないので呼び出し元は無い(設定行を足すときに使う)。
 #[allow(dead_code)]
 pub fn set_disaster_since(year: i32) {
     DISASTER_SINCE.store(year.max(0), Ordering::Relaxed);
@@ -454,10 +446,8 @@ fn boundary_cells(b: Bbox) -> Vec<String> {
 
 // 過去災害は交通量・規制と同じ1次メッシュだが、キーに年代しきい値を足した複合キーにする
 // (例 "5339_1926"、全期間は "5339_0")。しきい値を切り替えても別ファイルになって混ざらない。
-// disaster/boundaryはMAX_CELLS_PER_JOBの上限を持たない(new_uncapped、設計
-// docs/disaster-choropleth-unlimited-zoom-design.md §3.2)ため、広域で1次メッシュが
-// 何十枚要っても取得を止めない。その代わり中心から近い順に並べて返し、spawn_jobが
-// 1個ずつ順に取っていく間、常に「今見ている場所の近く」から埋まるようにする(同 §3.3)。
+// MAX_CELLS_PER_JOBの上限を持たない(new_uncapped、docs/disaster-choropleth-unlimited-zoom-design.md §3.2)代わりに、
+// 中心から近い順に返し、spawn_jobが今見ている場所の近くから埋めていくようにする(同 §3.3)。
 fn disaster_cells(b: Bbox) -> Vec<String> {
     let since = disaster_since().max(0);
     // primary_codes(通常版)のMAX_CODES安全弁に当たると、この関数だけが空を返し
@@ -609,9 +599,8 @@ pub fn boundary() -> PlotLayer<muni::MuniArea> {
 }
 
 /// 500mメッシュ別推計人口(国土数値情報)。都道府県単位・z11未満では取得しない。
-/// z11 は交通量・通行規制・過去災害と同じ値で、複数レイヤを同時にONにしたときに
-/// 「このレイヤだけ端が欠ける」状態にならないようにしてある。z10ではメッシュ1枚が
-/// braille の4×4ドットまで縮み、ディザで間引いた時点で隣の階級と区別できない(設計 §6.3)。
+/// z11 は交通量・通行規制・過去災害と揃え、複数レイヤを同時にONにしてもこのレイヤだけ端が欠けないようにしている。
+/// z10ではメッシュ1枚が braille の4×4ドットまで縮み、隣の階級と区別できない(設計 §6.3)。
 /// メモリ保持は4県まで(1県が最大3.6MBあるため他レイヤの32とは別枠)。
 pub fn population() -> PlotLayer<population::PopMesh> {
     PlotLayer::new_with_cap(
@@ -1080,11 +1069,9 @@ mod tests {
         }
     }
 
-    // 過去災害/境界は MAX_CELLS_PER_JOB の上限を持たない(new_uncapped)。z9で1次メッシュ
-    // 48枚が必要な東京でも、1件も取りに行かず諦める(suppressed)ことなくmissingが積まれる。
-    // 設計 docs/disaster-choropleth-unlimited-zoom-design.md §3.2。
-    // 実際のdisaster()は実ネットワークを叩くfetch_disaster_cellを使うため、ここでは
-    // ten_cells(10件、通常上限9を超える)+test_fetch(モック)の組み合わせで安全に確認する。
+    // 過去災害/境界は MAX_CELLS_PER_JOB の上限を持たない(new_uncapped、docs/disaster-choropleth-unlimited-zoom-design.md §3.2)。
+    // z9で1次メッシュ48枚が必要な東京でも suppressed にならず missing が積まれること。
+    // 実ネットワークを避けるため、ten_cells(10件、通常上限9超)+test_fetch(モック)で確かめる。
     #[test]
     fn uncapped_layer_does_not_suppress_when_more_than_the_normal_cap_is_needed() {
         let _env = TestEnv::new("uncapped");
@@ -1124,9 +1111,6 @@ mod tests {
         }
     }
 
-    // 中心から近いセルほど先に来る(取得の優先度)。既知の並びで固定する:
-    // 東京中心の視野では、東京駅を含むメッシュ(5339)が最初に来るはず。
-    #[test]
     // primary_codes(通常版)はMAX_CODES=256の安全弁でz7以下では空を返すが、disaster_cellsは
     // primary_codes_unboundedを使うため、同じズームでも0件にならない(設計 unlimited-zoom §3.1)。
     #[test]
@@ -1139,6 +1123,7 @@ mod tests {
         }
     }
 
+    // 中心から近いセルほど先に来る(取得の優先度)。東京中心の視野では東京駅を含む 5339 が先頭。
     #[test]
     fn disaster_cells_are_ordered_nearest_to_center_first() {
         let (cx, cy) = tokyo_center(9);
@@ -1324,11 +1309,9 @@ mod tests {
     }
 
     // 実ネットワークを叩く手動確認用(CIでは走らない)。`cargo test --release -- --ignored`で実行。
-    // 最も混む広域セル(1309 = 緯度34.67〜37.33度・経度136〜140度。東京・横浜・名古屋・静岡・
-    // 長野を含む)の集計が、取得元の打ち切り(maxRecordCount=2,000行)に当たらないこと。
-    // 集計クエリでは resultOffset が黙って無視されるので、**打ち切られたら回復手段が無い**。
-    // 打ち切られると市区町村がまるごと塗られなくなり、画面上は「記録が無い」と区別がつかない
-    // (設計 §2.2/§7)。データが増えて近づいたら気づけるよう、地点数を出力する。
+    // 最も混む広域セル(1309。東京・横浜・名古屋・静岡・長野を含む)の集計が取得元の打ち切り(maxRecordCount=2,000行)に当たらないこと。
+    // 集計クエリでは resultOffset が黙って無視されるので**打ち切られたら回復手段が無く**、市区町村がまるごと塗られず
+    // 「記録が無い」と区別がつかない(設計 §2.2/§7)。データが増えて近づいたら気づけるよう、地点数を出力する。
     #[test]
     #[ignore]
     fn live_the_busiest_wide_cell_is_not_truncated() {
@@ -1337,7 +1320,7 @@ mod tests {
         println!("広域セル {key}: 地点 {} 件", sites.len());
         assert!(!sites.is_empty(), "最も混むセルが空はおかしい");
         assert!(!disaster::truncation_seen(), "2,000行の打ち切りに当たっている(件数が黙って減る)");
-        // 全期間(since=0)でも余裕があること(Stage2 で年代しきい値を設定に出すときの前提)。
+        // 全期間(since=0)でも余裕があること(年代しきい値を設定に出すときの前提)。
         let all = fetch_disaster_cell("w1309_0", &mut None).expect("live fetch should succeed");
         println!("広域セル w1309_0(全期間): 地点 {} 件", all.len());
         assert!(!disaster::truncation_seen(), "全期間で打ち切りに当たっている");

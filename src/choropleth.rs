@@ -1,13 +1,7 @@
-// 過去災害のコロプレス(市区町村の境界ポリゴンを記録の多さで塗り分ける)の組み立て。
-// 設計は docs/disaster-choropleth-design.md §3〜§5。
-//
-// 「どの市区町村を何色で塗るか」だけを持ち、描画そのものは render.rs のプリミティブへ、
-// 幾何は geopoly.rs へ、境界データは muni.rs へ、件数は disaster.rs へ委ねる。
-// ui.rs へ持ち込まないのは、あちらが既に2,600行あって並列作業のぶつかりどころになっているため。
-//
-// 色の軸は「最も件数の多い災害種別の色 × 件数のアルファ5段」。マーカーが持っていた情報
-// (色=最多種別・大きさ=件数)を1つも落とさずに点から面へ移す。実データの9割近くが風水害なので、
-// 実際には画面のほぼ全部が青系の濃淡になり、色相が変わるのは地震・雪氷が上回っている土地だけになる。
+// 過去災害のコロプレス(市区町村の境界ポリゴンを記録の多さで塗り分ける)の組み立て。設計は docs/disaster-choropleth-design.md §3〜§5。
+// 「どの市区町村を何色で塗るか」だけを持ち、描画は render.rs、幾何は geopoly.rs、境界は muni.rs、件数は disaster.rs に委ねる。
+// ui.rs に置かないのは、並列作業で編集がぶつかりやすいため。
+// 色は「最多の災害種別の色 × 件数のアルファ5段」。実データの9割近くが風水害なので、画面の大半は青系の濃淡になる。
 
 use crate::disaster::{self, DisasterKind, DisasterSite};
 use crate::geo::{deg_to_pixel, pixel_to_deg};
@@ -24,34 +18,24 @@ pub const DEFAULT_OPACITY: f64 = 0.45;
 
 /// braille/edge で面を点描にするときの、**最も濃い階級での**間隔(画素)。
 /// 薄い階級ほど render 側で間隔が広がる(6 / 9 / 12 / 18)ので、件数が点の密度として読める。
-/// 固定間隔8から6へ下げるのは、階級を疎らな側へ広げるぶん最も濃い側を詰めて全体の見え方を保つため
-/// (docs/disaster-choropleth-wide-zoom-design.md §3.2)。
-/// 6なら 6x6=36画素に1点で、braille のセル(2x4画素)4〜5個に1点に収まる。
+/// 6なのは、階級を疎らな側へ広げたぶん最も濃い側を詰めて見え方を保つため(docs/disaster-choropleth-wide-zoom-design.md §3.2)。
+/// 6x6画素に1点で、braille のセル(2x4画素)4〜5個に1点になる。
 pub const STIPPLE_SPACING: u32 = 6;
 
-/// 塗りをどう出すか。`opacity` はこのモジュールでは使わず、呼び出し側が
-/// `render::blend_rgba_over` / `InkLayer` へ渡す濃さとして持ち回る
-/// (層の中身は濃さに依存しないので、濃さを変えてもラスタライズし直す必要が無い)。
-///
-/// 硬い輪郭線(旧・stroke_rings_rgba)は廃止した。市区町村1区域が19px程度まで縮む広域
-/// ズームでは、1px幅の縁取りだけで面積の1割前後を占めてしまい、輪郭が塗りより目立って
-/// しまう(docs/disaster-choropleth-wide-zoom-design.md §2.5)。代わりに`blur_radius`で
-/// 塗り自体をボックスブラーし、隣接区域の境界を滲ませて見せる(フォントのアンチエイリアシングと
-/// 同じ考え方。docs/disaster-choropleth-unlimited-zoom-design.md §4)。0ならブラー無し。
+/// 塗りをどう出すか。`opacity` はこのモジュールでは使わず、呼び出し側が `render::blend_rgba_over` / `InkLayer`
+/// へ渡す濃さとして持ち回る(層の中身は濃さに依存しないので、濃さを変えてもラスタライズし直さずに済む)。
+/// 輪郭線は引かない。広域ズームでは1px幅の縁取りが塗りより目立つため(docs/disaster-choropleth-wide-zoom-design.md §2.5)。
+/// 代わりに `blur_radius` で塗りをぼかして境界を滲ませる。0ならブラー無し(docs/disaster-choropleth-unlimited-zoom-design.md §4)。
 pub struct Shading {
     pub opacity: f64,
     pub fill: bool,
     pub blur_radius: u32,
 }
 
-/// 5桁の市区町村コード → (件数, 最多種別)。
-///
-/// 設計では `areas` も引数に取る形だったが、集計に境界は要らない(コードだけで積める)ので
-/// 落とした。呼び出し側は build_layer / area_summary 経由で使う。
-///
-/// 同じコードに複数の地点が落ちた場合は種別ごとに件数を足し合わせてから最多種別を決める
-/// (地点単位で比べると、細かく分かれた種別が合算後の最多と食い違う)。実測では市区町村あたり
-/// 代表点は1つだが、重複しても壊れない形にしておく。
+/// 5桁の市区町村コード → (件数, 最多種別)。集計に境界は要らないので `areas` は取らない。
+/// 呼び出し側は build_layer / area_summary 経由で使う。
+/// 同じコードに複数の地点が落ちた場合は、種別ごとに件数を合算してから最多種別を決める
+/// (地点単位で比べると合算後の最多と食い違うため)。
 pub fn tally(sites: &[&DisasterSite]) -> HashMap<String, (u32, DisasterKind)> {
     let mut merged: HashMap<String, DisasterSite> = HashMap::new();
     for s in sites {
@@ -83,10 +67,8 @@ pub fn tally(sites: &[&DisasterSite]) -> HashMap<String, (u32, DisasterKind)> {
 }
 
 /// 表示中の市区町村を災害件数で塗った層を1枚作る。塗る対象が無ければ None。
-///
 /// `cx`/`cy` は視野中心のグローバル画素、`w`/`h` は作る層の画素寸法(=描画に使う画像と同じ)。
-/// ラスタライズは地図を組み直すフレームでしか走らない(ui.rs の map_sig)ので、走査線方式の
-/// 素直な実装のままにしてある(1区域あたり平均82頂点)。
+/// ラスタライズは地図を組み直すフレーム(ui.rs の map_sig)でしか走らないので、素直な走査線方式のままにしてある。
 pub fn build_layer(
     sites: &[&DisasterSite],
     areas: &[&MuniArea],
@@ -142,10 +124,8 @@ pub fn build_layer(
 
 /// このズームで塗り(コロプレス)を出すか。z14以上は画面幅が1km前後になり「全面が同じ色」に
 /// 退化するので、そこは従来の代表点マーカーへ譲る(呼び出し側がdisaster_markers等で判定)。
-/// 下限は無い(無制限ズーム対応。設計 docs/disaster-choropleth-unlimited-zoom-design.md)。
-/// 以前はz9未満を除外していたが、それは取得側(mesh::primary_codes)のMAX_CODES安全弁に
-/// 当たって黙って0件になっていたための暫定処置で、primary_codes_unboundedへ切り替えた
-/// 現在は不要(実機で「広域にしても表示されない」という形で発覚・修正した)。
+/// 下限は無い(docs/disaster-choropleth-unlimited-zoom-design.md)。以前のz9下限は mesh::primary_codes の
+/// MAX_CODES安全弁で黙って0件になるのを避ける暫定処置で、primary_codes_unboundedへ切り替えて不要になった。
 pub fn fill_visible_at_zoom(z: u32) -> bool {
     z <= 13
 }
@@ -562,7 +542,7 @@ mod tests {
         println!("塗られた画素 {filled}/{} ({:.1}%)", w * h, coverage * 100.0);
         assert!(coverage > 0.5, "都心の画面がほとんど塗られていない: {coverage:.3}");
 
-        // 野田市(#75 の設計書に出てくる代表点)が、名前と件数の両方で引けること。
+        // 野田市(設計書に出てくる代表点)が、名前と件数の両方で引けること。
         let (name, total) = area_summary(&site_refs, &area_refs, 35.955106, 139.874828).expect("野田市が引けない");
         println!("野田市の代表点 → {name} {total}件");
         assert_eq!(name, "野田市");
